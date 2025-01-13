@@ -1,0 +1,10 @@
+datasets>=3.2.0
+numpy>=2.2.1
+safetensors>=0.4.5
+sentencepiece>=0.2.0
+torch>=2.4.1
+torchvision>=0.15.1
+tqdm>=4.67.1
+transformers>=4.46.3
+triton>=3.0.0
+wandb>=0.19.2

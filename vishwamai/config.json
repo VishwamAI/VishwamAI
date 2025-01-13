@@ -1,0 +1,35 @@
+{
+    "model_config": {
+        "dim": 4096,
+        "n_layers": 32,
+        "n_heads": 32,
+        "vocab_size": 102400,
+        "max_seq_len": 8192,
+        "n_kv_heads": null,
+        "multiple_of": 256,
+        "ffn_dim_multiplier": null,
+        "norm_eps": 1e-5,
+        "max_batch_size": 32,
+        "rope_theta": 10000.0,
+        "qk_dim": 128,
+        "v_dim": 128,
+        "rope_scaling": null,
+        "dtype": "float16"
+    },
+    "conceptual_config": {
+        "concept_dim": 512,
+        "n_concepts": 1000,
+        "concept_dropout": 0.1,
+        "use_concept_attention": true,
+        "concept_layer_norm": true,
+        "num_concept_layers": 2,
+        "concept_diversity_weight": 0.1
+    },
+    "training_config": {
+        "batch_size": 32,
+        "learning_rate": 2e-5,
+        "weight_decay": 0.01,
+        "warmup_steps": 1000,
+        "max_steps": 100000
+    }
+}

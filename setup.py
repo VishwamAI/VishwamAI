@@ -12,7 +12,7 @@ setup(
         "transformers>=4.46.3",
         "datasets>=3.2.0",
         "wandb>=0.19.2",
-        "numpy>=2.2.1",
+        "numpy==1.21.6",
         "tqdm>=4.67.1",
         "sentencepiece>=0.2.0",
     ],

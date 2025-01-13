@@ -27,3 +27,6 @@ dataclasses>=0.6
 tensorboard>=2.12.0
 accelerate>=0.20.0
 bitsandbytes>=0.41.0
+
+# Add spacy dependency
+spacy

@@ -19,12 +19,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install .
     
-    - name: Install spaCy
-      run: pip install spacy
+    - name: Install pytest
+      run: pip install pytest
     
-    - name: Install spaCy model
-      run: python -m spacy download en_core_web_sm
-      
     - name: Set up PYTHONPATH
       run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 

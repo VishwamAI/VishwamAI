@@ -127,6 +127,9 @@ class VishwamaiDataset(Dataset):
         with Pool(processes=num_workers) as pool:
             processed = list(pool.map(preprocess, self.load_raw_data()))
         
+        # Detect and handle outliers
+        processed = self.detect_and_handle_outliers(processed)
+        
         return processed
     
     def load_raw_data(self):
@@ -139,6 +142,22 @@ class VishwamaiDataset(Dataset):
         # Example preprocessing step
         processed_data = data.float().type(dtype)
         return processed_data
+    
+    def detect_and_handle_outliers(self, data):
+        """
+        Detect and handle outliers in the dataset.
+        """
+        lengths = [len(example["input_ids"]) for example in data]
+        mean_length = np.mean(lengths)
+        std_length = np.std(lengths)
+        
+        # Define outlier threshold
+        threshold = mean_length + 3 * std_length
+        
+        # Filter out outliers
+        filtered_data = [example for example in data if len(example["input_ids"]) <= threshold]
+        
+        return filtered_data
     
     def __len__(self):
         return len(self.examples)

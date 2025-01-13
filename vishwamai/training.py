@@ -78,7 +78,9 @@ class VishwamaiTrainer:
         device=None,
         train_batch_size=16,  # Reduced from 32
         eval_batch_size=16,   # Reduced from 32
-        gradient_accumulation_steps=2  # To simulate larger batch size
+        gradient_accumulation_steps=2,  # To simulate larger batch size
+        num_epochs=10,
+        patience=3
     ):
         chosen_device = select_device(device or "auto")
         self.model = model.to(chosen_device)
@@ -89,6 +91,8 @@ class VishwamaiTrainer:
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_epochs = num_epochs
+        self.patience = patience
         
         # Initialize optimizer and scheduler
         self.optimizer = torch.optim.AdamW(
@@ -97,6 +101,14 @@ class VishwamaiTrainer:
             betas=(0.9, 0.999),
             eps=1e-8,
             weight_decay=0.01
+        )
+        
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=3e-4,
+            epochs=self.num_epochs,
+            steps_per_epoch=len(self.train_loader),
+            pct_start=0.1  # 10% warmup
         )
         
         self.scaler = GradScaler()
@@ -115,6 +127,18 @@ class VishwamaiTrainer:
                 num_workers=2,
                 pin_memory=True
             )
+        
+        # Initialize metrics
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        
+        # Initialize wandb for monitoring
+        try:
+            import wandb
+            wandb.init(project="vishwamai", config=kwargs)
+            self.use_wandb = True
+        except ImportError:
+            self.use_wandb = False
     
     def train(
         self,
@@ -170,6 +194,17 @@ class VishwamaiTrainer:
             
             # Save after each epoch
             self.save_model(os.path.join(save_dir, f"checkpoint-epoch-{epoch}"))
+            
+            # Early stopping
+            if eval_loss < self.best_val_loss:
+                self.best_val_loss = eval_loss
+                self.patience_counter = 0
+                self.save_model(os.path.join(save_dir, f"best_model_epoch_{epoch}.pt"))
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= self.patience:
+                    print(f"Early stopping triggered after epoch {epoch}")
+                    break
     
     def evaluate(self):
         self.model.eval()

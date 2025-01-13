@@ -21,6 +21,8 @@ class ConceptualModelConfig:
     use_concept_attention: bool = True
     concept_layer_norm: bool = True
     num_concept_layers: int = 2
+    use_adaptive_routing: bool = False  # New feature for adaptive routing
+    use_multi_scale_reasoning: bool = False  # New feature for multi-scale reasoning
 
 class ConceptualLayer(nn.Module):
     """
@@ -51,6 +53,10 @@ class ConceptualLayer(nn.Module):
             self.concept_norm = nn.LayerNorm(base_dim)
         
         self.dropout = nn.Dropout(config.concept_dropout)
+
+        # Adaptive routing components
+        if config.use_adaptive_routing:
+            self.routing_weights = nn.Parameter(torch.ones(config.n_concepts))
 
     def forward(
         self, 
@@ -101,7 +107,12 @@ class ConceptualLayer(nn.Module):
         
         # Combine original and concept features
         output = hidden_states + gate_values * concept_features
-        
+
+        # Apply adaptive routing if enabled
+        if self.config.use_adaptive_routing:
+            routing_weights = torch.sigmoid(self.routing_weights)
+            output = output * routing_weights.unsqueeze(0).unsqueeze(0)
+
         if self.config.concept_layer_norm:
             output = self.concept_norm(output)
         

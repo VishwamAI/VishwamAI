@@ -10,6 +10,7 @@ from vishwamai.conceptualmodel import (
     advanced_concept_flow,
     ensure_gpu_availability
 )
+from vishwamai.dataprocessing import VishwamaiDataset
 import math  # Added import if not present
 
 # Updated test configuration with even smaller dimensions
@@ -394,3 +395,17 @@ def test_example_feature():
     finally:
         del model
         gc.collect()
+
+def test_outlier_detection():
+    data = [
+        {"input_ids": [1, 2, 3]},
+        {"input_ids": [1, 2]},
+        {"input_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]},
+        {"input_ids": [1]},
+        {"input_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]}
+    ]
+    dataset = VishwamaiDataset(data_path="", tokenizer=None)
+    filtered_data = dataset.detect_and_handle_outliers(data)
+    
+    assert len(filtered_data) == 4  # One outlier should be removed
+    assert all(len(example["input_ids"]) <= 10 for example in filtered_data), "Outlier not handled correctly"

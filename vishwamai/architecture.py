@@ -430,6 +430,14 @@ class VishwamaiV1(nn.Module):
         
         return safe_ids
 
+    def enable_gradient_checkpointing(self):
+        """
+        Enable gradient checkpointing for memory-efficient training.
+        """
+        for layer in self.layers:
+            layer.attention = torch.utils.checkpoint.checkpoint(layer.attention)
+            layer.feed_forward = torch.utils.checkpoint.checkpoint(layer.feed_forward)
+
 def init_model(config: VishwamaiConfig) -> VishwamaiV1:
     model = VishwamaiV1(config)
     # Initialize with proper scaling

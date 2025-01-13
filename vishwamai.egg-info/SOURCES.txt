@@ -1,0 +1,13 @@
+LICENSE
+README.md
+setup.py
+vishwamai/__init__.py
+vishwamai/architecture.py
+vishwamai/conceptualmodel.py
+vishwamai/dataprocessing.py
+vishwamai/training.py
+vishwamai.egg-info/PKG-INFO
+vishwamai.egg-info/SOURCES.txt
+vishwamai.egg-info/dependency_links.txt
+vishwamai.egg-info/requires.txt
+vishwamai.egg-info/top_level.txt

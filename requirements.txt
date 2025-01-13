@@ -1,0 +1,29 @@
+# Core dependencies
+torch==2.4.1
+triton==3.0.0
+safetensors==0.4.5
+transformers==4.46.3
+datasets==3.2.0
+wandb==0.19.2
+numpy==2.2.1
+tqdm==4.67.1
+sentencepiece==0.2.0
+
+# CPU Performance optimization
+torchvision==0.15.1
+
+# Development dependencies
+pytest>=7.3.1
+mypy>=1.4.1
+black>=23.3.0
+isort>=5.12.0
+flake8>=6.0.0
+
+# Type checking support
+typing-extensions>=4.5.0
+dataclasses>=0.6
+
+# Optional dependencies for research and experimentation
+tensorboard>=2.12.0
+accelerate>=0.20.0
+bitsandbytes>=0.41.0

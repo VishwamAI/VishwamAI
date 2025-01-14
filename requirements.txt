@@ -7,7 +7,7 @@ datasets==3.2.0
 wandb==0.19.2
 numpy==1.21.6
 tqdm==4.67.1
-sentencepiece # Ensure this line is present
+sentencepiece==0.1.96  # Ensure this line is present
 
 # CPU Performance optimization
 torchvision==0.15.1

@@ -7,6 +7,7 @@ import numpy as np
 from dataclasses import dataclass
 from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 import os  # Added import
+from vishwamai.architecture import push_model_to_hub
 
 @dataclass
 class ParquetConfig:
@@ -183,3 +184,29 @@ def update_parquet_model(parquet_path: str, new_texts: List[str], output_path: s
     
     # Write merged data to new parquet file
     pq.write_table(merged_table, output_path)
+    pq.write_table(merged_table, output_path)
+
+def update_and_upload_model(parquet_path: str, new_texts: List[str], output_path: str, model_name: str, token: str) -> None:
+    update_parquet_model(parquet_path, new_texts, output_path)
+    
+    # Load the updated model
+    model = VishwamaiV1.from_pretrained(output_path)
+    tokenizer = AutoTokenizer.from_pretrained(output_path)
+    
+    # Push to Hugging Face Hub
+    push_model_to_hub(model, tokenizer, model_name, token)
+
+def upload_to_huggingface(model_directory: str, model_name: str, token: str) -> None:
+    """
+    Uploads the model to Hugging Face Hub.
+    
+    Args:
+        model_directory (str): Path to the model directory.
+        model_name (str): Desired name on Hugging Face Hub.
+        token (str): Hugging Face authentication token.
+    """
+    model.push_to_hub(model_name, use_auth_token=token)
+    tokenizer.push_to_hub(model_name, use_auth_token=token)
+
+# Example usage after saving the model
+# upload_to_huggingface("./models/updated_model", "your-username/updated-model", "your_hf_token")

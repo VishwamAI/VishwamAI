@@ -9,6 +9,7 @@ import json
 import os
 
 from .architecture import VishwamaiV1
+from vishwamai.parquet_handling import ParquetConfig, ParquetDataset, create_parquet_dataloader
 
 @dataclass
 class GenerationConfig:
@@ -78,7 +79,9 @@ class VishwamaiTrainer:
         device=None,
         train_batch_size=16,  # Reduced from 32
         eval_batch_size=16,   # Reduced from 32
-        gradient_accumulation_steps=2  # To simulate larger batch size
+        gradient_accumulation_steps=2,  # To simulate larger batch size
+        use_parquet: bool = False,
+        parquet_config: Optional[ParquetConfig] = None
     ):
         chosen_device = select_device(device or "auto")
         self.model = model.to(chosen_device)
@@ -100,21 +103,38 @@ class VishwamaiTrainer:
         )
         
         self.scaler = GradScaler()
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.train_batch_size,
-            shuffle=True,
-            num_workers=2,  # Optimized number of workers
-            pin_memory=True
-        )
-        if self.eval_dataset:
-            self.eval_loader = DataLoader(
-                eval_dataset,
-                batch_size=self.eval_batch_size,
-                shuffle=False,
-                num_workers=2,
+        
+        if use_parquet:
+            if not isinstance(train_dataset, ParquetDataset):
+                raise ValueError("When use_parquet=True, train_dataset must be ParquetDataset")
+            self.train_loader = create_parquet_dataloader(
+                train_dataset,
+                parquet_config or ParquetConfig(),
+                distributed=torch.distributed.is_initialized()
+            )
+            
+            if self.eval_dataset:
+                self.eval_loader = create_parquet_dataloader(
+                    eval_dataset,
+                    parquet_config or ParquetConfig(),
+                    distributed=False
+                )
+        else:
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.train_batch_size,
+                shuffle=True,
+                num_workers=2,  # Optimized number of workers
                 pin_memory=True
             )
+            if self.eval_dataset:
+                self.eval_loader = DataLoader(
+                    eval_dataset,
+                    batch_size=self.eval_batch_size,
+                    shuffle=False,
+                    num_workers=2,
+                    pin_memory=True
+                )
     
     def train(
         self,

@@ -32,6 +32,9 @@ from .dataprocessing import (
     VishwamaiDataset
 )
 
+from .conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
+from .parquet_handling import ParquetDataset, ParquetConfig
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -61,5 +64,13 @@ __all__ = [
     
     # Data Processing
     "DataCollatorForLanguageModeling",
-    "VishwamaiDataset"
+    "VishwamaiDataset",
+    
+    # Conceptual Tokenizer
+    "ConceptualTokenizer",
+    "ConceptualTokenizerConfig",
+    
+    # Parquet Handling
+    "ParquetDataset",
+    "ParquetConfig"
 ]

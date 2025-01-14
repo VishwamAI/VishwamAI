@@ -6,6 +6,7 @@ from typing import List, Dict, Optional, Any
 import numpy as np
 from dataclasses import dataclass
 from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
+import os  # Added import
 
 @dataclass
 class ParquetConfig:
@@ -24,6 +25,10 @@ class ParquetDataset(Dataset):
         text_column: str = "text",
         max_length: int = 2048
     ):
+        # Check if the parquet file exists
+        if not os.path.isfile(parquet_path):
+            raise FileNotFoundError(f"Parquet file not found at path: {parquet_path}")
+        
         self.parquet_file = pq.ParquetFile(parquet_path)
         self.tokenizer = tokenizer if tokenizer else ConceptualTokenizer(ConceptualTokenizerConfig())  # Updated initialization
         self.config = config

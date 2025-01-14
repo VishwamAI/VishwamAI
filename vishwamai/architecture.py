@@ -440,3 +440,6 @@ def init_model(config: VishwamaiConfig) -> VishwamaiV1:
         for param in model.parameters():
             param.requires_grad = True
     return model
+
+# Add the following line at the end of the file to create an alias
+TransformerBlock = VishwamaiBlock

@@ -11,6 +11,7 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 
 from .architecture import VishwamaiV1
+from .architecture import VishwamaiBlock  # Removed TransformerBlock import
 from .training import VishwamaiTrainer
 
 @dataclass

@@ -330,3 +330,112 @@ def train_model(model, optimizer, criterion, dataloader, device, dtype):
         loss.backward()
         optimizer.step()
     # ...existing code...
+
+import os
+import torch
+from torch.utils.data import DataLoader
+from vishwamai.parquet_handling import ParquetDataset, ParquetConfig
+from vishwamai.model import VishwamaiModel, init_model
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
+from torch.optim import Adam
+from torch.nn import CrossEntropyLoss
+from tqdm import tqdm
+
+def load_data(config):
+    train_data_path = config.get("train_data")
+    val_data_path = config.get("val_data")
+    
+    if not os.path.isfile(train_data_path):
+        raise FileNotFoundError(f"Training data file not found at path: {train_data_path}")
+    
+    if not os.path.isfile(val_data_path):
+        raise FileNotFoundError(f"Validation data file not found at path: {val_data_path}")
+    
+    # ...existing data loading logic...
+
+def train_model(train_data_path: str, val_data_path: str, config: dict, output_dir: str, epochs: int, batch_size: int):
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize tokenizer
+    tokenizer_config = ConceptualTokenizerConfig(
+        vocab_size=config.get('vocab_size', 32000),
+        max_length=config.get('max_length', 512),
+        concept_tokens=["math", "logic", "science"],
+        reasoning_tokens=["if", "then", "equals", "because"]
+    )
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+    
+    # Initialize datasets
+    train_config = ParquetConfig(chunk_size=config.get('chunk_size', 10000), batch_size=batch_size)
+    val_config = ParquetConfig(chunk_size=config.get('chunk_size', 10000), batch_size=batch_size)
+    
+    train_dataset = ParquetDataset(
+        parquet_path=train_data_path,
+        config=train_config,
+        tokenizer=tokenizer,
+        max_length=tokenizer_config.max_length
+    )
+    
+    val_dataset = ParquetDataset(
+        parquet_path=val_data_path,
+        config=val_config,
+        tokenizer=tokenizer,
+        max_length=tokenizer_config.max_length
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    
+    # Initialize model
+    model_config = init_model(config)
+    model = VishwamaiModel(model_config)
+    model.train()
+    
+    # Setup optimizer and loss
+    optimizer = Adam(model.parameters(), lr=config.get('learning_rate', 1e-4))
+    criterion = CrossEntropyLoss()
+    
+    # Training loop
+    for epoch in range(1, epochs + 1):
+        print(f"Epoch {epoch}/{epochs}")
+        epoch_loss = 0.0
+        for batch in tqdm(train_loader, desc="Training"):
+            input_ids = batch['input_ids'].to(config.get('device', 'cpu'))
+            attention_mask = batch['attention_mask'].to(config.get('device', 'cpu'))
+            labels = batch['input_ids'].to(config.get('device', 'cpu'))  # Assuming labels are the same as input_ids
+            
+            optimizer.zero_grad()
+            outputs = model(input_ids, attention_mask=attention_mask)
+            loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+        
+        avg_loss = epoch_loss / len(train_loader)
+        print(f"Average Training Loss: {avg_loss}")
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validation"):
+                input_ids = batch['input_ids'].to(config.get('device', 'cpu'))
+                attention_mask = batch['attention_mask'].to(config.get('device', 'cpu'))
+                labels = batch['input_ids'].to(config.get('device', 'cpu'))
+                
+                outputs = model(input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
+                
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"Average Validation Loss: {avg_val_loss}")
+        model.train()
+        
+        # Save model checkpoint
+        checkpoint_path = os.path.join(output_dir, f"model_epoch_{epoch}.pth")
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Model saved to {checkpoint_path}")

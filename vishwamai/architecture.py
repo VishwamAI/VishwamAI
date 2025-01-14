@@ -7,7 +7,6 @@ from torch import nn
 import logging
 import torch.nn.utils.prune
 import torch.nn.utils.prune
-from transformers import PreTrainedModel, PretrainedConfig
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device='cpu').float() / dim))
@@ -37,8 +36,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
             .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim))
 
 @dataclass
-class VishwamaiConfig(PretrainedConfig):
-    model_type: str = "vishwamai"
+class VishwamaiConfig:
     dim: int = 4096  # Model dimension
     n_layers: int = 32
     n_heads: int = 32
@@ -159,10 +157,9 @@ class VishwamaiBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
-class VishwamaiV1(PreTrainedModel):
-    config_class = VishwamaiConfig
+class VishwamaiV1(nn.Module):
     def __init__(self, config: VishwamaiConfig):
-        super().__init__(config)
+        super().__init__()
         self.config = config
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         
@@ -433,17 +430,6 @@ class VishwamaiV1(PreTrainedModel):
         
         return safe_ids
 
-    def save_pretrained(self, save_directory: str, **kwargs):
-        super().save_pretrained(save_directory, **kwargs)
-        # Add any additional saving mechanisms if necessary
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-        config = VishwamaiConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        model = super().from_pretrained(pretrained_model_name_or_path, config=config, *model_args, **kwargs)
-        return model
-
-    """
 def init_model(config: VishwamaiConfig) -> VishwamaiV1:
     model = VishwamaiV1(config)
     # Initialize with proper scaling
@@ -454,19 +440,6 @@ def init_model(config: VishwamaiConfig) -> VishwamaiV1:
         for param in model.parameters():
             param.requires_grad = True
     return model
-
-# Add the following line at the end of the file to create an alias
-TransformerBlock = VishwamaiBlock
-    Pushes the model and tokenizer to Hugging Face Hub.
-    
-    Args:
-        model: The trained model instance.
-        tokenizer: The tokenizer instance.
-        model_name (str): The name to assign to the model on Hugging Face Hub.
-        token (str): Hugging Face authentication token.
-    """
-    model.push_to_hub(model_name, use_auth_token=token)
-    tokenizer.push_to_hub(model_name, use_auth_token=token)
 
 # Add the following line at the end of the file to create an alias
 TransformerBlock = VishwamaiBlock

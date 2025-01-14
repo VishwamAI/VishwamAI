@@ -340,6 +340,7 @@ from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokeni
 from torch.optim import Adam
 from torch.nn import CrossEntropyLoss
 from tqdm import tqdm
+from transformers import Trainer, TrainingArguments
 
 def load_data(config):
     train_data_path = config.get("train_data")
@@ -396,6 +397,35 @@ def train_model(train_data_path: str, val_data_path: str, config: dict, output_d
     # Setup optimizer and loss
     optimizer = Adam(model.parameters(), lr=config.get('learning_rate', 1e-4))
     criterion = CrossEntropyLoss()
+    
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        evaluation_strategy="steps",
+        save_steps=1000,
+        eval_steps=100,
+        logging_steps=10,
+        learning_rate=config['training_config']['learning_rate'],
+        weight_decay=config['training_config']['weight_decay'],
+        warmup_steps=config['training_config']['warmup_steps'],
+        fp16=True if config['model_config']['dtype'] == "float16" else False,
+        push_to_hub=True,
+        hub_model_id="YourHuggingFaceUsername/VishwamaiModel",
+        hub_token=os.getenv("HF_TOKEN")
+    )
+    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_loader,
+        eval_dataset=val_loader,
+        tokenizer=tokenizer,
+    )
+    
+    trainer.train()
+    trainer.push_to_hub()
     
     # Training loop
     for epoch in range(1, epochs + 1):

@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from dataclasses import dataclass
+from transformers import PreTrainedModel, BertConfig
 
 from .architecture import (
     VishwamaiConfig,
@@ -13,16 +14,14 @@ from .architecture import (
     precompute_freqs_cis
 )
 
-class VishwamaiModel(nn.Module):
+class VishwamaiModel(PreTrainedModel):
     """
-    Main Vishwamai model implementation with support for:
-    - Expert routing with balanced load
-    - Multi-token prediction
-    - Efficient inference
-    - Memory-efficient training
+    Main Vishwamai model implementation compatible with Hugging Face's Transformers.
     """
+    config_class = VishwamaiConfig
+
     def __init__(self, config: VishwamaiConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         
         # Core components

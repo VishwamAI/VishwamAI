@@ -8,9 +8,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 import logging
+from transformers import HfArgumentParser
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train VishwamAI DeepMind Math Model")
+    parser = argparse.ArgumentParser(description="Train VishwamAI DeepMind Math Model with Hugging Face")
     parser.add_argument('--config', type=str, required=True, help='Path to the config JSON file')
     parser.add_argument('--train_data', type=str, required=True, help='Path to the training data Parquet file')
     parser.add_argument('--val_data', type=str, required=True, help='Path to the validation data Parquet file')
@@ -64,7 +65,7 @@ def main():
     with open(args.config, 'r') as f:
         config = json.load(f)
     
-    # Initiate training
+    # Initiate training with Hugging Face Trainer
     model = train_model(
         train_data_path=args.train_data,
         val_data_path=args.val_data,

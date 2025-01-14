@@ -19,9 +19,6 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Install sentencepiece
-      run: pip install sentencepiece
-    
     - name: Install pytest
       run: pip install pytest
     

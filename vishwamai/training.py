@@ -410,7 +410,6 @@ def train_model(train_data_path: str, val_data_path: str, config: dict, output_d
         learning_rate=config['training_config']['learning_rate'],
         weight_decay=config['training_config']['weight_decay'],
         warmup_steps=config['training_config']['warmup_steps'],
-        fp16=True if config['model_config']['dtype'] == "float16" else False,
         push_to_hub=True,
         hub_model_id="YourHuggingFaceUsername/VishwamaiModel",
         hub_token=os.getenv("HF_TOKEN")

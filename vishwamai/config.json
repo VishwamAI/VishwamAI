@@ -13,8 +13,7 @@
         "rope_theta": 10000.0,
         "qk_dim": 128,
         "v_dim": 128,
-        "rope_scaling": null,
-        "dtype": "float16"
+        "rope_scaling": null
     },
     "conceptual_config": {
         "concept_dim": 512,

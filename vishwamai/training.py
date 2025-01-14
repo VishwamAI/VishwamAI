@@ -7,9 +7,13 @@ from torch.nn import CrossEntropyLoss
 from torch.cuda.amp import autocast
 import json
 import os
+from transformers import Trainer, TrainingArguments
 
 from .architecture import VishwamaiV1
 from vishwamai.parquet_handling import ParquetConfig, ParquetDataset, create_parquet_dataloader
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
+from vishwamai.model import VishwamaiModel, VishwamaiConfig, init_model
+from .dataprocessing import VishwamaiDataset  # Ensure correct import
 
 @dataclass
 class GenerationConfig:
@@ -472,3 +476,33 @@ def train_model(train_data_path: str, val_data_path: str, config: dict, output_d
 
     # Save the tokenizer after training
     tokenizer.save_tokenizer()
+
+def train_with_sample_data(json_path="data/sample.json"):
+    # Load sample data
+    with open(json_path, "r") as f:
+        raw_data = json.load(f)
+
+    # Prepare dataset
+    dataset = VishwamaiDataset(raw_data)  # Now defined
+
+    # Initialize tokenizer
+    tokenizer_config = ConceptualTokenizerConfig()
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+
+    # Train tokenizer if not already trained
+    tokenizer.train_tokenizer([item["question"] + " " + item["answer"] for item in raw_data["examples"]])
+
+    # Model initialization using from_pretrained if available
+    model_config = VishwamaiConfig()
+    model = VishwamaiModel(config=model_config)
+
+    # Trainer setup
+    trainer = VishwamaiTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset
+    )
+
+    # Training
+    trainer.train()
+    print("Training complete. You can now interact with the model.")

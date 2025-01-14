@@ -1,5 +1,6 @@
 import argparse
 from vishwamai.training import train_model
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer
 import json
 import os
 import subprocess
@@ -76,6 +77,10 @@ def main():
         device=device,
         local_rank=args.local_rank
     )
+    
+    # Optionally, save the trained tokenizer
+    tokenizer = ConceptualTokenizer.from_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
 
 if __name__ == "__main__":
     main()

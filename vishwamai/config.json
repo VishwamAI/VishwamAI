@@ -1,11 +1,11 @@
 {
     "model_config": {
-        "dim": 256,
-        "n_layers": 6,
-        "n_heads": 8,
-        "vocab_size": 1000,
-        "max_seq_len": 512,
-        "n_kv_heads": 8,
+        "dim": 4096,
+        "n_layers": 32,
+        "n_heads": 32,
+        "vocab_size": 102400,
+        "max_seq_len": 8192,
+        "n_kv_heads": null,
         "multiple_of": 256,
         "ffn_dim_multiplier": null,
         "norm_eps": 1e-5,
@@ -13,7 +13,9 @@
         "rope_theta": 10000.0,
         "qk_dim": 128,
         "v_dim": 128,
-        "rope_scaling": null
+        "rope_scaling": null,
+        "dtype": "float16",
+        "model_prefix": "conceptual_tokenizer"
     },
     "conceptual_config": {
         "concept_dim": 512,

@@ -75,13 +75,13 @@ class VishwamaiTrainer:
         model,
         tokenizer,
         train_dataset,
+        use_parquet: bool,
+        parquet_config: Optional[ParquetConfig],
         eval_dataset=None,
         device=None,
         train_batch_size=16,  # Reduced from 32
         eval_batch_size=16,   # Reduced from 32
-        gradient_accumulation_steps=2,  # To simulate larger batch size
-        use_parquet: bool = False,
-        parquet_config: Optional[ParquetConfig] = None
+        gradient_accumulation_steps=2  # To simulate larger batch size
     ):
         chosen_device = select_device(device or "auto")
         self.model = model.to(chosen_device)
@@ -410,6 +410,7 @@ def train_model(train_data_path: str, val_data_path: str, config: dict, output_d
         learning_rate=config['training_config']['learning_rate'],
         weight_decay=config['training_config']['weight_decay'],
         warmup_steps=config['training_config']['warmup_steps'],
+        fp16=True if config['model_config']['dtype'] == "float16" else False,
         push_to_hub=True,
         hub_model_id="YourHuggingFaceUsername/VishwamaiModel",
         hub_token=os.getenv("HF_TOKEN")
@@ -468,3 +469,6 @@ def train_model(train_data_path: str, val_data_path: str, config: dict, output_d
         checkpoint_path = os.path.join(output_dir, f"model_epoch_{epoch}.pth")
         torch.save(model.state_dict(), checkpoint_path)
         print(f"Model saved to {checkpoint_path}")
+
+    # Save the tokenizer after training
+    tokenizer.save_tokenizer()

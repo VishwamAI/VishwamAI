@@ -82,71 +82,86 @@ class VishwamaiModel(PreTrainedModel):
             Model outputs either as tensor or dictionary
         """
         # Input validation
-        batch_size, seq_length = input_ids.shape
-        device = input_ids.device
-        
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length), 
-                dtype=torch.bool,
-                device=device
+        try:
+            if input_ids.size(0) == 0:
+                raise ValueError("Batch size cannot be zero.")
+            if input_ids.dim() != 2:
+                raise ValueError("input_ids must be a 2D tensor [batch_size, sequence_length]")
+            
+            if (input_ids >= self.config.vocab_size).any():
+                raise ValueError("Token indices exceed vocabulary size.")
+            
+            batch_size, seq_length = input_ids.shape
+            device = input_ids.device
+            
+            # Ensure tokens are within vocabulary size
+            input_ids = torch.clamp(input_ids, max=self.config.vocab_size - 1)
+            
+            # Create attention mask if not provided
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    (batch_size, seq_length), 
+                    dtype=torch.bool,
+                    device=device
+                )
+            
+            # Create causal mask
+            causal_mask = torch.triu(
+                torch.full(
+                    (seq_length, seq_length), 
+                    float('-inf'),
+                    device=device
+                ),
+                diagonal=1
             )
-        
-        # Create causal mask
-        causal_mask = torch.triu(
-            torch.full(
-                (seq_length, seq_length), 
-                float('-inf'),
-                device=device
-            ),
-            diagonal=1
-        )
-        attention_mask = attention_mask.unsqueeze(1).unsqueeze(1) * causal_mask
-        
-        # Initialize outputs
-        hidden_states = []
-        attentions = []
-        present_key_values = [] if use_cache else None
-        
-        # Get input embeddings
-        h = self.tok_embeddings(input_ids)
-        
-        # Process through transformer layers
-        for idx, layer in enumerate(self.layers):
-            if output_hidden_states:
-                hidden_states.append(h)
-                
-            past_kv = past_key_values[idx] if past_key_values is not None else None
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1) * causal_mask
             
-            h = layer(
-                h,
-                start_pos=start_pos,
-                freqs_cis=self.freqs_cis,
-                mask=attention_mask
-            )
+            # Initialize outputs
+            hidden_states = []
+            attentions = []
+            present_key_values = [] if use_cache else None
             
-            if use_cache:
-                present_key_values.append(layer.attention.get_kv_cache())
-                
-            if output_attentions:
-                attentions.append(layer.attention.get_attention_weights())
-                
-        # Final normalization
-        h = self.norm(h)
-        
-        # Get logits
-        logits = self.output(h)
-        
-        if not return_dict:
-            return logits
+            # Get input embeddings
+            h = self.tok_embeddings(input_ids)
             
-        return {
-            'logits': logits,
-            'hidden_states': hidden_states if output_hidden_states else None,
-            'attentions': attentions if output_attentions else None,
-            'past_key_values': present_key_values
-        }
+            # Process through transformer layers
+            for idx, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    hidden_states.append(h)
+                    
+                past_kv = past_key_values[idx] if past_key_values is not None else None
+                
+                h = layer(
+                    h,
+                    start_pos=start_pos,
+                    freqs_cis=self.freqs_cis,
+                    mask=attention_mask
+                )
+                
+                if use_cache:
+                    present_key_values.append(layer.attention.get_kv_cache())
+                    
+                if output_attentions:
+                    attentions.append(layer.attention.get_attention_weights())
+                    
+            # Final normalization
+            h = self.norm(h)
+            
+            # Get logits
+            logits = self.output(h)
+            
+            if not return_dict:
+                return logits
+                
+            return {
+                'logits': logits,
+                'hidden_states': hidden_states if output_hidden_states else None,
+                'attentions': attentions if output_attentions else None,
+                'past_key_values': present_key_values
+            }
+        except Exception as e:
+            logging.error(f"Real-world error in VishwamaiModel.forward: {e}")
+            raise e
 
     @torch.no_grad()
     def generate(

@@ -22,39 +22,190 @@ class VishwamaiModel(PreTrainedModel):
 
     def __init__(self, config: VishwamaiConfig):
         super().__init__(config)
-        self.config = config
-        
-        # Core components
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        
-        # Transformer layers
-        self.layers = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.n_layers)
-        ])
-        
-        # Output components
-        self.norm = RMSNorm(config.dim, config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-        
-        # Position embeddings
-        self.freqs_cis = precompute_freqs_cis(
-            config.dim // config.n_heads,
-            config.max_seq_len * 2,
-            config.rope_theta,
-            config.rope_scaling
-        )
-        
-        # Initialize weights
-        self.apply(self._init_weights)
+        retries = 0
+        while retries < 3:
+            try:
+                # Core components
+                self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+                
+                # Transformer layers
+                self.layers = nn.ModuleList([
+                    TransformerBlock(config) for _ in range(config.n_layers)
+                ])
+                
+                # Output components
+                self.norm = RMSNorm(config.dim, config.norm_eps)
+                self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+                
+                # Position embeddings
+                self.freqs_cis = precompute_freqs_cis(
+                    config.dim // config.n_heads,
+                    config.max_seq_len * 2,
+                    config.rope_theta,
+                    config.rope_scaling
+                )
+                
+                # Initialize weights
+                self.apply(self._init_weights)
+                
+                # Add memory optimization flags
+                self.gradient_checkpointing = False
+                self.use_activation_checkpointing = False
+                break
+            except RuntimeError:
+                retries += 1
+                if retries == 3:
+                    raise
 
     def _init_weights(self, module):
         """Initialize model weights."""
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        try:
+            if isinstance(module, nn.Linear):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        except Exception as e:
+            logging.error(f"Error in _init_weights: {e}")
+            raise
+
+    def enable_memory_efficient_training(self):
+        """Enable memory optimizations."""
+        try:
+            self.gradient_checkpointing = True
+            self.use_activation_checkpointing = True
+            for layer in self.layers:
+                layer.gradient_checkpointing = True
+                layer.attention.use_flash_attention = True
+        except Exception as e:
+            logging.error(f"Error enabling memory efficient training: {e}")
+            raise
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.gradient_checkpointing = True
+        for layer in self.layers:
+            if hasattr(layer, 'gradient_checkpointing'):
+                layer.gradient_checkpointing = True
 
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        start_pos: int = 0,
+        return_dict: bool = True,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Forward pass of the model.
+        
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            attention_mask: Optional attention mask
+            past_key_values: Optional cached key/value states for efficient inference
+            use_cache: Whether to use cached key/values
+            start_pos: Starting position for position embeddings
+            return_dict: Whether to return outputs as dictionary
+            output_hidden_states: Whether to return all hidden states
+            output_attentions: Whether to return attention weights
+            
+        Returns:
+            Model outputs either as tensor or dictionary
+        """
+        # Input validation
+        try:
+            if input_ids.size(0) == 0:
+                raise ValueError("Batch size cannot be zero.")
+            if input_ids.dim() != 2:
+                raise ValueError("input_ids must be a 2D tensor [batch_size, sequence_length]")
+            
+            if (input_ids >= self.config.vocab_size).any():
+                raise ValueError("Token indices exceed vocabulary size.")
+            
+            batch_size, seq_length = input_ids.shape
+            device = input_ids.device
+            
+            # Ensure tokens are within vocabulary size
+            input_ids = torch.clamp(input_ids, max=self.config.vocab_size - 1)
+            
+            # Create attention mask if not provided
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    (batch_size, seq_length), 
+                    dtype=torch.bool,
+                    device=device
+                )
+            
+            # Create causal mask
+            causal_mask = torch.triu(
+                torch.full(
+                    (seq_length, seq_length), 
+                    float('-inf'),
+                    device=device
+                ),
+                diagonal=1
+            )
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1) * causal_mask
+            
+            # Initialize outputs
+            hidden_states = []
+            attentions = []
+            present_key_values = [] if use_cache else None
+            
+            # Get input embeddings
+            h = self.tok_embeddings(input_ids)
+            
+            # Process through transformer layers
+            for idx, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    hidden_states.append(h)
+                    
+                past_kv = past_key_values[idx] if past_key_values is not None else None
+                
+                if self.gradient_checkpointing and self.training:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+
+                    h = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(layer),
+                        h,
+                        start_pos,
+                        self.freqs_cis,
+                        attention_mask
+                    )
+                else:
+                    h = layer(h, start_pos, self.freqs_cis, attention_mask)
+                
+                if use_cache:
+                    present_key_values.append(layer.attention.get_kv_cache())
+                    
+                if output_attentions:
+                    attentions.append(layer.attention.get_attention_weights())
+                    
+            # Final normalization
+            h = self.norm(h)
+            
+            # Get logits
+            logits = self.output(h)
+            
+            if not return_dict:
+                return logits
+                
+            return {
+                'logits': logits,
+                'hidden_states': hidden_states if output_hidden_states else None,
+                'attentions': attentions if output_attentions else None,
+                'past_key_values': present_key_values
+            }
+        except Exception as e:
+            logging.error(f"Real-world error in VishwamaiModel.forward: {e}")
+            raise e
+
+    def _forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -312,15 +463,16 @@ class VishwamaiModel(PreTrainedModel):
 
 def init_model(config: VishwamaiConfig) -> VishwamaiModel:
     """Initialize a new Vishwamai model."""
-    model = VishwamaiModel(config)
-    
-    # Initialize with proper scaling
-    for name, param in model.named_parameters():
-        if param.ndim == 2:
-            torch.nn.init.normal_(param, mean=0.0, std=0.02)
-            
-    # Ensure all parameters require gradients
-    for param in model.parameters():
-        param.requires_grad = True
-        
-    return model
+    try:
+        model = VishwamaiModel(config)
+        # Initialize with proper scaling
+        for name, param in model.named_parameters():
+            if param.ndim == 2:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+        # Ensure all parameters require gradients
+        for param in model.parameters():
+            param.requires_grad = True
+        return model
+    except Exception as e:
+        logging.error(f"Error initializing model: {e}")
+        raise

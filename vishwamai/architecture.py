@@ -9,10 +9,27 @@ import torch.nn.utils.prune
 import torch.nn.utils.prune
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device='cpu').float() / dim))
-    t = torch.arange(end, device='cpu')
-    freqs = torch.outer(t, freqs).float()
-    return torch.polar(torch.ones_like(freqs), freqs)
+    if dim <= 0 or end <= 0:
+        raise ValueError("Dimension and end must be positive.")
+    """
+    Precompute the complex frequencies for rotary embeddings.
+    
+    Args:
+        dim (int): Dimension of the model.
+        end (int): Maximum sequence length.
+        theta (float, optional): Scaling factor. Defaults to 10000.0.
+    
+    Returns:
+        torch.Tensor: Precomputed complex frequencies.
+    """
+    try:
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device='cpu').float() / dim))
+        t = torch.arange(end, device='cpu')
+        freqs = torch.outer(t, freqs).float()
+        return torch.polar(torch.ones_like(freqs), freqs)
+    except Exception as e:
+        logging.error(f"Error in precompute_freqs_cis: {e}")
+        raise
 
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     # Ensure freqs_cis matches the sequence length
@@ -82,6 +99,12 @@ class AdvancedAttention(nn.Module):
                                   self.n_kv_heads, self.head_dim))
         self.cache_v = torch.zeros((config.max_batch_size, config.max_seq_len,
                                   self.n_kv_heads, self.head_dim))
+        
+        # Add Flash Attention support
+        self.use_flash_attention = (
+            hasattr(torch.nn.functional, 'scaled_dot_product_attention') and 
+            torch.cuda.is_available()
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
                 mask: Optional[torch.Tensor] = None):
@@ -113,29 +136,24 @@ class AdvancedAttention(nn.Module):
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        if mask is not None:
-            # Ensure mask has correct dimensions for attention scores
-            if mask.dim() == 2:
-                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seqlen, seqlen]
-            elif mask.dim() == 3:
-                mask = mask.unsqueeze(1)  # [bsz, 1, seqlen, seqlen]
-            
-            # Ensure mask can be broadcast to scores shape
-            target_shape = (bsz, self.n_heads, seqlen, scores.size(-1))
-            if mask.size(-1) != scores.size(-1):  # Fix size mismatch
-                pad_size = scores.size(-1) - mask.size(-1)
-                if pad_size > 0:
-                    mask = F.pad(mask, (0, pad_size), value=float('-inf'))
-                # Expand head dimension only
-                mask = mask.expand(-1, self.n_heads, -1, -1)
-            
-            scores = scores + mask.type_as(scores)
-        
-        scores = F.softmax(scores, dim=-1)
-        output = torch.matmul(scores, values)
-        
+        if self.use_flash_attention:
+            # Use Flash Attention when available
+            output = F.scaled_dot_product_attention(
+                xq,
+                keys,
+                values,
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=True
+            )
+        else:
+            # Fall back to standard attention
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores + mask
+            scores = F.softmax(scores, dim=-1)
+            output = torch.matmul(scores, values)
+
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 

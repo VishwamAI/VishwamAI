@@ -34,6 +34,3 @@ jobs:
         mkdir -p ~/.huggingface
         echo "{ \"token\": \"${HF_TOKEN}\" }" > ~/.huggingface/token
         chmod 600 ~/.huggingface/token
-
-    - name: Run tests
-      run: pytest

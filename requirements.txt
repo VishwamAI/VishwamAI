@@ -32,7 +32,7 @@ plotly==5.13.1
 # Memory and Performance Optimization
 psutil==6.1.0
 triton==3.1.0
-ninja==1.11.0
+ninja==1.11.1
 
 # Monitoring and Logging
 wandb==0.19.1

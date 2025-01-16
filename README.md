@@ -54,6 +54,23 @@ For general training, use:
 python train.py --train-data path/to/train_data.txt --val-data path/to/val_data.txt --output-dir models --model-size 2b --batch-size 32 --num-epochs 10
 ```
 
+### Tokenization for Math, Physics, and Biology
+
+The `ConceptualTokenizer` class in `vishwamai/conceptual_tokenizer.py` now includes subject-specific tokens for math, physics, and biology. This allows for more precise tokenization and understanding of subject-specific texts.
+
+To use the subject-specific tokens, ensure that the `ConceptualTokenizer` is initialized with the appropriate subject-specific tokens. For example:
+```python
+tokenizer = ConceptualTokenizer(
+    vocab_size=32000,
+    max_length=512
+)
+tokenizer.subject_specific_tokens.update({
+    "math": 6,
+    "physics": 7,
+    "biology": 8
+})
+```
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.

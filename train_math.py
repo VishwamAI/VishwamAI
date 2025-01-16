@@ -106,6 +106,13 @@ def train_math_model(
         max_length=config.max_position_embeddings
     )
     
+    # Add subject-specific tokens for math, physics, and biology
+    tokenizer.subject_specific_tokens.update({
+        "math": 6,
+        "physics": 7,
+        "biology": 8
+    })
+    
     # Create dataloaders
     train_loader, val_loader = create_math_dataloaders(batch_size)
     

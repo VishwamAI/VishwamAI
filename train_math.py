@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from vishwamai.architecture import init_model, create_config_from_template
 from vishwamai.training import VishwamaiTrainer
-from vishwamai.conceptual_tokenizer import ConceptualTokenizer
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 from vishwamai.generate import GenerationConfig, VishwamaiGenerator  # Add VishwamaiGenerator import
 
 logging.basicConfig(level=logging.INFO)
@@ -60,24 +60,38 @@ def create_math_dataloaders(batch_size: int = 32):
 def math_collate_fn(batch, tokenizer=None):
     """Custom collate function for math problems"""
     if tokenizer is None:
-        tokenizer = ConceptualTokenizer(vocab_size=32000, max_length=512)
+        config = ConceptualTokenizerConfig(vocab_size=32000, max_length=512)
+        tokenizer = ConceptualTokenizer(config)
         
     questions = [item['question'] for item in batch]
-    answers = [item['answer'] for item in batch]
     
-    # Combine question and answer with special separator
-    combined_texts = [q + " [SEP] " + a for q, a in zip(questions, answers)]
+    # First encode all questions
+    encoded_batch = []
+    for question in questions:
+        encoded = tokenizer.encode_with_concepts(
+            text=question,
+            max_length=512,
+            max_concepts=10
+        )
+        encoded_batch.append(encoded)
     
-    # Tokenize using instance method instead of class method
-    tokenized = tokenizer.batch_encode_with_concepts(
-        texts=combined_texts,
-        max_length=512,
-        max_concepts=8
-    )
+    # Pad sequences
+    max_len = max(len(item['input_ids']) for item in encoded_batch)
+    
+    # Create padded tensors
+    input_ids = torch.tensor([
+        item['input_ids'] + [tokenizer.config.pad_id] * (max_len - len(item['input_ids']))
+        for item in encoded_batch
+    ])
+    
+    concept_ids = torch.tensor([
+        item['concept_ids'] + [0] * (10 - len(item['concept_ids']))  # Pad concepts to max 10
+        for item in encoded_batch
+    ])
     
     return {
-        'input_ids': tokenized['token_ids'],
-        'concept_ids': tokenized['concept_ids']
+        'input_ids': input_ids,
+        'concept_ids': concept_ids
     }
 
 def train_math_model(

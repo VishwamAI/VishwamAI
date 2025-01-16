@@ -1,0 +1,43 @@
+{
+  "os":  "Linux-6.8.0-51-generic-x86_64-with-glibc2.35",
+  "python":  "CPython 3.10.12",
+  "startedAt":  "2025-01-16T12:05:34.980137Z",
+  "args":  [
+    "--rootdir=/home/kasinadhsarma/VishwamAI"
+  ],
+  "program":  "/home/kasinadhsarma/.vscode/extensions/ms-python.python-2024.22.2-linux-x64/python_files/vscode_pytest/run_pytest_script.py",
+  "git":  {
+    "remote":  "https://github.com/VishwamAI/VishwamAI.git",
+    "commit":  "19658ec3531724af9cb62b2c117b8aeef1324567"
+  },
+  "email":  "kasinadhsarma@gmail.com",
+  "root":  "/home/kasinadhsarma/VishwamAI",
+  "host":  "bgentech",
+  "executable":  "/usr/bin/python3",
+  "cpu_count":  6,
+  "cpu_count_logical":  12,
+  "gpu":  "NVIDIA GeForce GTX 1650",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "250375106560",
+      "used":  "201471455232"
+    }
+  },
+  "memory":  {
+    "total":  "16100909056"
+  },
+  "cpu":  {
+    "count":  6,
+    "countLogical":  12
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce GTX 1650",
+      "memoryTotal":  "4294967296",
+      "cudaCores":  896,
+      "architecture":  "Turing"
+    }
+  ],
+  "cudaVersion":  "12.4"
+}

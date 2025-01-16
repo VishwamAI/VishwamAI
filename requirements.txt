@@ -35,7 +35,6 @@ triton==3.1.0
 ninja==1.11.1
 
 # Monitoring and Logging
-wandb==0.19.1
 tensorboard==2.18.0
 rich==13.9.4
 

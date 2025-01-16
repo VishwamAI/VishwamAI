@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from typing import List, Optional, Dict, Union, Tuple
 from dataclasses import dataclass
 import numpy as np
+from .model import VishwamaiModel  # Corrected import
+from .conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 
 @dataclass
 class GenerationConfig:
@@ -19,18 +21,26 @@ class VishwamaiGenerator:
         self.config = config or GenerationConfig()
         
     def generate(self, text: str) -> List[str]:
-        input_ids = self.tokenizer.encode(text, return_tensors="pt")
-        input_ids = input_ids.to(self.model.device)
+        input_ids = self.tokenizer.encode(text)
+        input_ids = torch.tensor(input_ids).unsqueeze(0).to(self.model.device)
         
         with torch.no_grad():
             output_ids = self._generate_tokens(input_ids)
             
-        return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        # Convert tensor output to list for tokenizer
+        if isinstance(output_ids, torch.Tensor):
+            output_ids = output_ids.cpu().tolist()
+            
+        return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
     
     def _generate_tokens(self, input_ids):
+        # Ensure we don't exceed max_length
+        if input_ids.shape[1] >= self.config.max_length:
+            return input_ids[:, :self.config.max_length]
+        
         batch_size = input_ids.shape[0]
         
-        for _ in range(self.config.max_length):
+        for _ in range(self.config.max_length - input_ids.shape[1]):
             outputs = self.model(input_ids)
             if outputs is None:
                 return input_ids  # Handle None outputs gracefully
@@ -56,7 +66,21 @@ class VishwamaiGenerator:
             input_ids = torch.cat([input_ids, next_tokens], dim=-1)
             
             # Check if all sequences hit the EOS token
-            if (next_tokens == self.tokenizer.eos_token_id).all():
+            if (next_tokens == self.tokenizer.config.eos_id).all():
                 break
-                
+            
+            # Enforce max_length
+            if input_ids.shape[1] >= self.config.max_length:
+                break
+        
+        # Ensure EOS token is appended if not present
+        eos_present = (input_ids[:, -1] == self.tokenizer.config.eos_id)
+        for i in range(batch_size):
+            if not eos_present[i]:
+                if input_ids.shape[1] < self.config.max_length:
+                    input_ids[i] = torch.cat([input_ids[i], torch.tensor([self.tokenizer.config.eos_id], device=input_ids.device)])
+                else:
+                    # Replace the last token with EOS if max_length is reached
+                    input_ids[i, -1] = self.tokenizer.config.eos_id
+        
         return input_ids

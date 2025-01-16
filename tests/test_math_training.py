@@ -4,6 +4,7 @@ import pyarrow as pa
 from pathlib import Path
 from datasets import Dataset
 from train_math import create_math_dataloaders, math_collate_fn
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 
 def test_math_collate_fn():
     batch = [
@@ -11,7 +12,9 @@ def test_math_collate_fn():
         {'question': 'What is 3*3?', 'answer': '9'}
     ]
     
-    output = math_collate_fn(batch)
+    config = ConceptualTokenizerConfig(vocab_size=32000, max_length=512)
+    tokenizer = ConceptualTokenizer(config)
+    output = math_collate_fn(batch, tokenizer)
     assert 'input_ids' in output
     assert 'concept_ids' in output
     assert isinstance(output['input_ids'], torch.Tensor)

@@ -88,7 +88,8 @@ class VishwamaiBlock(nn.Module):
         # Pre-norm architecture
         h = self.input_norm(x)
         h = self.attention(h, attention_mask)
-        x = x + h
+        if h is not None:
+            x = x + h
         
         h = self.post_attention_norm(x)
         h = self.mlp(h)

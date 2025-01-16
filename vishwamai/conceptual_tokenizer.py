@@ -29,8 +29,15 @@ class ConceptualTokenizer:
             "<mask>": 4,
             "<sep>": 5
         }
+        self.eos_token_id = self.special_tokens["</s>"]
         self.concept_patterns = self._compile_patterns()
         self._initialize_special_tokens()
+        self.subject_specific_tokens = {
+            "math": 6,
+            "physics": 7,
+            "biology": 8
+        }
+        self._initialize_subject_specific_tokens()
         
     def _compile_patterns(self) -> Dict[str, re.Pattern]:
         """Compile regex patterns for concept extraction"""
@@ -44,6 +51,12 @@ class ConceptualTokenizer:
     def _initialize_special_tokens(self):
         """Initialize special tokens in vocabulary"""
         for token, idx in self.special_tokens.items():
+            self.concept_to_id[token] = idx
+            self.id_to_concept[idx] = token
+
+    def _initialize_subject_specific_tokens(self):
+        """Initialize subject-specific tokens in vocabulary"""
+        for token, idx in self.subject_specific_tokens.items():
             self.concept_to_id[token] = idx
             self.id_to_concept[idx] = token
             
@@ -103,7 +116,7 @@ class ConceptualTokenizer:
         concepts.sort(key=lambda x: x[1], reverse=True)
         
         # Assign IDs
-        next_id = len(self.special_tokens)
+        next_id = len(self.special_tokens) + len(self.subject_specific_tokens)
         for concept, _ in concepts:
             if next_id >= self.vocab_size:
                 break
@@ -180,7 +193,8 @@ class ConceptualTokenizer:
             'vocab_size': self.vocab_size,
             'max_length': self.max_length,
             'concept_to_id': self.concept_to_id,
-            'special_tokens': self.special_tokens
+            'special_tokens': self.special_tokens,
+            'subject_specific_tokens': self.subject_specific_tokens
         }
         
         with open(path, 'w', encoding='utf-8') as f:
@@ -200,6 +214,7 @@ class ConceptualTokenizer:
         tokenizer.concept_to_id = save_dict['concept_to_id']
         tokenizer.id_to_concept = {int(k): v for k, v in tokenizer.concept_to_id.items()}
         tokenizer.special_tokens = save_dict['special_tokens']
+        tokenizer.subject_specific_tokens = save_dict['subject_specific_tokens']
         
         return tokenizer
 

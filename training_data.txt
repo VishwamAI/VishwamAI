@@ -1,6 +1,0 @@
-test text
-simple example
-basic input
-if conditions are met then actions follow
-equals sign usage in equations
-logical reasoning and if statements

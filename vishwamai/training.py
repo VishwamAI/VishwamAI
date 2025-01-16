@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import Optional, Dict, Any, Union
-import wandb
 from tqdm import tqdm
 import os
 from pathlib import Path
@@ -41,8 +40,6 @@ class VishwamaiTrainer:
         fp16: bool = True,
     ):
         """Train the model"""
-        if self.use_wandb:
-            wandb.init(project="vishwamai")
             
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -60,10 +57,8 @@ class VishwamaiTrainer:
                     # Move batch to device
                     batch = {k: v.to(self.device) for k, v in batch.items()}
                     
-                    with torch.cuda.amp.autocast(enabled=fp16):
-                        outputs = self.model(**batch)
-                        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-                        loss = loss / gradient_accumulation_steps
+                    # Compute loss using the compute_loss method
+                    loss = self.compute_loss(batch)
                     
                     if fp16:
                         scaler.scale(loss).backward()
@@ -86,21 +81,11 @@ class VishwamaiTrainer:
                     pbar.set_postfix({"loss": loss.item()})
                     
                     # Logging
-                    if global_step % logging_steps == 0:
-                        if self.use_wandb:
-                            wandb.log({
-                                "loss": loss.item(),
-                                "lr": self.scheduler.get_last_lr()[0],
-                                "epoch": epoch,
-                                "global_step": global_step
-                            })
                     
                     # Evaluation
                     if global_step % evaluation_steps == 0:
                         eval_results = self.evaluate()
                         self.model.train()
-                        if self.use_wandb:
-                            wandb.log({"eval": eval_results})
                     
                     # Save model
                     if global_step % save_steps == 0:
@@ -129,8 +114,7 @@ class VishwamaiTrainer:
         with torch.no_grad():
             for batch in self.eval_dataset:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                outputs = self.model(**batch)
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                loss = self.compute_loss(batch)
                 eval_loss += loss.item()
                 
         eval_loss = eval_loss / len(self.eval_dataset)
@@ -145,10 +129,57 @@ class VishwamaiTrainer:
         torch.save(self.model.state_dict(), path / "model.pt")
         
         # Save tokenizer
-        self.tokenizer.save(path / "tokenizer.json")
+        self.tokenizer.save_pretrained(path)  # Changed from 'save' to 'save_pretrained'
         
         # Save training state
         torch.save({
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict()
         }, path / "training_state.pt")
+        
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+        """Perform a single training step"""
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        # Move batch to device if needed
+        batch = {k: v.to(self.device) for k, v in batch.items()}
+        
+        # Forward pass
+        loss = self.compute_loss(batch)
+        
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        
+        return loss.item()
+        
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute the loss for a batch of data"""
+        # Get labels and remove from inputs
+        labels = batch.pop('labels').view(-1)  # Flatten labels
+        
+        # Get required inputs
+        model_inputs = {
+            'input_ids': batch['input_ids'],
+            'attention_mask': batch['attention_mask']
+        }
+        
+        # Only add concept_ids if present
+        if 'concept_ids' in batch:
+            model_inputs['concept_ids'] = batch['concept_ids']
+        
+        # Forward pass
+        outputs = self.model(**model_inputs)
+        
+        # Reshape outputs to match labels
+        outputs = outputs.view(-1, outputs.size(-1))  # (batch_size * seq_length, vocab_size)
+        
+        # Compute loss
+        loss = torch.nn.functional.cross_entropy(outputs, labels)
+        
+        # Add labels back to batch for potential later use
+        batch['labels'] = labels.view(model_inputs['input_ids'].size(0), -1)  # Restore original shape
+        
+        return loss

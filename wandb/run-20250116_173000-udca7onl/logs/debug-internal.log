@@ -1,0 +1,16 @@
+{"time":"2025-01-16T17:30:00.059947085+05:30","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-16T17:30:00.059975929+05:30","level":"INFO","msg":"created symlink","path":"/home/kasinadhsarma/VishwamAI/wandb/run-20250116_173000-udca7onl/logs/debug-core.log"}
+{"time":"2025-01-16T17:30:00.171900244+05:30","level":"INFO","msg":"created new stream","id":"udca7onl"}
+{"time":"2025-01-16T17:30:00.171991595+05:30","level":"INFO","msg":"stream: started","id":"udca7onl"}
+{"time":"2025-01-16T17:30:00.172184843+05:30","level":"INFO","msg":"handler: started","stream_id":"udca7onl"}
+{"time":"2025-01-16T17:30:00.172450375+05:30","level":"INFO","msg":"sender: started","stream_id":"udca7onl"}
+{"time":"2025-01-16T17:30:00.172468883+05:30","level":"INFO","msg":"writer: Do: started","stream_id":"udca7onl"}
+{"time":"2025-01-16T17:30:01.021070456+05:30","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-01-16T17:30:01.705957097+05:30","level":"INFO","msg":"stream: closing","id":"udca7onl"}
+{"time":"2025-01-16T17:30:01.706042441+05:30","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-01-16T17:30:01.706668349+05:30","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-01-16T17:30:03.917802812+05:30","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-01-16T17:30:04.634416366+05:30","level":"INFO","msg":"handler: closed","stream_id":"udca7onl"}
+{"time":"2025-01-16T17:30:04.634456804+05:30","level":"INFO","msg":"writer: Close: closed","stream_id":"udca7onl"}
+{"time":"2025-01-16T17:30:04.634472378+05:30","level":"INFO","msg":"sender: closed","stream_id":"udca7onl"}
+{"time":"2025-01-16T17:30:04.634530345+05:30","level":"INFO","msg":"stream: closed","id":"udca7onl"}

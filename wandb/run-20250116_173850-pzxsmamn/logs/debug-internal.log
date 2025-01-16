@@ -1,0 +1,16 @@
+{"time":"2025-01-16T17:38:50.500143199+05:30","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-16T17:38:50.500175466+05:30","level":"INFO","msg":"created symlink","path":"/home/kasinadhsarma/VishwamAI/wandb/run-20250116_173850-pzxsmamn/logs/debug-core.log"}
+{"time":"2025-01-16T17:38:50.60646841+05:30","level":"INFO","msg":"created new stream","id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:50.606597267+05:30","level":"INFO","msg":"stream: started","id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:50.606685895+05:30","level":"INFO","msg":"writer: Do: started","stream_id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:50.606702587+05:30","level":"INFO","msg":"handler: started","stream_id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:50.60678032+05:30","level":"INFO","msg":"sender: started","stream_id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:51.045646528+05:30","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-01-16T17:38:51.57679446+05:30","level":"INFO","msg":"stream: closing","id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:51.576833222+05:30","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-01-16T17:38:51.57758527+05:30","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-01-16T17:38:54.446929094+05:30","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-01-16T17:38:54.85686745+05:30","level":"INFO","msg":"handler: closed","stream_id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:54.856904675+05:30","level":"INFO","msg":"sender: closed","stream_id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:54.856895596+05:30","level":"INFO","msg":"writer: Close: closed","stream_id":"pzxsmamn"}
+{"time":"2025-01-16T17:38:54.856946999+05:30","level":"INFO","msg":"stream: closed","id":"pzxsmamn"}

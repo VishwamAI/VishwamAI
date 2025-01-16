@@ -1,2 +1,73 @@
 # VishwamAI
-comming soon
+
+## Overview
+
+VishwamAI is a cutting-edge project focused on the development and training of generative AI models. Our goal is to create advanced AI systems capable of understanding and generating human-like text, solving complex mathematical problems, and more.
+
+## Features
+
+- **Generative AI Models**: Train and deploy state-of-the-art generative AI models.
+- **Mathematical Reasoning**: Specialized models for solving mathematical problems.
+- **Custom Tokenization**: Advanced tokenization techniques for better text understanding.
+- **Flexible Architecture**: Easily configurable model architecture to suit various needs.
+- **Continuous Integration**: Automated testing and deployment using GitHub Actions.
+
+## Installation
+
+To get started with VishwamAI, follow these steps to install the necessary dependencies:
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/VishwamAI/VishwamAI.git
+   cd VishwamAI
+   ```
+
+2. Create a virtual environment and activate it:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+   ```
+
+3. Install the required packages:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Usage
+
+### Running Tests
+
+To run the tests, use the following command:
+```bash
+pytest
+```
+
+### Training Models
+
+To train a model, use the provided training scripts. For example, to train a model on the mathematical dataset, run:
+```bash
+python train_math.py --output-dir math_models --model-size 2b --batch-size 32 --num-epochs 10
+```
+
+For general training, use:
+```bash
+python train.py --train-data path/to/train_data.txt --val-data path/to/val_data.txt --output-dir models --model-size 2b --batch-size 32 --num-epochs 10
+```
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
+
+## Contributing
+
+We welcome contributions to VishwamAI! To contribute, please follow these guidelines:
+
+1. Fork the repository.
+2. Create a new branch for your feature or bugfix.
+3. Make your changes and commit them with clear and concise messages.
+4. Push your changes to your forked repository.
+5. Create a pull request to the main repository.
+
+For any issues or feature requests, please open an issue on GitHub.
+
+Happy coding!

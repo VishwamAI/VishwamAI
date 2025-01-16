@@ -32,6 +32,8 @@ class VishwamaiGenerator:
         
         for _ in range(self.config.max_length):
             outputs = self.model(input_ids)
+            if outputs is None:
+                return input_ids  # Handle None outputs gracefully
             next_token_logits = outputs[:, -1, :]
             
             # Apply temperature

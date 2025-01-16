@@ -120,7 +120,7 @@ class ConceptualTokenizer:
         for child in node.children.values():
             self._collect_concepts(child, concepts)
             
-    def encode(self, text: str, max_length: Optional[int] = None) -> List[int]:
+    def encode(self, text: str, max_length: Optional[int] = None, return_tensors: Optional[str] = None) -> Union[List[int], torch.Tensor]:
         """Encode text to concept IDs"""
         if max_length is None:
             max_length = self.max_length
@@ -143,8 +143,11 @@ class ConceptualTokenizer:
         # Add special tokens
         concept_ids = [self.special_tokens['<s>']] + concept_ids + [self.special_tokens['</s>']]
         
-        return concept_ids
-    
+        if return_tensors == "pt":
+            return torch.tensor(concept_ids).unsqueeze(0)  # Add batch dimension
+        else:
+            return concept_ids
+        
     def _tokenize_unknown(self, concept: str) -> List[int]:
         """Handle unknown concepts by breaking into known parts"""
         parts = []

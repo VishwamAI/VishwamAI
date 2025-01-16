@@ -6,7 +6,7 @@ import wandb
 from tqdm import tqdm
 import os
 from pathlib import Path
-from .conceptual_tokenizer import ConceptualTokenizer
+from conceptual_tokenizer import ConceptualTokenizer
 
 class VishwamaiTrainer:
     def __init__(

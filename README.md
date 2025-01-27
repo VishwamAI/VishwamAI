@@ -71,6 +71,19 @@ tokenizer.subject_specific_tokens.update({
 })
 ```
 
+### Using the Jupyter Notebook for Math Dataset Integration
+
+A new Jupyter Notebook file `math/vishwamai_math_integration.ipynb` has been added to demonstrate how to integrate a small math dataset with VishwamAI. The notebook includes sections for loading the dataset, initializing the model, training the model, and evaluating the results.
+
+To use the notebook, follow these steps:
+
+1. Open the Jupyter Notebook:
+   ```bash
+   jupyter notebook math/vishwamai_math_integration.ipynb
+   ```
+
+2. Follow the instructions in the notebook to load the dataset, initialize the model, train the model, and evaluate the results.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.

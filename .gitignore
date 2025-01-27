@@ -1,2 +1,62 @@
-venv/
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# PyTorch / ML
+*.pt
+*.pth
+*.onnx
+.torch/
+lightning_logs/
+wandb/
+
+# Project-specific
+*.vocab
+*.model
+*.bin
+logs/
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+
+data.jsonl
+gsm8k/

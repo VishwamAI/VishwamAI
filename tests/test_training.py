@@ -184,12 +184,25 @@ def test_fp16_training(trainer_components):
         device="cuda"
     )
     
+    # Set up GradScaler for FP16 training
+    scaler = torch.amp.GradScaler('cuda')
+    
     # Verify FP16 training works
     batch = next(iter(train_loader))
     batch = {k: v.cuda() for k, v in batch.items()}
     
-    with torch.cuda.amp.autocast():
+    # Test mixed precision training
+    with torch.amp.autocast('cuda'):
         loss = trainer.compute_loss(batch)
+    
+    # Test gradient scaling
+    scaler.scale(loss).backward()
+    scaler.unscale_(trainer.optimizer)
+    scaler.step(trainer.optimizer)
+    scaler.update()
     
     assert not torch.isnan(loss)
     assert not torch.isinf(loss)
+    
+    # Verify optimizer state is maintained
+    assert trainer.optimizer.state_dict()['param_groups'][0]['lr'] > 0

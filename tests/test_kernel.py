@@ -54,7 +54,18 @@ def setup_tensors():
     
     return x, w, s
 
-@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
+def get_cuda_arch():
+    """Get CUDA architecture version if available"""
+    if not CUDA_AVAILABLE:
+        return 0
+    device = torch.cuda.current_device()
+    capabilities = torch.cuda.get_device_capability(device)
+    return capabilities[0] * 10 + capabilities[1]
+
+CUDA_ARCH = get_cuda_arch()
+SUPPORTS_FP8 = CUDA_ARCH >= 89
+
+@pytest.mark.skipif(not TRITON_AVAILABLE or not SUPPORTS_FP8, reason="Triton not available or FP8 not supported")
 def test_act_quant_gpu(setup_tensors):
     """Test activation quantization on GPU"""
     x, _, _ = setup_tensors
@@ -80,7 +91,7 @@ def test_act_quant_cpu(setup_tensors):
     assert s.shape == (x.size(0),), "Scale shape should be correct"
     assert torch.all(torch.isfinite(y)), "All values should be finite"
 
-@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
+@pytest.mark.skipif(not TRITON_AVAILABLE or not SUPPORTS_FP8, reason="Triton not available or FP8 not supported")
 def test_weight_dequant_gpu(setup_tensors):
     """Test weight dequantization on GPU"""
     _, w, s = setup_tensors
@@ -157,7 +168,7 @@ def test_numerical_stability_cpu():
     y_mixed, s_mixed = cpu_quantize(x_mixed)
     assert torch.all(torch.isfinite(y_mixed)), "Should handle mixed scales"
 
-@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
+@pytest.mark.skipif(not TRITON_AVAILABLE or not SUPPORTS_FP8, reason="Triton not available or FP8 not supported")
 def test_gpu_cpu_consistency(setup_tensors):
     """Test consistency between GPU and CPU implementations"""
     if not CUDA_AVAILABLE:

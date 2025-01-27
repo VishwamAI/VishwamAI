@@ -113,10 +113,9 @@ class VishwamaiModel(nn.Module):
         
     @property
     def device(self):
-        return self._device
+        return next(self.parameters()).device
         
     def to(self, device):
-        self._device = device if isinstance(device, str) else device.type
         return super().to(device)
         
     def forward(self, input_ids, attention_mask=None):

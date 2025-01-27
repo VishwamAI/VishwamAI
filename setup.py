@@ -9,7 +9,11 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/kasinadhsarma/VishwamAI",
-    packages=find_packages(),
+    packages=find_packages(include=['vishwamai', 'vishwamai.*', 'math']),
+    package_data={
+        'vishwamai': ['configs/*.json'],
+        'math': ['*.jsonl', 'gsm8k/*.parquet', 'gsm8k/socratic/*.parquet']
+    },
     install_requires=[
         "torch>=2.1.0",
         "numpy>=1.26.0",

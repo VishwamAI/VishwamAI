@@ -39,11 +39,13 @@ def test_model_with_attention_mask(model, config):
 
 def test_model_device_transfer(config):
     model = VishwamaiModel(config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
     input_ids = torch.randint(0, config.vocab_size, (1, 10)).to(device)
     output = model(input_ids)
-    assert output.device == device, "Model output device mismatch"
+    assert output.device.type == device.type, "Model output device type mismatch"
+    if device.type == "cuda":
+        assert output.device.index == device.index, "Model output device index mismatch"
 
 def test_model_forward_no_attention_mask(model, config):
     input_ids = torch.randint(0, config.vocab_size, (3, 20))

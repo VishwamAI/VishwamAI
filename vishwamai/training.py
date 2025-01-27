@@ -45,7 +45,7 @@ class VishwamaiTrainer:
         save_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup mixed precision training
-        scaler = torch.cuda.amp.GradScaler() if fp16 else None
+        scaler = torch.amp.GradScaler('cuda') if fp16 else None
         
         global_step = 0
         for epoch in range(num_epochs):
@@ -61,6 +61,10 @@ class VishwamaiTrainer:
                     loss = self.compute_loss(batch)
                     
                     if fp16:
+                        with torch.amp.autocast('cuda'):
+                            loss = self.compute_loss(batch)
+                            loss = loss / gradient_accumulation_steps
+                            
                         scaler.scale(loss).backward()
                         if (step + 1) % gradient_accumulation_steps == 0:
                             scaler.unscale_(self.optimizer)

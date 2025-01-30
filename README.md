@@ -65,3 +65,21 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Contributing
 
 Contributions are welcome! Please read our contributing guidelines before submitting pull requests.
+
+## Troubleshooting Workflow Failures
+
+If you encounter issues with the GitHub Actions workflow, here are some common troubleshooting steps:
+
+1. **Check Dependencies**: Ensure all required dependencies are listed in `requirements.txt` and `vishwamai/requirements.txt`. Missing or incompatible packages can cause workflow failures.
+
+2. **Verify Configuration**: Double-check the configurations in `.github/workflows/ci.yml` and `pytest.ini`. Incorrect configurations can lead to test discovery or execution issues.
+
+3. **Review Logs**: Examine the logs from the failed workflow run. Logs often provide detailed error messages that can help identify the root cause of the failure.
+
+4. **Run Locally**: Try running the tests and workflow steps locally on your machine. This can help isolate whether the issue is specific to the GitHub Actions environment.
+
+5. **Update Dependencies**: Ensure that all dependencies are up to date. Sometimes, newer versions of packages include bug fixes that can resolve workflow issues.
+
+6. **Seek Help**: If you're unable to resolve the issue, consider seeking help from the community or the project maintainers. Provide detailed information about the failure and the steps you've already taken to troubleshoot.
+
+By following these steps, you can effectively troubleshoot and resolve common workflow failures.

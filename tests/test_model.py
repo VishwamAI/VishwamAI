@@ -26,8 +26,8 @@ def model(config):
 def input_data(config):
     batch_size = 2
     seq_length = 32
-    input_ids = torch.randint(0, config.vocab_size, (batch_size, 32))
-    attention_mask = torch.ones((batch_size, 32), dtype=torch.long)
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length))
+    attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
     return input_ids, attention_mask
 
 def test_model_initialization(model):
@@ -95,8 +95,8 @@ def test_gradient_flow(model, input_data):
 
 def test_large_sequence_input(model, config):
     # Test with a sequence longer than max_position_embeddings
-    input_ids = torch.randint(0, config.vocab_size, (2, 32 + 10))
-    attention_mask = torch.ones((2, 32 + 10), dtype=torch.long)
+    input_ids = torch.randint(0, config.vocab_size, (2, config.max_position_embeddings + 10))
+    attention_mask = torch.ones((2, config.max_position_embeddings + 10), dtype=torch.long)
 
     with pytest.raises(RuntimeError): # Expecting a different error, but keeping RuntimeError for now.
         model(input_ids, attention_mask)
@@ -105,7 +105,7 @@ def test_memory_device_mismatch(model, input_data):
     input_ids, attention_mask = input_data
     if torch.cuda.is_available():
         # Create memory state on CPU
-        memory_state = [torch.zeros(2, model.config.memory_size, model.config.hidden_size // 2) for _ in range(model.config.num_hidden_layers)]
+        memory_state = [torch.zeros(2, model.config.memory_size, model.config.hidden_size) for _ in range(model.config.num_hidden_layers)]
         with pytest.raises(RuntimeError): # Expecting a different error, but keeping RuntimeError for now.
             model(input_ids, attention_mask, memory_state=memory_state)
     else:

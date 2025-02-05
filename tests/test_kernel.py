@@ -35,7 +35,9 @@ def test_weight_dequant(input_tensor, scale_tensor, device="cuda" if torch.cuda.
 def test_fp8_gemm(input_tensor, scale_tensor, device="cuda" if torch.cuda.is_available() else "cpu"):
     b = torch.randn(128, 128, dtype=torch.float32, device=device)
     b_s = torch.randn(128, 128, dtype=torch.float32, device=device)
-    result = fp8_gemm(input_tensor, scale_tensor, b, b_s)
+    try:
+        result = fp8_gemm(input_tensor, scale_tensor, b, b_s)
+    except IndexError as e:
+        pytest.fail(f"IndexError occurred: {e}")
     assert result.dtype == torch.float32, "FP8 GEMM result dtype mismatch"
     assert result.shape == (128, 128), "FP8 GEMM result shape mismatch"
-

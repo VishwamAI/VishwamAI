@@ -286,12 +286,15 @@ class WeightConverter:
             if min_val == max_val:
                 return weights, {"scale": 1.0, "zero_point": 0.0}
                 
-            # Calculate scale and zero point
-            scale = (2**bits - 1) / (max_val - min_val)
-            zero_point = torch.round(-min_val * scale)
+            # Calculate scale and zero point with higher precision
+            scale = ((2**bits - 1) / (max_val - min_val)).to(torch.float32)
+            zero_point = torch.round(-min_val * scale).to(torch.float32)
+            
+            # Convert weights to float32 for quantization
+            weights_f32 = weights.to(torch.float32)
             
             # Quantize and clamp
-            quantized = torch.round(weights * scale + zero_point)
+            quantized = torch.round(weights_f32 * scale + zero_point)
             quantized = torch.clamp(quantized, 0, 2**bits - 1)
             
             # Preserve original dtype
@@ -327,8 +330,8 @@ class WeightConverter:
             if "zero_point" not in params:
                 return quantized
                 
-            # Dequantize asymmetric weights
-            dequantized = (quantized - params["zero_point"]) / params["scale"]
+            # Dequantize asymmetric weights with higher precision
+            dequantized = ((quantized.to(torch.float32) - params["zero_point"]) / params["scale"])
             
         # Preserve original dtype
         return dequantized.to(orig_dtype)

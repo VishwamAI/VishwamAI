@@ -145,3 +145,37 @@ class CrossAttention(FlashMultiHeadAttention):
         out = self.drop(out)
         
         return out
+
+class MultiHeadAttention(nn.Module):
+    """Standard multi-head attention mechanism."""
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert dim % num_heads == 0
+        
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.drop = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, L, D = x.shape
+        
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        
+        attn = F.softmax(scores, dim=-1)
+        attn = self.drop(attn)
+        
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, D)
+        out = self.proj(out)
+        out = self.drop(out)
+        
+        return out

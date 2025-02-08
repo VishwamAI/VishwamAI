@@ -38,29 +38,50 @@ class VishwamaiTrainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         fp16: bool = True,
+        resume_from_checkpoint: Optional[Union[str, Path]] = None
     ):
         """Train the model"""
             
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup mixed precision training
-        scaler = torch.cuda.amp.GradScaler() if fp16 else None
-        
+        # Initialize or resume training state
         global_step = 0
+        best_eval_loss = float('inf')
+        
+        if resume_from_checkpoint:
+            checkpoint_path = Path(resume_from_checkpoint)
+            if checkpoint_path.exists():
+                # Load model
+                self.model.load_state_dict(torch.load(checkpoint_path / "model.pt"))
+                
+                # Load training state
+                training_state = torch.load(checkpoint_path / "training_state.pt")
+                self.optimizer.load_state_dict(training_state["optimizer"])
+                self.scheduler.load_state_dict(training_state["scheduler"])
+                if "global_step" in training_state:
+                    global_step = training_state["global_step"]
+                if "best_eval_loss" in training_state:
+                    best_eval_loss = training_state["best_eval_loss"]
+                    
+                print(f"Resumed from checkpoint: {checkpoint_path}")
+                
+        # Setup mixed precision training
+        scaler = torch.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
         for epoch in range(num_epochs):
             self.model.train()
             epoch_loss = 0
             
             with tqdm(self.train_dataset, desc=f"Epoch {epoch+1}") as pbar:
                 for step, batch in enumerate(pbar):
-                    # Move batch to device
-                    batch = {k: v.to(self.device) for k, v in batch.items()}
-                    
-                    # Compute loss using the compute_loss method
+                    # Compute loss using the compute_loss method which handles device transfers
                     loss = self.compute_loss(batch)
                     
                     if fp16:
+                        with torch.amp.autocast('cuda'):
+                            loss = self.compute_loss(batch)
+                            loss = loss / gradient_accumulation_steps
+                            
                         scaler.scale(loss).backward()
                         if (step + 1) % gradient_accumulation_steps == 0:
                             scaler.unscale_(self.optimizer)
@@ -87,9 +108,34 @@ class VishwamaiTrainer:
                         eval_results = self.evaluate()
                         self.model.train()
                     
-                    # Save model
-                    if global_step % save_steps == 0:
-                        self.save_model(save_dir / f"checkpoint-{global_step}")
+                    # Evaluation and model saving
+                    if global_step % evaluation_steps == 0:
+                        eval_results = self.evaluate()
+                        self.model.train()
+                        
+                        if eval_results:  # If evaluation was performed
+                            current_eval_loss = eval_results["eval_loss"]
+                            
+                            # Save best model
+                            if current_eval_loss < best_eval_loss:
+                                best_eval_loss = current_eval_loss
+                                self.save_model(
+                                    save_dir / "best_model",
+                                    {
+                                        "global_step": global_step,
+                                        "best_eval_loss": best_eval_loss
+                                    }
+                                )
+                            
+                    # Regular checkpoint saving
+                    if global_step > 0 and global_step % save_steps == 0:
+                        self.save_model(
+                            save_dir / f"checkpoint-{global_step}",
+                            {
+                                "global_step": global_step,
+                                "best_eval_loss": best_eval_loss
+                            }
+                        )
                         
                     global_step += 1
                     
@@ -113,7 +159,7 @@ class VishwamaiTrainer:
         
         with torch.no_grad():
             for batch in self.eval_dataset:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                # compute_loss handles device transfers
                 loss = self.compute_loss(batch)
                 eval_loss += loss.item()
                 
@@ -142,10 +188,7 @@ class VishwamaiTrainer:
         self.model.train()
         self.optimizer.zero_grad()
         
-        # Move batch to device if needed
-        batch = {k: v.to(self.device) for k, v in batch.items()}
-        
-        # Forward pass
+        # Forward pass - compute_loss handles device transfers
         loss = self.compute_loss(batch)
         
         # Backward pass
@@ -157,27 +200,44 @@ class VishwamaiTrainer:
         
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute the loss for a batch of data"""
+        # Validate required fields
+        required_fields = ['input_ids', 'attention_mask', 'labels']
+        for field in required_fields:
+            if field not in batch:
+                raise ValueError(f"Missing required field: {field}")
+        
         # Get labels and remove from inputs
-        labels = batch.pop('labels').view(-1)  # Flatten labels
+        labels = batch.pop('labels')
+        orig_shape = labels.shape
+        labels = labels.view(-1)  # Flatten labels
         
-        # Get required inputs
-        model_inputs = {
-            'input_ids': batch['input_ids'],
-            'attention_mask': batch['attention_mask']
-        }
+        # Handle device transfers properly
+        model_inputs = {}
+        for key in ['input_ids', 'attention_mask', 'concept_ids']:
+            if key in batch:
+                # Pin memory first if on CPU and going to CUDA
+                if self.device == 'cuda' and batch[key].device.type == 'cpu' and not batch[key].is_pinned():
+                    batch[key] = batch[key].pin_memory()
+                # Then transfer to device
+                model_inputs[key] = batch[key].to(self.device, non_blocking=True)
         
-        # Only add concept_ids if present
-        if 'concept_ids' in batch:
-            model_inputs['concept_ids'] = batch['concept_ids']
-        
-        # Forward pass
+        # Forward pass and get logits from output dictionary
         outputs = self.model(**model_inputs)
+        logits = outputs['logits']
         
-        # Reshape outputs to match labels
-        outputs = outputs.view(-1, outputs.size(-1))  # (batch_size * seq_length, vocab_size)
+        # Handle shape mismatch
+        if logits.size(1) != orig_shape[1]:
+            # Reshape logits to match target shape
+            logits = logits.view(orig_shape[0], orig_shape[1], -1)
         
-        # Compute loss
-        loss = torch.nn.functional.cross_entropy(outputs, labels)
+        # Reshape for loss computation
+        logits = logits.view(-1, logits.size(-1))  # (batch_size * seq_length, vocab_size)
+        
+        # Compute loss with shape validation
+        if logits.size(0) != labels.size(0):
+            raise ValueError(f"Logits and labels size mismatch: {logits.size()} vs {labels.size()}")
+        
+        loss = torch.nn.functional.cross_entropy(logits, labels)
         
         # Add labels back to batch for potential later use
         batch['labels'] = labels.view(model_inputs['input_ids'].size(0), -1)  # Restore original shape

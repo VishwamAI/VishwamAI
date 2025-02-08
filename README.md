@@ -1,90 +1,68 @@
 # VishwamAI
 
-## Overview
-
-VishwamAI is a cutting-edge project focused on the development and training of generative AI models. Our goal is to create advanced AI systems capable of understanding and generating human-like text, solving complex mathematical problems, and more.
+VishwamAI is a sophisticated machine learning library focusing on efficient model quantization, advanced tokenization, and mathematical reasoning capabilities.
 
 ## Features
 
-- **Generative AI Models**: Train and deploy state-of-the-art generative AI models.
-- **Mathematical Reasoning**: Specialized models for solving mathematical problems.
-- **Custom Tokenization**: Advanced tokenization techniques for better text understanding.
-- **Flexible Architecture**: Easily configurable model architecture to suit various needs.
-- **Continuous Integration**: Automated testing and deployment using GitHub Actions.
+- **Advanced Tokenization**: Conceptual tokenizer with semantic clustering and special token handling
+- **Efficient Quantization**: Support for FP8 and BF16 quantization
+- **Mathematical Reasoning**: Integration with GSM8K dataset for advanced mathematical problem-solving
+- **Model Architecture**: Flexible transformer-based architecture with configurable parameters
+- **Training Utilities**: Support for distributed training, mixed precision, and gradient accumulation
+- **Deep Research and Development**: Recent advancements in model training techniques and dataset loading
 
 ## Installation
 
-To get started with VishwamAI, follow these steps to install the necessary dependencies:
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/VishwamAI/VishwamAI.git
-   cd VishwamAI
-   ```
-
-2. Create a virtual environment and activate it:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
-   ```
-
-3. Install the required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-
-### Running Tests
-
-To run the tests, use the following command:
 ```bash
-pytest
+pip install -e .
 ```
 
-### Training Models
+## Quick Start
 
-To train a model, use the provided training scripts. For example, to train a model on the mathematical dataset, run:
-```bash
-python train_math.py --output-dir math_models --model-size 2b --batch-size 32 --num-epochs 10
-```
-
-For general training, use:
-```bash
-python train.py --train-data path/to/train_data.txt --val-data path/to/val_data.txt --output-dir models --model-size 2b --batch-size 32 --num-epochs 10
-```
-
-### Tokenization for Math, Physics, and Biology
-
-The `ConceptualTokenizer` class in `vishwamai/conceptual_tokenizer.py` now includes subject-specific tokens for math, physics, and biology. This allows for more precise tokenization and understanding of subject-specific texts.
-
-To use the subject-specific tokens, ensure that the `ConceptualTokenizer` is initialized with the appropriate subject-specific tokens. For example:
 ```python
-tokenizer = ConceptualTokenizer(
-    vocab_size=32000,
-    max_length=512
-)
-tokenizer.subject_specific_tokens.update({
-    "math": 6,
-    "physics": 7,
-    "biology": 8
-})
+from vishwamai.model import VishwamaiModel
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer
+
+# Initialize tokenizer and model
+tokenizer = ConceptualTokenizer()
+model = VishwamaiModel()
+
+# Example usage
+text = "Solve: If John has 5 apples and gives 2 to Mary, how many does he have left?"
+tokens = tokenizer.encode(text)
+output = model.generate(tokens)
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+pytest -v
+```
+
+## Requirements
+
+- Python >= 3.8
+- PyTorch >= 2.1.0
+- CUDA toolkit (for GPU support)
+- Additional dependencies listed in setup.py
+
+## Project Structure
+
+```
+vishwamai/
+├── conceptual_tokenizer.py   # Advanced tokenization implementation
+├── kernel.py                 # CUDA kernels and quantization
+├── model.py                 # Core model architecture
+├── training.py              # Training utilities
+└── configs/                 # Model configurations
 ```
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Contributing
 
-We welcome contributions to VishwamAI! To contribute, please follow these guidelines:
-
-1. Fork the repository.
-2. Create a new branch for your feature or bugfix.
-3. Make your changes and commit them with clear and concise messages.
-4. Push your changes to your forked repository.
-5. Create a pull request to the main repository.
-
-For any issues or feature requests, please open an issue on GitHub.
-
-Happy coding!
+Contributions are welcome! Please read our contributing guidelines before submitting pull requests.

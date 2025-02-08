@@ -186,7 +186,7 @@ class TestWeightConverter:
         weights_f16 = torch.randn(10, 10, dtype=torch.float16)
         quantized, params = WeightConverter.quantize_weights(weights_f16)
         dequantized = WeightConverter.dequantize_weights(quantized, params)
-        assert torch.allclose(dequantized, weights_f16, rtol=2e-1, atol=5e-2)
+        assert torch.allclose(dequantized, weights_f16, rtol=0.1, atol=0.01)
         assert dequantized.dtype == torch.float16
 
     def test_dequantize_edge_cases(self):

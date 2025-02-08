@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional
-# from .fp8_cast_bf16 import fp8_cast # Removed import as fp8_cast_bf16 is not defined in provided code
 
 @dataclass
 class VishwamaiConfig:

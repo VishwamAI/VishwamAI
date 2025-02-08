@@ -14,7 +14,8 @@ from .architecture import (
     VishwamaiConfig,
     TrainingConfig,
     GenerationConfig,
-    init_model
+    init_model,
+    MultiHeadAttention
 )
 
 from .toknizer import (
@@ -49,6 +50,7 @@ __all__ = [
     "TrainingConfig",
     "GenerationConfig",
     "init_model",
+    "MultiHeadAttention",
     
     # Tokenizer
     "ConceptualTokenizer",

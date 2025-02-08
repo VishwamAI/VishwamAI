@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, weight_dequant, fp8_gemm
+from vishwamai.architecture import MultiHeadAttention
 
 
 world_size = 1
@@ -180,7 +181,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         return max(low, 0), min(high, dim-1)
 
     def linear_ramp_factor(min, max, dim):
-        if min == max:
+        if (min == max):
             max += 0.001
         linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
         ramp_func = torch.clamp(linear_func, 0, 1)
@@ -216,7 +217,7 @@ class MemoryEfficientMLA(nn.Module):
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
 
         if self.q_lora_rank == 0:

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import numpy as np
 from dataclasses import dataclass
-from kernel import efficient_attention, tree_attention
+import warnings
 
 @dataclass
 class ConversionConfig:
@@ -50,20 +50,8 @@ class ModelConverter:
         
     def _replace_attention(self, model: nn.Module) -> nn.Module:
         """Replace standard attention with optimized versions"""
-        for name, module in model.named_modules():
-            if "attention" in name.lower():
-                if self.config.use_tree_attention:
-                    # Replace with tree attention
-                    setattr(model, name, tree_attention.TreeAttention(
-                        module.embed_dim,
-                        module.num_heads
-                    ))
-                else:
-                    # Replace with efficient attention
-                    setattr(model, name, efficient_attention.EfficientAttention(
-                        module.embed_dim,
-                        module.num_heads
-                    ))
+        if self.config.use_tree_attention or self.config.use_efficient_attention:
+            warnings.warn("Tree attention and efficient attention optimizations are not currently available")
         return model
         
     def _convert_dtype(self, model: nn.Module) -> nn.Module:
@@ -85,8 +73,12 @@ class ModelConverter:
         if not self.config.quantization_aware:
             return model
             
+        model.train()  # Set to training mode before quantization
         model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-        model = torch.quantization.prepare_qat(model)
+        custom_qat_module_mappings = {
+            nn.Linear: torch.ao.nn.qat.Linear
+        }
+        model = torch.quantization.prepare_qat(model, mapping=custom_qat_module_mappings)
         return model
         
     def _apply_advanced_optimizations(self, model: nn.Module) -> nn.Module:

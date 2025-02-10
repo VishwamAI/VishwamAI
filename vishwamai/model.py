@@ -18,8 +18,6 @@ class VishwamaiConfig:
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
-    hidden_dropout_prob: float = 0.1
-    attention_dropout_prob: float = 0.1
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):

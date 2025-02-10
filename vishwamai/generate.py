@@ -6,18 +6,17 @@ from argparse import ArgumentParser
 
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer
-from safetensors.torch import load_model
-
 from .model import VishwamaiModel, VishwamaiConfig
+from .conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 
 @dataclass
 class GenerationConfig:
-    max_new_tokens: int = 200
+    max_length: int = 100
     temperature: float = 0.7
     top_k: int = 50
     top_p: float = 0.9
     do_sample: bool = True
+    num_return_sequences: int = 1
     repetition_penalty: float = 1.1
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -26,10 +25,12 @@ class GenerationConfig:
 class VishwamaiGenerator:
     def __init__(
         self, 
-        model: VishwamaiModel, 
+        model: VishwamaiModel,
+        tokenizer: ConceptualTokenizer,
         config: Optional[GenerationConfig] = None
     ):
         self.model = model
+        self.tokenizer = tokenizer
         self.config = config or GenerationConfig()
         
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
@@ -56,39 +57,65 @@ class VishwamaiGenerator:
             
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+    def generate(self, prompt: str) -> List[str]:
+        """Generate completions for a text prompt."""
+        input_ids = self.tokenizer.encode(prompt)
+        output_ids = self._generate_tokens(torch.tensor([input_ids], device=self.model.device))
+        return [self.tokenizer.decode(ids) for ids in output_ids.tolist()]
+
     @torch.inference_mode()
-    def generate(
+    def _generate_tokens(
         self,
-        prompt_tokens: List[List[int]],
-        max_new_tokens: Optional[int] = None,
-    ) -> List[List[int]]:
-        if max_new_tokens is None:
-            max_new_tokens = self.config.max_new_tokens
-            
-        batch_size = len(prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
-        total_len = min(self.model.config.max_seq_len, max_new_tokens + max_prompt_len)
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size = input_ids.shape[0]
+        max_prompt_len = input_ids.shape[1]
+        # Get actual content length by finding first pad token
+        prompt_mask = input_ids != self.config.pad_token_id
+        actual_lengths = prompt_mask.sum(dim=1)
+        max_actual_len = actual_lengths.max().item()
         
-        # Initialize token buffer
-        tokens = torch.full(
-            (batch_size, total_len), 
-            self.config.pad_token_id, 
-            dtype=torch.long, 
-            device=self.model.device
+        # Calculate output length capped by config limits
+        total_len = min(
+            self.config.max_length,  # Maximum sequence length from generation config
+            self.model.config.max_seq_len  # Maximum length supported by model architecture
         )
         
-        # Copy prompt tokens
-        for i, t in enumerate(prompt_tokens):
-            tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device=self.model.device)
-            
-        # Track completed sequences
-        finished = torch.tensor([False] * batch_size, device=self.model.device)
-        prompt_mask = tokens != self.config.pad_token_id
-        
+        # Copy input tokens
+        tokens = torch.full(
+            (batch_size, total_len),
+            self.config.pad_token_id,
+            dtype=torch.long,
+            device=input_ids.device
+        )
+        for i in range(batch_size):
+            length = actual_lengths[i]
+            tokens[i, :length] = input_ids[i, :length]
+
+        # Create or expand attention mask
+        attention_mask = torch.zeros(
+            (batch_size, total_len),
+            dtype=torch.float,
+            device=input_ids.device
+        )
+        for i in range(batch_size):
+            length = actual_lengths[i]
+            attention_mask[i, :length] = 1.0
+
+        # Track completed sequences and start from actual content length
+        finished = torch.tensor([False] * batch_size, device=input_ids.device)
+        cur_pos = max_actual_len
+
         # Generate tokens
-        prev_pos = 0
-        for cur_pos in range(max_prompt_len, total_len):
-            logits = self.model(tokens[:, :cur_pos])[:, -1]
+        while cur_pos < total_len and not finished.all():
+            # Forward pass with attention mask
+            # Forward pass
+            model_output = self.model(
+                tokens[:, :cur_pos],
+                attention_mask=attention_mask[:, :cur_pos]
+            )
+            logits = model_output[:, -1]
             
             # Apply repetition penalty
             if self.config.repetition_penalty != 1.0:
@@ -96,28 +123,26 @@ class VishwamaiGenerator:
                     scored_tokens = tokens[i, :cur_pos]
                     logits[i, scored_tokens] /= self.config.repetition_penalty
                     
+            # Sample next token
             next_token = self.sample(logits)
-            next_token = torch.where(
-                prompt_mask[:, cur_pos], 
-                tokens[:, cur_pos], 
-                next_token
-            )
             tokens[:, cur_pos] = next_token
-            
-            # Check for completed sequences
-            finished |= (~prompt_mask[:, cur_pos] & (next_token == self.config.eos_token_id))
-            if finished.all():
-                break
-                
-        # Extract completions
-        completions = []
-        for i, toks in enumerate(tokens.tolist()):
-            completion = toks[len(prompt_tokens[i]):cur_pos + 1]
-            if self.config.eos_token_id in completion:
-                completion = completion[:completion.index(self.config.eos_token_id)]
-            completions.append(completion)
-            
-        return completions
+            attention_mask[:, cur_pos] = 1.0
+
+            # Update finished state
+            finished = finished | (next_token == self.config.eos_token_id)
+            cur_pos += 1
+
+        # Find sequence end positions
+        eos_positions = (tokens == self.config.eos_token_id).float()
+        eos_positions[eos_positions.sum(-1) == 0, -1] = 1
+        sequence_lengths = eos_positions.argmax(-1)
+
+        # Truncate sequences at EOS
+        for b in range(batch_size):
+            length = sequence_lengths[b]
+            tokens[b, length+1:] = self.config.pad_token_id
+
+        return tokens
 
 def main():
     parser = ArgumentParser()
@@ -125,32 +150,30 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
     parser.add_argument("--interactive", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--max-length", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.7)
     args = parser.parse_args()
-    
-    # Initialize distributed setup if needed
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
-    rank = int(os.getenv("LOCAL_RANK", "0"))
-    if world_size > 1:
-        dist.init_process_group("nccl")
-        torch.cuda.set_device(rank)
-        
-    # Load model and tokenizer
+
+    # Initialize model and tokenizer
     model_config = VishwamaiConfig()
-    model = VishwamaiModel(model_config).to(rank)
-    tokenizer = AutoTokenizer.from_pretrained(args.ckpt_path)
-    
+    model = VishwamaiModel(model_config)
+    tokenizer_config = ConceptualTokenizerConfig.from_pretrained(args.ckpt_path)
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+
+    if torch.cuda.is_available():
+        model = model.cuda()
+
+    # Load generation config if provided
     if os.path.exists(args.config):
         with open(args.config) as f:
             gen_config = GenerationConfig(**json.load(f))
     else:
         gen_config = GenerationConfig(
-            max_new_tokens=args.max_new_tokens,
+            max_length=args.max_length,
             temperature=args.temperature
         )
-        
-    generator = VishwamaiGenerator(model, gen_config)
+
+    generator = VishwamaiGenerator(model, tokenizer, gen_config)
 
     # Interactive mode
     if args.interactive:
@@ -158,25 +181,21 @@ def main():
             prompt = input(">>> ")
             if prompt.lower() in ["/exit", "quit", "exit"]:
                 break
-                
-            tokens = tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
-            completion = generator.generate([tokens])[0]
-            print(tokenizer.decode(completion))
-            
+
+            outputs = generator.generate(prompt)
+            for output in outputs:
+                print(output)
+
     # Batch mode
     else:
         with open(args.input_file) as f:
             prompts = [line.strip() for line in f]
-            
-        tokens = [tokenizer.encode(p) for p in prompts]
-        completions = generator.generate(tokens)
-        
-        for prompt, completion in zip(prompts, completions):
+
+        for prompt in prompts:
+            outputs = generator.generate(prompt)
             print(f"Prompt: {prompt}")
-            print(f"Completion: {tokenizer.decode(completion)}\n")
-            
-    if world_size > 1:
-        dist.destroy_process_group()
+            for i, output in enumerate(outputs):
+                print(f"Output {i+1}: {output}\n")
 
 if __name__ == "__main__":
     main()

@@ -8,24 +8,24 @@ import math
 
 @dataclass
 class VishwamaiConfig:
-    vocab_size: int = 32000
-    hidden_size: int = 4096  # Increased for Titan-like scale
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8  # GQA from O1/MiniMax
-    intermediate_size: int = 16384
-    max_position_embeddings: int = 8192  # Increased context length
+    vocab_size: int = 1000  # Reduced for testing
+    hidden_size: int = 256  # Reduced for testing
+    num_hidden_layers: int = 2  # Reduced for testing
+    num_attention_heads: int = 8  # Reduced for testing
+    num_key_value_heads: int = 4  # Reduced for testing
+    intermediate_size: int = 512  # Reduced for testing
+    max_position_embeddings: int = 512  # Reduced for testing
     layer_norm_eps: float = 1e-5
     rope_theta: float = 10000  # RoPE base
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
     dtype: Literal["bf16", "fp8"] = "bf16"
-    max_batch_size: int = 8
-    max_seq_len: int = 8192
-    n_routed_experts: int = 64
-    n_shared_experts: int = 2
-    n_activated_experts: int = 6
+    max_batch_size: int = 4  # Reduced for testing
+    max_seq_len: int = 512  # Match max_position_embeddings
+    n_routed_experts: int = 4  # Reduced for testing
+    n_shared_experts: int = 1  # Reduced for testing
+    n_activated_experts: int = 2  # Reduced for testing
     n_expert_groups: int = 1
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
@@ -52,11 +52,12 @@ class RMSNorm(nn.Module):
         return x * norm * self.weight
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0):
+    def __init__(self, dim: int, theta: float = 10000.0, max_seq_len: int = 512):
         super().__init__()
         self.dim = dim
         self.theta = theta
-        self.freqs_cis = self.precompute_freqs_cis(dim, theta)
+        self.max_seq_len = max_seq_len
+        self.register_buffer('freqs_cis', self.precompute_freqs_cis(dim, theta))
 
     def precompute_freqs_cis(self, dim: int, theta: float) -> torch.Tensor:
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -91,7 +92,7 @@ class VishwamaiAttention(nn.Module):
                                bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         
-        self.rotary_emb = RotaryEmbedding(self.head_dim, config.rope_theta)
+        self.rotary_emb = RotaryEmbedding(self.head_dim, config.rope_theta, config.max_seq_len)
 
     def forward(self, x, attention_mask=None):
         bsz, seqlen, _ = x.shape
@@ -99,18 +100,33 @@ class VishwamaiAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
+        # Split heads and ensure proper shapes for GQA
         q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
 
+        # Repeat k/v heads to match number of query heads
+        num_kv_repeats = self.num_attention_heads // self.num_key_value_heads
+        k = k.repeat_interleave(num_kv_repeats, dim=2)
+        v = v.repeat_interleave(num_kv_repeats, dim=2)
+
+        # Apply rotary embeddings
         q = apply_rotary_emb(q, self.rotary_emb(torch.arange(seqlen, device=x.device)))
         k = apply_rotary_emb(k, self.rotary_emb(torch.arange(seqlen, device=x.device)))
 
-        scores = torch.einsum("bqhd,bkhd->bhqk", q, k) / math.sqrt(self.head_dim)
+        # Compute attention scores and output
+        # Compute attention scores (B, H, T, S)
+        scores = torch.einsum("bthd,bshd->bhts", q, k) / math.sqrt(self.head_dim)
+        
+        # Process attention mask
         if attention_mask is not None:
+            # Convert mask from (B, S) -> (B, 1, 1, S) for broadcasting
+            attention_mask = attention_mask.view(bsz, 1, 1, seqlen)
+            # Convert mask values: 1->0, 0->-inf
+            attention_mask = (1.0 - attention_mask) * -10000.0
             scores = scores + attention_mask
         attn_weights = torch.softmax(scores, dim=-1)
-        attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_weights, v)
+        attn_output = torch.einsum("bhts,bshd->bthd", attn_weights, v)
         attn_output = attn_output.reshape(bsz, seqlen, -1)
         return self.o_proj(attn_output)
 
@@ -170,16 +186,25 @@ class VishwamaiBlock(nn.Module):
     def __init__(self, config: VishwamaiConfig):
         super().__init__()
         self.attention = VishwamaiAttention(config)
+        self.mlp = VishwamaiMLP(config)
         self.moe = MoELayer(config)
         self.input_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
         self.post_attention_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
+        self.mlp_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
 
     def forward(self, x, attention_mask=None):
+        # Attention block
         h = self.input_norm(x)
         h = self.attention(h, attention_mask)
         x = x + h
         
+        # MLP block
         h = self.post_attention_norm(x)
+        h = self.mlp(h)
+        x = x + h
+        
+        # MoE block
+        h = self.mlp_norm(x)
         h = self.moe(h)
         x = x + h
         

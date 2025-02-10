@@ -125,13 +125,13 @@ class ConceptualTokenizer:
             if last_end < len(t):
                 pieces.extend(self.sp_model.encode_as_ids(t[last_end:]))
             
+            # Add special tokens if requested
             if add_special_tokens:
                 pieces = [self.config.bos_id] + pieces + [self.config.eos_id]
             
+            # No padding by default - let the generation code handle padding
             if len(pieces) > self.config.max_length:
                 pieces = pieces[:self.config.max_length - 1] + [self.config.eos_id]
-            else:
-                pieces += [self.config.pad_id] * (self.config.max_length - len(pieces))
             
             results.append(pieces)
         

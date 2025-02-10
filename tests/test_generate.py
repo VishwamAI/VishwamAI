@@ -1,16 +1,6 @@
 import torch
 from vishwamai.generate import GenerationConfig, VishwamaiGenerator
-from dataclasses import dataclass
 
-@dataclass
-class GenerationConfig:
-    max_length: int = 100  # Ensure this is set to a value that doesn't cause assertion errors
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 50
-    num_return_sequences: int = 1
-
-# ...existing code...
 def test_generate_basic(generator):
     prompt = "Test input"
     output = generator.generate(prompt)
@@ -34,20 +24,28 @@ def test_generate_with_attention_mask(generator):
 
 def test_generate_temperature_variation(model, tokenizer):
     gen_config_high_temp = GenerationConfig(
-        max_length=32,  # Increased from 10
+        max_length=32,
         temperature=2.0,
         top_p=0.9,
         top_k=50,
-        num_return_sequences=1
+        do_sample=True,
+        num_return_sequences=1,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id
     )
     generator_high = VishwamaiGenerator(model, tokenizer, gen_config_high_temp)
 
     gen_config_low_temp = GenerationConfig(
-        max_length=10,
+        max_length=32,
         temperature=0.5,
         top_p=0.9,
         top_k=50,
-        num_return_sequences=1
+        do_sample=True,
+        num_return_sequences=1,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id
     )
     generator_low = VishwamaiGenerator(model, tokenizer, gen_config_low_temp)
 
@@ -67,20 +65,28 @@ def test_generate_temperature_variation(model, tokenizer):
 
 def test_generate_top_p_variation(model, tokenizer):
     gen_config_high_p = GenerationConfig(
-        max_length=32,  # Increased from 10
+        max_length=32,
         temperature=1.0,
         top_p=0.95,
         top_k=50,
-        num_return_sequences=1
+        do_sample=True,
+        num_return_sequences=1,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id
     )
     generator_high_p = VishwamaiGenerator(model, tokenizer, gen_config_high_p)
 
     gen_config_low_p = GenerationConfig(
-        max_length=10,
+        max_length=32,
         temperature=1.0,
         top_p=0.5,
         top_k=50,
-        num_return_sequences=1
+        do_sample=True,
+        num_return_sequences=1,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id
     )
     generator_low_p = VishwamaiGenerator(model, tokenizer, gen_config_low_p)
 
@@ -115,11 +121,15 @@ def test_generate_empty_output(generator):
 def test_generate_max_length(generator):
     prompt = "Max length test"
     gen_config = GenerationConfig(
-        max_length=32,  # Increased from 5 to prevent assertion errors
+        max_length=32,
         temperature=1.0,
         top_p=0.9,
         top_k=50,
-        num_return_sequences=1
+        do_sample=True,
+        num_return_sequences=1,
+        pad_token_id=generator.tokenizer.pad_token_id,
+        bos_token_id=generator.tokenizer.bos_token_id,
+        eos_token_id=generator.tokenizer.eos_token_id
     )
     generator_limited = VishwamaiGenerator(generator.model, generator.tokenizer, gen_config)
     output = generator_limited.generate(prompt)

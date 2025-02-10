@@ -177,10 +177,22 @@ class VishwamaiTrainer:
         
         # Forward pass
         outputs = self.model(**model_inputs)
+        print(f"outputs shape before reshape: {outputs.shape}")
+        print(f"labels shape before reshape: {labels.shape}")
+        # Get sequence lengths
+        batch_size, seq_length_output, vocab_size = outputs.size()
+        batch_size_labels, seq_length_labels = labels.size()
+        
+        # Use the minimum sequence length between outputs and labels
+        min_seq_length = min(seq_length_output, seq_length_labels)
+        
+        # Truncate both tensors to minimum length
+        outputs = outputs[:, :min_seq_length, :]
+        labels = labels[:, :min_seq_length]
         
         # Reshape both outputs and labels
-        outputs = outputs.view(batch_size * seq_length, -1)  # (batch_size * seq_length, vocab_size)
-        labels = labels.view(-1)  # (batch_size * seq_length)
+        outputs = outputs.reshape(-1, vocab_size)  # (batch_size * seq_length, vocab_size)
+        labels = labels.reshape(-1)  # (batch_size * seq_length)
         
         # Compute loss
         loss = torch.nn.functional.cross_entropy(outputs, labels)

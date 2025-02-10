@@ -231,7 +231,7 @@ class VishwamaiModel(nn.Module):
     def to(self, device):
         return super().to(device)
         
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, concept_ids=None):
         batch_size, seq_length = input_ids.shape
         
         position_ids = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)

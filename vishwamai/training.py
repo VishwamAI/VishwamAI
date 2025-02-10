@@ -161,8 +161,9 @@ class VishwamaiTrainer:
         
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute the loss for a batch of data"""
-        # Get labels and remove from inputs
-        labels = batch.pop('labels').view(-1)  # Flatten labels
+        # Get labels but keep a copy
+        labels = batch['labels']
+        batch_size, seq_length = labels.size()
         
         # Get required inputs
         model_inputs = {
@@ -177,13 +178,11 @@ class VishwamaiTrainer:
         # Forward pass
         outputs = self.model(**model_inputs)
         
-        # Reshape outputs to match labels
-        outputs = outputs.view(-1, outputs.size(-1))  # (batch_size * seq_length, vocab_size)
+        # Reshape both outputs and labels
+        outputs = outputs.view(batch_size * seq_length, -1)  # (batch_size * seq_length, vocab_size)
+        labels = labels.view(-1)  # (batch_size * seq_length)
         
         # Compute loss
         loss = torch.nn.functional.cross_entropy(outputs, labels)
-        
-        # Add labels back to batch for potential later use
-        batch['labels'] = labels.view(model_inputs['input_ids'].size(0), -1)  # Restore original shape
         
         return loss

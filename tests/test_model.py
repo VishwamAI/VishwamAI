@@ -7,6 +7,7 @@ from vishwamai.model import (
     MoELayer,
     VishwamaiBlock
 )
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 
 def test_model_initialization():
     config = VishwamaiConfig()
@@ -125,6 +126,38 @@ def test_model_different_sizes(batch_size, seq_length):
     output = model(input_ids)
     assert output.shape == (batch_size, seq_length, config.vocab_size), \
         f"Output shape mismatch for batch_size={batch_size}, seq_length={seq_length}"
+
+def test_model_with_tokenizer():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    tokenizer_config = ConceptualTokenizerConfig(
+        vocab_size=config.vocab_size,
+        max_length=config.max_position_embeddings
+    )
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+    
+    input_text = "Test input for tokenizer integration"
+    input_ids = tokenizer.encode(input_text)
+    input_ids = torch.tensor([input_ids])
+    
+    logits = model(input_ids)
+    assert logits.shape == (1, len(input_ids[0]), config.vocab_size), "Output shape mismatch with tokenizer integration"
+
+def test_math_training_compatibility():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    tokenizer_config = ConceptualTokenizerConfig(
+        vocab_size=config.vocab_size,
+        max_length=config.max_position_embeddings
+    )
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+    
+    input_text = "Solve for x: 2x + 3 = 11"
+    input_ids = tokenizer.encode(input_text)
+    input_ids = torch.tensor([input_ids])
+    
+    logits = model(input_ids)
+    assert logits.shape == (1, len(input_ids[0]), config.vocab_size), "Output shape mismatch for math training compatibility"
 
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -136,3 +136,18 @@ def test_gsm8k_model_generation(sample_gsm8k_data, tokenizer, max_length):
     assert isinstance(output, list)
     assert len(output) > 0
     assert isinstance(output[0], str)
+
+def test_vishwamai_math_integration_notebook():
+    import nbformat
+    from nbconvert.preprocessors import ExecutePreprocessor
+
+    notebook_filename = "math/vishwamai_math_integration.ipynb"
+    with open(notebook_filename) as f:
+        notebook = nbformat.read(f, as_version=4)
+
+    ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
+    ep.preprocess(notebook, {'metadata': {'path': './'}})
+
+    # Check if the notebook ran without errors
+    assert notebook['metadata']['kernelspec']['name'] == 'python3'
+    assert all(cell['cell_type'] != 'code' or 'outputs' in cell for cell in notebook.cells)

@@ -23,3 +23,7 @@ scikit-learn>=1.0.2  # Useful for ML tasks
 
 # Optional dependencies
 protobuf==4.25.1  # Avoid issues with Hugging Face libraries
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0  # For test coverage reporting

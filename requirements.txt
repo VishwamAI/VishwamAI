@@ -2,9 +2,7 @@ torch==2.4.1
 triton==3.0.0
 transformers==4.46.3
 safetensors==0.4.5
-accelerate==0.27.1  # For memory efficient attention
-bitsandbytes==0.41.3  # For 8-bit quantization
-flash-attn==2.5.3  # For optimized attention implementation
-deepspeed==0.13.1  # For memory optimization and parallelization
-nvidia-ml-py==12.535.77  # For GPU memory monitoring
-psutil==5.9.8  # For system resource monitoring
+pandas== 2.1.0
+numpy==1.21.0
+matplotlib == 3.4.3
+seaborn==0.11.2

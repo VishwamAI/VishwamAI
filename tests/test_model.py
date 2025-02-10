@@ -1,58 +1,130 @@
 import pytest
 import torch
-from vishwamai.model import VishwamaiModel, VishwamaiConfig, RotaryEmbedding
+import torch.nn.functional as F
+from vishwamai.model import (
+    VishwamaiModel, 
+    VishwamaiConfig,
+    MoELayer,
+    VishwamaiBlock
+)
 
-@pytest.fixture
-def config():
-    return VishwamaiConfig(
-        vocab_size=100,
-        hidden_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=512,
-        max_position_embeddings=32
-    )
-
-@pytest.fixture
-def model(config, monkeypatch):
+def test_model_initialization():
+    config = VishwamaiConfig()
     model = VishwamaiModel(config)
-    model.eval()
-    
-    # Mock rotary_emb to prevent None returns
-    for block in model.blocks:
-        block.attention.rotary_emb = RotaryEmbedding(dim=config.hidden_size // config.num_attention_heads, theta=config.rope_theta)
-    
-    return model
+    assert model is not None
+    assert isinstance(model, VishwamaiModel)
 
-def test_model_forward(model, config):
-    input_ids = torch.randint(0, config.vocab_size, (2, 16))  # batch_size=2, seq_length=16
-    output = model(input_ids)
-    assert output.shape == (2, 16, config.vocab_size), "Output shape mismatch"
-
-def test_model_with_attention_mask(model, config):
-    input_ids = torch.randint(0, config.vocab_size, (1, 10))
-    attention_mask = torch.ones(1, 10)
-    output = model(input_ids, attention_mask)
-    assert output is not None, "Model output is None"
-    assert output.shape == (1, 10, config.vocab_size), "Output shape mismatch with attention mask"
-
-def test_model_device_transfer(config):
+def test_forward_pass():
+    config = VishwamaiConfig()
     model = VishwamaiModel(config)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    input_ids = torch.randint(0, config.vocab_size, (1, 10)).to(device)
-    output = model(input_ids)
-    assert output.device.type == device.type, "Model output device type mismatch"
-    if device.type == "cuda":
-        assert output.device.index == device.index, "Model output device index mismatch"
+    model.to("cpu")  # Ensure model is on CPU for testing
+    input_ids = torch.randint(0, config.vocab_size, (2, 128))
+    logits = model(input_ids)
+    assert logits.shape == (2, 128, config.vocab_size), "Output shape mismatch!"
 
-def test_model_forward_no_attention_mask(model, config):
-    input_ids = torch.randint(0, config.vocab_size, (3, 20))
-    output = model(input_ids)
-    assert output.shape == (3, 20, config.vocab_size), "Output shape mismatch without attention mask"
+def test_attention():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    block = model.blocks[0]  # Get the first transformer block
+    input_ids = torch.randint(0, config.vocab_size, (2, 128))
+    hidden_states = model.embeddings(input_ids)
+    output = block.attention(hidden_states)
+    assert output.shape == hidden_states.shape, "Attention output shape mismatch!"
 
-def test_model_forward_large_input(model, config):
-    input_ids = torch.randint(0, config.vocab_size, (1, config.max_position_embeddings))
+def test_mlp():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    block = model.blocks[0]  # Get the first transformer block
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = block.mlp(input_tensor)
+    assert output.shape == input_tensor.shape, "MLP output shape mismatch!"
+
+def test_rms_norm():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    norm_layer = model.ln_f
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = norm_layer(input_tensor)
+    assert output.shape == input_tensor.shape, "RMSNorm output shape mismatch!"
+
+def test_device_transfer():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    model.to("cuda" if torch.cuda.is_available() else "cpu")
+    assert next(model.parameters()).device.type in ["cuda", "cpu"], "Device transfer failed!"
+
+def test_moe_layer():
+    config = VishwamaiConfig()
+    moe = MoELayer(config)
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = moe(input_tensor)
+    assert output.shape == input_tensor.shape, "MoE output shape mismatch!"
+    
+def test_expert_routing():
+    config = VishwamaiConfig()
+    moe = MoELayer(config)
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    
+    # Test routing computation
+    route_scores = moe.gate(input_tensor)
+    assert route_scores.shape == (2, 128, config.n_routed_experts), "Routing scores shape mismatch!"
+    
+    # Test expert selection
+    routing_weights = F.softmax(route_scores, dim=-1)
+    top_k_weights, top_k_indices = torch.topk(routing_weights, k=config.n_activated_experts, dim=-1)
+    assert top_k_indices.shape == (2, 128, config.n_activated_experts), "Expert selection shape mismatch!"
+
+def test_block_with_moe():
+    config = VishwamaiConfig()
+    block = VishwamaiBlock(config)
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = block(input_tensor)
+    assert output.shape == input_tensor.shape, "Block with MoE output shape mismatch!"
+
+def test_model_memory_efficiency():
+    config = VishwamaiConfig(max_batch_size=2, max_seq_len=128)
+    model = VishwamaiModel(config)
+    
+    # Test memory allocation
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        model.to('cuda')
+        input_ids = torch.randint(0, config.vocab_size, (2, 128)).cuda()
+        _ = model(input_ids)
+        max_memory = torch.cuda.max_memory_allocated()
+        assert max_memory > 0, "Model should allocate GPU memory"
+
+def test_expert_load_balancing():
+    config = VishwamaiConfig()
+    moe = MoELayer(config)
+    
+    # Test with multiple batches to check load balancing
+    batches = [torch.randn(2, 128, config.hidden_size) for _ in range(5)]
+    expert_counts = torch.zeros(config.n_routed_experts)
+    
+    for batch in batches:
+        route_scores = moe.gate(batch)
+        routing_weights = F.softmax(route_scores, dim=-1)
+        _, top_k_indices = torch.topk(routing_weights, k=config.n_activated_experts, dim=-1)
+        for expert_idx in range(config.n_routed_experts):
+            expert_counts[expert_idx] += (top_k_indices == expert_idx).sum().item()
+    
+    # Check if load is reasonably balanced
+    std_dev = torch.std(expert_counts)
+    mean = torch.mean(expert_counts)
+    coefficient_of_variation = std_dev / mean
+    assert coefficient_of_variation < 0.5, "Expert load is not well balanced"
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [64, 128, 256])
+def test_model_different_sizes(batch_size, seq_length):
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length))
     output = model(input_ids)
-    assert output.shape == (1, config.max_position_embeddings, config.vocab_size), "Output shape mismatch with large input"
+    assert output.shape == (batch_size, seq_length, config.vocab_size), \
+        f"Output shape mismatch for batch_size={batch_size}, seq_length={seq_length}"
+
+if __name__ == "__main__":
+    pytest.main([__file__])

@@ -1,0 +1,21 @@
+{
+  "vocab_size": 32000,
+  "max_length": 128,
+  "pad_token": "[PAD]",
+  "unk_token": "[UNK]",
+  "bos_token": "[BOS]",
+  "eos_token": "[EOS]",
+  "concept_tokens": null,
+  "reasoning_tokens": null,
+  "min_freq": 5,
+  "special_tokens_map": null,
+  "model_type": "unigram",
+  "character_coverage": 0.9995,
+  "model_prefix": "conceptual",
+  "pad_id": 0,
+  "unk_id": 1,
+  "bos_id": 2,
+  "eos_id": 3,
+  "control_symbols": null,
+  "user_defined_symbols": null
+}

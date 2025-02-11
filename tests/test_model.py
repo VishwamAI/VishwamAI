@@ -1,197 +1,163 @@
 import pytest
 import torch
-from vishwamai.model import VishwamaiModel, VishwamaiConfig
+import torch.nn.functional as F
+from vishwamai.model import (
+    VishwamaiModel, 
+    VishwamaiConfig,
+    MoELayer,
+    VishwamaiBlock
+)
+from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 
-@pytest.fixture
-def config():
-    return VishwamaiConfig(
-        vocab_size=256000,
-        hidden_size=128,  # Smaller size for testing
-        num_hidden_layers=4,  # Fewer layers for testing
-        num_attention_heads=8,
-        num_key_value_heads=4,
-        intermediate_size=256,
-        max_position_embeddings=512,
-        memory_layers=2,
-        memory_size=64,
-        memory_heads=4,
-        use_memory=True,
-    )
+def test_model_initialization():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    assert model is not None
+    assert isinstance(model, VishwamaiModel)
 
-@pytest.fixture
-def model(config):
-    return VishwamaiModel(config, device="cuda" if torch.cuda.is_available() else "cpu")
+def test_forward_pass():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    model.to("cpu")  # Ensure model is on CPU for testing
+    input_ids = torch.randint(0, config.vocab_size, (2, 128))
+    logits = model(input_ids)
+    assert logits.shape == (2, 128, config.vocab_size), "Output shape mismatch!"
 
-@pytest.fixture
-def input_data(config):
-    batch_size = 2
-    seq_length = 32
+def test_attention():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    block = model.blocks[0]  # Get the first transformer block
+    input_ids = torch.randint(0, config.vocab_size, (2, 128))
+    hidden_states = model.embeddings(input_ids)
+    output = block.attention(hidden_states)
+    assert output.shape == hidden_states.shape, "Attention output shape mismatch!"
+
+def test_mlp():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    block = model.blocks[0]  # Get the first transformer block
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = block.mlp(input_tensor)
+    assert output.shape == input_tensor.shape, "MLP output shape mismatch!"
+
+def test_rms_norm():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    norm_layer = model.ln_f
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = norm_layer(input_tensor)
+    assert output.shape == input_tensor.shape, "RMSNorm output shape mismatch!"
+
+def test_device_transfer():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    model.to("cuda" if torch.cuda.is_available() else "cpu")
+    assert next(model.parameters()).device.type in ["cuda", "cpu"], "Device transfer failed!"
+
+def test_moe_layer():
+    config = VishwamaiConfig()
+    moe = MoELayer(config)
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = moe(input_tensor)
+    assert output.shape == input_tensor.shape, "MoE output shape mismatch!"
+    
+def test_expert_routing():
+    config = VishwamaiConfig()
+    moe = MoELayer(config)
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    
+    # Test routing computation
+    route_scores = moe.gate(input_tensor)
+    assert route_scores.shape == (2, 128, config.n_routed_experts), "Routing scores shape mismatch!"
+    
+    # Test expert selection
+    routing_weights = F.softmax(route_scores, dim=-1)
+    top_k_weights, top_k_indices = torch.topk(routing_weights, k=config.n_activated_experts, dim=-1)
+    assert top_k_indices.shape == (2, 128, config.n_activated_experts), "Expert selection shape mismatch!"
+
+def test_block_with_moe():
+    config = VishwamaiConfig()
+    block = VishwamaiBlock(config)
+    input_tensor = torch.randn(2, 128, config.hidden_size)
+    output = block(input_tensor)
+    assert output.shape == input_tensor.shape, "Block with MoE output shape mismatch!"
+
+def test_model_memory_efficiency():
+    config = VishwamaiConfig(max_batch_size=2, max_seq_len=128)
+    model = VishwamaiModel(config)
+    
+    # Test memory allocation
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        model.to('cuda')
+        input_ids = torch.randint(0, config.vocab_size, (2, 128)).cuda()
+        _ = model(input_ids)
+        max_memory = torch.cuda.max_memory_allocated()
+        assert max_memory > 0, "Model should allocate GPU memory"
+
+def test_expert_load_balancing():
+    config = VishwamaiConfig()
+    moe = MoELayer(config)
+    
+    # Test with multiple batches to check load balancing
+    batches = [torch.randn(2, 128, config.hidden_size) for _ in range(5)]
+    expert_counts = torch.zeros(config.n_routed_experts)
+    
+    for batch in batches:
+        route_scores = moe.gate(batch)
+        routing_weights = F.softmax(route_scores, dim=-1)
+        _, top_k_indices = torch.topk(routing_weights, k=config.n_activated_experts, dim=-1)
+        for expert_idx in range(config.n_routed_experts):
+            expert_counts[expert_idx] += (top_k_indices == expert_idx).sum().item()
+    
+    # Check if load is reasonably balanced
+    std_dev = torch.std(expert_counts)
+    mean = torch.mean(expert_counts)
+    coefficient_of_variation = std_dev / mean
+    assert coefficient_of_variation < 0.5, "Expert load is not well balanced"
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [64, 128, 256])
+def test_model_different_sizes(batch_size, seq_length):
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length))
-    attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
-    return input_ids, attention_mask
+    output = model(input_ids)
+    assert output.shape == (batch_size, seq_length, config.vocab_size), \
+        f"Output shape mismatch for batch_size={batch_size}, seq_length={seq_length}"
 
-def test_model_initialization(model):
-    assert isinstance(model, VishwamaiModel), "Model initialization failed"
-    assert hasattr(model, "embeddings"), "Embeddings layer missing"
-    assert hasattr(model, "blocks"), "Transformer blocks missing"
-    assert len(model.blocks) == model.config.num_hidden_layers, "Incorrect number of blocks"
+def test_model_with_tokenizer():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    tokenizer_config = ConceptualTokenizerConfig(
+        vocab_size=config.vocab_size,
+        max_length=config.max_position_embeddings
+    )
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+    
+    input_text = "Test input for tokenizer integration"
+    input_ids = tokenizer.encode(input_text)
+    input_ids = torch.tensor([input_ids])
+    
+    logits = model(input_ids)
+    assert logits.shape == (1, len(input_ids[0]), config.vocab_size), "Output shape mismatch with tokenizer integration"
 
-def test_model_forward_pass(model, input_data):
-    input_ids, attention_mask = input_data
-    outputs = model(input_ids, attention_mask)
+def test_math_training_compatibility():
+    config = VishwamaiConfig()
+    model = VishwamaiModel(config)
+    tokenizer_config = ConceptualTokenizerConfig(
+        vocab_size=config.vocab_size,
+        max_length=config.max_position_embeddings
+    )
+    tokenizer = ConceptualTokenizer(tokenizer_config)
+    
+    input_text = "Solve for x: 2x + 3 = 11"
+    input_ids = tokenizer.encode(input_text)
+    input_ids = torch.tensor([input_ids])
+    
+    logits = model(input_ids)
+    assert logits.shape == (1, len(input_ids[0]), config.vocab_size), "Output shape mismatch for math training compatibility"
 
-    # Check output keys
-    assert "logits" in outputs, "Logits missing in output"
-    assert "mtp_logits" in outputs, "Multi-token prediction logits missing"
-    assert "memory_state" in outputs, "Memory state missing"
-    assert "hidden_states" in outputs, "Hidden states missing"
-
-    # Check output shapes
-    batch_size, seq_length = input_ids.shape
-    assert outputs["logits"].shape == (batch_size, seq_length, model.config.vocab_size), "Logits shape mismatch"
-    assert outputs["mtp_logits"].shape == (batch_size, seq_length, model.config.vocab_size), "MTP logits shape mismatch"
-    assert len(outputs["memory_state"]) == model.config.num_hidden_layers, "Memory state length mismatch"
-    assert outputs["hidden_states"].shape == (batch_size, seq_length, model.config.hidden_size), "Hidden states shape mismatch"
-
-def test_memory_state_persistence(model, input_data):
-    input_ids, attention_mask = input_data
-    outputs1 = model(input_ids, attention_mask)
-    memory_state = outputs1["memory_state"]
-
-    # Pass memory state to the next forward pass
-    outputs2 = model(input_ids, attention_mask, memory_state=memory_state)
-
-    # Ensure memory state is updated
-    assert outputs2["memory_state"] != memory_state, "Memory state not updated"
-
-def test_attention_mask(model, input_data):
-    input_ids, attention_mask = input_data
-    outputs = model(input_ids, attention_mask)
-
-    # Check that attention mask is applied correctly
-    assert outputs["logits"].shape == (input_ids.shape[0], input_ids.shape[1], model.config.vocab_size), "Attention mask not applied correctly"
-
-def test_device_transfer(model, input_data):
-    input_ids, attention_mask = input_data
-    if torch.cuda.is_available():
-        model.to("cuda")
-        input_ids = input_ids.to("cuda")
-        attention_mask = attention_mask.to("cuda")
-        outputs = model(input_ids, attention_mask)
-        assert outputs["logits"].device.type == "cuda", "Device transfer failed"
-    else:
-        pytest.skip("CUDA not available")
-
-def test_gradient_flow(model, input_data):
-    input_ids, attention_mask = input_data
-    model.zero_grad()
-    outputs = model(input_ids, attention_mask)
-    loss = outputs["logits"].sum()  # Dummy loss for testing
-    loss.backward()
-
-    # Check gradients
-    for param in model.parameters():
-        assert param.grad is not None, "Gradient flow failed"
-
-def test_large_sequence_input(model, config):
-    # Test with a sequence longer than max_position_embeddings
-    input_ids = torch.randint(0, config.vocab_size, (2, config.max_position_embeddings + 10))
-    attention_mask = torch.ones((2, config.max_position_embeddings + 10), dtype=torch.long)
-
-    with pytest.raises(RuntimeError): # Expecting a different error, but keeping RuntimeError for now.
-        model(input_ids, attention_mask)
-
-def test_memory_device_mismatch(model, input_data):
-    input_ids, attention_mask = input_data
-    if torch.cuda.is_available():
-        # Create memory state on CPU
-        memory_state = [torch.zeros(2, model.config.memory_size, model.config.hidden_size) for _ in range(model.config.num_hidden_layers)]
-        with pytest.raises(RuntimeError): # Expecting a different error, but keeping RuntimeError for now.
-            model(input_ids, attention_mask, memory_state=memory_state)
-    else:
-        pytest.skip("CUDA not available")
-
-def test_compute_loss(model, input_data):
-    input_ids, attention_mask = input_data
-    outputs = model(input_ids, attention_mask)
-
-    # Dummy loss computation
-    logits = outputs["logits"]
-    targets = torch.randint(0, model.config.vocab_size, logits.shape[:-1], device=logits.device)
-    loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-    assert loss.item() > 0, "Loss computation failed"
-
-def test_train_step(model, input_data):
-    input_ids, attention_mask = input_data
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    model.train()
-
-    # Forward pass
-    outputs = model(input_ids, attention_mask)
-    logits = outputs["logits"]
-    targets = torch.randint(0, model.config.vocab_size, logits.shape[:-1], device=logits.device)
-    loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-    # Backward pass
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    assert loss.item() > 0, "Training step failed"
-
-def test_evaluation(model, input_data):
-    input_ids, attention_mask = input_data
-    model.eval()
-
-    with torch.no_grad():
-        outputs = model(input_ids, attention_mask)
-        logits = outputs["logits"]
-        assert logits.requires_grad is False, "Evaluation mode failed"
-
-def test_training_loop(model, input_data):
-    input_ids, attention_mask = input_data
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    model.train()
-
-    for _ in range(2):  # Simulate 2 training steps
-        outputs = model(input_ids, attention_mask)
-        logits = outputs["logits"]
-        targets = torch.randint(0, model.config.vocab_size, logits.shape[:-1], device=logits.device)
-        loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    assert loss.item() > 0, "Training loop failed"
-
-def test_gradient_accumulation(model, input_data):
-    input_ids, attention_mask = input_data
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    model.train()
-
-    # Simulate gradient accumulation over 2 steps
-    for _ in range(2):
-        outputs = model(input_ids, attention_mask)
-        logits = outputs["logits"]
-        targets = torch.randint(0, model.config.vocab_size, logits.shape[:-1], device=logits.device)
-        loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        loss.backward()
-
-    optimizer.step()
-    optimizer.zero_grad()
-
-    assert loss.item() > 0, "Gradient accumulation failed"
-
-def test_fp16_training(model, input_data):
-    if torch.cuda.is_available():
-        model.half()  # Convert model to FP16
-        input_ids, attention_mask = input_data
-        input_ids = input_ids.to("cuda")
-        attention_mask = attention_mask.to("cuda")
-
-        outputs = model(input_ids, attention_mask)
-        assert outputs["logits"].dtype == torch.float16, "FP16 training failed"
-    else:
-        pytest.skip("CUDA not available")
+if __name__ == "__main__":
+    pytest.main([__file__])

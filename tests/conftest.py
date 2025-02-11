@@ -1,40 +1,47 @@
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 import pytest
-from vishwamai.model import VishwamaiModel, VishwamaiConfig
+import torch
 from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
+from vishwamai.model import VishwamaiModel, VishwamaiConfig
 from vishwamai.generate import VishwamaiGenerator, GenerationConfig
 
 @pytest.fixture
 def config():
-    return VishwamaiConfig(
-        vocab_size=100,
-        hidden_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=512,
-        max_position_embeddings=32
-    )
+    return VishwamaiConfig()
 
 @pytest.fixture
 def model(config):
-    model = VishwamaiModel(config)
-    model.eval()
-    return model
+    return VishwamaiModel(config)
 
 @pytest.fixture
 def tokenizer():
-    config = ConceptualTokenizerConfig(vocab_size=100, max_length=32)
+    config = ConceptualTokenizerConfig(
+        vocab_size=100,
+        pad_token="<pad>",
+        bos_token="<s>",
+        eos_token="</s>",
+        pad_id=0,
+        bos_id=1,
+        eos_id=2,
+        unk_id=3,
+        model_type="unigram"
+    )
+    
     tokenizer = ConceptualTokenizer(config)
+    
+    with open("tests/test_data.txt", "r") as f:
+        texts = f.readlines()
+    tokenizer.train_tokenizer(texts)
+    
+    tokenizer.add_concept("TEST", ["test", "testing", "tested"])
+    tokenizer.add_concept("INPUT", ["input", "inputs", "inputted"])
     return tokenizer
 
 @pytest.fixture
 def generator(model, tokenizer):
-    config = GenerationConfig(
-        max_length=10,
-        temperature=0.7,
-        top_p=0.9,
-        top_k=50,
-        num_return_sequences=1
-    )
-    generator = VishwamaiGenerator(model, tokenizer, config)
-    return generator
+    gen_config = GenerationConfig()
+    return VishwamaiGenerator(model, tokenizer, gen_config)

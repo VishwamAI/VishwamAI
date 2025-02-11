@@ -7,67 +7,49 @@ from vishwamai.model import VishwamaiModel, VishwamaiConfig
 from vishwamai.conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
 
 class DummyDataset(Dataset):
-    def __init__(self, size=100, seq_length=32, device='cpu'):
+    def __init__(self, size=100, seq_length=32):
         self.size = size
         self.seq_length = seq_length
-        self.device = device
-
+        
     def __len__(self):
         return self.size
-
+        
     def __getitem__(self, idx):
-        input_ids = torch.randint(0, 100, (self.seq_length,), device=self.device)
-        attention_mask = torch.ones(self.seq_length, device=self.device)
-        labels = torch.randint(0, 100, (self.seq_length,), device=self.device)
         return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
+            'input_ids': torch.randint(0, 100, (self.seq_length,)),
+            'attention_mask': torch.ones(self.seq_length),
+            'labels': torch.randint(0, 100, (self.seq_length,))
         }
 
 @pytest.fixture
 def trainer_components():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     config = VishwamaiConfig(
         vocab_size=100,
         hidden_size=128,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,  # Added to match model config
-        intermediate_size=512
+        num_attention_heads=4
     )
-    model = VishwamaiModel(config, device=device)
+    model = VishwamaiModel(config)
     
     tokenizer_config = ConceptualTokenizerConfig(vocab_size=100)
     tokenizer = ConceptualTokenizer(tokenizer_config)
     
-    # Ensure datasets use correct sequence length
-    seq_length = 32
-    train_dataset = DummyDataset(size=100, seq_length=seq_length, device=device)
-    eval_dataset = DummyDataset(size=10, seq_length=seq_length, device=device)
+    train_dataset = DummyDataset()
+    eval_dataset = DummyDataset(size=10)
     
-    # Use smaller batch size and pin memory for GPU
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=4,
-        pin_memory=False if torch.cuda.is_available() else True
-    )
-    eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=4,
-        pin_memory=False if torch.cuda.is_available() else True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=4)
+    eval_loader = DataLoader(eval_dataset, batch_size=4)
     
-    return model, tokenizer, train_loader, eval_loader, device
+    return model, tokenizer, train_loader, eval_loader
 
 def test_trainer_initialization(trainer_components):
-    model, tokenizer, train_loader, eval_loader, device = trainer_components
+    model, tokenizer, train_loader, eval_loader = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
         eval_dataset=eval_loader,
-        device=device
+        device="cpu"
     )
     
     assert trainer.model is not None
@@ -78,12 +60,12 @@ def test_trainer_initialization(trainer_components):
     assert trainer.scheduler is not None
 
 def test_compute_loss(trainer_components):
-    model, tokenizer, train_loader, _, device = trainer_components
+    model, tokenizer, train_loader, _ = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
-        device=device
+        device="cpu"
     )
     
     batch = next(iter(train_loader))
@@ -95,12 +77,12 @@ def test_compute_loss(trainer_components):
     assert not torch.isinf(loss)
 
 def test_train_step(trainer_components):
-    model, tokenizer, train_loader, _, device = trainer_components
+    model, tokenizer, train_loader, _ = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
-        device=device
+        device="cpu"
     )
     
     batch = next(iter(train_loader))
@@ -111,13 +93,13 @@ def test_train_step(trainer_components):
     assert not torch.isinf(torch.tensor(loss))
 
 def test_evaluation(trainer_components):
-    model, tokenizer, train_loader, eval_loader, device = trainer_components
+    model, tokenizer, train_loader, eval_loader = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
         eval_dataset=eval_loader,
-        device=device
+        device="cpu"
     )
     
     eval_results = trainer.evaluate()
@@ -127,12 +109,12 @@ def test_evaluation(trainer_components):
     assert isinstance(eval_results["eval_loss"], float)
 
 def test_save_load_model(trainer_components, tmp_path):
-    model, tokenizer, train_loader, _, device = trainer_components
+    model, tokenizer, train_loader, _ = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
-        device=device
+        device="cpu"
     )
     
     # Save model
@@ -144,13 +126,13 @@ def test_save_load_model(trainer_components, tmp_path):
     assert (save_path / "training_state.pt").exists()
 
 def test_training_loop(trainer_components, tmp_path):
-    model, tokenizer, train_loader, eval_loader, device = trainer_components
+    model, tokenizer, train_loader, eval_loader = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
         eval_dataset=eval_loader,
-        device=device
+        device="cpu"
     )
     
     # Run short training loop
@@ -167,12 +149,12 @@ def test_training_loop(trainer_components, tmp_path):
     assert (tmp_path / "test_training" / "final_model" / "model.pt").exists()
 
 def test_gradient_accumulation(trainer_components):
-    model, tokenizer, train_loader, _, device = trainer_components
+    model, tokenizer, train_loader, _ = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_loader,
-        device=device
+        device="cpu"
     )
     
     # Get initial parameters
@@ -194,7 +176,7 @@ def test_fp16_training(trainer_components):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
         
-    model, tokenizer, train_loader, _, device = trainer_components
+    model, tokenizer, train_loader, _ = trainer_components
     trainer = VishwamaiTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -205,10 +187,11 @@ def test_fp16_training(trainer_components):
     # Set up GradScaler for FP16 training
     scaler = torch.amp.GradScaler('cuda')
     
-    # Get batch and pin memory before CUDA transfer
+    # Verify FP16 training works
     batch = next(iter(train_loader))
+    batch = {k: v.cuda() for k, v in batch.items()}
     
-    # Test mixed precision training on device
+    # Test mixed precision training
     with torch.amp.autocast('cuda'):
         loss = trainer.compute_loss(batch)
     

@@ -9,7 +9,6 @@ VishwamAI is a sophisticated machine learning library focusing on efficient mode
 - **Mathematical Reasoning**: Integration with GSM8K dataset for advanced mathematical problem-solving
 - **Model Architecture**: Flexible transformer-based architecture with configurable parameters
 - **Training Utilities**: Support for distributed training, mixed precision, and gradient accumulation
-- **Deep Research and Development**: Recent advancements in model training techniques and dataset loading
 
 ## Installation
 

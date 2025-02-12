@@ -93,6 +93,8 @@ class VishwamaiAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         
         self.rotary_emb = RotaryEmbedding(self.head_dim, config.rope_theta, config.max_seq_len)
+        self.window_size = getattr(config, 'window_size', 512)
+        self.use_flash_attn = getattr(config, 'use_flash_attn', False)
 
     def forward(self, x, attention_mask=None):
         bsz, seqlen, _ = x.shape
@@ -223,6 +225,7 @@ class VishwamaiModel(nn.Module):
         self.ln_f = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.head = nn.Linear(config.hidden_size, config.vocab_size)
         self._device = "cpu"
+        self.gradient_checkpointing = False
         
     @property
     def device(self):
@@ -232,6 +235,16 @@ class VishwamaiModel(nn.Module):
         return super().to(device)
         
     def forward(self, input_ids, attention_mask=None, concept_ids=None):
+        if self.gradient_checkpointing:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward,
+                input_ids,
+                attention_mask,
+                concept_ids
+            )
+        return self._forward(input_ids, attention_mask, concept_ids)
+        
+    def _forward(self, input_ids, attention_mask=None, concept_ids=None):
         batch_size, seq_length = input_ids.shape
         
         position_ids = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)

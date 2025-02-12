@@ -32,6 +32,8 @@ class VishwamaiGenerator:
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or GenerationConfig()
+        # Add nucleus sampling parameters
+        self.min_tokens_to_keep = 1
         
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.config.do_sample:
@@ -55,6 +57,20 @@ class VishwamaiGenerator:
             probs = probs.masked_fill(indices_to_remove, 0.0)
             probs = probs / probs.sum(dim=-1, keepdim=True)
             
+            # Add better nucleus sampling
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > self.config.top_p
+            
+            # Keep at least min_tokens_to_keep
+            sorted_indices_to_remove[..., :self.min_tokens_to_keep] = 0
+            
+            # Scatter sorted tensors to original indexing
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            logits = logits.masked_fill(indices_to_remove, float('-inf'))
+        
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def generate(self, prompt: str) -> List[str]:

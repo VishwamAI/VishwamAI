@@ -27,6 +27,9 @@ class VishwamaiTrainer:
         self.optimizer = optimizer_class(model.parameters())
         self.scheduler = scheduler_class(self.optimizer, T_max=1000)
         self.use_wandb = use_wandb
+        # Add support for tracking best model
+        self.best_eval_loss = float('inf')
+        self.best_model_path = None
         
     def train(
         self,
@@ -84,12 +87,25 @@ class VishwamaiTrainer:
                     # Update progress bar
                     pbar.set_postfix({"loss": loss.item()})
                     
-                    # Logging
+                    # Improved logging
+                    log_data = {
+                        "train_loss": loss.item(),
+                        "learning_rate": self.scheduler.get_last_lr()[0],
+                        "epoch": epoch,
+                        "global_step": global_step
+                    }
+
                     
                     # Evaluation
                     if global_step % evaluation_steps == 0:
                         eval_results = self.evaluate()
                         self.model.train()
+                        
+                        # Save best model
+                        if eval_results and eval_results["eval_loss"] < self.best_eval_loss:
+                            self.best_eval_loss = eval_results["eval_loss"]
+                            self.best_model_path = save_dir / f"best_model"
+                            self.save_model(self.best_model_path)
                     
                     # Save model
                     if global_step % save_steps == 0:
@@ -186,9 +202,9 @@ class VishwamaiTrainer:
         # Use the minimum sequence length between outputs and labels
         min_seq_length = min(seq_length_output, seq_length_labels)
         
-        # Truncate both tensors to minimum length
-        outputs = outputs[:, :min_seq_length, :]
-        labels = labels[:, :min_seq_length]
+        # Fix sequence length mismatch
+        outputs = outputs[:, :min_seq_length, :]  # Truncate outputs
+        labels = labels[:, :min_seq_length]       # Truncate labels
         
         # Reshape both outputs and labels
         outputs = outputs.reshape(-1, vocab_size)  # (batch_size * seq_length, vocab_size)

@@ -1,73 +1,208 @@
-import torch
-import torch.nn as nn
-from dataclasses import dataclass
-from typing import Optional, Literal
-import torch.distributed as dist
-import torch.nn.functional as F
 import math
+from dataclasses import dataclass
+from typing import Tuple, Optional, Literal
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+from kernel import act_quant, weight_dequant, fp8_gemm
+from cache_augmentation import CacheConfig, DifferentiableCacheAugmentation
+from neural_memory import ReasoningMemoryTransformer
+from tree_of_thoughts import TreeConfig, TreeOfThoughts
+
+
+world_size = 1
+rank = 0
+block_size = 128
+gemm_impl: Literal["bf16", "fp8"] = "bf16"
+attn_impl: Literal["naive", "absorb"] = "absorb"
 
 @dataclass
-class VishwamaiConfig:
-    vocab_size: int = 1000  # Reduced for testing
-    hidden_size: int = 256  # Reduced for testing
-    num_hidden_layers: int = 2  # Reduced for testing
-    num_attention_heads: int = 8  # Reduced for testing
-    num_key_value_heads: int = 4  # Reduced for testing
-    intermediate_size: int = 512  # Reduced for testing
-    max_position_embeddings: int = 512  # Reduced for testing
-    layer_norm_eps: float = 1e-5
-    rope_theta: float = 10000  # RoPE base
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
+class ModelArgs:
+    max_batch_size: int = 8
+    max_seq_len: int = 4096 * 4
     dtype: Literal["bf16", "fp8"] = "bf16"
-    max_batch_size: int = 4  # Reduced for testing
-    max_seq_len: int = 512  # Match max_position_embeddings
-    n_routed_experts: int = 4  # Reduced for testing
-    n_shared_experts: int = 1  # Reduced for testing
-    n_activated_experts: int = 2  # Reduced for testing
+    vocab_size: int = 102400
+    dim: int = 2048
+    inter_dim: int = 10944
+    moe_inter_dim: int = 1408
+    n_layers: int = 27
+    n_dense_layers: int = 1
+    n_heads: int = 16
+    # moe
+    n_routed_experts: int = 64
+    n_shared_experts: int = 2
+    n_activated_experts: int = 6
     n_expert_groups: int = 1
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
-    route_scale: float = 1.0
+    route_scale: float = 1.
+    # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+    # yarn
     original_seq_len: int = 4096
+    rope_theta: float = 10000.0
     rope_factor: float = 40
     beta_fast: int = 32
     beta_slow: int = 1
-    mscale: float = 1.0
+    mscale: float = 1.
+    # cache augmentation
+    use_cache_augmentation: bool = True
+    cache_hidden_size: int = 256
+    cache_num_heads: int = 4
+    cache_dropout: float = 0.1
+    cache_max_length: int = 1024
+    # neural memory
+    use_neural_memory: bool = True
+    memory_size: int = 512
+    num_memory_layers: int = 3
+    memory_dropout: float = 0.1
+    # tree of thoughts
+    use_tree_of_thoughts: bool = True
+    tot_max_branches: int = 4
+    tot_max_depth: int = 3
+    tot_beam_width: int = 2
+    tot_temperature: float = 0.8
+    tot_min_score_diff: float = 0.1
+
+
+class ParallelEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        assert vocab_size % world_size == 0, f"Vocabulary size must be divisible by world size (world_size={world_size})"
+        self.part_vocab_size = (vocab_size // world_size)
+        self.vocab_start_idx = rank * self.part_vocab_size
+        self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if world_size > 1:
+            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
+            x = x - self.vocab_start_idx
+            x[mask] = 0
+        y = F.embedding(x, self.weight)
+        if world_size > 1:
+            y[mask] = 0
+            dist.all_reduce(y)
+        return y
+
+
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if weight.element_size() > 1:
+        return F.linear(x, weight, bias)
+    elif gemm_impl == "bf16":
+        weight = weight_dequant(weight, weight.scale)
+        return F.linear(x, weight, bias)
+    else:
+        x, scale = act_quant(x, block_size)
+        y = fp8_gemm(x, scale, weight, weight.scale)
+        if bias is not None:
+            y += bias
+        return y
+
+
+class Linear(nn.Module):
+    dtype = torch.bfloat16
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        if self.weight.element_size() == 1:
+            scale_out_features = (out_features + block_size - 1) // block_size
+            scale_in_features = (in_features + block_size - 1) // block_size
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+        else:
+            self.register_parameter("scale", None)
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.weight, self.bias)
+
+
+class ColumnParallelLinear(Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+        assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
+        self.part_out_features = out_features // world_size
+        super().__init__(in_features, self.part_out_features, bias, dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = linear(x, self.weight, self.bias)
+        return y
+
+
+class RowParallelLinear(Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+        assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
+        self.part_in_features = in_features // world_size
+        super().__init__(self.part_in_features, out_features, bias, dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = linear(x, self.weight)
+        if world_size > 1:
+            dist.all_reduce(y)
+        if self.bias is not None:
+            y += self.bias
+        return y
+
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight
+    def forward(self, x: torch.Tensor):
+        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0, max_seq_len: int = 512):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.max_seq_len = max_seq_len
-        self.register_buffer('freqs_cis', self.precompute_freqs_cis(dim, theta))
 
-    def precompute_freqs_cis(self, dim: int, theta: float) -> torch.Tensor:
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        t = torch.arange(self.max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs_cis
+def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
+    dim = args.qk_rope_head_dim
+    seqlen = args.max_seq_len
+    beta_fast = args.beta_fast
+    beta_slow = args.beta_slow
+    base = args.rope_theta
+    factor = args.rope_factor
 
-    def forward(self, positions):
-        return self.freqs_cis[positions]
+    def find_correction_dim(num_rotations, dim, base, max_seq_len):
+        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim-1)
+
+    def linear_ramp_factor(min, max, dim):
+        if min == max:
+            max += 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        ramp_func = torch.clamp(linear_func, 0, 1)
+        return ramp_func
+
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if seqlen > args.original_seq_len:
+        low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+    t = torch.arange(seqlen)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     dtype = x.dtype
@@ -76,197 +211,281 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
-class VishwamaiAttention(nn.Module):
-    def __init__(self, config: VishwamaiConfig):
+
+class MLA(nn.Module):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, 
-                               self.head_dim * config.num_key_value_heads, 
-                               bias=False)
-        self.v_proj = nn.Linear(config.hidden_size,
-                               self.head_dim * config.num_key_value_heads,
-                               bias=False)
-        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        
-        self.rotary_emb = RotaryEmbedding(self.head_dim, config.rope_theta, config.max_seq_len)
-        self.window_size = getattr(config, 'window_size', 512)
-        self.use_flash_attn = getattr(config, 'use_flash_attn', False)
+        self.dim = args.dim
+        self.n_heads = args.n_heads
+        self.n_local_heads = args.n_heads // world_size
+        self.q_lora_rank = args.q_lora_rank
+        self.kv_lora_rank = args.kv_lora_rank
+        self.qk_nope_head_dim = args.qk_nope_head_dim
+        self.qk_rope_head_dim = args.qk_rope_head_dim
+        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
+        self.v_head_dim = args.v_head_dim
 
-    def forward(self, x, attention_mask=None):
-        bsz, seqlen, _ = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        if self.q_lora_rank == 0:
+            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
+        else:
+            self.wq_a = Linear(self.dim, self.q_lora_rank)
+            self.q_norm = RMSNorm(self.q_lora_rank)
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.kv_norm = RMSNorm(self.kv_lora_rank)
+        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.softmax_scale = self.qk_head_dim ** -0.5
+        if args.max_seq_len > args.original_seq_len:
+            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
+            self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        # Split heads and ensure proper shapes for GQA
-        q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+        if attn_impl == "naive":
+            self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
+            self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
+        else:
+            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
+            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
-        # Repeat k/v heads to match number of query heads
-        num_kv_repeats = self.num_attention_heads // self.num_key_value_heads
-        k = k.repeat_interleave(num_kv_repeats, dim=2)
-        v = v.repeat_interleave(num_kv_repeats, dim=2)
-
-        # Apply rotary embeddings
-        q = apply_rotary_emb(q, self.rotary_emb(torch.arange(seqlen, device=x.device)))
-        k = apply_rotary_emb(k, self.rotary_emb(torch.arange(seqlen, device=x.device)))
-
-        # Compute attention scores and output
-        # Compute attention scores (B, H, T, S)
-        scores = torch.einsum("bthd,bshd->bhts", q, k) / math.sqrt(self.head_dim)
-        
-        # Process attention mask
-        if attention_mask is not None:
-            # Convert mask from (B, S) -> (B, 1, 1, S) for broadcasting
-            attention_mask = attention_mask.view(bsz, 1, 1, seqlen)
-            # Convert mask values: 1->0, 0->-inf
-            attention_mask = (1.0 - attention_mask) * -10000.0
-            scores = scores + attention_mask
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_output = torch.einsum("bhts,bshd->bthd", attn_weights, v)
-        attn_output = attn_output.reshape(bsz, seqlen, -1)
-        return self.o_proj(attn_output)
-
-class MoELayer(nn.Module):
-    def __init__(self, config: VishwamaiConfig):
-        super().__init__()
-        self.n_experts = config.n_routed_experts
-        self.n_active = config.n_activated_experts
-        self.hidden_dim = config.intermediate_size
-        self.route_scale = config.route_scale
-        
-        # Expert network components
-        self.gate = nn.Linear(config.hidden_size, self.n_experts, bias=False)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(config.hidden_size, self.hidden_dim),
-                nn.SiLU(),
-                nn.Linear(self.hidden_dim, config.hidden_size)
-            ) for _ in range(self.n_experts)
-        ])
-
-    def forward(self, x):
-        # Gate computation
-        route_scores = self.gate(x)
-        routing_weights = F.softmax(route_scores, dim=-1)
-        
-        # Select top-k experts
-        top_k_weights, top_k_indices = torch.topk(routing_weights, k=self.n_active, dim=-1)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        
-        # Compute expert outputs
-        final_output = torch.zeros_like(x)
-        for i in range(self.n_active):
-            expert_idx = top_k_indices[:, :, i]
-            expert_weight = top_k_weights[:, :, i].unsqueeze(-1)
-            for j, expert in enumerate(self.experts):
-                mask = (expert_idx == j)
-                if mask.any():
-                    expert_input = x[mask]
-                    expert_output = expert(expert_input)
-                    final_output[mask] += expert_output * expert_weight[mask]
-        
-        return final_output * self.route_scale
-
-class VishwamaiMLP(nn.Module):
-    def __init__(self, config: VishwamaiConfig):
-        super().__init__()
-        self.gate = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.act = nn.SiLU()
-
-    def forward(self, x):
-        return self.down(self.act(self.gate(x)) * self.up(x))
-
-class VishwamaiBlock(nn.Module):
-    def __init__(self, config: VishwamaiConfig):
-        super().__init__()
-        self.attention = VishwamaiAttention(config)
-        self.mlp = VishwamaiMLP(config)
-        self.moe = MoELayer(config)
-        self.input_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
-        self.post_attention_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
-        self.mlp_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
-
-    def forward(self, x, attention_mask=None):
-        # Attention block
-        h = self.input_norm(x)
-        h = self.attention(h, attention_mask)
-        x = x + h
-        
-        # MLP block
-        h = self.post_attention_norm(x)
-        h = self.mlp(h)
-        x = x + h
-        
-        # MoE block
-        h = self.mlp_norm(x)
-        h = self.moe(h)
-        x = x + h
-        
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        if self.q_lora_rank == 0:
+            q = self.wq(x)
+        else:
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        kv = self.wkv_a(x)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        if attn_impl == "naive":
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            kv = self.wkv_b(self.kv_norm(kv))
+            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            self.k_cache[:bsz, start_pos:end_pos] = k
+            self.v_cache[:bsz, start_pos:end_pos] = v
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+        else:
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+        if mask is not None:
+            scores += mask.unsqueeze(1)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        if attn_impl == "naive":
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        else:
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+        x = self.wo(x.flatten(2))
         return x
 
-class VishwamaiModel(nn.Module):
-    def __init__(self, config: VishwamaiConfig):
+
+class MLP(nn.Module):
+    def __init__(self, dim: int, inter_dim: int):
         super().__init__()
-        self.config = config
+        self.w1 = ColumnParallelLinear(dim, inter_dim)
+        self.w2 = RowParallelLinear(inter_dim, dim)
+        self.w3 = ColumnParallelLinear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class Gate(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.topk = args.n_activated_experts
+        self.n_groups = args.n_expert_groups
+        self.topk_groups = args.n_limited_groups
+        self.score_func = args.score_func
+        self.route_scale = args.route_scale
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores = linear(x, self.weight)
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = scores.sigmoid()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.n_groups > 1:
+            scores = scores.view(x.size(0), self.n_groups, -1)
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
+            else:
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+            scores = (scores * mask.unsqueeze(-1)).flatten(1)
+        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        if self.score_func == "sigmoid":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights.type_as(x), indices
+
+
+class Expert(nn.Module):
+    def __init__(self, dim: int, inter_dim: int):
+        super().__init__()
+        self.w1 = Linear(dim, inter_dim)
+        self.w2 = Linear(inter_dim, dim)
+        self.w3 = Linear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class MoE(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        assert args.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_activated_experts = args.n_activated_experts
+        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.gate = Gate(args)
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
+                                      for i in range(self.n_routed_experts)])
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x)
+        y = torch.zeros_like(x)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        z = self.shared_experts(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        return (y + z).view(shape)
+
+
+class Block(nn.Module):
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.attn = MLA(args)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
         
-        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        
-        self.blocks = nn.ModuleList([VishwamaiBlock(config) for _ in range(config.num_hidden_layers)])
-        
-        self.ln_f = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.head = nn.Linear(config.hidden_size, config.vocab_size)
-        self._device = "cpu"
-        self.gradient_checkpointing = False
-        
-    @property
-    def device(self):
-        return next(self.parameters()).device
-        
-    def to(self, device):
-        return super().to(device)
-        
-    def forward(self, input_ids, attention_mask=None, concept_ids=None):
-        if self.gradient_checkpointing:
-            return torch.utils.checkpoint.checkpoint(
-                self._forward,
-                input_ids,
-                attention_mask,
-                concept_ids
+        # Initialize optional components
+        if args.use_cache_augmentation:
+            self.cache = DifferentiableCacheAugmentation(
+                CacheConfig(
+                    hidden_size=args.cache_hidden_size,
+                    num_heads=args.cache_num_heads,
+                    dropout=args.cache_dropout,
+                    max_cache_length=args.cache_max_length
+                )
             )
-        return self._forward(input_ids, attention_mask, concept_ids)
-        
-    def _forward(self, input_ids, attention_mask=None, concept_ids=None):
-        batch_size, seq_length = input_ids.shape
-        
-        position_ids = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)
-        
-        inputs_embeds = self.embeddings(input_ids)
-        position_embeds = self.position_embeddings(position_ids)
-        
-        hidden_states = inputs_embeds + position_embeds
-        
-        for block in self.blocks:
-            hidden_states = block(hidden_states, attention_mask)
             
-        hidden_states = self.ln_f(hidden_states)
-        logits = self.head(hidden_states)
+        if args.use_neural_memory:
+            self.memory = ReasoningMemoryTransformer(
+                hidden_size=args.dim,
+                memory_size=args.memory_size,
+                num_memory_layers=args.num_memory_layers,
+                dropout=args.memory_dropout
+            )
+            
+        if args.use_tree_of_thoughts:
+            self.tot = TreeOfThoughts(
+                hidden_size=args.dim,
+                config=TreeConfig(
+                    max_branches=args.tot_max_branches,
+                    max_depth=args.tot_max_depth,
+                    beam_width=args.tot_beam_width,
+                    temperature=args.tot_temperature,
+                    min_score_diff=args.tot_min_score_diff
+                )
+            )
+
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        # Base transformer processing
+        h = self.attn_norm(x)
+        h = x + self.attn(h, start_pos, freqs_cis, mask)
         
+        # Apply cache augmentation if enabled
+        if self.args.use_cache_augmentation:
+            h, _ = self.cache(h, mask)
+            
+        # Apply neural memory if enabled
+        if self.args.use_neural_memory:
+            h = self.memory(h, mask)
+            
+        # Apply tree of thoughts if enabled
+        if self.args.use_tree_of_thoughts:
+            h = self.tot(h, mask)
+        
+        # FFN processing
+        h = h + self.ffn(self.ffn_norm(h))
+        
+        return h
+
+
+class Transformer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        super().__init__()
+        self.args = args
+        self.max_seq_len = args.max_seq_len
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Block(layer_id, args))
+        self.norm = RMSNorm(args.dim)
+        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)[:, -1]
+        logits = self.head(h)
+        if world_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
         return logits
+
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
-    config = VishwamaiConfig()
-    model = VishwamaiModel(config)
-    input_ids = torch.randint(0, config.vocab_size, (2, 128))
-    print(model(input_ids).size())
+    args = ModelArgs()
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    model = Transformer(args)
+    print(model(x).size())

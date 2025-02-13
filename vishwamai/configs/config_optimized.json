@@ -1,0 +1,114 @@
+{
+    "model_type": "vishwamai",
+    "architectures": ["VishwamaiModel"],
+    "vocab_size": 64000,
+    "hidden_size": 8192,
+    "intermediate_size": 32768,
+    "num_attention_heads": 64,
+    "num_hidden_layers": 120,
+    "max_position_embeddings": 32768,
+    "use_conceptual_tokens": true,
+    "concept_embedding_size": 512,
+    "use_fp8": true,
+    "attention_dropout": 0.05,
+    "hidden_dropout": 0.05,
+    "max_concepts_per_token": 12,
+    "initializer_range": 0.02,
+    "layer_norm_epsilon": 1e-5,
+    "use_cache": true,
+    "pad_token_id": 0,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "tie_word_embeddings": true,
+    "rope_scaling": {
+        "type": "dynamic",
+        "factor": 4.0
+    },
+    "attention_config": {
+        "use_flash_attention": true,
+        "attention_softmax_in_fp32": true,
+        "fused_qkv": true,
+        "use_memory_efficient_attention": true
+    },
+    "cache_augmentation": {
+        "enabled": true,
+        "hidden_size": 512,
+        "num_heads": 8,
+        "dropout": 0.1,
+        "max_length": 4096,
+        "use_gated_connections": true
+    },
+    "neural_memory": {
+        "enabled": true,
+        "memory_size": 1024,
+        "num_memory_layers": 4,
+        "dropout": 0.1,
+        "use_flash_memory_attention": true
+    },
+    "tree_of_thoughts": {
+        "enabled": true,
+        "max_branches": 4,
+        "max_depth": 3,
+        "beam_width": 2,
+        "temperature": 0.8,
+        "min_score_diff": 0.1,
+        "use_parallel_search": true
+    },
+    "moe_config": {
+        "num_experts": 64,
+        "num_experts_per_tok": 8,
+        "expert_capacity": 128,
+        "aux_loss_weight": 0.1,
+        "router_z_loss_weight": 0.001,
+        "router_aux_loss_weight": 0.001
+    },
+    "optimization": {
+        "learning_rate": 1e-5,
+        "weight_decay": 0.1,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "grad_clip": 1.0,
+        "warmup_steps": 5000,
+        "lr_schedule": "cosine",
+        "use_gradient_checkpointing": true,
+        "gradient_accumulation_steps": 4
+    },
+    "training_config": {
+        "use_fsdp": true,
+        "mixed_precision": {
+            "enabled": true,
+            "dtype": "fp8",
+            "cast_inputs": true,
+            "cast_params": true,
+            "cast_model_outputs": true
+        },
+        "activation_checkpointing": {
+            "enabled": true,
+            "preserve_rng_state": true,
+            "granularity": "selective"
+        },
+        "zero_redundancy_optimizer": {
+            "enabled": true,
+            "stage": 3,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": true
+            },
+            "offload_params": {
+                "device": "cpu",
+                "pin_memory": true
+            }
+        }
+    },
+    "inference_config": {
+        "use_kv_cache": true,
+        "use_beam_search": true,
+        "beam_size": 4,
+        "temperature": 0.7,
+        "top_k": 50,
+        "top_p": 0.95,
+        "max_tokens_to_generate": 2048,
+        "repetition_penalty": 1.1,
+        "length_penalty": 1.0
+    }
+}

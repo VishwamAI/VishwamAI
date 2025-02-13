@@ -7,35 +7,7 @@ from tqdm import tqdm
 import torch
 from safetensors.torch import load_file, save_file
 
-def fp8_cast(tensor, dtype=torch.bfloat16):
-
-    if tensor.dtype == dtype:
-        return tensor
-        
-    # Simple scaling to prevent underflow/overflow
-    if dtype == torch.bfloat16:
-        # Scale to [-1, 1] range before casting
-        max_val = tensor.abs().max()
-        if max_val > 0:
-            scale = 1.0 / max_val
-            tensor = tensor * scale
-            
-        # Cast to bfloat16
-        tensor = tensor.to(dtype)
-        
-        # Restore scale
-        if max_val > 0:
-            tensor = tensor / scale
-            
-    else:
-        # Direct cast for other dtypes
-        tensor = tensor.to(dtype)
-        
-    return tensor
-
-def weight_dequant(weight, scale_inv):
-    dequant = weight.float() * scale_inv
-    return fp8_cast(dequant, torch.bfloat16)
+from kernel import weight_dequant
 
 def main(fp8_path, bf16_path):
     torch.set_default_dtype(torch.bfloat16)
@@ -51,7 +23,6 @@ def main(fp8_path, bf16_path):
 
     # Helper function to get tensor from the correct file
     def get_tensor(tensor_name):
-
         file_name = weight_map[tensor_name]
         if file_name not in loaded_files:
             file_path = os.path.join(fp8_path, file_name)
@@ -107,3 +78,4 @@ if __name__ == "__main__":
     parser.add_argument("--output-bf16-hf-path", type=str, required=True)
     args = parser.parse_args()
     main(args.input_fp8_hf_path, args.output_bf16_hf_path)
+    

@@ -1,217 +1,137 @@
 import os
 import json
-from dataclasses import dataclass
-from typing import List, Optional, Literal
 from argparse import ArgumentParser
+from typing import List
 
 import torch
 import torch.distributed as dist
-from .model import VishwamaiModel, VishwamaiConfig
-from .conceptual_tokenizer import ConceptualTokenizer, ConceptualTokenizerConfig
+from transformers import AutoTokenizer
+from safetensors.torch import load_model
 
-@dataclass
-class GenerationConfig:
-    max_length: int = 100
-    temperature: float = 0.7
-    top_k: int = 50
-    top_p: float = 0.9
-    do_sample: bool = True
-    num_return_sequences: int = 1
-    repetition_penalty: float = 1.1
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
+from model import Transformer, ModelArgs
 
-class VishwamaiGenerator:
-    def __init__(
-        self, 
-        model: VishwamaiModel,
-        tokenizer: ConceptualTokenizer,
-        config: Optional[GenerationConfig] = None
-    ):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.config = config or GenerationConfig()
-        # Add nucleus sampling parameters
-        self.min_tokens_to_keep = 1
-        
-    def sample(self, logits: torch.Tensor) -> torch.Tensor:
-        if not self.config.do_sample:
-            return logits.argmax(dim=-1)
-            
-        logits = logits / max(self.config.temperature, 1e-5)
-        
-        if self.config.top_k > 0:
-            v, _ = torch.topk(logits, min(self.config.top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-            
-        probs = torch.softmax(logits, dim=-1)
-        
-        if self.config.top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            sorted_indices_to_remove = cumulative_probs > self.config.top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            probs = probs.masked_fill(indices_to_remove, 0.0)
-            probs = probs / probs.sum(dim=-1, keepdim=True)
-            
-            # Add better nucleus sampling
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > self.config.top_p
-            
-            # Keep at least min_tokens_to_keep
-            sorted_indices_to_remove[..., :self.min_tokens_to_keep] = 0
-            
-            # Scatter sorted tensors to original indexing
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits = logits.masked_fill(indices_to_remove, float('-inf'))
-        
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-    def generate(self, prompt: str) -> List[str]:
-        """Generate completions for a text prompt."""
-        input_ids = self.tokenizer.encode(prompt)
-        output_ids = self._generate_tokens(torch.tensor([input_ids], device=self.model.device))
-        return [self.tokenizer.decode(ids) for ids in output_ids.tolist()]
+def sample(logits, temperature: float = 1.0):
+    logits = logits / max(temperature, 1e-5)
+    probs = torch.softmax(logits, dim=-1)
+    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
-    @torch.inference_mode()
-    def _generate_tokens(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size = input_ids.shape[0]
-        max_prompt_len = input_ids.shape[1]
-        # Get actual content length by finding first pad token
-        prompt_mask = input_ids != self.config.pad_token_id
-        actual_lengths = prompt_mask.sum(dim=1)
-        max_actual_len = actual_lengths.max().item()
-        
-        # Calculate output length capped by config limits
-        total_len = min(
-            self.config.max_length,  # Maximum sequence length from generation config
-            self.model.config.max_seq_len  # Maximum length supported by model architecture
-        )
-        
-        # Copy input tokens
-        tokens = torch.full(
-            (batch_size, total_len),
-            self.config.pad_token_id,
-            dtype=torch.long,
-            device=input_ids.device
-        )
-        for i in range(batch_size):
-            length = actual_lengths[i]
-            tokens[i, :length] = input_ids[i, :length]
 
-        # Create or expand attention mask
-        attention_mask = torch.zeros(
-            (batch_size, total_len),
-            dtype=torch.float,
-            device=input_ids.device
-        )
-        for i in range(batch_size):
-            length = actual_lengths[i]
-            attention_mask[i, :length] = 1.0
+@torch.inference_mode()
+def generate(
+    model: Transformer,
+    prompt_tokens: List[List[int]],
+    max_new_tokens: int,
+    eos_id: int,
+    temperature: float = 1.0
+) -> List[List[int]]:
+    prompt_lens = [len(t) for t in prompt_tokens]
+    assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
+    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+    tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
+    for i, t in enumerate(prompt_tokens):
+        tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+    prev_pos = 0
+    finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
+    prompt_mask = tokens != -1
+    for cur_pos in range(min(prompt_lens), total_len):
+        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        if temperature > 0:
+            next_token = sample(logits, temperature)
+        else:
+            next_token = logits.argmax(dim=-1)
+        next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+        tokens[:, cur_pos] = next_token
+        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+        prev_pos = cur_pos
+        if finished.all():
+            break
+    completion_tokens = []
+    for i, toks in enumerate(tokens.tolist()):
+        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+        if eos_id in toks:
+            toks = toks[:toks.index(eos_id)]
+        completion_tokens.append(toks)
+    return completion_tokens
 
-        # Track completed sequences and start from actual content length
-        finished = torch.tensor([False] * batch_size, device=input_ids.device)
-        cur_pos = max_actual_len
 
-        # Generate tokens
-        while cur_pos < total_len and not finished.all():
-            # Forward pass with attention mask
-            # Forward pass
-            model_output = self.model(
-                tokens[:, :cur_pos],
-                attention_mask=attention_mask[:, :cur_pos]
-            )
-            logits = model_output[:, -1]
-            
-            # Apply repetition penalty
-            if self.config.repetition_penalty != 1.0:
-                for i in range(batch_size):
-                    scored_tokens = tokens[i, :cur_pos]
-                    logits[i, scored_tokens] /= self.config.repetition_penalty
-                    
-            # Sample next token
-            next_token = self.sample(logits)
-            tokens[:, cur_pos] = next_token
-            attention_mask[:, cur_pos] = 1.0
+def main(
+    ckpt_path: str,
+    config: str,
+    input_file: str = "",
+    interactive: bool = True,
+    max_new_tokens: int = 100,
+    temperature: float = 1.0,
+) -> None:
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    if world_size > 1:
+        dist.init_process_group("nccl")
+    global print
+    if rank != 0:
+        print = lambda *_, **__: None
+    torch.cuda.set_device(local_rank)
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_num_threads(8)
+    torch.manual_seed(965)
+    with open(config) as f:
+        args = ModelArgs(**json.load(f))
+    print(args)
+    with torch.device("cuda"):
+        model = Transformer(args)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+    tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
+    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
-            # Update finished state
-            finished = finished | (next_token == self.config.eos_token_id)
-            cur_pos += 1
+    if interactive:
+        messages = []
+        while True:
+            if world_size == 1:
+                prompt = input(">>> ")
+            elif rank == 0:
+                prompt = input(">>> ")
+                objects = [prompt]
+                dist.broadcast_object_list(objects, 0)
+            else:
+                objects = [None]
+                dist.broadcast_object_list(objects, 0)
+                prompt = objects[0]
+            if prompt == "/exit":
+                break
+            elif prompt == "/clear":
+                messages.clear()
+                continue
+            messages.append({"role": "user", "content": prompt})
+            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+            completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
+            print(completion)
+            messages.append({"role": "assistant", "content": completion})
+    else:
+        with open(input_file) as f:
+            prompts = [line.strip() for line in f.readlines()]
+        assert len(prompts) <= args.max_batch_size, f"Number of prompts exceeds maximum batch size ({args.max_batch_size})"
+        prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
+        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
+        completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
+        for prompt, completion in zip(prompts, completions):
+            print("Prompt:", prompt)
+            print("Completion:", completion)
+            print()
 
-        # Find sequence end positions
-        eos_positions = (tokens == self.config.eos_token_id).float()
-        eos_positions[eos_positions.sum(-1) == 0, -1] = 1
-        sequence_lengths = eos_positions.argmax(-1)
+    if world_size > 1:
+        dist.destroy_process_group()
 
-        # Truncate sequences at EOS
-        for b in range(batch_size):
-            length = sequence_lengths[b]
-            tokens[b, length+1:] = self.config.pad_token_id
 
-        return tokens
-
-def main():
+if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--ckpt-path", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
     parser.add_argument("--interactive", action="store_true")
-    parser.add_argument("--max-length", type=int, default=100)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--temperature", type=float, default=0.2)
     args = parser.parse_args()
-
-    # Initialize model and tokenizer
-    model_config = VishwamaiConfig()
-    model = VishwamaiModel(model_config)
-    tokenizer_config = ConceptualTokenizerConfig.from_pretrained(args.ckpt_path)
-    tokenizer = ConceptualTokenizer(tokenizer_config)
-
-    if torch.cuda.is_available():
-        model = model.cuda()
-
-    # Load generation config if provided
-    if os.path.exists(args.config):
-        with open(args.config) as f:
-            gen_config = GenerationConfig(**json.load(f))
-    else:
-        gen_config = GenerationConfig(
-            max_length=args.max_length,
-            temperature=args.temperature
-        )
-
-    generator = VishwamaiGenerator(model, tokenizer, gen_config)
-
-    # Interactive mode
-    if args.interactive:
-        while True:
-            prompt = input(">>> ")
-            if prompt.lower() in ["/exit", "quit", "exit"]:
-                break
-
-            outputs = generator.generate(prompt)
-            for output in outputs:
-                print(output)
-
-    # Batch mode
-    else:
-        with open(args.input_file) as f:
-            prompts = [line.strip() for line in f]
-
-        for prompt in prompts:
-            outputs = generator.generate(prompt)
-            print(f"Prompt: {prompt}")
-            for i, output in enumerate(outputs):
-                print(f"Output {i+1}: {output}\n")
-
-if __name__ == "__main__":
-    main()
+    assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
+    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)

@@ -9,6 +9,7 @@ import re
 from collections import defaultdict
 from .model import VishwamaiModel
 from .conceptual_tokenizer import ConceptualTokenizer
+from .architecture import init_model  # Import init_model function
 
 THINK_START = "<think>"
 THINK_END = "</think>"

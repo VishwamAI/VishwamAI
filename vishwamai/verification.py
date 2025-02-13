@@ -12,23 +12,27 @@ class SelfVerification(nn.Module):
     def forward(
         self,
         generated_output: torch.Tensor,
-        knowledge_context: torch.Tensor
+        knowledge_context: torch.Tensor,
+        reasoning_history: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         # Check internal consistency
         batch_size = generated_output.size(0)
+        # Reshape and expand tensors properly
+        reshaped_output = generated_output.view(batch_size, -1, generated_output.size(-1))
         pairs = torch.cat([
-            generated_output.unsqueeze(1).expand(-1, batch_size, -1),
-            generated_output.unsqueeze(0).expand(batch_size, -1, -1)
+            reshaped_output.unsqueeze(1).expand(-1, batch_size, -1, -1),
+            reshaped_output.unsqueeze(0).expand(batch_size, -1, -1, -1)
         ], dim=-1)
         consistency_scores = torch.sigmoid(self.consistency_checker(pairs))
         
-        # Validate against knowledge
+        # Validate against knowledge and reasoning history
         fact_scores = torch.sigmoid(self.fact_validator(
-            generated_output * knowledge_context
+            (generated_output * knowledge_context) + reasoning_history
         ))
         
-        # Estimate uncertainty
-        uncertainty = torch.sigmoid(self.uncertainty_estimator(generated_output))
+        # Estimate uncertainty considering reasoning history
+        joint_state = generated_output + reasoning_history
+        uncertainty = torch.sigmoid(self.uncertainty_estimator(joint_state))
         
         return {
             "consistency": consistency_scores,

@@ -12,7 +12,7 @@ import torch
 from transformers import TrainingArguments, Trainer
 from datasets import load_dataset
 
-from vishwamai.model import Transformer
+from vishwamai.model import VishwamaiModel
 from vishwamai.model_utils import load_model, get_training_config, get_gpu_memory
 
 def get_gpu_config(gpu_type: Optional[str] = None):

@@ -1,132 +1,150 @@
 import os
 import json
-from typing import Optional
-
 import torch
-import torch.distributed as dist
-
-from .model import VishwamaiModel, VishwamaiConfig
-
-def setup_distributed():
-    """Setup distributed training if available."""
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
-        return True
-    return False
-
-def get_gpu_memory():
-    """Get available GPU memory in GB."""
-    if torch.cuda.is_available():
-        total_memory = torch.cuda.get_device_properties(0).total_memory
-        return total_memory / (1024**3)  # Convert to GB
-    return 0
-
-def optimize_config_for_gpu(config_path: str, gpu_memory: float):
-    """Optimize model configuration based on available GPU memory."""
-    with open(config_path) as f:
-        config = json.load(f)
-    
-    # Adjust model size based on GPU memory
-    if gpu_memory < 8:  # Less than 8GB (T4)
-        config.update({
-            'dim': 1024,
-            'inter_dim': 4096,
-            'n_heads': 8,
-            'batch_size': 1,
-            'gradient_accumulation_steps': 16,
-            'max_seq_len': 1024
-        })
-    elif gpu_memory < 16:  # Less than 16GB (P100, older GPUs)
-        config.update({
-            'dim': 2048,
-            'inter_dim': 8192,
-            'n_heads': 16,
-            'batch_size': 2,
-            'gradient_accumulation_steps': 8,
-            'max_seq_len': 2048
-        })
-    else:  # 16GB or more (V100, A100)
-        config.update({
-            'dim': 2048,
-            'inter_dim': 10944,
-            'n_heads': 16,
-            'batch_size': 4,
-            'gradient_accumulation_steps': 4,
-            'max_seq_len': 4096
-        })
-    
-    # Enable performance optimizations
-    config.update({
-        'use_flash_attention': True,
-        'gradient_checkpointing': True,
-        'fp16': True if gpu_memory < 32 else False,  # Use FP16 for smaller GPUs
-        'bf16': True if gpu_memory >= 32 else False  # Use BF16 for A100
-    })
-    
-    return config
+from typing import Optional
+from .model import VishwamAIModel, ModelArgs
 
 def load_model(
     config_path: str,
-    device: str = "cuda",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
     pretrained_path: Optional[str] = None,
     use_cache: bool = True
-) -> VishwamaiModel:
-    """Load VishwamAI model with optimized settings."""
+) -> VishwamAIModel:
+    """Load VishwamAI model with configuration."""
     
-    # Get GPU memory and optimize config
-    gpu_memory = get_gpu_memory()
-    config = optimize_config_for_gpu(config_path, gpu_memory)
+    # Load configuration
+    with open(config_path) as f:
+        config = json.load(f)
     
-    # Initialize model args
-    model_args = VishwamaiConfig(
-        max_batch_size=config['batch_size'],
-        max_seq_len=config['max_seq_len'],
-        dim=config['dim'],
-        inter_dim=config['inter_dim'],
-        n_heads=config['n_heads'],
-        dtype="fp8" if gpu_memory >= 32 else "bf16"  # Use FP8 for larger GPUs
+    # Create model arguments
+    model_args = ModelArgs(
+        dim=config.get("dim", 8192),
+        n_layers=config.get("n_layers", 120),
+        vocab_size=config.get("vocab_size", 64000),
+        max_seq_len=config.get("max_seq_len", 32768),
+        num_attention_heads=config.get("num_attention_heads", 64),
+        use_neural_memory=config.get("use_neural_memory", True),
+        use_tree_of_thoughts=config.get("use_tree_of_thoughts", True),
+        use_cache_augmentation=config.get("use_cache_augmentation", True),
+        memory_size=config.get("memory_size", 2048),
+        tree_beam_width=config.get("tree_beam_width", 4),
+        cache_size=config.get("cache_size", 65536)
     )
     
-    # Create model
-    model = VishwamaiModel(model_args)
+    # Initialize model
+    model = VishwamAIModel(model_args)
     
+    # Load pretrained weights if available
     if pretrained_path and os.path.exists(pretrained_path):
-        state_dict = torch.load(pretrained_path, map_location='cpu')
+        state_dict = torch.load(
+            pretrained_path,
+            map_location=device
+        )
         model.load_state_dict(state_dict)
-        
-    # Setup distributed training
-    if setup_distributed():
-        model = torch.nn.parallel.DistributedDataParallel(model)
     
-    # Move to device and set training mode
-    model = model.to(device)
-    model.train()
-    
-    if not use_cache:
-        model.config.use_cache = False
-    
-    # Enable memory optimizations
-    if config.get('gradient_checkpointing', False):
-        model.gradient_checkpointing_enable()
-    
+    model.to(device)
     return model
 
-def get_training_config(model_args: VishwamaiConfig, gpu_memory: float):
-    """Get optimized training configuration."""
-    return {
-        'learning_rate': 2e-5 if gpu_memory < 16 else 3e-5,
-        'warmup_steps': 100,
-        'max_steps': 1000,
-        'eval_steps': 100,
-        'save_steps': 200,
-        'weight_decay': 0.01,
-        'logging_steps': 10,
-        'fp16': gpu_memory < 32,
-        'bf16': gpu_memory >= 32,
-        'gradient_checkpointing': True,
-        'evaluation_strategy': 'steps',
-        'save_strategy': 'steps'
+def get_gpu_memory() -> float:
+    """Get available GPU memory in GB."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).total_memory / 1e9
+    return 0.0
+
+def enable_memory_efficient_attention(model: VishwamAIModel):
+    """Enable memory efficient attention for large models."""
+    for block in model.blocks:
+        if hasattr(block.attention, "enable_memory_efficient_attention"):
+            block.attention.enable_memory_efficient_attention()
+
+def find_optimal_batch_size(
+    model: VishwamAIModel,
+    starting_batch_size: int = 8,
+    gpu_memory_threshold: float = 0.9,
+    sequence_length: int = 2048
+) -> int:
+    """Find optimal batch size for given model and GPU memory."""
+    if not torch.cuda.is_available():
+        return 1
+        
+    total_memory = get_gpu_memory()
+    batch_size = starting_batch_size
+    
+    while True:
+        try:
+            # Test batch with random inputs
+            inputs = torch.randint(
+                0, model.args.vocab_size,
+                (batch_size, sequence_length),
+                device="cuda"
+            )
+            
+            # Clear cache
+            torch.cuda.empty_cache()
+            
+            # Test forward pass
+            with torch.no_grad():
+                model(inputs)
+            
+            # Check memory usage
+            memory_used = torch.cuda.memory_allocated() / 1e9
+            if memory_used / total_memory > gpu_memory_threshold:
+                return batch_size // 2
+            
+            batch_size *= 2
+            
+        except RuntimeError:  # Out of memory
+            return batch_size // 2
+
+def save_checkpoint(
+    model: VishwamAIModel,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    loss: float,
+    save_path: str
+):
+    """Save model checkpoint with all components."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+        'model_args': model.args
     }
+    
+    # Save components separately
+    if hasattr(model, 'memory'):
+        checkpoint['memory_state'] = model.memory.state_dict()
+    
+    if hasattr(model, 'tree'):
+        checkpoint['tree_state'] = model.tree.state_dict()
+        
+    if hasattr(model, 'cache'):
+        checkpoint['cache_state'] = model.cache.state_dict()
+    
+    torch.save(checkpoint, save_path)
+
+def load_checkpoint(
+    checkpoint_path: str,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+) -> tuple:
+    """Load model checkpoint with all components."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Create model
+    model = VishwamAIModel(checkpoint['model_args'])
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load components
+    if 'memory_state' in checkpoint and hasattr(model, 'memory'):
+        model.memory.load_state_dict(checkpoint['memory_state'])
+        
+    if 'tree_state' in checkpoint and hasattr(model, 'tree'):
+        model.tree.load_state_dict(checkpoint['tree_state'])
+        
+    if 'cache_state' in checkpoint and hasattr(model, 'cache'):
+        model.cache.load_state_dict(checkpoint['cache_state'])
+    
+    model.to(device)
+    
+    return model, checkpoint['epoch'], checkpoint['loss']

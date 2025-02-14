@@ -2,14 +2,14 @@ import os
 import json
 import torch
 from typing import Optional
-from .model import VishwamAIModel, ModelArgs
+from .model import Transformer, ModelArgs
 
 def load_model(
     config_path: str,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     pretrained_path: Optional[str] = None,
     use_cache: bool = True
-) -> VishwamAIModel:
+) -> Transformer:
     """Load VishwamAI model with configuration."""
     
     # Load configuration
@@ -18,21 +18,38 @@ def load_model(
     
     # Create model arguments
     model_args = ModelArgs(
-        dim=config.get("dim", 8192),
-        n_layers=config.get("n_layers", 120),
-        vocab_size=config.get("vocab_size", 64000),
-        max_seq_len=config.get("max_seq_len", 32768),
-        num_attention_heads=config.get("num_attention_heads", 64),
-        use_neural_memory=config.get("use_neural_memory", True),
-        use_tree_of_thoughts=config.get("use_tree_of_thoughts", True),
-        use_cache_augmentation=config.get("use_cache_augmentation", True),
-        memory_size=config.get("memory_size", 2048),
-        tree_beam_width=config.get("tree_beam_width", 4),
-        cache_size=config.get("cache_size", 65536)
+        max_batch_size=config.get("max_batch_size", 8),
+        max_seq_len=config.get("max_seq_len", 4096 * 4),
+        dtype=config.get("dtype", "bf16"),
+        vocab_size=config.get("vocab_size", 102400),
+        dim=config.get("dim", 2048),
+        inter_dim=config.get("inter_dim", 10944),
+        moe_inter_dim=config.get("moe_inter_dim", 1408),
+        n_layers=config.get("n_layers", 27),
+        n_dense_layers=config.get("n_dense_layers", 1),
+        n_heads=config.get("n_heads", 16),
+        n_routed_experts=config.get("n_routed_experts", 64),
+        n_shared_experts=config.get("n_shared_experts", 2),
+        n_activated_experts=config.get("n_activated_experts", 6),
+        n_expert_groups=config.get("n_expert_groups", 1),
+        n_limited_groups=config.get("n_limited_groups", 1),
+        score_func=config.get("score_func", "softmax"),
+        route_scale=config.get("route_scale", 1.0),
+        q_lora_rank=config.get("q_lora_rank", 0),
+        kv_lora_rank=config.get("kv_lora_rank", 512),
+        qk_nope_head_dim=config.get("qk_nope_head_dim", 128),
+        qk_rope_head_dim=config.get("qk_rope_head_dim", 64),
+        v_head_dim=config.get("v_head_dim", 128),
+        original_seq_len=config.get("original_seq_len", 4096),
+        rope_theta=config.get("rope_theta", 10000.0),
+        rope_factor=config.get("rope_factor", 40),
+        beta_fast=config.get("beta_fast", 32),
+        beta_slow=config.get("beta_slow", 1),
+        mscale=config.get("mscale", 1.0)
     )
     
     # Initialize model
-    model = VishwamAIModel(model_args)
+    model = Transformer(model_args)
     
     # Load pretrained weights if available
     if pretrained_path and os.path.exists(pretrained_path):
@@ -51,14 +68,8 @@ def get_gpu_memory() -> float:
         return torch.cuda.get_device_properties(0).total_memory / 1e9
     return 0.0
 
-def enable_memory_efficient_attention(model: VishwamAIModel):
-    """Enable memory efficient attention for large models."""
-    for block in model.blocks:
-        if hasattr(block.attention, "enable_memory_efficient_attention"):
-            block.attention.enable_memory_efficient_attention()
-
 def find_optimal_batch_size(
-    model: VishwamAIModel,
+    model: Transformer,
     starting_batch_size: int = 8,
     gpu_memory_threshold: float = 0.9,
     sequence_length: int = 2048
@@ -74,7 +85,7 @@ def find_optimal_batch_size(
         try:
             # Test batch with random inputs
             inputs = torch.randint(
-                0, model.args.vocab_size,
+                0, model.embed.vocab_size,
                 (batch_size, sequence_length),
                 device="cuda"
             )
@@ -97,54 +108,35 @@ def find_optimal_batch_size(
             return batch_size // 2
 
 def save_checkpoint(
-    model: VishwamAIModel,
+    model: Transformer,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     loss: float,
     save_path: str
 ):
-    """Save model checkpoint with all components."""
+    """Save model checkpoint."""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
-        'model_args': model.args
     }
-    
-    # Save components separately
-    if hasattr(model, 'memory'):
-        checkpoint['memory_state'] = model.memory.state_dict()
-    
-    if hasattr(model, 'tree'):
-        checkpoint['tree_state'] = model.tree.state_dict()
-        
-    if hasattr(model, 'cache'):
-        checkpoint['cache_state'] = model.cache.state_dict()
     
     torch.save(checkpoint, save_path)
 
 def load_checkpoint(
     checkpoint_path: str,
+    model: Transformer,
+    optimizer: Optional[torch.optim.Optimizer] = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> tuple:
-    """Load model checkpoint with all components."""
+    """Load model checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Create model
-    model = VishwamAIModel(checkpoint['model_args'])
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Load components
-    if 'memory_state' in checkpoint and hasattr(model, 'memory'):
-        model.memory.load_state_dict(checkpoint['memory_state'])
-        
-    if 'tree_state' in checkpoint and hasattr(model, 'tree'):
-        model.tree.load_state_dict(checkpoint['tree_state'])
-        
-    if 'cache_state' in checkpoint and hasattr(model, 'cache'):
-        model.cache.load_state_dict(checkpoint['cache_state'])
-    
     model.to(device)
+    
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
     return model, checkpoint['epoch'], checkpoint['loss']

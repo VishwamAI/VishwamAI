@@ -2,11 +2,34 @@
     "model_variants": {
         "671B": {
             "model_config": {
-                "dim": 8192,
-                "n_layers": 120,
-                "vocab_size": 64000,
+                "max_batch_size": 8,
                 "max_seq_len": 32768,
-                "num_attention_heads": 64
+                "dtype": "bf16",
+                "vocab_size": 102400,
+                "dim": 8192,
+                "inter_dim": 32768,
+                "moe_inter_dim": 4096,
+                "n_layers": 120,
+                "n_dense_layers": 2,
+                "n_heads": 64,
+                "n_routed_experts": 128,
+                "n_shared_experts": 4,
+                "n_activated_experts": 8,
+                "n_expert_groups": 2,
+                "n_limited_groups": 1,
+                "score_func": "softmax",
+                "route_scale": 1.0,
+                "q_lora_rank": 0,
+                "kv_lora_rank": 512,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128,
+                "original_seq_len": 4096,
+                "rope_theta": 10000.0,
+                "rope_factor": 40,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0
             },
             "hardware_requirements": {
                 "min_gpu_memory": 80,
@@ -17,11 +40,34 @@
         },
         "335B": {
             "model_config": {
-                "dim": 6144,
-                "n_layers": 90,
-                "vocab_size": 64000,
+                "max_batch_size": 8,
                 "max_seq_len": 32768,
-                "num_attention_heads": 48
+                "dtype": "bf16",
+                "vocab_size": 102400,
+                "dim": 6144,
+                "inter_dim": 24576,
+                "moe_inter_dim": 3072,
+                "n_layers": 90,
+                "n_dense_layers": 2,
+                "n_heads": 48,
+                "n_routed_experts": 96,
+                "n_shared_experts": 3,
+                "n_activated_experts": 6,
+                "n_expert_groups": 2,
+                "n_limited_groups": 1,
+                "score_func": "softmax",
+                "route_scale": 1.0,
+                "q_lora_rank": 0,
+                "kv_lora_rank": 512,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128,
+                "original_seq_len": 4096,
+                "rope_theta": 10000.0,
+                "rope_factor": 40,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0
             },
             "hardware_requirements": {
                 "min_gpu_memory": 40,
@@ -32,11 +78,34 @@
         },
         "167B": {
             "model_config": {
-                "dim": 4096,
-                "n_layers": 60,
-                "vocab_size": 64000,
+                "max_batch_size": 8,
                 "max_seq_len": 32768,
-                "num_attention_heads": 32
+                "dtype": "bf16",
+                "vocab_size": 102400,
+                "dim": 4096,
+                "inter_dim": 16384,
+                "moe_inter_dim": 2048,
+                "n_layers": 60,
+                "n_dense_layers": 1,
+                "n_heads": 32,
+                "n_routed_experts": 64,
+                "n_shared_experts": 2,
+                "n_activated_experts": 6,
+                "n_expert_groups": 1,
+                "n_limited_groups": 1,
+                "score_func": "softmax",
+                "route_scale": 1.0,
+                "q_lora_rank": 0,
+                "kv_lora_rank": 512,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128,
+                "original_seq_len": 4096,
+                "rope_theta": 10000.0,
+                "rope_factor": 40,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0
             },
             "hardware_requirements": {
                 "min_gpu_memory": 32,
@@ -47,94 +116,38 @@
         }
     },
     
-    "hardware_optimizations": {
-        "A100_80GB": {
-            "components": {
-                "memory_size": 2048,
-                "tree_beam_width": 4,
-                "cache_size": 65536,
-                "memory_layers": 3
-            },
-            "training": {
-                "batch_size": 8,
-                "gradient_accumulation": 4,
-                "mixed_precision": "fp16",
-                "gradient_checkpointing": true,
-                "memory_efficient_attention": true
-            }
+    "colab_specific": {
+        "A100_optimized": {
+            "max_batch_size": 8,
+            "gradient_accumulation_steps": 4,
+            "mixed_precision": true,
+            "dtype": "bf16",
+            "gradient_checkpointing": true
         },
-        "A100_40GB": {
-            "components": {
-                "memory_size": 1536,
-                "tree_beam_width": 3,
-                "cache_size": 49152,
-                "memory_layers": 3
-            },
-            "training": {
-                "batch_size": 6,
-                "gradient_accumulation": 6,
-                "mixed_precision": "fp16",
-                "gradient_checkpointing": true,
-                "memory_efficient_attention": true
-            }
+        "V100_optimized": {
+            "max_batch_size": 4,
+            "gradient_accumulation_steps": 8,
+            "mixed_precision": true,
+            "dtype": "bf16",
+            "gradient_checkpointing": true
         },
-        "V100_32GB": {
-            "components": {
-                "memory_size": 1024,
-                "tree_beam_width": 3,
-                "cache_size": 32768,
-                "memory_layers": 2
-            },
-            "training": {
-                "batch_size": 4,
-                "gradient_accumulation": 8,
-                "mixed_precision": "fp16",
-                "gradient_checkpointing": true,
-                "memory_efficient_attention": true
-            }
-        },
-        "V100_16GB": {
-            "components": {
-                "memory_size": 768,
-                "tree_beam_width": 2,
-                "cache_size": 24576,
-                "memory_layers": 2
-            },
-            "training": {
-                "batch_size": 2,
-                "gradient_accumulation": 16,
-                "mixed_precision": "fp16",
-                "gradient_checkpointing": true,
-                "memory_efficient_attention": true
-            }
-        },
-        "T4_16GB": {
-            "components": {
-                "memory_size": 512,
-                "tree_beam_width": 2,
-                "cache_size": 16384,
-                "memory_layers": 1
-            },
-            "training": {
-                "batch_size": 1,
-                "gradient_accumulation": 32,
-                "mixed_precision": "fp16",
-                "gradient_checkpointing": true,
-                "memory_efficient_attention": true
-            }
+        "T4_optimized": {
+            "max_batch_size": 2,
+            "gradient_accumulation_steps": 16,
+            "mixed_precision": true,
+            "dtype": "bf16",
+            "gradient_checkpointing": true
         }
     },
     
-    "optimization_techniques": {
+    "optimization_config": {
         "memory_management": {
             "activation_checkpointing": true,
             "selective_activation_recomputation": true,
-            "memory_efficient_attention": true,
             "cpu_offloading": true,
             "optimizer_state_sharding": true
         },
         "training_efficiency": {
-            "mixed_precision_training": true,
             "gradient_accumulation": true,
             "dynamic_batch_size": true,
             "gradient_checkpointing": true,
@@ -143,7 +156,6 @@
         "inference_optimization": {
             "kv_cache": true,
             "beam_search_optimization": true,
-            "attention_cache": true,
             "memory_pruning": true,
             "dynamic_memory_allocation": true
         }

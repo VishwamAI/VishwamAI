@@ -1,87 +1,166 @@
 {
-    "model_config": {
-        "vocab_size": 102400,
-        "dim": 2048,
-        "inter_dim": 8192,
-        "n_heads": 16,
-        "n_layers": 24,
-        "n_dense_layers": 1,
-        "max_seq_len": 2048,
-        "max_batch_size": 4,
-        "dtype": "bf16",
-        "n_routed_experts": 32,
-        "n_shared_experts": 2,
-        "n_activated_experts": 4,
-        "moe_inter_dim": 4096,
-        "use_cache_augmentation": true,
-        "cache_hidden_size": 256,
-        "cache_num_heads": 4,
-        "use_neural_memory": true,
-        "memory_size": 512,
-        "use_tree_of_thoughts": true
-    },
-    "training_config": {
-        "batch_size": 4,
-        "gradient_accumulation_steps": 8,
-        "learning_rate": 2e-5,
-        "weight_decay": 0.01,
-        "warmup_steps": 100,
-        "max_steps": 1000,
-        "save_steps": 200,
-        "eval_steps": 100,
-        "logging_steps": 10
-    },
-    "optimization_config": {
-        "use_flash_attention": true,
-        "gradient_checkpointing": true,
-        "fp16": true,
-        "bf16": true,
-        "use_fused_adam": true,
-        "offload_optimizer": false,
-        "use_kernel_optimizations": true,
-        "cache_size": "auto",
-        "memory_efficient_attention": true
-    },
-    "hardware_config": {
-        "gpu_memory_threshold": {
-            "small": 8,
-            "medium": 16,
-            "large": 32
-        },
-        "scaling_factors": {
-            "dim_scale": {
-                "small": 0.5,
-                "medium": 0.75,
-                "large": 1.0
+    "model_variants": {
+        "671B": {
+            "model_config": {
+                "dim": 8192,
+                "n_layers": 120,
+                "vocab_size": 64000,
+                "max_seq_len": 32768,
+                "num_attention_heads": 64
             },
-            "batch_scale": {
-                "small": 0.25,
-                "medium": 0.5,
-                "large": 1.0
+            "hardware_requirements": {
+                "min_gpu_memory": 80,
+                "recommended_gpu": "A100",
+                "min_ram": 128,
+                "min_cpu_cores": 32
+            }
+        },
+        "335B": {
+            "model_config": {
+                "dim": 6144,
+                "n_layers": 90,
+                "vocab_size": 64000,
+                "max_seq_len": 32768,
+                "num_attention_heads": 48
+            },
+            "hardware_requirements": {
+                "min_gpu_memory": 40,
+                "recommended_gpu": "A100",
+                "min_ram": 64,
+                "min_cpu_cores": 16
+            }
+        },
+        "167B": {
+            "model_config": {
+                "dim": 4096,
+                "n_layers": 60,
+                "vocab_size": 64000,
+                "max_seq_len": 32768,
+                "num_attention_heads": 32
+            },
+            "hardware_requirements": {
+                "min_gpu_memory": 32,
+                "recommended_gpu": "V100",
+                "min_ram": 32,
+                "min_cpu_cores": 8
             }
         }
     },
-    "colab_specific": {
-        "T4_optimized": {
-            "dim": 1536,
-            "batch_size": 2,
-            "gradient_accumulation": 16,
-            "use_fp16": true,
-            "max_seq_len": 1024
+    
+    "hardware_optimizations": {
+        "A100_80GB": {
+            "components": {
+                "memory_size": 2048,
+                "tree_beam_width": 4,
+                "cache_size": 65536,
+                "memory_layers": 3
+            },
+            "training": {
+                "batch_size": 8,
+                "gradient_accumulation": 4,
+                "mixed_precision": "fp16",
+                "gradient_checkpointing": true,
+                "memory_efficient_attention": true
+            }
         },
-        "V100_optimized": {
-            "dim": 2048,
-            "batch_size": 4,
-            "gradient_accumulation": 8,
-            "use_fp16": true,
-            "max_seq_len": 2048
+        "A100_40GB": {
+            "components": {
+                "memory_size": 1536,
+                "tree_beam_width": 3,
+                "cache_size": 49152,
+                "memory_layers": 3
+            },
+            "training": {
+                "batch_size": 6,
+                "gradient_accumulation": 6,
+                "mixed_precision": "fp16",
+                "gradient_checkpointing": true,
+                "memory_efficient_attention": true
+            }
         },
-        "A100_optimized": {
-            "dim": 2048,
-            "batch_size": 8,
-            "gradient_accumulation": 4,
-            "use_fp8": true,
-            "max_seq_len": 4096
+        "V100_32GB": {
+            "components": {
+                "memory_size": 1024,
+                "tree_beam_width": 3,
+                "cache_size": 32768,
+                "memory_layers": 2
+            },
+            "training": {
+                "batch_size": 4,
+                "gradient_accumulation": 8,
+                "mixed_precision": "fp16",
+                "gradient_checkpointing": true,
+                "memory_efficient_attention": true
+            }
+        },
+        "V100_16GB": {
+            "components": {
+                "memory_size": 768,
+                "tree_beam_width": 2,
+                "cache_size": 24576,
+                "memory_layers": 2
+            },
+            "training": {
+                "batch_size": 2,
+                "gradient_accumulation": 16,
+                "mixed_precision": "fp16",
+                "gradient_checkpointing": true,
+                "memory_efficient_attention": true
+            }
+        },
+        "T4_16GB": {
+            "components": {
+                "memory_size": 512,
+                "tree_beam_width": 2,
+                "cache_size": 16384,
+                "memory_layers": 1
+            },
+            "training": {
+                "batch_size": 1,
+                "gradient_accumulation": 32,
+                "mixed_precision": "fp16",
+                "gradient_checkpointing": true,
+                "memory_efficient_attention": true
+            }
+        }
+    },
+    
+    "optimization_techniques": {
+        "memory_management": {
+            "activation_checkpointing": true,
+            "selective_activation_recomputation": true,
+            "memory_efficient_attention": true,
+            "cpu_offloading": true,
+            "optimizer_state_sharding": true
+        },
+        "training_efficiency": {
+            "mixed_precision_training": true,
+            "gradient_accumulation": true,
+            "dynamic_batch_size": true,
+            "gradient_checkpointing": true,
+            "fused_adam_optimizer": true
+        },
+        "inference_optimization": {
+            "kv_cache": true,
+            "beam_search_optimization": true,
+            "attention_cache": true,
+            "memory_pruning": true,
+            "dynamic_memory_allocation": true
+        }
+    },
+    
+    "monitoring": {
+        "memory_tracking": {
+            "gpu_memory_tracking": true,
+            "cpu_memory_tracking": true,
+            "memory_profiling": true,
+            "leak_detection": true
+        },
+        "performance_metrics": {
+            "throughput_tracking": true,
+            "latency_monitoring": true,
+            "gpu_utilization": true,
+            "memory_bandwidth": true
         }
     }
 }

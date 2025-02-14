@@ -218,7 +218,7 @@ class MLA(nn.Module):
                     hidden_size=args.cache_hidden_size,
                     num_heads=args.cache_num_heads,
                     dropout=args.cache_dropout,
-                    max_length=args.cache_max_length
+                    max_cache_length=args.cache_max_length
                 )
             )
 

@@ -1,0 +1,12 @@
+[lfs]
+    url = https://huggingface.co/kasinadhsarma/vishwamai-model.git/info/lfs
+    pushurl = https://huggingface.co/kasinadhsarma/vishwamai-model.git/info/lfs
+[lfs "transfer"]
+    maxretries = 3
+    maxverifies = 3
+    maxconcurrenttransfers = 8
+[filter "lfs"]
+    clean = git-lfs clean -- %f
+    smudge = git-lfs smudge -- %f
+    process = git-lfs filter-process
+    required = true

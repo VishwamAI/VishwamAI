@@ -4,6 +4,9 @@
 
 VishwamAI is a transformer-based language model enhanced with cache augmentation, neural memory, and tree of thoughts reasoning capabilities. It is optimized for both local and cloud GPU environments.
 
+## Official Repository
+https://github.com/VishwamAI/VishwamAI
+
 ## Specifications
 
 - **Architecture**: Transformer-based with MLA (Multi-head Linear Attention)
@@ -95,6 +98,11 @@ Use the provided `colab_train.ipynb` notebook.
    - Keep reasonable sequence lengths
    - Utilize model caching when appropriate
 
+## Installation & Setup
+
+For detailed installation instructions, see `SETUP.md` in the official repository: 
+https://github.com/VishwamAI/VishwamAI
+
 ## Limitations
 
 1. Hardware Constraints
@@ -123,5 +131,5 @@ If you use this model in your research, please cite:
   title = {VishwamAI: A High-Performance Transformer with Enhanced Reasoning},
   author = {Kasinadh Sarma},
   year = {2025},
-  url = {https://github.com/kasinadhsarma/VishwamAI}
+  url = {https://github.com/VishwamAI/VishwamAI}
 }

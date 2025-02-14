@@ -2,23 +2,30 @@
 
 This document provides detailed instructions for training the VishwamAI model on different GPU configurations.
 
+## Official Repository
+https://github.com/VishwamAI/VishwamAI
+
 ## Google Colab Training
 
-1. Open `colab_train.ipynb` in Google Colab
-2. Set runtime to GPU: Runtime > Change runtime type > GPU
-3. Run the setup cells:
+1. Access the repository:
+```python
+!git clone https://github.com/VishwamAI/VishwamAI.git
+%cd VishwamAI
+```
+
+2. Open `colab_train.ipynb` in Google Colab
+3. Set runtime to GPU: Runtime > Change runtime type > GPU
+4. Run the setup cells:
 ```python
 # Install dependencies
 !pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 !pip install transformers==4.34.0 datasets accelerate
 
-# Clone repository
-!git clone https://github.com/kasinadhsarma/VishwamAI.git
-%cd VishwamAI
+# Install package
 !pip install -e .
 ```
 
-4. The notebook will automatically detect your GPU type and apply optimized settings
+5. The notebook will automatically detect your GPU type and apply optimized settings
 
 ## Local Training
 
@@ -31,7 +38,7 @@ This document provides detailed instructions for training the VishwamAI model on
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/kasinadhsarma/VishwamAI.git
+git clone https://github.com/VishwamAI/VishwamAI.git
 cd VishwamAI
 ```
 
@@ -190,3 +197,11 @@ torch.save(model.state_dict(), "final_model.pt")
 Load trained model:
 ```python
 model = load_model(config_path, pretrained_path="final_model.pt")
+```
+
+## Support
+
+For training issues and questions:
+1. Check the documentation
+2. Search existing issues in the [official repository](https://github.com/VishwamAI/VishwamAI)
+3. Create a new issue if needed

@@ -117,17 +117,7 @@ self.latency_histogram = Histogram(
 ### 4.2 Results
 
 #### Latency Improvements
-| Batch Size | Base (ms) | VishwamAI (ms) | Improvement |
-|------------|-----------|----------------|-------------|
-| 1          | 15.2      | 12.1          | 20.4%       |
-| 8          | 45.6      | 32.3          | 29.2%       |
-| 32         | 156.3     | 98.7          | 36.9%       |
-
-#### Resource Utilization
-- 30% reduction in GPU memory usage
-- 45% improvement in throughput
-- 25% reduction in p99 latency
-
+    coming soon
 ## 5. Security Analysis
 
 ### 5.1 Threat Model

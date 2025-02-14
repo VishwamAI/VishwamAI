@@ -98,13 +98,7 @@ trainer.train()
 - **Storage**: 1TB+ SSD
 
 ## Model Performance
-
-| Benchmark | Score | Component Impact |
-|-----------|-------|-----------------|
-| MMLU      | 92.4% | Memory: +7.8%   |
-| GSM8K     | 94.7% | Tree: +6.4%     |
-| HumanEval | 88.9% | Cache: +4.2%    |
-| MATH      | 89.2% | Combined: +18.4% |
+coming soon 
 
 ## Examples
 

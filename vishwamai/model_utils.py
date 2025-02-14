@@ -1,229 +1,132 @@
+import os
 import json
-from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
+
 import torch
+import torch.distributed as dist
+
 from .model import Transformer, ModelArgs
 
-def load_config(config_path: Union[str, Path]) -> dict:
-    """Load a model configuration file"""
+def setup_distributed():
+    """Setup distributed training if available."""
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        return True
+    return False
+
+def get_gpu_memory():
+    """Get available GPU memory in GB."""
+    if torch.cuda.is_available():
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        return total_memory / (1024**3)  # Convert to GB
+    return 0
+
+def optimize_config_for_gpu(config_path: str, gpu_memory: float):
+    """Optimize model configuration based on available GPU memory."""
     with open(config_path) as f:
         config = json.load(f)
+    
+    # Adjust model size based on GPU memory
+    if gpu_memory < 8:  # Less than 8GB (T4)
+        config.update({
+            'dim': 1024,
+            'inter_dim': 4096,
+            'n_heads': 8,
+            'batch_size': 1,
+            'gradient_accumulation_steps': 16,
+            'max_seq_len': 1024
+        })
+    elif gpu_memory < 16:  # Less than 16GB (P100, older GPUs)
+        config.update({
+            'dim': 2048,
+            'inter_dim': 8192,
+            'n_heads': 16,
+            'batch_size': 2,
+            'gradient_accumulation_steps': 8,
+            'max_seq_len': 2048
+        })
+    else:  # 16GB or more (V100, A100)
+        config.update({
+            'dim': 2048,
+            'inter_dim': 10944,
+            'n_heads': 16,
+            'batch_size': 4,
+            'gradient_accumulation_steps': 4,
+            'max_seq_len': 4096
+        })
+    
+    # Enable performance optimizations
+    config.update({
+        'use_flash_attention': True,
+        'gradient_checkpointing': True,
+        'fp16': True if gpu_memory < 32 else False,  # Use FP16 for smaller GPUs
+        'bf16': True if gpu_memory >= 32 else False  # Use BF16 for A100
+    })
+    
     return config
 
-def config_to_model_args(config: dict) -> ModelArgs:
-    """Convert a configuration dictionary to ModelArgs"""
-    args = ModelArgs()
-    
-    # Basic model configuration
-    args.vocab_size = config.get('vocab_size', args.vocab_size)
-    args.dim = config.get('hidden_size', args.dim)
-    args.inter_dim = config.get('intermediate_size', args.inter_dim)
-    args.n_heads = config.get('num_attention_heads', args.n_heads)
-    args.n_layers = config.get('num_hidden_layers', args.n_layers)
-    args.max_seq_len = config.get('max_position_embeddings', args.max_seq_len)
-    
-    # MoE configuration
-    if 'moe_config' in config:
-        moe_config = config['moe_config']
-        args.n_routed_experts = moe_config.get('num_experts', args.n_routed_experts)
-        args.n_activated_experts = moe_config.get('num_experts_per_tok', args.n_activated_experts)
-    
-    # Cache augmentation configuration
-    if 'cache_augmentation' in config:
-        cache_config = config['cache_augmentation']
-        args.use_cache_augmentation = cache_config.get('enabled', True)
-        args.cache_hidden_size = cache_config.get('hidden_size', 256)
-        args.cache_num_heads = cache_config.get('num_heads', 4)
-        args.cache_dropout = cache_config.get('dropout', 0.1)
-        args.cache_max_length = cache_config.get('max_length', 1024)
-    
-    # Neural memory configuration
-    if 'neural_memory' in config:
-        memory_config = config['neural_memory']
-        args.use_neural_memory = memory_config.get('enabled', True)
-        args.memory_size = memory_config.get('memory_size', 512)
-        args.num_memory_layers = memory_config.get('num_memory_layers', 3)
-        args.memory_dropout = memory_config.get('dropout', 0.1)
-    
-    # Tree of thoughts configuration
-    if 'tree_of_thoughts' in config:
-        tot_config = config['tree_of_thoughts']
-        args.use_tree_of_thoughts = tot_config.get('enabled', True)
-        args.tot_max_branches = tot_config.get('max_branches', 4)
-        args.tot_max_depth = tot_config.get('max_depth', 3)
-        args.tot_beam_width = tot_config.get('beam_width', 2)
-        args.tot_temperature = tot_config.get('temperature', 0.8)
-        args.tot_min_score_diff = tot_config.get('min_score_diff', 0.1)
-    
-    # RoPE configuration
-    if 'rope_scaling' in config:
-        rope_config = config['rope_scaling']
-        args.rope_factor = rope_config.get('factor', args.rope_factor)
-    
-    # Training precision
-    args.dtype = "fp8" if config.get('use_fp8', False) else "bf16"
-    
-    return args
-
 def load_model(
-    config_path: Union[str, Path],
-    device: Optional[Union[str, torch.device]] = None,
-    **kwargs
+    config_path: str,
+    device: str = "cuda",
+    pretrained_path: Optional[str] = None,
+    use_cache: bool = True
 ) -> Transformer:
-    """
-    Load a Transformer model from a configuration file.
+    """Load VishwamAI model with optimized settings."""
     
-    Args:
-        config_path: Path to the configuration file
-        device: Device to load the model on
-        **kwargs: Additional arguments to override configuration values
+    # Get GPU memory and optimize config
+    gpu_memory = get_gpu_memory()
+    config = optimize_config_for_gpu(config_path, gpu_memory)
     
-    Returns:
-        Initialized Transformer model
-    """
-    # Load configuration
-    config = load_config(config_path)
+    # Initialize model args
+    model_args = ModelArgs(
+        max_batch_size=config['batch_size'],
+        max_seq_len=config['max_seq_len'],
+        dim=config['dim'],
+        inter_dim=config['inter_dim'],
+        n_heads=config['n_heads'],
+        dtype="fp8" if gpu_memory >= 32 else "bf16"  # Use FP8 for larger GPUs
+    )
     
-    # Override config with kwargs
-    for k, v in kwargs.items():
-        if '.' in k:
-            # Handle nested config values
-            parts = k.split('.')
-            curr = config
-            for part in parts[:-1]:
-                if part not in curr:
-                    curr[part] = {}
-                curr = curr[part]
-            curr[parts[-1]] = v
-        else:
-            config[k] = v
+    # Create model
+    model = Transformer(model_args)
     
-    # Convert to model args
-    args = config_to_model_args(config)
-    
-    # Initialize model
-    model = Transformer(args)
-    
-    # Move to device if specified
-    if device is not None:
-        model = model.to(device)
-    
-    return model
-
-def get_model_size(model: Transformer) -> int:
-    """Calculate the total number of parameters in the model"""
-    return sum(p.numel() for p in model.parameters())
-
-def print_model_size(model: Transformer) -> None:
-    """Print the model size in a human readable format"""
-    num_params = get_model_size(model)
-    
-    if num_params < 1e6:
-        print(f"Model size: {num_params:,} parameters")
-    elif num_params < 1e9:
-        print(f"Model size: {num_params/1e6:.1f}M parameters")
-    else:
-        print(f"Model size: {num_params/1e9:.1f}B parameters")
-
-def save_pretrained(
-    model: Transformer,
-    save_directory: Union[str, Path],
-    save_config: bool = True
-) -> None:
-    """
-    Save a model to a directory, optionally saving its configuration
-    
-    Args:
-        model: The model to save
-        save_directory: Directory to save the model to
-        save_config: Whether to save the model's configuration
-    """
-    save_directory = Path(save_directory)
-    save_directory.mkdir(parents=True, exist_ok=True)
-    
-    # Save the model weights
-    model_path = save_directory / "pytorch_model.bin"
-    torch.save(model.state_dict(), model_path)
-    
-    # Save the configuration if requested
-    if save_config:
-        config = {
-            "model_type": "vishwamai",
-            "architectures": ["VishwamaiModel"],
-            "vocab_size": model.args.vocab_size,
-            "hidden_size": model.args.dim,
-            "intermediate_size": model.args.inter_dim,
-            "num_attention_heads": model.args.n_heads,
-            "num_hidden_layers": model.args.n_layers,
-            "max_position_embeddings": model.args.max_seq_len,
-            "use_cache": True,
-            "pad_token_id": 0,
-            "bos_token_id": 1,
-            "eos_token_id": 2,
-            
-            # Advanced features
-            "cache_augmentation": {
-                "enabled": model.args.use_cache_augmentation,
-                "hidden_size": model.args.cache_hidden_size,
-                "num_heads": model.args.cache_num_heads,
-                "dropout": model.args.cache_dropout,
-                "max_length": model.args.cache_max_length
-            },
-            "neural_memory": {
-                "enabled": model.args.use_neural_memory,
-                "memory_size": model.args.memory_size,
-                "num_memory_layers": model.args.num_memory_layers,
-                "dropout": model.args.memory_dropout
-            },
-            "tree_of_thoughts": {
-                "enabled": model.args.use_tree_of_thoughts,
-                "max_branches": model.args.tot_max_branches,
-                "max_depth": model.args.tot_max_depth,
-                "beam_width": model.args.tot_beam_width,
-                "temperature": model.args.tot_temperature,
-                "min_score_diff": model.args.tot_min_score_diff
-            }
-        }
+    if pretrained_path and os.path.exists(pretrained_path):
+        state_dict = torch.load(pretrained_path, map_location='cpu')
+        model.load_state_dict(state_dict)
         
-        config_path = save_directory / "config.json"
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-
-def load_pretrained(
-    model_path: Union[str, Path],
-    device: Optional[Union[str, torch.device]] = None,
-    **kwargs
-) -> Transformer:
-    """
-    Load a pretrained model from a directory
+    # Setup distributed training
+    if setup_distributed():
+        model = torch.nn.parallel.DistributedDataParallel(model)
     
-    Args:
-        model_path: Path to the model directory
-        device: Device to load the model on
-        **kwargs: Additional arguments to override configuration values
+    # Move to device and set training mode
+    model = model.to(device)
+    model.train()
     
-    Returns:
-        Loaded Transformer model
-    """
-    model_path = Path(model_path)
+    if not use_cache:
+        model.config.use_cache = False
     
-    # Load configuration
-    config_path = model_path / "config.json"
-    if not config_path.exists():
-        raise ValueError(f"No configuration file found at {config_path}")
-    
-    # Initialize model
-    model = load_model(config_path, device, **kwargs)
-    
-    # Load weights
-    weights_path = model_path / "pytorch_model.bin"
-    if not weights_path.exists():
-        raise ValueError(f"No model weights found at {weights_path}")
-    
-    state_dict = torch.load(weights_path, map_location='cpu')
-    model.load_state_dict(state_dict)
-    
-    if device is not None:
-        model = model.to(device)
+    # Enable memory optimizations
+    if config.get('gradient_checkpointing', False):
+        model.gradient_checkpointing_enable()
     
     return model
+
+def get_training_config(model_args: ModelArgs, gpu_memory: float):
+    """Get optimized training configuration."""
+    return {
+        'learning_rate': 2e-5 if gpu_memory < 16 else 3e-5,
+        'warmup_steps': 100,
+        'max_steps': 1000,
+        'eval_steps': 100,
+        'save_steps': 200,
+        'weight_decay': 0.01,
+        'logging_steps': 10,
+        'fp16': gpu_memory < 32,
+        'bf16': gpu_memory >= 32,
+        'gradient_checkpointing': True,
+        'evaluation_strategy': 'steps',
+        'save_strategy': 'steps'
+    }

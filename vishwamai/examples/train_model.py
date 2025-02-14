@@ -1,132 +1,117 @@
+#!/usr/bin/env python3
+"""
+Example script for training VishwamAI model with optimized settings.
+"""
+
 import os
+import argparse
+import json
+from typing import Optional
+
 import torch
-from pathlib import Path
-from torch.utils.data import DataLoader
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-import torch.multiprocessing as mp
-import torch.distributed as dist
+from transformers import TrainingArguments, Trainer
+from datasets import load_dataset
 
-from vishwamai.model_utils import load_model
-from vishwamai.trainer import Trainer, TrainingArgs
+from vishwamai.model import Transformer
+from vishwamai.model_utils import load_model, get_training_config, get_gpu_memory
 
-def setup_distributed(rank: int, world_size: int):
-    """Initialize distributed training"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+def get_gpu_config(gpu_type: Optional[str] = None):
+    """Get configuration based on GPU type."""
+    config_path = os.path.join(os.path.dirname(__file__), 
+                              "../configs/config_optimized.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    
+    if not gpu_type:
+        # Auto-detect GPU type
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            if 'a100' in gpu_name:
+                gpu_type = 'A100_optimized'
+            elif 'v100' in gpu_name:
+                gpu_type = 'V100_optimized'
+            else:
+                gpu_type = 'T4_optimized'
+    
+    # Get GPU-specific config
+    gpu_config = config['colab_specific'][gpu_type]
+    config['model_config'].update(gpu_config)
+    return config
 
-def cleanup_distributed():
-    """Clean up distributed training"""
-    dist.destroy_process_group()
-
-def create_dataloaders(args: TrainingArgs):
-    """
-    Create training and evaluation dataloaders
-    This is a placeholder - replace with your actual data loading logic
-    """
-    # Dummy data for demonstration
-    train_data = torch.randint(0, 64000, (1000, 128))
-    train_labels = torch.randint(0, 64000, (1000, 128))
-    eval_data = torch.randint(0, 64000, (100, 128))
-    eval_labels = torch.randint(0, 64000, (100, 128))
+def setup_training(args):
+    """Setup training environment and configuration."""    
+    # Get GPU-optimized config
+    config = get_gpu_config(args.gpu_type)
     
-    train_dataloader = DataLoader(
-        list(zip(train_data, train_labels)),
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True
-    )
-    
-    eval_dataloader = DataLoader(
-        list(zip(eval_data, eval_labels)),
-        batch_size=args.batch_size,
-        shuffle=False,
-        pin_memory=True
-    )
-    
-    return train_dataloader, eval_dataloader
-
-def train_process(rank: int, world_size: int):
-    """Main training process"""
-    # Initialize distributed training
-    if world_size > 1:
-        setup_distributed(rank, world_size)
-    
-    # Training arguments
-    train_args = TrainingArgs(
-        output_dir="checkpoints",
-        num_epochs=3,
-        batch_size=32,
-        gradient_accumulation_steps=4,
-        learning_rate=1e-4,
-        warmup_steps=100,
-        weight_decay=0.1,
-        max_grad_norm=1.0,
-        save_steps=500,
-        logging_steps=50,
-        use_fsdp=True if world_size > 1 else False,
-        mixed_precision=True,
-        cpu_offload=False,
-        gradient_checkpointing=True
-    )
-    
-    # Load model
-    config_path = Path(__file__).parent.parent / "configs" / "config_optimized.json"
+    # Load model with optimized settings
     model = load_model(
-        config_path=config_path,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        config_path=args.config_path,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        pretrained_path=args.pretrained_path,
+        use_cache=not args.disable_cache
     )
     
-    # Create dataloaders
-    train_dataloader, eval_dataloader = create_dataloaders(train_args)
+    # Load datasets
+    datasets = {
+        "train": load_dataset(args.train_dataset, split="train"),
+        "validation": load_dataset(args.eval_dataset, split="validation")
+    }
+    
+    # Get training configuration
+    gpu_memory = get_gpu_memory()
+    training_config = get_training_config(model.config, gpu_memory)
+    
+    # Setup training arguments
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=config['model_config']['batch_size'],
+        per_device_eval_batch_size=config['model_config']['batch_size'],
+        gradient_accumulation_steps=config['training_config']['gradient_accumulation_steps'],
+        learning_rate=config['training_config']['learning_rate'],
+        weight_decay=config['training_config']['weight_decay'],
+        warmup_steps=config['training_config']['warmup_steps'],
+        evaluation_strategy="steps",
+        save_strategy="steps",
+        eval_steps=config['training_config']['eval_steps'],
+        save_steps=config['training_config']['save_steps'],
+        logging_steps=config['training_config']['logging_steps'],
+        fp16=config['optimization_config']['fp16'],
+        bf16=config['optimization_config']['bf16'],
+        gradient_checkpointing=config['optimization_config']['gradient_checkpointing'],
+        report_to="none"  # Disable wandb reporting
+    )
+    
+    return model, datasets, training_args
+
+def main():
+    parser = argparse.ArgumentParser(description="Train VishwamAI model")
+    parser.add_argument("--config_path", type=str, default="configs/config_optimized.json")
+    parser.add_argument("--train_dataset", type=str, default="gsm8k")
+    parser.add_argument("--eval_dataset", type=str, default="cais/mmlu")
+    parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--gpu_type", type=str, choices=["T4_optimized", "V100_optimized", "A100_optimized"])
+    parser.add_argument("--pretrained_path", type=str)
+    parser.add_argument("--disable_cache", action="store_true")
+    args = parser.parse_args()
+    
+    # Setup training
+    model, datasets, training_args = setup_training(args)
     
     # Initialize trainer
     trainer = Trainer(
         model=model,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader,
-        args=train_args
+        args=training_args,
+        train_dataset=datasets["train"],
+        eval_dataset=datasets["validation"]
     )
     
-    if rank == 0:
-        print("\nTraining Configuration:")
-        print(f"Number of GPUs: {world_size}")
-        print(f"Mixed Precision: {train_args.mixed_precision}")
-        print(f"Gradient Checkpointing: {train_args.gradient_checkpointing}")
-        print(f"Number of Parameters: {sum(p.numel() for p in model.parameters()):,}\n")
-    
-    # Train
+    # Start training
     trainer.train()
     
-    # Clean up
-    if world_size > 1:
-        cleanup_distributed()
-
-def main():
-    # Check if CUDA is available
-    if not torch.cuda.is_available():
-        print("CUDA not available, running on CPU")
-        world_size = 1
-    else:
-        world_size = torch.cuda.device_count()
-    
-    if world_size > 1:
-        # Multi-GPU training
-        mp.spawn(
-            train_process,
-            args=(world_size,),
-            nprocs=world_size,
-            join=True
-        )
-    else:
-        # Single GPU or CPU training
-        train_process(0, 1)
+    # Save final model
+    trainer.save_model(args.output_dir)
 
 if __name__ == "__main__":
-    # Set random seed for reproducibility
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-    
     main()

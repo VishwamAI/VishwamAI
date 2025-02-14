@@ -20,109 +20,38 @@ wheels/
 .installed.cfg
 *.egg
 
-<<<<<<< HEAD
-# Checkpoints and model files
-pretrain_checkpoints/
-vishwamai_pretrained/
-*.bin
+# Training outputs
+output/
+pretrain_output/
+runs/
+final_model/
+checkpoints/
 *.pt
-*.pth
+model_checkpoint.pt
+status.txt
 
-# Virtual Environment
-venv/
+# Environment
+.env
+.venv
 env/
-.env/
-.venv/
-
-# IDE
-=======
-# Virtual Environment
 venv/
-env/
 ENV/
 
-# IDEs and editors
->>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-<<<<<<< HEAD
-*~
 
-# Logs and databases
+# Logs and data
 *.log
-*.sqlite
-wandb/
-
-# Distribution / packaging
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Data
+logs/
 data/
 datasets/
-raw/
-processed/
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-=======
-.DS_Store
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# PyTorch / ML
-*.pt
-*.pth
-*.onnx
-.torch/
-lightning_logs/
+cache/
+*.cache
 wandb/
 
-# Project-specific
-*.vocab
-*.model
-*.bin
-logs/
-checkpoints/
-
-# Jupyter
-.ipynb_checkpoints
-*.ipynb_checkpoints/
-
-
-data.jsonl
->>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
+# OS
+.DS_Store
+Thumbs.db

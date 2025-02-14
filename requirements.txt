@@ -1,33 +1,19 @@
 # Core dependencies
 torch>=2.4.1
-triton>=3.0.0
-transformers>=4.46.3
-safetensors>=0.4.5
+torchvision>=0.15.0
+torchaudio>=2.4.1
 
 # Training dependencies
-accelerate>=0.27.0
+transformers==4.34.0
 datasets>=2.17.0
-huggingface-hub>=0.20.3
-sentencepiece>=0.2.0
-tokenizers>=0.15.0
-wandb>=0.16.3
+accelerate>=0.27.0
 
 # Model-specific dependencies
 einops>=0.7.0
 flash-attn>=2.5.0
 bitsandbytes>=0.42.0
-optimum>=1.16.1
 
 # Utilities
 tqdm>=4.66.1
 numpy>=1.24.0
 scipy>=1.11.0
-pandas>=2.1.0
-
-# Optional: Better CPU performance
-intel-extension-for-pytorch>=2.1.0
-mkl>=2023.0.0
-
-# Optional: Monitoring and profiling
-psutil>=5.9.0
-gputil>=1.4.0

@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, weight_dequant, fp8_gemm
+from .kernel import act_quant, weight_dequant, fp8_gemm
 
 world_size = 1
 rank = 0
@@ -45,6 +45,11 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
+    use_alibi: bool = True  # Enable ALiBi positional embeddings
+    use_rope_scaling: bool = True  # Enable RoPE scaling
+    gradient_checkpointing: bool = True
+    parallel_attn: bool = True  # Parallel attention computation
+    rope_condense_ratio: float = 1.0
 
 class ParallelEmbedding(nn.Module):
     """Embedding layer with parallelism support across distributed processes."""
@@ -386,9 +391,27 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        self.gradient_checkpointing = args.gradient_checkpointing
+        
+        # Add ALiBi slopes if enabled
+        if args.use_alibi:
+            self.alibi_slopes = self._get_alibi_slopes()
+
+    def _get_alibi_slopes(self):
+        """Generate ALiBi attention slopes."""
+        slopes = torch.arange(1 - self.n_heads, 1, 2, dtype=torch.float32)
+        return -torch.abs(slopes)
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+        # Enable gradient checkpointing during training
+        if self.training and self.gradient_checkpointing:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl, tokens, start_pos, use_reentrant=False
+            )
+        return self._forward_impl(tokens, start_pos)
+
+    def _forward_impl(self, tokens: torch.Tensor, start_pos: int = 0):
         seqlen = tokens.size(1)
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]

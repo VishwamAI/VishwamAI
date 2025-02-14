@@ -1,119 +1,156 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple
+import math
 from dataclasses import dataclass
+from typing import Optional, List, Tuple
 
 @dataclass
 class CacheConfig:
-    hidden_size: int = 256  # Size of cache embeddings
-    num_heads: int = 4      # Number of attention heads for cache processing
-    dropout: float = 0.1    # Dropout rate
-    max_cache_length: int = 1024  # Maximum number of cached items
-    use_gated_connections: bool = True  # Whether to use gated connections
+    """Configuration for differentiable cache module."""
+    hidden_size: int = 8192
+    num_heads: int = 8
+    max_cache_length: int = 65536
+    dropout: float = 0.1
+    retrieval_factor: float = 1.0  # Controls cache retrieval strength
+    update_freq: int = 100  # Update frequency for cache entries
 
 class DifferentiableCacheAugmentation(nn.Module):
-    """
-    Differentiable cache augmentation module that processes and enriches the transformer's key-value cache.
-    This allows for asynchronous reasoning and better long-term memory utilization.
-    """
-    def __init__(self, config: CacheConfig):
+    """Differentiable cache augmentation for enhanced memory retrieval."""
+    
+    def __init__(self, config: Optional[CacheConfig] = None):
         super().__init__()
-        self.config = config
+        self.config = config or CacheConfig()
         
-        # Cache embedding layers
-        self.cache_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.cache_layernorm = nn.LayerNorm(config.hidden_size)
+        # Cache storage
+        self.cache_keys = nn.Parameter(
+            torch.randn(self.config.max_cache_length, self.config.hidden_size)
+        )
+        self.cache_values = nn.Parameter(
+            torch.randn(self.config.max_cache_length, self.config.hidden_size)
+        )
         
-        # Multi-head attention for cache processing
+        # Cache attention mechanism
         self.cache_attention = nn.MultiheadAttention(
-            config.hidden_size,
-            config.num_heads,
-            dropout=config.dropout,
+            embed_dim=self.config.hidden_size,
+            num_heads=self.config.num_heads,
+            dropout=self.config.dropout,
             batch_first=True
         )
         
-        # Gate mechanism for selective updating
-        if config.use_gated_connections:
-            self.gate = nn.Sequential(
-                nn.Linear(config.hidden_size * 2, config.hidden_size),
-                nn.Sigmoid()
-            )
-        
-        # Cache update network
-        self.update_net = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size * 4),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size * 4, config.hidden_size)
+        # Cache update networks
+        self.key_update_net = nn.Sequential(
+            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_size, self.config.hidden_size)
         )
         
-        # Importance scoring network
-        self.importance_net = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size // 2, 1)
+        self.value_update_net = nn.Sequential(
+            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_size, self.config.hidden_size)
         )
         
-        self.register_buffer("cache_memory", torch.zeros(1, config.max_cache_length, config.hidden_size))
-        self.register_buffer("cache_mask", torch.ones(1, config.max_cache_length, dtype=torch.bool))
+        # Learnable temperature parameter
+        self.temperature = nn.Parameter(torch.tensor(1.0))
         
-    def forward(self, 
-                hidden_states: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process hidden states through cache augmentation.
+        # Cache statistics
+        self.access_counts = torch.zeros(self.config.max_cache_length)
+        self.update_step = 0
         
-        Args:
-            hidden_states: Input tensor of shape (batch_size, sequence_length, hidden_size)
-            attention_mask: Optional attention mask
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Process hidden states through cache retrieval and update."""
+        batch_size = hidden_states.size(0)
+        device = hidden_states.device
+        
+        # Move cache to correct device
+        self._ensure_cache_on_device(device)
+        
+        # Retrieve from cache
+        enhanced_states = self._retrieve_from_cache(hidden_states)
+        
+        # Update cache if needed
+        if self.training and self.update_step % self.config.update_freq == 0:
+            self._update_cache(hidden_states)
             
-        Returns:
-            Tuple of (augmented_states, cache_states)
-        """
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # Project input states
-        cache_states = self.cache_proj(hidden_states)
-        cache_states = self.cache_layernorm(cache_states)
-        
-        # Process with self-attention
-        cache_states, _ = self.cache_attention(
-            cache_states, 
-            self.cache_memory,
-            self.cache_memory,
-            key_padding_mask=self.cache_mask,
-            need_weights=False
-        )
-        
-        # Update gate
-        if self.config.use_gated_connections:
-            gate_values = self.gate(torch.cat([hidden_states, cache_states], dim=-1))
-            cache_states = gate_values * cache_states
-        
-        # Generate importance scores for cache updating
-        importance_scores = self.importance_net(cache_states)
-        
-        # Update cache memory based on importance
-        if self.training:
-            # During training, update cache with most important items
-            _, top_indices = importance_scores.squeeze(-1).topk(
-                min(seq_len, self.config.max_cache_length),
-                dim=1
-            )
-            new_cache = cache_states.gather(
-                1, 
-                top_indices.unsqueeze(-1).expand(-1, -1, hidden_size)
-            )
-            self.cache_memory = new_cache.detach()
-            self.cache_mask = torch.zeros_like(self.cache_mask)
-            self.cache_mask[:, :new_cache.size(1)] = True
-            
-        # Generate augmented states
-        augmented_states = self.update_net(torch.cat([hidden_states, cache_states], dim=-1))
-        
-        return augmented_states, cache_states
+        self.update_step += 1
+        return enhanced_states
     
-    def reset_cache(self):
-        """Reset the cache memory and mask"""
-        self.cache_memory.zero_()
-        self.cache_mask.fill_(True)
+    def _ensure_cache_on_device(self, device: torch.device):
+        """Ensure cache tensors are on the correct device."""
+        if self.cache_keys.device != device:
+            self.cache_keys.data = self.cache_keys.data.to(device)
+            self.cache_values.data = self.cache_values.data.to(device)
+            self.access_counts = self.access_counts.to(device)
+    
+    def _retrieve_from_cache(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Retrieve relevant information from cache using attention."""
+        # Compute attention scores
+        attn_output, attn_weights = self.cache_attention(
+            query=hidden_states,
+            key=self.cache_keys.unsqueeze(0).expand(hidden_states.size(0), -1, -1),
+            value=self.cache_values.unsqueeze(0).expand(hidden_states.size(0), -1, -1)
+        )
+        
+        # Update access statistics
+        if self.training:
+            self.access_counts += attn_weights.sum(dim=(0, 1)).detach()
+        
+        # Combine with input using learnable factor
+        enhanced = hidden_states + self.config.retrieval_factor * attn_output
+        return enhanced
+    
+    def _update_cache(self, hidden_states: torch.Tensor):
+        """Update cache entries based on current inputs."""
+        with torch.no_grad():
+            # Find least accessed entries
+            _, update_indices = torch.topk(
+                self.access_counts, 
+                k=min(hidden_states.size(0), self.config.max_cache_length),
+                largest=False
+            )
+            
+            # Compute updates
+            new_keys = self.key_update_net(
+                torch.cat([
+                    hidden_states,
+                    self.cache_keys[update_indices].repeat(hidden_states.size(0), 1)
+                ], dim=-1)
+            )
+            
+            new_values = self.value_update_net(
+                torch.cat([
+                    hidden_states,
+                    self.cache_values[update_indices].repeat(hidden_states.size(0), 1)
+                ], dim=-1)
+            )
+            
+            # Update cache
+            self.cache_keys.data[update_indices] = new_keys.detach().mean(dim=0)
+            self.cache_values.data[update_indices] = new_values.detach().mean(dim=0)
+            self.access_counts[update_indices] = 0
+    
+    def save_pretrained(self, save_path: str):
+        """Save cache components."""
+        torch.save({
+            'config': self.config,
+            'state_dict': self.state_dict(),
+            'access_counts': self.access_counts,
+            'update_step': self.update_step
+        }, f"{save_path}/cache_augmentation.pt")
+    
+    @classmethod
+    def from_pretrained(cls, load_path: str):
+        """Load cache components."""
+        checkpoint = torch.load(f"{load_path}/cache_augmentation.pt")
+        model = cls(config=checkpoint['config'])
+        model.load_state_dict(checkpoint['state_dict'])
+        model.access_counts = checkpoint['access_counts']
+        model.update_step = checkpoint['update_step']
+        return model
+
+    def reset_statistics(self):
+        """Reset cache statistics."""
+        self.access_counts.zero_()
+        self.update_step = 0

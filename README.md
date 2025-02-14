@@ -2,7 +2,7 @@
 
 VishwamAI is a state-of-the-art language model enhanced with structured reasoning capabilities through neural memory, tree of thoughts, and differentiable cache components.
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://vishwamai.readthedocs.io)
 [![Downloads](https://pepy.tech/badge/vishwamai)](https://pepy.tech/project/vishwamai)

@@ -15,7 +15,7 @@ from torch.distributed.fsdp import (
     ShardingStrategy
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from .model import Transformer, Block
+from .model import VishwamaiModel, Block
 
 @dataclass
 class TrainingArgs:
@@ -65,7 +65,7 @@ class TrainerState:
 class Trainer:
     def __init__(
         self,
-        model: Transformer,
+        model: VishwamaiModel,
         train_dataloader: DataLoader,
         eval_dataloader: Optional[DataLoader] = None,
         args: Optional[TrainingArgs] = None

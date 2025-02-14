@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from .model import Transformer, ModelArgs
+from .model import VishwamaiModel, VishwamaiConfig
 
 def setup_distributed():
     """Setup distributed training if available."""
@@ -73,7 +73,7 @@ def load_model(
     device: str = "cuda",
     pretrained_path: Optional[str] = None,
     use_cache: bool = True
-) -> Transformer:
+) -> VishwamaiModel:
     """Load VishwamAI model with optimized settings."""
     
     # Get GPU memory and optimize config
@@ -81,7 +81,7 @@ def load_model(
     config = optimize_config_for_gpu(config_path, gpu_memory)
     
     # Initialize model args
-    model_args = ModelArgs(
+    model_args = VishwamaiConfig(
         max_batch_size=config['batch_size'],
         max_seq_len=config['max_seq_len'],
         dim=config['dim'],
@@ -91,7 +91,7 @@ def load_model(
     )
     
     # Create model
-    model = Transformer(model_args)
+    model = VishwamaiModel(model_args)
     
     if pretrained_path and os.path.exists(pretrained_path):
         state_dict = torch.load(pretrained_path, map_location='cpu')
@@ -114,7 +114,7 @@ def load_model(
     
     return model
 
-def get_training_config(model_args: ModelArgs, gpu_memory: float):
+def get_training_config(model_args: VishwamaiConfig, gpu_memory: float):
     """Get optimized training configuration."""
     return {
         'learning_rate': 2e-5 if gpu_memory < 16 else 3e-5,

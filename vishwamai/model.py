@@ -7,10 +7,10 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, weight_dequant, fp8_gemm
-from cache_augmentation import CacheConfig, DifferentiableCacheAugmentation
-from neural_memory import ReasoningMemoryTransformer
-from tree_of_thoughts import TreeConfig, TreeOfThoughts
+from .kernel import act_quant, weight_dequant, fp8_gemm
+from .cache_augmentation import CacheConfig, DifferentiableCacheAugmentation
+from .neural_memory import ReasoningMemoryTransformer
+from .tree_of_thoughts import TreeConfig, TreeOfThoughts
 
 # Global settings
 world_size = 1
@@ -20,7 +20,7 @@ gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
 @dataclass
-class ModelArgs:
+class VishwamaiConfig:
     max_batch_size: int = 8
     max_seq_len: int = 4096 * 4
     dtype: Literal["bf16", "fp8"] = "bf16"
@@ -183,7 +183,7 @@ class ParallelEmbedding(nn.Module):
             dist.all_reduce(output)
         return output
 
-def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
+def precompute_freqs_cis(args: VishwamaiConfig) -> torch.Tensor:
     dim = args.qk_rope_head_dim
     seqlen = args.max_seq_len
     freqs = torch.arange(0, dim, 2, dtype=torch.float32, device="cuda")
@@ -200,7 +200,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 class MLA(nn.Module):
     """Multi-head Linear Attention."""
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: VishwamaiConfig):
         super().__init__()
         self.n_heads = args.n_heads
         self.n_kv_heads = args.n_heads
@@ -250,7 +250,7 @@ class MLA(nn.Module):
 
 class Block(nn.Module):
     """Transformer block with attention and MLP."""
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: VishwamaiConfig):
         super().__init__()
         self.attn = MLA(args)
         self.mlp = Linear(args.dim, args.inter_dim)
@@ -289,9 +289,9 @@ class Block(nn.Module):
             
         return h + self.mlp(self.norm2(h))
 
-class Transformer(nn.Module):
+class VishwamaiModel(nn.Module):
     """Main transformer model."""
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: VishwamaiConfig):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
@@ -323,8 +323,8 @@ if __name__ == "__main__":
     torch.set_default_device("cuda")
     torch.manual_seed(0)
     
-    args = ModelArgs()
-    model = Transformer(args)
+    args = VishwamaiConfig()
+    model = VishwamaiModel(args)
     
     # Generate random input
     bs, seqlen = 2, 1024

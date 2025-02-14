@@ -148,7 +148,6 @@
 @article{vishwamai2025enhanced,
   title={VishwamAI: Enhanced Language Model with Neural Memory and Tree of Thoughts},
   author={Sarma, Kasinadh and Team, VishwamAI},
-  journal={arXiv preprint arXiv:2502.00000},
   year={2025}
 }
 ```

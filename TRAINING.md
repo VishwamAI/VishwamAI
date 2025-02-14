@@ -1,48 +1,192 @@
 # Training VishwamAI Model
 
-This guide explains how to train the VishwamAI model using Google Colab and HuggingFace.
+This document provides detailed instructions for training the VishwamAI model on different GPU configurations.
 
-## Prerequisites
+## Google Colab Training
 
-1. Google Account (for Colab access)
-2. HuggingFace Account (for model hosting)
-3. HuggingFace API Token with write access
+1. Open `colab_train.ipynb` in Google Colab
+2. Set runtime to GPU: Runtime > Change runtime type > GPU
+3. Run the setup cells:
+```python
+# Install dependencies
+!pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+!pip install transformers==4.34.0 datasets accelerate
 
-## Steps to Train
+# Clone repository
+!git clone https://github.com/kasinadhsarma/VishwamAI.git
+%cd VishwamAI
+!pip install -e .
+```
 
-1. **Setup Google Colab**
-   - Open [Google Colab](https://colab.research.google.com)
-   - Click File > Upload Notebook
-   - Upload the `colab_train.ipynb` file
+4. The notebook will automatically detect your GPU type and apply optimized settings
 
-2. **Configure Environment**
-   - In Colab menu: Runtime > Change runtime type
-   - Set "Hardware accelerator" to GPU
-   - Set "Runtime shape" to High-RAM if available
+## Local Training
 
-3. **Run Training**
-   - Run each cell in sequence by clicking the play button or pressing Shift+Enter
-   - When prompted, login to HuggingFace using your token
-   - The notebook will:
-     - Install required dependencies
-     - Clone the repository
-     - Load and prepare datasets
-     - Initialize model with Colab-optimized settings
-     - Train the model
-     - Save and upload to HuggingFace
+### Prerequisites
+- NVIDIA GPU with CUDA support
+- Python 3.8 or higher
+- PyTorch 2.0 or higher
 
-## Training Configuration
+### Setup
 
-The notebook uses these optimized settings for Colab:
-- Model size: 2048 hidden size, 12 layers
-- Batch size: 8 with gradient accumulation
-- Mixed precision (FP16)
-- Gradient checkpointing
-- 3 training epochs
+1. Clone the repository:
+```bash
+git clone https://github.com/kasinadhsarma/VishwamAI.git
+cd VishwamAI
+```
 
-## Security Notes
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-- Never share or commit your HuggingFace token
-- Use HuggingFace's built-in notebook_login() for authentication
-- The training script expects tokens as environment variables
-- All credentials are handled securely through HuggingFace's auth system
+3. Make training script executable:
+```bash
+chmod +x vishwamai/scripts/pretrain.sh
+```
+
+### Training Options
+
+1. Basic Training:
+```bash
+./vishwamai/scripts/pretrain.sh \
+    -b 4 \           # Batch size
+    -e 3 \           # Number of epochs
+    -o ./output \    # Output directory
+    -c configs/config_optimized.json  # Model config
+```
+
+2. GPU-Specific Training:
+
+For T4 GPU:
+```bash
+./vishwamai/scripts/pretrain.sh \
+    -b 2 \
+    -e 3 \
+    -o ./output \
+    -c configs/config_optimized.json \
+    --gpu_type T4_optimized
+```
+
+For V100 GPU:
+```bash
+./vishwamai/scripts/pretrain.sh \
+    -b 4 \
+    -e 3 \
+    -o ./output \
+    -c configs/config_optimized.json \
+    --gpu_type V100_optimized
+```
+
+For A100 GPU:
+```bash
+./vishwamai/scripts/pretrain.sh \
+    -b 8 \
+    -e 3 \
+    -o ./output \
+    -c configs/config_optimized.json \
+    --gpu_type A100_optimized
+```
+
+## Memory Optimization
+
+1. Enable gradient checkpointing:
+```python
+model.gradient_checkpointing_enable()
+```
+
+2. Use smaller batch size with gradient accumulation:
+```bash
+./vishwamai/scripts/pretrain.sh \
+    -b 2 \
+    --gradient_accumulation_steps 8
+```
+
+3. Disable caching during training:
+```bash
+./vishwamai/scripts/pretrain.sh --disable_cache
+```
+
+## Training Monitoring
+
+The training script saves:
+- Model checkpoints in the output directory
+- Training logs in `output/status.txt`
+- Training metrics in `output/trainer_state.json`
+
+Monitor GPU usage during training:
+```bash
+watch -n 1 nvidia-smi
+```
+
+## Advanced Configuration
+
+Edit `configs/config_optimized.json` to customize:
+- Model architecture
+- Training hyperparameters
+- Optimization settings
+- GPU-specific configurations
+
+Example configuration adjustments:
+```json
+{
+    "model_config": {
+        "dim": 2048,
+        "n_heads": 16,
+        "n_layers": 24
+    },
+    "optimization_config": {
+        "use_flash_attention": true,
+        "gradient_checkpointing": true
+    }
+}
+```
+
+## Training Data
+
+The model uses two main datasets:
+1. GSM8K for mathematical reasoning
+2. MMLU for multi-task learning
+
+Load custom datasets:
+```python
+from datasets import load_dataset
+
+datasets = {
+    "train": load_dataset("your_dataset", split="train"),
+    "validation": load_dataset("your_dataset", split="validation")
+}
+```
+
+## Common Issues
+
+1. Out of Memory (OOM):
+   - Reduce batch size
+   - Enable gradient checkpointing
+   - Reduce model size for your GPU
+
+2. Slow Training:
+   - Enable mixed precision (FP16/BF16)
+   - Use flash attention
+   - Optimize sequence length
+
+3. GPU Utilization:
+   - Adjust batch size
+   - Enable kernel optimizations
+   - Monitor with nvidia-smi
+
+## Training Results
+
+Expected training metrics:
+- Loss convergence in 3-5 epochs
+- GPU utilization > 90%
+- Memory usage ~85% of available VRAM
+
+Save trained model:
+```python
+torch.save(model.state_dict(), "final_model.pt")
+```
+
+Load trained model:
+```python
+model = load_model(config_path, pretrained_path="final_model.pt")

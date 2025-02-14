@@ -7,22 +7,21 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, weight_dequant, fp8_gemm
-<<<<<<< HEAD
-from .triton_cpu_kernels import TritonLinearCPU, triton_layer_norm
-=======
->>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
+# Local imports
+from cpu_kernels import act_quant, weight_dequant, fp8_gemm
+from triton_cpu_kernels import TritonLinearCPU, triton_layer_norm
 from cache_augmentation import CacheConfig, DifferentiableCacheAugmentation
 from neural_memory import ReasoningMemoryTransformer
 from tree_of_thoughts import TreeConfig, TreeOfThoughts
 
-
+# Global settings
 world_size = 1
 rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
+# Model configuration
 @dataclass
 class ModelArgs:
     max_batch_size: int = 8
@@ -35,7 +34,6 @@ class ModelArgs:
     n_layers: int = 27
     n_dense_layers: int = 1
     n_heads: int = 16
-    # moe
     n_routed_experts: int = 64
     n_shared_experts: int = 2
     n_activated_experts: int = 6
@@ -43,31 +41,26 @@ class ModelArgs:
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 1.
-    # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
-    # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
     rope_factor: float = 40
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
-    # cache augmentation
     use_cache_augmentation: bool = True
     cache_hidden_size: int = 256
     cache_num_heads: int = 4
     cache_dropout: float = 0.1
     cache_max_length: int = 1024
-    # neural memory
     use_neural_memory: bool = True
     memory_size: int = 512
     num_memory_layers: int = 3
     memory_dropout: float = 0.1
-    # tree of thoughts
     use_tree_of_thoughts: bool = True
     tot_max_branches: int = 4
     tot_max_depth: int = 3
@@ -75,8 +68,145 @@ class ModelArgs:
     tot_temperature: float = 0.8
     tot_min_score_diff: float = 0.1
 
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Basic linear operation with CPU/GPU implementation."""
+    if weight.element_size() > 1:
+        return F.linear(x, weight, bias)
+    elif gemm_impl == "bf16":
+        weight = weight_dequant(weight, weight.scale)
+        return F.linear(x, weight, bias)
+    else:
+        x, scale = act_quant(x, block_size)
+        y = fp8_gemm(x, scale, weight, weight.scale)
+        if bias is not None:
+            y += bias
+        return y
+
+# Base linear layer
+class Linear(nn.Module):
+    """Base linear layer with CPU/GPU implementations."""
+    dtype = torch.bfloat16
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        if torch.cuda.is_available():
+            self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+            if self.weight.element_size() == 1:
+                scale_out_features = (out_features + block_size - 1) // block_size
+                scale_in_features = (in_features + block_size - 1) // block_size
+                self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+            else:
+                self.register_parameter("scale", None)
+        else:
+            # Use CPU optimized implementation
+            self.cpu_linear = TritonLinearCPU(in_features, out_features, bias, dtype)
+            self.weight = self.cpu_linear.weight
+            
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == 'cpu':
+            return self.cpu_linear(x)
+        else:
+            return linear(x, self.weight, self.bias)
+
+# Parallel linear layers
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column parallelism."""
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, dtype = None):
+        super().__init__()
+        assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
+        self.in_features = in_features
+        self.out_features = out_features // world_size
+        
+        if torch.cuda.is_available():
+            self.weight = nn.Parameter(torch.empty(self.out_features, in_features, dtype=dtype or Linear.dtype))
+            if self.weight.element_size() == 1:
+                scale_out_features = (self.out_features + block_size - 1) // block_size
+                scale_in_features = (in_features + block_size - 1) // block_size
+                self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+            else:
+                self.register_parameter("scale", None)
+        else:
+            # Use CPU optimized implementation
+            self.cpu_linear = TritonLinearCPU(in_features, self.out_features, bias, dtype)
+            self.weight = self.cpu_linear.weight
+            
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == 'cpu':
+            return self.cpu_linear(x)
+        else:
+            return linear(x, self.weight, self.bias)
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with row parallelism."""
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, dtype = None):
+        super().__init__()
+        assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
+        self.in_features = in_features // world_size
+        self.out_features = out_features
+        
+        if torch.cuda.is_available():
+            self.weight = nn.Parameter(torch.empty(out_features, self.in_features, dtype=dtype or Linear.dtype))
+            if self.weight.element_size() == 1:
+                scale_out_features = (out_features + block_size - 1) // block_size
+                scale_in_features = (self.in_features + block_size - 1) // block_size
+                self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+            else:
+                self.register_parameter("scale", None)
+        else:
+            # Use CPU optimized implementation
+            self.cpu_linear = TritonLinearCPU(self.in_features, out_features, bias, dtype)
+            self.weight = self.cpu_linear.weight
+            
+        if bias:
+            # Bias is applied after the parallel reduction
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == 'cpu':
+            output = self.cpu_linear(x)
+        else:
+            output = linear(x, self.weight, None)  # Don't apply bias yet
+            
+        if world_size > 1:
+            dist.all_reduce(output)
+            
+        if self.bias is not None:
+            output = output + self.bias
+            
+        return output
+
+# Common layers
+class RMSNorm(nn.Module):
+    """RMS normalization with CPU/GPU implementations."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor):
+        if x.device.type == 'cpu':
+            return triton_layer_norm(x, self.weight, None, self.eps)
+        else:
+            return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
 class ParallelEmbedding(nn.Module):
+    """Parallel embedding layer."""
     def __init__(self, vocab_size: int, dim: int):
         super().__init__()
         self.vocab_size = vocab_size
@@ -98,96 +228,8 @@ class ParallelEmbedding(nn.Module):
             dist.all_reduce(y)
         return y
 
-
-def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if weight.element_size() > 1:
-        return F.linear(x, weight, bias)
-    elif gemm_impl == "bf16":
-        weight = weight_dequant(weight, weight.scale)
-        return F.linear(x, weight, bias)
-    else:
-        x, scale = act_quant(x, block_size)
-        y = fp8_gemm(x, scale, weight, weight.scale)
-        if bias is not None:
-            y += bias
-        return y
-
-
-<<<<<<< HEAD
-class Linear(TritonLinearCPU):
-    """CPU-optimized linear layer using Triton kernels"""
-=======
-class Linear(nn.Module):
-    dtype = torch.bfloat16
-
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
-        if self.weight.element_size() == 1:
-            scale_out_features = (out_features + block_size - 1) // block_size
-            scale_in_features = (in_features + block_size - 1) // block_size
-            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
-        else:
-            self.register_parameter("scale", None)
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
-        else:
-            self.register_parameter("bias", None)
->>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.weight, self.bias)
-
-
-class ColumnParallelLinear(Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
-        assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
-        self.part_out_features = out_features // world_size
-        super().__init__(in_features, self.part_out_features, bias, dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = linear(x, self.weight, self.bias)
-        return y
-
-
-class RowParallelLinear(Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
-        assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
-        self.part_in_features = in_features // world_size
-        super().__init__(self.part_in_features, out_features, bias, dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = linear(x, self.weight)
-        if world_size > 1:
-            dist.all_reduce(y)
-        if self.bias is not None:
-            y += self.bias
-        return y
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-<<<<<<< HEAD
-        
-    def forward(self, x: torch.Tensor):
-        if x.device.type == 'cpu':
-            return triton_layer_norm(x, self.weight, None, self.eps)
-        else:
-            return F.rms_norm(x, (self.dim,), self.weight, self.eps)
-=======
-
-    def forward(self, x: torch.Tensor):
-        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
->>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
-
-
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
+    """Precompute frequencies for rotary embeddings."""
     dim = args.qk_rope_head_dim
     seqlen = args.max_seq_len
     beta_fast = args.beta_fast
@@ -221,93 +263,94 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
-
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embeddings to input tensors."""
     dtype = x.dtype
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
-
 class MLA(nn.Module):
+    """Multi-head Linear Attention with cache augmentation."""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // world_size
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
-        self.qk_nope_head_dim = args.qk_nope_head_dim
-        self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim
-
-        if self.q_lora_rank == 0:
-            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
-        else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
-            self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
-        self.softmax_scale = self.qk_head_dim ** -0.5
+        
+        # Query, Key, Value projections
+        self.q_proj = ColumnParallelLinear(args.dim, args.n_heads * args.qk_nope_head_dim)
+        self.k_proj = ColumnParallelLinear(args.dim, args.n_heads * args.qk_nope_head_dim)
+        self.v_proj = ColumnParallelLinear(args.dim, args.n_heads * args.v_head_dim)
+        
+        # Output projection
+        self.o_proj = RowParallelLinear(args.n_heads * args.v_head_dim, args.dim)
+        
+        # Attention scaling
+        self.scale = args.qk_nope_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
-            self.softmax_scale = self.softmax_scale * mscale * mscale
-
+            self.scale = self.scale * mscale * mscale
+        
+        # Rotary embeddings
+        self.rope_theta = args.rope_theta
+        self.max_seq_len = args.max_seq_len
+        
+        # Cache setup
         if attn_impl == "naive":
-            self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
-            self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
-        else:
-            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
-            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
+            self.register_buffer("k_cache", torch.zeros(
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_heads,
+                args.qk_nope_head_dim
+            ), persistent=False)
+            self.register_buffer("v_cache", torch.zeros(
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_heads,
+                args.v_head_dim
+            ), persistent=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         bsz, seqlen, _ = x.size()
-        end_pos = start_pos + seqlen
-        if self.q_lora_rank == 0:
-            q = self.wq(x)
-        else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        
+        q = xq.view(bsz, seqlen, self.n_local_heads, -1)
+        k = xk.view(bsz, seqlen, self.n_local_heads, -1)
+        v = xv.view(bsz, seqlen, self.n_local_heads, -1)
+        
+        # Apply rotary embeddings
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
+        
+        # Update cache
         if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-        else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+            self.k_cache[:bsz, start_pos:start_pos+seqlen] = k
+            self.v_cache[:bsz, start_pos:start_pos+seqlen] = v
+            
+            # Get cached keys and values
+            k = self.k_cache[:bsz, :start_pos+seqlen]
+            v = self.v_cache[:bsz, :start_pos+seqlen]
+        
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        
         if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
-        else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
-        x = self.wo(x.flatten(2))
-        return x
+            scores = scores + mask.unsqueeze(1)
+        
+        # Attention weights
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        
+        # Compute attention output
+        out = torch.matmul(scores, v)
+        out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        
+        return self.o_proj(out)
 
-
+# Model components
 class MLP(nn.Module):
+    """MLP layer."""
     def __init__(self, dim: int, inter_dim: int):
         super().__init__()
         self.w1 = ColumnParallelLinear(dim, inter_dim)
@@ -317,8 +360,19 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+class Expert(nn.Module):
+    """Expert layer."""
+    def __init__(self, dim: int, inter_dim: int):
+        super().__init__()
+        self.w1 = Linear(dim, inter_dim)
+        self.w2 = Linear(inter_dim, dim)
+        self.w3 = Linear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Gate(nn.Module):
+    """Gate layer."""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
@@ -355,19 +409,8 @@ class Gate(nn.Module):
         weights *= self.route_scale
         return weights.type_as(x), indices
 
-
-class Expert(nn.Module):
-    def __init__(self, dim: int, inter_dim: int):
-        super().__init__()
-        self.w1 = Linear(dim, inter_dim)
-        self.w2 = Linear(inter_dim, dim)
-        self.w3 = Linear(dim, inter_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
-
 class MoE(nn.Module):
+    """Mixture of experts layer."""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
@@ -399,16 +442,15 @@ class MoE(nn.Module):
             dist.all_reduce(y)
         return (y + z).view(shape)
 
-
 class Block(nn.Module):
+    """Transformer block."""
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.args = args
-        self.attn = MLA(args)
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
-        
+
         # Initialize optional components
         if args.use_cache_augmentation:
             self.cache = DifferentiableCacheAugmentation(
@@ -440,10 +482,8 @@ class Block(nn.Module):
                 )
             )
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        # Base transformer processing
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         h = self.attn_norm(x)
-        h = x + self.attn(h, start_pos, freqs_cis, mask)
         
         # Apply cache augmentation if enabled
         if self.args.use_cache_augmentation:
@@ -462,8 +502,8 @@ class Block(nn.Module):
         
         return h
 
-
 class Transformer(nn.Module):
+    """Main transformer model."""
     def __init__(self, args: ModelArgs):
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -478,18 +518,25 @@ class Transformer(nn.Module):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
-        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
-        seqlen = tokens.size(1)
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        bsz, seqlen = tokens.size()
         h = self.embed(tokens)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        
+        # Compute attention mask
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+            
+        # Get rotary embeddings
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        
+        # Process through layers
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+            
+        # Final normalization and head
         h = self.norm(h)[:, -1]
         logits = self.head(h)
         if world_size > 1:
@@ -497,7 +544,6 @@ class Transformer(nn.Module):
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
         return logits
-
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)

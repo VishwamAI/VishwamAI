@@ -1,210 +1,111 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple
 import math
+from dataclasses import dataclass
+from typing import Optional
 
-class MemoryGatingUnit(nn.Module):
-    """
-    Gating unit that controls information flow into and out of the memory module.
-    """
-    def __init__(self, hidden_size: int, memory_size: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.memory_size = memory_size
-        
-        # Write gate
-        self.write_gate = nn.Sequential(
-            nn.Linear(hidden_size + memory_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, memory_size),
-            nn.Sigmoid()
-        )
-        
-        # Read gate
-        self.read_gate = nn.Sequential(
-            nn.Linear(hidden_size + memory_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, memory_size),
-            nn.Sigmoid()
-        )
-        
-        # Forget gate
-        self.forget_gate = nn.Sequential(
-            nn.Linear(memory_size, memory_size),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = x.size(0)
-        
-        # Combine input and memory for gate computation
-        combined = torch.cat([x, memory], dim=-1)
-        
-        # Compute gates
-        write = self.write_gate(combined)
-        read = self.read_gate(combined)
-        forget = self.forget_gate(memory)
-        
-        # Update memory
-        new_memory = forget * memory + write * x
-        
-        # Read from memory
-        output = read * new_memory
-        
-        return output, new_memory
-
-class NeuralMemoryModule(nn.Module):
-    """
-    Neural long-term memory module that can learn to store and retrieve information over long sequences.
-    """
-    def __init__(self, 
-                 hidden_size: int,
-                 memory_size: int,
-                 num_memory_layers: int = 3,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.memory_size = memory_size
-        self.num_memory_layers = num_memory_layers
-        
-        # Input projection
-        self.input_proj = nn.Linear(hidden_size, memory_size)
-        self.input_norm = nn.LayerNorm(memory_size)
-        
-        # Memory layers
-        self.memory_layers = nn.ModuleList([
-            MemoryGatingUnit(hidden_size, memory_size)
-            for _ in range(num_memory_layers)
-        ])
-        
-        # Memory attention
-        self.memory_attention = nn.MultiheadAttention(
-            memory_size,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Output projection
-        self.output_proj = nn.Linear(memory_size, hidden_size)
-        self.output_norm = nn.LayerNorm(hidden_size)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-        # Initialize memory states
-        self.register_buffer("memory_states", 
-                           torch.zeros(num_memory_layers, 1, 1, memory_size))
-        
-    def forward(self, 
-                hidden_states: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Process hidden states through the memory module.
-        
-        Args:
-            hidden_states: Input tensor of shape (batch_size, sequence_length, hidden_size)
-            attention_mask: Optional attention mask
-            
-        Returns:
-            Processed hidden states with long-term memory information
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Project input to memory space
-        memory = self.input_proj(hidden_states)
-        memory = self.input_norm(memory)
-        
-        # Expand memory states if needed
-        if self.memory_states.size(1) != batch_size:
-            self.memory_states = self.memory_states.expand(-1, batch_size, -1, -1)
-        
-        # Process through memory layers
-        layer_outputs = []
-        current_memory = memory
-        
-        for i, layer in enumerate(self.memory_layers):
-            # Process through gating unit
-            output, new_memory = layer(current_memory, self.memory_states[i])
-            
-            # Update memory state
-            if self.training:
-                self.memory_states[i] = new_memory.detach()
-            
-            # Apply memory attention
-            attended_memory, _ = self.memory_attention(
-                output,
-                output,
-                output,
-                key_padding_mask=attention_mask,
-                need_weights=False
-            )
-            
-            current_memory = self.dropout(attended_memory) + output
-            layer_outputs.append(current_memory)
-        
-        # Combine layer outputs
-        combined_memory = torch.stack(layer_outputs).mean(0)
-        
-        # Project back to hidden space
-        output = self.output_proj(combined_memory)
-        output = self.output_norm(output)
-        
-        return output
-    
-    def reset_memory(self):
-        """Reset memory states"""
-        self.memory_states.zero_()
+@dataclass
+class MemoryConfig:
+    hidden_size: int = 8192
+    memory_size: int = 2048
+    num_memory_layers: int = 3
+    num_attention_heads: int = 32
+    intermediate_size: int = 16384
+    dropout: float = 0.1
 
 class ReasoningMemoryTransformer(nn.Module):
-    """
-    Wrapper that combines the neural memory module with standard transformer processing.
-    """
-    def __init__(self,
-                 hidden_size: int,
-                 memory_size: int,
-                 num_memory_layers: int = 3,
-                 dropout: float = 0.1):
+    """Neural memory implementation using transformer architecture for structured reasoning."""
+    
+    def __init__(self, config: Optional[MemoryConfig] = None):
         super().__init__()
+        self.config = config or MemoryConfig()
         
-        self.memory = NeuralMemoryModule(
-            hidden_size=hidden_size,
-            memory_size=memory_size,
-            num_memory_layers=num_memory_layers,
-            dropout=dropout
+        # Memory embeddings
+        self.memory_embeddings = nn.Parameter(
+            torch.randn(self.config.memory_size, self.config.hidden_size)
         )
         
-        # Memory integration layers
-        self.pre_memory_norm = nn.LayerNorm(hidden_size)
-        self.post_memory_norm = nn.LayerNorm(hidden_size)
+        # Multi-head attention layers
+        self.memory_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=self.config.hidden_size,
+                num_heads=self.config.num_attention_heads,
+                dropout=self.config.dropout,
+                batch_first=True
+            )
+            for _ in range(self.config.num_memory_layers)
+        ])
         
-    def forward(self, 
-                hidden_states: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Process hidden states through memory augmented reasoning.
+        # Layer norms and feedforward networks
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(self.config.hidden_size)
+            for _ in range(self.config.num_memory_layers * 2)
+        ])
         
-        Args:
-            hidden_states: Input tensor from transformer
-            attention_mask: Optional attention mask
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.config.hidden_size, self.config.intermediate_size),
+                nn.GELU(),
+                nn.Dropout(self.config.dropout),
+                nn.Linear(self.config.intermediate_size, self.config.hidden_size),
+                nn.Dropout(self.config.dropout)
+            )
+            for _ in range(self.config.num_memory_layers)
+        ])
+        
+        # Output projection
+        self.output_projection = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size, bias=False
+        )
+        
+        self.dropout = nn.Dropout(self.config.dropout)
+        
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Process hidden states through memory-augmented layers."""
+        batch_size = hidden_states.size(0)
+        
+        # Expand memory embeddings for batch
+        memory = self.memory_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Process through memory layers
+        for i in range(self.config.num_memory_layers):
+            # Self attention
+            normed_memory = self.layer_norms[i*2](memory)
+            attn_output, _ = self.memory_layers[i](
+                query=normed_memory,
+                key=normed_memory,
+                value=normed_memory
+            )
+            memory = memory + self.dropout(attn_output)
             
-        Returns:
-            Memory-augmented hidden states
-        """
-        # Pre-memory normalization
-        normed_states = self.pre_memory_norm(hidden_states)
+            # Feedforward
+            normed_memory = self.layer_norms[i*2 + 1](memory)
+            ff_output = self.ffns[i](normed_memory)
+            memory = memory + ff_output
+            
+        # Cross attention with input hidden states
+        output, _ = self.memory_layers[-1](
+            query=hidden_states,
+            key=memory,
+            value=memory
+        )
         
-        # Process through memory module
-        memory_states = self.memory(normed_states, attention_mask)
-        
-        # Combine with input and normalize
-        output = hidden_states + memory_states
-        output = self.post_memory_norm(output)
+        # Project outputs
+        output = self.output_projection(output)
         
         return output
     
-    def reset_memory(self):
-        """Reset all memory states"""
-        self.memory.reset_memory()
+    def save_pretrained(self, save_path: str):
+        """Save memory components."""
+        torch.save({
+            'config': self.config,
+            'state_dict': self.state_dict()
+        }, f"{save_path}/neural_memory.pt")
+        
+    @classmethod
+    def from_pretrained(cls, load_path: str):
+        """Load memory components."""
+        checkpoint = torch.load(f"{load_path}/neural_memory.pt")
+        model = cls(config=checkpoint['config'])
+        model.load_state_dict(checkpoint['state_dict'])
+        return model

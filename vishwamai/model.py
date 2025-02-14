@@ -262,7 +262,7 @@ class Block(nn.Module):
             self.memory = ReasoningMemoryTransformer(
                 hidden_size=args.dim,
                 memory_size=args.memory_size,
-                num_layers=args.num_memory_layers,
+                num_memory_layers=args.num_memory_layers,
                 dropout=args.memory_dropout
             )
             

@@ -1,204 +1,185 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
-import math
+from transformers import PreTrainedModel
+import numpy as np
 
 @dataclass
 class TreeConfig:
-    max_branches: int = 4  # Maximum number of branches to explore per node
-    max_depth: int = 3     # Maximum depth of the reasoning tree
-    beam_width: int = 2    # Number of best paths to maintain
-    temperature: float = 0.8  # Temperature for sampling
-    min_score_diff: float = 0.1  # Minimum score difference to consider a path different
+    """Configuration for Tree of Thoughts implementation."""
+    beam_width: int = 4
+    max_depth: int = 3
+    temperature: float = 0.7
+    top_k: int = 50
+    pruning_threshold: float = 0.1
+    rewrite_factor: float = 0.3
+    hidden_size: int = 8192
 
-class ThoughtNode:
-    """Represents a node in the reasoning tree"""
-    def __init__(self, 
-                 hidden_state: torch.Tensor,
-                 score: float,
-                 parent: Optional['ThoughtNode'] = None,
-                 depth: int = 0):
-        self.hidden_state = hidden_state
+class TreeNode:
+    """Node in the Tree of Thoughts structure."""
+    def __init__(self, state: torch.Tensor, score: float = 0.0):
+        self.state = state
         self.score = score
-        self.parent = parent
-        self.depth = depth
-        self.children: List['ThoughtNode'] = []
+        self.children: List[TreeNode] = []
+        self.parent: Optional[TreeNode] = None
+        self.depth: int = 0
         
-    def add_child(self, hidden_state: torch.Tensor, score: float) -> 'ThoughtNode':
-        child = ThoughtNode(hidden_state, score, self, self.depth + 1)
+    def add_child(self, child: 'TreeNode'):
+        """Add a child node and update its depth."""
+        child.parent = self
+        child.depth = self.depth + 1
         self.children.append(child)
-        return child
-        
-    def get_path_to_root(self) -> List[torch.Tensor]:
-        """Get the sequence of hidden states from root to this node"""
-        path = []
-        current = self
-        while current is not None:
-            path.append(current.hidden_state)
-            current = current.parent
-        return list(reversed(path))
 
 class TreeOfThoughts(nn.Module):
-    """
-    Implements tree-based reasoning by exploring multiple thought paths
-    and selecting the most promising ones.
-    """
+    """Tree of Thoughts implementation for structured reasoning."""
+    
     def __init__(self, 
-                 hidden_size: int,
-                 config: TreeConfig):
+                 model: PreTrainedModel,
+                 config: Optional[TreeConfig] = None):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.config = config
+        self.config = config or TreeConfig()
+        self.base_model = model
         
-        # Evaluation network to score reasoning paths
-        self.evaluator = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
+        # Reasoning networks
+        self.state_evaluator = nn.Sequential(
+            nn.Linear(self.config.hidden_size, self.config.hidden_size),
             nn.GELU(),
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()
+            nn.Dropout(0.1),
+            nn.Linear(self.config.hidden_size, 1)
         )
         
-        # Thought generation networks
-        self.thought_proj = nn.Linear(hidden_size, hidden_size)
-        self.thought_combine = nn.Linear(hidden_size * 2, hidden_size)
-        
-        # Value estimation for path selection
-        self.value_estimator = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+        self.state_expander = nn.Sequential(
+            nn.Linear(self.config.hidden_size, self.config.hidden_size * 2),
             nn.GELU(),
-            nn.Linear(hidden_size, 1),
-            nn.Tanh()
+            nn.Dropout(0.1),
+            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size * self.config.beam_width)
         )
         
-    def evaluate_state(self, state: torch.Tensor) -> torch.Tensor:
-        """Evaluate the promise of a particular reasoning state"""
-        return self.evaluator(state)
-    
-    def generate_thoughts(self, 
-                         current_state: torch.Tensor,
-                         num_branches: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate multiple possible next thoughts from current state"""
-        # Project current state
-        projected = self.thought_proj(current_state)
-        
-        # Generate multiple thought vectors through different linear projections
-        thoughts = []
-        for _ in range(num_branches):
-            # Create a unique projection for this branch
-            branch_proj = nn.Linear(self.hidden_size, self.hidden_size, device=current_state.device)
-            thought = F.gelu(branch_proj(projected))
-            thoughts.append(thought)
-        
-        thoughts = torch.stack(thoughts, dim=1)  # [batch_size, num_branches, hidden_size]
-        
-        # Generate scores for each thought
-        scores = self.evaluate_state(thoughts.view(-1, self.hidden_size))
-        scores = scores.view(-1, num_branches)
-        
-        return thoughts, scores
-    
-    def expand_node(self, 
-                   node: ThoughtNode, 
-                   temperature: float = 1.0) -> List[ThoughtNode]:
-        """Expand a node by generating multiple possible next thoughts"""
-        thoughts, scores = self.generate_thoughts(
-            node.hidden_state,
-            self.config.max_branches
+        self.state_refiner = nn.Sequential(
+            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.config.hidden_size, self.config.hidden_size)
         )
         
-        # Apply temperature to scores
-        scores = scores / temperature
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Process hidden states through tree-structured reasoning."""
+        batch_size = hidden_states.size(0)
+        device = hidden_states.device
         
-        # Create child nodes
-        children = []
-        for i in range(thoughts.size(1)):
-            thought = thoughts[:, i]
-            score = scores[:, i].mean().item()
-            
-            # Only add child if score is significantly different
-            if not children or min(abs(score - c.score) for c in children) >= self.config.min_score_diff:
-                child = node.add_child(thought, score)
-                children.append(child)
-                
-                # Limit number of children
-                if len(children) >= self.config.beam_width:
-                    break
-                
-        return children
-    
-    def search_best_path(self, 
-                        initial_state: torch.Tensor,
-                        attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Perform tree search to find the most promising reasoning path.
-        Uses beam search to maintain multiple promising paths.
-        """
-        # Initialize root node
-        root_score = self.evaluate_state(initial_state).mean().item()
-        root = ThoughtNode(initial_state, root_score)
+        # Initialize root nodes for each batch item
+        roots = [TreeNode(state) for state in hidden_states]
         
-        # Initialize beam with root node
-        beam = [root]
-        
-        # Expand tree up to max depth
+        # Build trees through iterative reasoning
         for depth in range(self.config.max_depth):
-            candidates = []
+            level_nodes = [node for node in self._get_level_nodes(roots, depth)]
             
-            # Expand each node in current beam
-            for node in beam:
-                children = self.expand_node(
-                    node,
-                    temperature=self.config.temperature
-                )
-                candidates.extend(children)
-            
-            if not candidates:
+            if not level_nodes:
                 break
                 
-            # Sort candidates by score and select top-k for beam
-            candidates.sort(key=lambda x: x.score, reverse=True)
-            beam = candidates[:self.config.beam_width]
+            # Expand nodes
+            expanded_states = []
+            for node in level_nodes:
+                expanded = self.state_expander(node.state)
+                expanded = expanded.view(-1, self.config.beam_width, self.config.hidden_size)
+                expanded_states.append(expanded)
+            
+            expanded_states = torch.cat(expanded_states, dim=0)
+            
+            # Evaluate expanded states
+            scores = self.state_evaluator(expanded_states.view(-1, self.config.hidden_size))
+            scores = scores.view(-1, self.config.beam_width)
+            
+            # Select best children
+            topk_scores, topk_indices = torch.topk(
+                scores, k=min(self.config.beam_width, scores.size(1)), dim=1
+            )
+            
+            # Create child nodes with pruning
+            for i, node in enumerate(level_nodes):
+                node_scores = topk_scores[i]
+                node_states = expanded_states[i][topk_indices[i]]
+                
+                for score, state in zip(node_scores, node_states):
+                    if score > self.config.pruning_threshold:
+                        child = TreeNode(state, score.item())
+                        node.add_child(child)
         
-        # Select best final node
-        best_node = max(beam, key=lambda x: x.score)
+        # Extract best paths and refine final states
+        best_paths = self._extract_best_paths(roots)
+        refined_states = self._refine_states(best_paths, hidden_states)
         
-        # Return sequence of hidden states along best path
-        path_states = best_node.get_path_to_root()
-        return torch.stack(path_states, dim=1)  # [batch_size, path_length, hidden_size]
+        return refined_states
     
-    def forward(self,
-                hidden_states: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Process hidden states through tree of thoughts reasoning.
-        
-        Args:
-            hidden_states: Input tensor of shape [batch_size, seq_length, hidden_size]
-            attention_mask: Optional attention mask
+    def _get_level_nodes(self, roots: List[TreeNode], depth: int) -> List[TreeNode]:
+        """Get all nodes at a specific depth."""
+        if depth == 0:
+            return roots
             
-        Returns:
-            Processed hidden states incorporating best reasoning path
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Process each sequence position through tree search
-        outputs = []
-        
-        for pos in range(seq_len):
-            current_state = hidden_states[:, pos]
+        nodes = []
+        def collect_nodes(node: TreeNode, current_depth: int):
+            if current_depth == depth:
+                nodes.append(node)
+            else:
+                for child in node.children:
+                    collect_nodes(child, current_depth + 1)
+                    
+        for root in roots:
+            collect_nodes(root, 0)
             
-            # Perform tree search from current state
-            path_states = self.search_best_path(current_state, attention_mask)
-            
-            # Use final state in best path
-            outputs.append(path_states[:, -1])
-            
-        # Combine outputs
-        output = torch.stack(outputs, dim=1)
+        return nodes
+    
+    def _extract_best_paths(self, roots: List[TreeNode]) -> List[List[torch.Tensor]]:
+        """Extract best reasoning paths from trees."""
+        paths = []
         
-        # Residual connection
-        return output + hidden_states
+        def get_best_path(node: TreeNode) -> List[torch.Tensor]:
+            path = [node.state]
+            if node.children:
+                best_child = max(node.children, key=lambda x: x.score)
+                path.extend(get_best_path(best_child))
+            return path
+        
+        for root in roots:
+            paths.append(get_best_path(root))
+            
+        return paths
+    
+    def _refine_states(self, paths: List[List[torch.Tensor]], 
+                      original_states: torch.Tensor) -> torch.Tensor:
+        """Refine states using reasoning paths."""
+        refined_states = []
+        
+        for path, orig_state in zip(paths, original_states):
+            # Combine all states in the path
+            path_tensor = torch.stack(path)
+            
+            # Get final refined state
+            path_encoding = path_tensor.mean(dim=0)
+            refined = self.state_refiner(
+                torch.cat([orig_state, path_encoding], dim=-1)
+            )
+            
+            # Interpolate with original state
+            refined = (1 - self.config.rewrite_factor) * orig_state + \
+                     self.config.rewrite_factor * refined
+            
+            refined_states.append(refined)
+            
+        return torch.stack(refined_states)
+    
+    def save_pretrained(self, save_path: str):
+        """Save tree of thoughts components."""
+        torch.save({
+            'config': self.config,
+            'state_dict': self.state_dict()
+        }, f"{save_path}/tree_of_thoughts.pt")
+        
+    @classmethod
+    def from_pretrained(cls, load_path: str, model: PreTrainedModel):
+        """Load tree of thoughts components."""
+        checkpoint = torch.load(f"{load_path}/tree_of_thoughts.pt")
+        instance = cls(model=model, config=checkpoint['config'])
+        instance.load_state_dict(checkpoint['state_dict'])
+        return instance

@@ -1,180 +1,254 @@
 # VishwamAI Setup Guide
 
-This guide covers setting up VishwamAI in different environments.
+This guide provides detailed instructions for setting up VishwamAI with all its enhanced components.
 
-## Official Repository
-https://github.com/VishwamAI/VishwamAI
+## Prerequisites
 
-## System Requirements
+### Hardware Requirements
+```
+GPU: NVIDIA A100 (80GB) or V100 (32GB)
+RAM: 64GB minimum
+Storage: 1TB+ SSD
+CUDA: 11.8 or higher
+```
 
-### Minimum (CPU Only)
-- Python 3.8+
-- 16GB RAM
-- 50GB disk space
-- CPU with AVX2 support
-
-### Recommended (GPU)
-- NVIDIA GPU with 8GB+ VRAM
-- CUDA 11.8+
-- 32GB RAM
-- 100GB disk space
+### Software Dependencies
+```bash
+# Core dependencies
+python>=3.9
+pytorch>=2.4.1
+transformers>=4.34.0
+numpy>=1.24.0
+wandb>=0.15.0
+```
 
 ## Installation
 
-1. Clone official repository:
+### 1. Environment Setup
+
 ```bash
+# Create and activate conda environment
+conda create -n vishwamai python=3.9
+conda activate vishwamai
+
+# Install PyTorch with CUDA support
+pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 2. Install VishwamAI
+
+```bash
+# Clone repository
 git clone https://github.com/VishwamAI/VishwamAI.git
 cd VishwamAI
-```
 
-2. Create virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# OR
-venv\Scripts\activate  # Windows
-```
-
-3. Install dependencies:
-```bash
-# For GPU
-pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-# For CPU only
-pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# Install other requirements
-pip install -r requirements.txt
-
-# Install package in development mode
+# Install package
 pip install -e .
 ```
 
-## Environment Setup
+### 3. Verify Installation
 
-### CPU Environment
 ```python
 import torch
-from vishwamai.model_utils import load_model
+from vishwamai import EnhancedVishwamAI
 
-# Load model in CPU mode
-model = load_model(
-    config_path="configs/config_optimized.json",
-    device="cpu"
+# Check CUDA availability
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# Test model loading
+model = EnhancedVishwamAI(
+    model_path="kasinadhsarma/vishwamai-model",
+    use_memory=True,
+    use_tree=True,
+    use_cache=True
 )
 ```
 
-### GPU Environment
+## Component Setup
+
+### 1. Neural Memory
+
 ```python
-import torch
-from vishwamai.model_utils import load_model
+from vishwamai.neural_memory import ReasoningMemoryTransformer, MemoryConfig
 
-# Check GPU
-assert torch.cuda.is_available(), "GPU not available"
-print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-
-# Load model in GPU mode
-model = load_model(
-    config_path="configs/config_optimized.json",
-    device="cuda"
+# Configure memory
+memory_config = MemoryConfig(
+    hidden_size=8192,
+    memory_size=2048,
+    num_memory_layers=3
 )
+
+# Initialize memory
+memory = ReasoningMemoryTransformer(memory_config)
 ```
 
-## Google Colab Setup
+### 2. Tree of Thoughts
 
-1. Clone repository:
 ```python
-!git clone https://github.com/VishwamAI/VishwamAI.git
-%cd VishwamAI
+from vishwamai.tree_of_thoughts import TreeOfThoughts, TreeConfig
+
+# Configure tree search
+tree_config = TreeConfig(
+    beam_width=4,
+    max_depth=3,
+    temperature=0.7
+)
+
+# Initialize tree
+tree = TreeOfThoughts(model, tree_config)
 ```
 
-2. Install dependencies:
+### 3. Cache Augmentation
+
+```python
+from vishwamai.cache_augmentation import DifferentiableCacheAugmentation, CacheConfig
+
+# Configure cache
+cache_config = CacheConfig(
+    hidden_size=8192,
+    num_heads=8,
+    max_cache_length=65536
+)
+
+# Initialize cache
+cache = DifferentiableCacheAugmentation(cache_config)
+```
+
+## Environment Variables
+
+Set these environment variables for optimal performance:
+
 ```bash
-!pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-!pip install -r requirements.txt
+# Model configuration
+export VISHWAMAI_MODEL_PATH="/path/to/model"
+export VISHWAMAI_CACHE_DIR="/path/to/cache"
+
+# Hardware optimization
+export CUDA_VISIBLE_DEVICES="0,1"  # For multi-GPU
+export TORCH_CUDA_ARCH_LIST="8.0"  # For A100
+export TORCH_DISTRIBUTED_DEBUG="INFO"
+
+# Memory management
+export MAX_MEMORY_ALLOCATION="70GB"
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512"
 ```
 
-3. Choose notebook:
-- `colab_train.ipynb`: For fine-tuning
-- `vishwamai_colab_pretrain.ipynb`: For pretraining
+## GPU Memory Optimization
+
+### 1. Memory Efficiency
+
+```python
+# Enable gradient checkpointing
+model.gradient_checkpointing_enable()
+
+# Use mixed precision
+from torch.cuda.amp import autocast
+
+with autocast():
+    outputs = model.generate(...)
+```
+
+### 2. Batch Size Optimization
+
+```python
+# Automatic batch size finder
+from vishwamai.utils import find_optimal_batch_size
+
+optimal_batch_size = find_optimal_batch_size(
+    model,
+    starting_batch_size=8,
+    gpu_memory_threshold=0.9
+)
+```
+
+## Monitoring Setup
+
+### 1. Weights & Biases
+
+```python
+import wandb
+
+wandb.login()
+wandb.init(project="vishwamai", name="training_run_1")
+```
+
+### 2. TensorBoard
+
+```bash
+# Start TensorBoard
+tensorboard --logdir ./runs
+```
 
 ## Common Issues
 
-### Out of Memory
+### 1. Out of Memory (OOM)
+
 ```python
-# Enable memory efficient settings
-model = load_model(
-    config_path="configs/config_optimized.json",
-    device="cuda",
-    use_cache=False
-)
-model.gradient_checkpointing_enable()
+# Solution 1: Reduce memory components
+memory_config.memory_size = 1024
+cache_config.max_cache_length = 32768
+
+# Solution 2: Enable memory efficient attention
+model.enable_memory_efficient_attention()
 ```
 
-### CPU Performance
-For better CPU performance:
-```python
-# Set number of threads
-import torch
-torch.set_num_threads(8)  # Adjust based on your CPU
+### 2. CUDA Issues
 
-# Use efficient forward pass
-with torch.inference_mode():
-    output = model(input_tokens)
-```
-
-### GPU Utilization
-Monitor GPU usage:
 ```bash
-# Linux
-watch -n 1 nvidia-smi
+# Verify CUDA setup
+python -c "import torch; print(torch.cuda.is_available())"
 
-# Windows PowerShell
-while(1) {nvidia-smi; Start-Sleep -s 1; cls}
+# Clear CUDA cache
+torch.cuda.empty_cache()
 ```
 
-## Quick Tests
+### 3. Component Conflicts
 
-1. Basic functionality:
 ```python
-from vishwamai.examples.model_examples import basic_usage
-basic_usage()
+# Ensure consistent dimensions
+assert memory_config.hidden_size == model.config.hidden_size
+assert cache_config.hidden_size == model.config.hidden_size
 ```
 
-2. Memory efficiency:
+## Performance Tuning
+
+### 1. Cache Warmup
+
 ```python
-from vishwamai.examples.model_examples import memory_efficient_usage
-memory_efficient_usage()
+# Warm up cache before inference
+model.cache_module.warmup(
+    sample_inputs,
+    num_iterations=100
+)
 ```
 
-3. CPU fallback:
+### 2. Memory Preloading
+
 ```python
-from vishwamai.examples.model_examples import cpu_fallback_usage
-cpu_fallback_usage()
+# Preload common patterns
+model.memory_module.preload_patterns(
+    pattern_dataset,
+    batch_size=32
+)
 ```
 
-## Directory Structure
+### 3. Tree Search Optimization
+
+```python
+# Adjust beam search parameters
+model.tree_module.optimize_beam_width(
+    validation_data,
+    min_width=2,
+    max_width=8
+)
 ```
-vishwamai/
-├── configs/              # Configuration files
-├── examples/             # Usage examples
-├── model.py             # Core model
-├── model_utils.py       # Utilities
-└── scripts/             # Training scripts
-```
 
-## Additional Resources
+## Next Steps
 
-- Official Repository: https://github.com/VishwamAI/VishwamAI
-- Training Guide: See `TRAINING.md`
-- Model Details: See `MODEL_CARD.md`
-- Example Usage: See `vishwamai/examples/`
+1. Check the [Training Guide](TRAINING.md) for training instructions
+2. Review [Model Card](MODEL_CARD.md) for model details
+3. Explore examples in `examples/` directory
+4. Join our [Discord community](https://discord.gg/vishwamai) for support
 
-## Support
-
-For issues and questions:
-1. Check the documentation
-2. Search existing issues on GitHub
-3. Create a new issue in the official repository
-
-For contributions, please see the contributing guidelines in the README.
+For more detailed documentation, visit [vishwamai.readthedocs.io](https://vishwamai.readthedocs.io).

@@ -16,70 +16,138 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.pytest_cache/
 
-# Project-specific
-output/
-pretrain_output/
-finetune_output/
-final_model/
-model_checkpoint.pt
-*.pt
-status.txt
-runs/
-checkpoints/
-
-# Training data
-datasets/
-data/
-cache/
-gsm8k/
-math/
-*.cache
-*.parquet
-*.arrow
-*.bin
-
-# Colab
-*.ipynb_checkpoints
-drive/
-content/
-
-# Environment
+# Virtual Environment
 .env
 .venv
 env/
 venv/
 ENV/
+env.bak/
+venv.bak/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# Logs and temp files
-*.log
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+*.ipynb-meta
+
+# Training artifacts
+pretrain_output/
+runs/
 logs/
-tmp/
-temp/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
 wandb/
+lightning_logs/
 
-# OS
+# Model files
+neural_memory.pt
+tree_of_thoughts.pt
+cache_augmentation.pt
+*.model
+*.safetensors
+
+# Data
+data/
+datasets/
+*.csv
+*.json
+*.jsonl
+*.txt
+!requirements.txt
+*.pkl
+*.h5
+*.hdf5
+
+# Documentation
+_build/
+_static/
+_templates/
+
+# System
 .DS_Store
+.directory
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Documentation drafts
-docs/_build/
+# Logs
+*.log
+*.log.*
+*.out
+*.err
+*.pid
 *.bak
-*.draft
-_temp/
 
-# Research
-Research/
-papers/
-notes/
-references/
+# Configuration
+*.env
+*.cfg
+config.ini
+!configs/*.json
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Distribution
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Cache
+.cache/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Local development
+*.local
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Hugging Face
+hub/
+.huggingface/
+
+# CUDA
+*.nvvp
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Custom project files
+*.vishwamai
+experimental/
+archive/
+debug/

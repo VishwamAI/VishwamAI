@@ -1,207 +1,220 @@
-# Training VishwamAI Model
+# VishwamAI Training Guide
 
-This document provides detailed instructions for training the VishwamAI model on different GPU configurations.
+This guide explains how to train and fine-tune the VishwamAI model with its enhanced reasoning components.
 
-## Official Repository
-https://github.com/VishwamAI/VishwamAI
+## Overview
 
-## Google Colab Training
+VishwamAI combines several advanced components to enhance language model reasoning:
 
-1. Access the repository:
-```python
-!git clone https://github.com/VishwamAI/VishwamAI.git
-%cd VishwamAI
-```
+1. **Neural Memory**: Long-term structured memory for retaining and retrieving information
+2. **Tree of Thoughts**: Tree-structured reasoning for complex problem-solving
+3. **Cache Augmentation**: Differentiable cache for efficient information access
 
-2. Open `colab_train.ipynb` in Google Colab
-3. Set runtime to GPU: Runtime > Change runtime type > GPU
-4. Run the setup cells:
-```python
-# Install dependencies
-!pip install torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-!pip install transformers==4.34.0 datasets accelerate
+## Hardware Requirements
 
-# Install package
-!pip install -e .
-```
+- **Recommended**: NVIDIA A100 GPU (80GB)
+- **Minimum**: NVIDIA V100 GPU (32GB)
+- **RAM**: 64GB+ recommended
+- **Storage**: 1TB+ SSD for model checkpoints and datasets
 
-5. The notebook will automatically detect your GPU type and apply optimized settings
+## Quick Start
 
-## Local Training
+The fastest way to start training is using Google Colab with an A100:
 
-### Prerequisites
-- NVIDIA GPU with CUDA support
-- Python 3.8 or higher
-- PyTorch 2.0 or higher
-
-### Setup
-
-1. Clone the repository:
 ```bash
+# Clone repository
 git clone https://github.com/VishwamAI/VishwamAI.git
 cd VishwamAI
+
+# Install dependencies
+pip install -e .
+
+# Open the training notebook
+jupyter notebook vishwamai_colab_pretrain.ipynb
 ```
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+## Configuration
 
-3. Make training script executable:
-```bash
-chmod +x vishwamai/scripts/pretrain.sh
-```
+### Base Model Config
 
-### Training Options
-
-1. Basic Training:
-```bash
-./vishwamai/scripts/pretrain.sh \
-    -b 4 \           # Batch size
-    -e 3 \           # Number of epochs
-    -o ./output \    # Output directory
-    -c configs/config_optimized.json  # Model config
-```
-
-2. GPU-Specific Training:
-
-For T4 GPU:
-```bash
-./vishwamai/scripts/pretrain.sh \
-    -b 2 \
-    -e 3 \
-    -o ./output \
-    -c configs/config_optimized.json \
-    --gpu_type T4_optimized
-```
-
-For V100 GPU:
-```bash
-./vishwamai/scripts/pretrain.sh \
-    -b 4 \
-    -e 3 \
-    -o ./output \
-    -c configs/config_optimized.json \
-    --gpu_type V100_optimized
-```
-
-For A100 GPU:
-```bash
-./vishwamai/scripts/pretrain.sh \
-    -b 8 \
-    -e 3 \
-    -o ./output \
-    -c configs/config_optimized.json \
-    --gpu_type A100_optimized
-```
-
-## Memory Optimization
-
-1. Enable gradient checkpointing:
-```python
-model.gradient_checkpointing_enable()
-```
-
-2. Use smaller batch size with gradient accumulation:
-```bash
-./vishwamai/scripts/pretrain.sh \
-    -b 2 \
-    --gradient_accumulation_steps 8
-```
-
-3. Disable caching during training:
-```bash
-./vishwamai/scripts/pretrain.sh --disable_cache
-```
-
-## Training Monitoring
-
-The training script saves:
-- Model checkpoints in the output directory
-- Training logs in `output/status.txt`
-- Training metrics in `output/trainer_state.json`
-
-Monitor GPU usage during training:
-```bash
-watch -n 1 nvidia-smi
-```
-
-## Advanced Configuration
-
-Edit `configs/config_optimized.json` to customize:
-- Model architecture
-- Training hyperparameters
-- Optimization settings
-- GPU-specific configurations
-
-Example configuration adjustments:
 ```json
 {
-    "model_config": {
-        "dim": 2048,
-        "n_heads": 16,
-        "n_layers": 24
-    },
-    "optimization_config": {
-        "use_flash_attention": true,
-        "gradient_checkpointing": true
-    }
+  "model_config": {
+    "dim": 8192,
+    "num_attention_heads": 64,
+    "num_hidden_layers": 120,
+    "vocab_size": 64000,
+    "max_position_embeddings": 32768
+  }
 }
 ```
 
-## Training Data
+### Component Configurations
 
-The model uses two main datasets:
-1. GSM8K for mathematical reasoning
-2. MMLU for multi-task learning
-
-Load custom datasets:
 ```python
-from datasets import load_dataset
+# Neural Memory
+memory_config = MemoryConfig(
+    hidden_size=8192,
+    memory_size=2048,
+    num_memory_layers=3,
+    dropout=0.1
+)
 
-datasets = {
-    "train": load_dataset("your_dataset", split="train"),
-    "validation": load_dataset("your_dataset", split="validation")
-}
+# Tree of Thoughts
+tree_config = TreeConfig(
+    beam_width=4,
+    max_depth=3,
+    temperature=0.7,
+    pruning_threshold=0.1
+)
+
+# Cache Augmentation
+cache_config = CacheConfig(
+    hidden_size=8192,
+    num_heads=8,
+    max_cache_length=65536,
+    dropout=0.1
+)
 ```
 
-## Common Issues
+## Training Pipeline
 
-1. Out of Memory (OOM):
+### 1. Initialize Components
+
+```python
+from vishwamai.trainer import VishwamAIPretrainer
+from vishwamai.neural_memory import ReasoningMemoryTransformer
+from vishwamai.tree_of_thoughts import TreeOfThoughts
+from vishwamai.cache_augmentation import DifferentiableCacheAugmentation
+
+# Initialize model and components
+model = load_model(config_path)
+memory = ReasoningMemoryTransformer(memory_config)
+tree = TreeOfThoughts(model, tree_config)
+cache = DifferentiableCacheAugmentation(cache_config)
+```
+
+### 2. Configure Training
+
+```python
+training_args = TrainingArguments(
+    output_dir="./output",
+    num_train_epochs=3,
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=4,
+    learning_rate=1.2e-4,
+    weight_decay=0.01,
+    warmup_steps=1000,
+    # Enable components
+    use_neural_memory=True,
+    use_tree_of_thoughts=True,
+    use_cache_augmentation=True
+)
+```
+
+### 3. Start Training
+
+```python
+trainer = VishwamAIPretrainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    memory_module=memory,
+    tree_module=tree,
+    cache_module=cache
+)
+
+trainer.train()
+```
+
+## Optimizing Performance
+
+### Memory Usage
+
+- Adjust `memory_size` based on available GPU memory
+- Use gradient checkpointing for larger models
+- Enable mixed precision training (FP16/BF16)
+
+### Training Speed
+
+- Increase `batch_size` and `gradient_accumulation_steps` for better throughput
+- Use FSDP for distributed training
+- Enable cache prefetching with `dataloader_num_workers`
+
+### Component Tuning
+
+1. **Neural Memory**:
+   - Increase `num_memory_layers` for more complex patterns
+   - Adjust `dropout` for better generalization
+
+2. **Tree of Thoughts**:
+   - Tune `beam_width` and `max_depth` for reasoning depth
+   - Adjust `pruning_threshold` to control tree growth
+
+3. **Cache Augmentation**:
+   - Optimize `max_cache_length` for memory efficiency
+   - Tune `retrieval_factor` for cache impact
+
+## Multi-GPU Training
+
+Enable distributed training with FSDP:
+
+```python
+training_args = TrainingArguments(
+    fsdp="full_shard",
+    fsdp_transformer_layer_cls_to_wrap="VishwamAILayer",
+    ...
+)
+```
+
+## Monitoring and Logging
+
+Training progress is tracked via:
+- Weights & Biases integration
+- TensorBoard logging
+- Regular model checkpoints
+
+```python
+training_args = TrainingArguments(
+    report_to=["tensorboard", "wandb"],
+    logging_steps=10,
+    save_strategy="epoch"
+)
+```
+
+## Fine-tuning Tips
+
+1. Start with a smaller learning rate (1e-5 to 1e-4)
+2. Use cosine learning rate scheduler
+3. Enable early stopping
+4. Monitor auxiliary losses from components
+5. Adjust component weights based on task
+
+## Troubleshooting
+
+Common issues and solutions:
+
+1. **OOM Errors**:
    - Reduce batch size
    - Enable gradient checkpointing
-   - Reduce model size for your GPU
+   - Decrease memory/cache sizes
 
-2. Slow Training:
-   - Enable mixed precision (FP16/BF16)
-   - Use flash attention
-   - Optimize sequence length
+2. **Slow Training**:
+   - Check GPU utilization
+   - Optimize dataloader workers
+   - Enable CUDA graphs
 
-3. GPU Utilization:
-   - Adjust batch size
-   - Enable kernel optimizations
-   - Monitor with nvidia-smi
+3. **Component Issues**:
+   - Verify component configurations match model dimensions
+   - Check device placement
+   - Monitor component-specific losses
 
-## Training Results
+## Advanced Usage
 
-Expected training metrics:
-- Loss convergence in 3-5 epochs
-- GPU utilization > 90%
-- Memory usage ~85% of available VRAM
+See `examples/` directory for:
+- Custom training loops
+- Component ablation studies
+- Performance benchmarks
+- Integration examples
 
-Save trained model:
-```python
-torch.save(model.state_dict(), "final_model.pt")
-```
-
-Load trained model:
-```python
-model = load_model(config_path, pretrained_path="final_model.pt")
-```
-
-## Support
-
-For training issues and questions:
-1. Check the documentation
-2. Search existing issues in the [official repository](https://github.com/VishwamAI/VishwamAI)
-3. Create a new issue if needed
+For more details, visit our [GitHub repository](https://github.com/VishwamAI/VishwamAI).

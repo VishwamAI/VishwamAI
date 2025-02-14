@@ -19,16 +19,34 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
-# Training outputs
+# Project-specific
 output/
 pretrain_output/
-runs/
+finetune_output/
 final_model/
-checkpoints/
-*.pt
 model_checkpoint.pt
+*.pt
 status.txt
+runs/
+checkpoints/
+
+# Training data
+datasets/
+data/
+cache/
+gsm8k/
+math/
+*.cache
+*.parquet
+*.arrow
+*.bin
+
+# Colab
+*.ipynb_checkpoints
+drive/
+content/
 
 # Environment
 .env
@@ -43,15 +61,25 @@ ENV/
 *.swp
 *.swo
 
-# Logs and data
+# Logs and temp files
 *.log
 logs/
-data/
-datasets/
-cache/
-*.cache
+tmp/
+temp/
 wandb/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Documentation drafts
+docs/_build/
+*.bak
+*.draft
+_temp/
+
+# Research
+Research/
+papers/
+notes/
+references/

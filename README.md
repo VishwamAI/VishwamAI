@@ -2,6 +2,9 @@
 
 VishwamAI is a high-performance transformer model with cache augmentation, neural memory, and tree of thoughts reasoning capabilities.
 
+## Official Repository
+https://github.com/VishwamAI/VishwamAI
+
 ## Features
 
 - Multi-head Linear Attention with cache augmentation
@@ -14,7 +17,8 @@ VishwamAI is a high-performance transformer model with cache augmentation, neura
 ## Installation
 
 ```bash
-git clone https://github.com/kasinadhsarma/VishwamAI.git
+# Clone from official repository
+git clone https://github.com/VishwamAI/VishwamAI.git
 cd VishwamAI
 pip install -e .
 ```
@@ -83,7 +87,7 @@ with torch.inference_mode():
     output = model(tokens)
 ```
 
-For more examples, see `vishwamai/examples/model_usage.py`.
+For more examples, see `vishwamai/examples/model_examples.py`.
 
 ## File Structure
 
@@ -130,9 +134,16 @@ config['optimization_config']['use_flash_attention'] = True
 config['optimization_config']['use_kernel_optimizations'] = True
 ```
 
+## Documentation
+
+- `SETUP.md`: Detailed setup instructions
+- `TRAINING.md`: Training documentation
+- `MODEL_CARD.md`: Model specifications
+- Examples directory: Usage examples
+
 ## Contributing
 
-1. Fork the repository
+1. Fork the official repository
 2. Create your feature branch
 3. Implement your changes
 4. Submit a pull request

@@ -1,0 +1,137 @@
+groups:
+  - name: vishwamai_alerts
+    rules:
+      # Performance Alerts
+      - alert: HighLatency
+        expr: rate(inference_latency_seconds_sum[5m]) / rate(inference_latency_seconds_count[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High inference latency
+          description: "Average inference latency is above 100ms for 5 minutes"
+
+      - alert: HighGPUUtilization
+        expr: gpu_utilization_percent > 95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: High GPU utilization
+          description: "GPU utilization above 95% for 10 minutes"
+
+      - alert: HighMemoryUsage
+        expr: nvidia_smi_memory_used_bytes / nvidia_smi_memory_total_bytes * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High GPU memory usage
+          description: "GPU memory usage is above 90% for 5 minutes"
+
+      # Error Monitoring
+      - alert: HighErrorRate
+        expr: rate(inference_errors_total[5m]) / rate(inference_requests_total[5m]) * 100 > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: High error rate
+          description: "Error rate is above 1% for 5 minutes"
+
+      - alert: ModelLoadFailure
+        expr: model_load_success == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Model failed to load
+          description: "Model initialization or loading has failed"
+
+      # Resource Health
+      - alert: NodeDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Node is down
+          description: "Service node has been down for 5 minutes"
+
+      - alert: GPUDown
+        expr: nvidia_smi_gpu_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GPU is unavailable
+          description: "GPU device is not responding or unavailable"
+
+      # Throughput Alerts
+      - alert: LowThroughput
+        expr: rate(inference_requests_total[5m]) < 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Low request throughput
+          description: "Request throughput is below expected threshold"
+
+      # Security Alerts
+      - alert: SecureEnclaveFailure
+        expr: secure_enclave_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Secure enclave failure
+          description: "Confidential computing enclave has failed"
+
+      # Cache Performance
+      - alert: CacheHitRateLow
+        expr: rate(cache_hits_total[5m]) / rate(cache_requests_total[5m]) < 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Low cache hit rate
+          description: "Cache hit rate is below 50% for 15 minutes"
+
+      # Memory Transformer Issues
+      - alert: MemoryTransformerError
+        expr: memory_transformer_errors_total > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Memory transformer errors detected
+          description: "Neural memory component is experiencing errors"
+
+      # Tree of Thoughts Issues
+      - alert: TreeSearchFailure
+        expr: tree_search_failures_total > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Tree search failures detected
+          description: "Multiple tree of thoughts search failures occurred"
+
+      # Infrastructure
+      - alert: HighCPUUsage
+        expr: rate(process_cpu_seconds_total[5m]) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: High CPU usage
+          description: "CPU usage is above 80% for 10 minutes"
+
+      - alert: APIEndpointDown
+        expr: probe_success{job="vishwamai"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: API endpoint is down
+          description: "API health check endpoint is not responding"

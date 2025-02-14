@@ -6,7 +6,7 @@
     "intermediate_size": 32768,
     "num_attention_heads": 64,
     "num_hidden_layers": 120,
-    "max_position_embeddings": 8192,
+    "max_position_embeddings": 32768,
     "tree_depth": 8,
     "branch_factor": 32,
     "use_conceptual_tokens": true,
@@ -33,11 +33,46 @@
         "use_memory_efficient_attention": true
     },
     "training_config": {
-        "learning_rate": 1e-5,
-        "weight_decay": 0.1,
+        "learning_rate": 1.2e-4,
+        "weight_decay": 0.01,
         "beta1": 0.9,
         "beta2": 0.95,
         "grad_clip": 1.0,
-        "warmup_steps": 5000
+        "warmup_steps": 1000
+    },
+    "colab_specific": {
+        "A100_optimized": {
+            "batch_size": 4,
+            "gradient_accumulation": 4,
+            "memory_size": 2048,
+            "tree_beam_width": 4,
+            "use_flash_attention": true,
+            "use_memory_efficient_attention": true,
+            "gradient_checkpointing": true,
+            "bf16": true,
+            "fp16": false
+        },
+        "V100_optimized": {
+            "batch_size": 2,
+            "gradient_accumulation": 8,
+            "memory_size": 1024,
+            "tree_beam_width": 2,
+            "use_flash_attention": true,
+            "use_memory_efficient_attention": true,
+            "gradient_checkpointing": true,
+            "bf16": false,
+            "fp16": true
+        },
+        "T4_optimized": {
+            "batch_size": 1,
+            "gradient_accumulation": 16,
+            "memory_size": 512,
+            "tree_beam_width": 1,
+            "use_flash_attention": false,
+            "use_memory_efficient_attention": true,
+            "gradient_checkpointing": true,
+            "bf16": false,
+            "fp16": true
+        }
     }
 }

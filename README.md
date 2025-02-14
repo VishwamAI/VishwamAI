@@ -1,155 +1,142 @@
-# VishwamAI: Enhanced Transformer with Advanced Reasoning Capabilities
+# VishwamAI
 
-VishwamAI is a state-of-the-art language model that incorporates several advanced mechanisms for improved reasoning, memory retention, and computational efficiency.
+VishwamAI is a high-performance transformer model with cache augmentation, neural memory, and tree of thoughts reasoning capabilities.
 
-## Model Description
+## Features
 
-VishwamAI extends the transformer architecture with three key innovations:
-
-1. **Differentiable Cache Augmentation**
-   - Enriches the transformer's key-value cache with learnable latent embeddings
-   - Enables asynchronous reasoning and better memory utilization
-   - Uses gated connections for selective updating
-
-2. **Neural Long-Term Memory**
-   - Explicit memory layers with read/write/forget gates
-   - Multi-head memory attention for improved information retrieval
-   - Hierarchical memory architecture for better information organization
-
-3. **Tree of Thoughts Reasoning**
-   - Explores multiple reasoning paths simultaneously
-   - Uses beam search to maintain promising solution paths
-   - Scores intermediate steps for better decision making
-
-## Model Architecture
-
-- Base Architecture: Transformer with Mixture of Experts
-- Context Length: 32,768 tokens
-- Hidden Size: 8,192
-- Number of Attention Heads: 64
-- Number of Layers: 120
-- Vocabulary Size: 64,000
-- Parameter Count: 671B
-
-## Training
-
-The model is trained on a diverse set of datasets:
-
-- [GSM8K](https://huggingface.co/datasets/openai/gsm8k): Grade school math problems
-- [MMLU](https://huggingface.co/datasets/cais/mmlu): Multi-task language understanding
-- [MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro): Advanced professional knowledge
-- [MMMLU](https://huggingface.co/datasets/openai/MMMLU): Massive multi-task language understanding
-
-Training optimizations include:
-- FP8 precision support
-- Fully Sharded Data Parallel (FSDP) training
-- Gradient checkpointing
-- Mixed precision training
-- CPU offloading support
-
-## Performance
-
-Current demo model training and evaluation in progress. Full performance metrics will be added after completion of training.
+- Multi-head Linear Attention with cache augmentation
+- Neural Memory Transformer integration
+- Tree of Thoughts reasoning
+- GPU-optimized implementation
+- Automatic configuration based on GPU type
+- Support for T4, V100, and A100 GPUs
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/VishwamAI.git
+git clone https://github.com/kasinadhsarma/VishwamAI.git
 cd VishwamAI
-pip install -r requirements.txt
+pip install -e .
 ```
 
-## Usage
+## Training
 
-Basic usage:
+### Training on Google Colab
+
+1. Open `colab_train.ipynb` in Google Colab
+2. Select GPU runtime: Runtime > Change runtime type > GPU
+3. Run all cells in order
+
+### Local Training
+
+1. Make the training script executable:
+```bash
+chmod +x vishwamai/scripts/pretrain.sh
+```
+
+2. Start training:
+```bash
+./vishwamai/scripts/pretrain.sh \
+    -b 4 \           # Batch size
+    -e 3 \           # Number of epochs
+    -o ./output \    # Output directory
+    -c configs/config_optimized.json  # Model config
+```
+
+### GPU-Specific Configurations
+
+The model automatically detects your GPU and applies optimized settings:
+
+- T4 GPU (16GB):
+  - Dimension: 1536
+  - Batch size: 2
+  - Sequence length: 1024
+  - FP16 precision
+
+- V100 GPU (32GB):
+  - Dimension: 2048
+  - Batch size: 4
+  - Sequence length: 2048
+  - FP16 precision
+
+- A100 GPU (40/80GB):
+  - Dimension: 2048
+  - Batch size: 8
+  - Sequence length: 4096
+  - FP8 precision
+
+## Model Usage
 
 ```python
 from vishwamai.model_utils import load_model
 
-# Load model
-model = load_model("path/to/config.json", device="cuda")
-
-# Generate output
-input_ids = tokenizer.encode("Your input text", return_tensors="pt")
-output = model(input_ids)
-```
-
-Training:
-
-```python
-from vishwamai.trainer import Trainer, TrainingArgs
-from vishwamai.model_utils import load_model
-
-# Load model
-model = load_model("path/to/config.json", device="cuda")
-
-# Initialize trainer
-trainer = Trainer(
-    model=model,
-    train_dataloader=train_dataloader,
-    eval_dataloader=eval_dataloader,
-    args=TrainingArgs(
-        output_dir="checkpoints",
-        num_epochs=3,
-        batch_size=32,
-        learning_rate=1e-4,
-        use_fsdp=True,
-        mixed_precision=True
-    )
+# Load model with optimized settings
+model = load_model(
+    config_path="configs/config_optimized.json",
+    device="cuda"
 )
 
-# Train
-trainer.train()
+# Example inference
+import torch
+tokens = torch.randint(0, model.args.vocab_size, (1, 128)).cuda()
+with torch.inference_mode():
+    output = model(tokens)
 ```
 
-## Key Features
+For more examples, see `vishwamai/examples/model_usage.py`.
 
-1. **Enhanced Memory and Reasoning**
-   - Long-term memory retention through neural memory module
-   - Tree of thoughts for improved reasoning capabilities
-   - Differentiable cache for better context utilization
+## File Structure
 
-2. **Efficient Training**
-   - FP8 and mixed precision support
-   - Distributed training with FSDP
-   - Gradient checkpointing
-   - CPU offloading options
+```
+vishwamai/
+├── configs/              # Model configurations
+├── examples/             # Usage examples
+├── scripts/             # Training scripts
+├── model.py             # Core model implementation
+├── model_utils.py       # Model utilities
+├── cache_augmentation.py # Cache augmentation
+├── neural_memory.py     # Neural memory
+└── tree_of_thoughts.py  # Tree of thoughts
+```
 
-3. **Advanced Architecture**
-   - Mixture of Experts for specialized processing
-   - Multi-head latent attention
-   - Dynamic position embeddings
+## Training Data
+
+The model can be trained on various datasets:
+- GSM8K for mathematical reasoning
+- MMLU for multi-task learning
+- Custom datasets (see examples)
+
+## Performance Optimization
+
+1. Memory Optimization:
+```python
+# Enable gradient checkpointing
+model.gradient_checkpointing_enable()
+
+# Disable caching for training
+model = load_model(config_path, use_cache=False)
+```
+
+2. Training Speed:
+```bash
+# Use larger batch size with gradient accumulation
+./vishwamai/scripts/pretrain.sh -b 8 --gradient_accumulation_steps 4
+```
+
+3. GPU Utilization:
+```python
+# Enable flash attention and optimized kernels
+config['optimization_config']['use_flash_attention'] = True
+config['optimization_config']['use_kernel_optimizations'] = True
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch
+3. Implement your changes
+4. Submit a pull request
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Citation
-
-If you use this model in your research, please cite:
-
-```bibtex
-@software{vishwamai2024,
-  author = {Your Team},
-  title = {VishwamAI: Enhanced Transformer with Advanced Reasoning Capabilities},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/yourusername/VishwamAI}
-}
-```
-
-## Limitations
-
-This is a demo version under active development. Current limitations include:
-- Training is still in progress
-- Performance metrics are preliminary
-- Not all features are fully optimized
-
-## Future Work
-
-- Complete training on full dataset
-- Add support for more languages
-- Enhance Tree of Thoughts reasoning
-- Optimize memory usage
-- Add more specialized experts
-- Improve inference speed
+This project is licensed under the MIT License - see the LICENSE file for details.

@@ -1,45 +1,67 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Simple pretraining script for VishwamAI model
 
-# Enable strict mode
-set -euo pipefail
+# Default values
+BATCH_SIZE=4
+EPOCHS=3
+OUTPUT_DIR="./pretrain_output"
+CONFIG_PATH="configs/config_optimized.json"
 
-# Script directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PROJECT_ROOT="$SCRIPT_DIR/../.."
-
-# Check for Hugging Face token
-if [ -z "${HF_TOKEN:-}" ]; then
-    echo "Error: HF_TOKEN environment variable is not set"
-    echo "Please set your Hugging Face token first:"
-    echo "export HF_TOKEN='your_token_here'"
+# Function to display usage
+usage() {
+    echo "Usage: $0 [-b BATCH_SIZE] [-e EPOCHS] [-o OUTPUT_DIR] [-c CONFIG_PATH]"
+    echo "Options:"
+    echo "  -b : Batch size (default: 4)"
+    echo "  -e : Number of epochs (default: 3)"
+    echo "  -o : Output directory (default: ./pretrain_output)"
+    echo "  -c : Config file path (default: configs/config_optimized.json)"
     exit 1
-fi
+}
 
-# Check Python version
-if ! command -v python3 &> /dev/null; then
-    echo "Python3 is required but not installed. Aborting."
-    exit 1
-fi
+# Parse command line arguments
+while getopts "b:e:o:c:h" opt; do
+    case $opt in
+        b) BATCH_SIZE=$OPTARG ;;
+        e) EPOCHS=$OPTARG ;;
+        o) OUTPUT_DIR=$OPTARG ;;
+        c) CONFIG_PATH=$OPTARG ;;
+        h) usage ;;
+        ?) usage ;;
+    esac
+done
 
-# Install required packages
-echo "Installing packages..."
-python3 -m pip install --upgrade pip
+# Create output directory
+mkdir -p $OUTPUT_DIR
 
-# Install PyTorch with CUDA support if available
-if command -v nvidia-smi &> /dev/null; then
-    echo "Installing PyTorch (GPU version)..."
-    python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# Start training
+echo "Starting pretraining with:"
+echo "Batch size: $BATCH_SIZE"
+echo "Epochs: $EPOCHS"
+echo "Output directory: $OUTPUT_DIR"
+echo "Config path: $CONFIG_PATH"
+
+# Set environment variables for better GPU utilization
+export CUDA_VISIBLE_DEVICES=0
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCH_SHOW_CPP_STACKTRACES=1
+
+# Run training script
+python -m vishwamai.examples.train_model \
+    --config_path $CONFIG_PATH \
+    --output_dir $OUTPUT_DIR \
+    --epochs $EPOCHS \
+    --train_dataset "gsm8k" \
+    --eval_dataset "cais/mmlu" \
+    --disable_cache
+
+# Save training completion status
+if [ $? -eq 0 ]; then
+    echo "Training completed successfully" > $OUTPUT_DIR/status.txt
+    echo "$(date)" >> $OUTPUT_DIR/status.txt
 else
-    echo "Installing PyTorch (CPU version)..."
-    python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+    echo "Training failed" > $OUTPUT_DIR/status.txt
+    echo "$(date)" >> $OUTPUT_DIR/status.txt
 fi
 
-# Install other requirements
-echo "Installing other dependencies..."
-python3 -m pip install transformers datasets huggingface-hub accelerate
-python3 -m pip install tqdm pandas numpy scikit-learn
-
-echo "Running training script..."
-python3 "$PROJECT_ROOT/vishwamai/examples/pretrain_and_upload.py"
-
-echo "Training complete!"
+# Print final status
+echo "Training process completed. Check $OUTPUT_DIR/status.txt for details."

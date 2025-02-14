@@ -1,61 +1,50 @@
+#!/usr/bin/env python3
+"""
+Example script showing how to use the VishwamAI model.
+"""
+
 import torch
-from pathlib import Path
-from vishwamai.model_utils import load_model, print_model_size
+from vishwamai.model_utils import load_model, get_gpu_memory
 
 def main():
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Get GPU information
+    gpu_available = torch.cuda.is_available()
+    device = "cuda" if gpu_available else "cpu"
     
-    # Load model with optimized configuration
-    config_path = Path(__file__).parent.parent / "configs" / "config_optimized.json"
-    print("\nLoading model from config:", config_path)
-    
-    # Prepare configuration overrides
-    overrides = {
-        'cache_augmentation.max_length': 2048,
-        'neural_memory.memory_size': 768,
-        'tree_of_thoughts.max_depth': 4
-    }
-    
-    # Load model with overrides
+    if gpu_available:
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = get_gpu_memory()
+        print(f"Using GPU: {gpu_name} ({gpu_memory:.1f} GB)")
+    else:
+        print("Using CPU")
+
+    # Load model with optimized settings
     model = load_model(
-        config_path=config_path,
-        device=device,
-        **overrides
-    )
-    
-    print("\nModel loaded successfully!")
-    print_model_size(model)
-    
-    # Example input
-    batch_size = 1
-    seq_length = 128
-    input_ids = torch.randint(
-        0,
-        model.args.vocab_size,
-        (batch_size, seq_length),
+        config_path="configs/config_optimized.json",
         device=device
     )
-    
-    print(f"\nProcessing input sequence of length {seq_length}")
+    print(f"Model loaded with {sum(p.numel() for p in model.parameters())/1e6:.1f}M parameters")
+
+    # Example input
+    input_text = "What is 2+2?"
+    tokens = torch.randint(0, model.args.vocab_size, (1, 128)).to(device)  # Placeholder for actual tokenization
     
     # Generate output
     with torch.inference_mode():
-        output = model(input_ids)
-    
-    print("\nOutput shape:", output.shape)
-    print("Output dtype:", output.dtype)
-    
-    # Example of memory reset
-    print("\nResetting memory states...")
-    for layer in model.layers:
-        if hasattr(layer, 'memory'):
-            layer.memory.reset_memory()
-        if hasattr(layer, 'cache'):
-            layer.cache.reset_cache()
-    
-    print("\nDone!")
+        output = model(tokens)
+    print(f"Output shape: {output.shape}")
+
+    # Example of saving model
+    torch.save(model.state_dict(), "model_checkpoint.pt")
+    print("Model saved to model_checkpoint.pt")
+
+    # Load saved model
+    new_model = load_model(
+        config_path="configs/config_optimized.json",
+        device=device,
+        pretrained_path="model_checkpoint.pt"
+    )
+    print("Model loaded from checkpoint")
 
 if __name__ == "__main__":
     main()

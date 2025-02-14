@@ -20,6 +20,7 @@ wheels/
 .installed.cfg
 *.egg
 
+<<<<<<< HEAD
 # Checkpoints and model files
 pretrain_checkpoints/
 vishwamai_pretrained/
@@ -34,10 +35,19 @@ env/
 .venv/
 
 # IDE
+=======
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs and editors
+>>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
 .idea/
 .vscode/
 *.swp
 *.swo
+<<<<<<< HEAD
 *~
 
 # Logs and databases
@@ -85,3 +95,34 @@ processed/
 .Trashes
 ehthumbs.db
 Thumbs.db
+=======
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# PyTorch / ML
+*.pt
+*.pth
+*.onnx
+.torch/
+lightning_logs/
+wandb/
+
+# Project-specific
+*.vocab
+*.model
+*.bin
+logs/
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+
+data.jsonl
+>>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8

@@ -8,7 +8,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, weight_dequant, fp8_gemm
+<<<<<<< HEAD
 from .triton_cpu_kernels import TritonLinearCPU, triton_layer_norm
+=======
+>>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
 from cache_augmentation import CacheConfig, DifferentiableCacheAugmentation
 from neural_memory import ReasoningMemoryTransformer
 from tree_of_thoughts import TreeConfig, TreeOfThoughts
@@ -110,8 +113,29 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         return y
 
 
+<<<<<<< HEAD
 class Linear(TritonLinearCPU):
     """CPU-optimized linear layer using Triton kernels"""
+=======
+class Linear(nn.Module):
+    dtype = torch.bfloat16
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        if self.weight.element_size() == 1:
+            scale_out_features = (out_features + block_size - 1) // block_size
+            scale_in_features = (in_features + block_size - 1) // block_size
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+        else:
+            self.register_parameter("scale", None)
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+>>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return linear(x, self.weight, self.bias)
@@ -149,12 +173,18 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+<<<<<<< HEAD
         
     def forward(self, x: torch.Tensor):
         if x.device.type == 'cpu':
             return triton_layer_norm(x, self.weight, None, self.eps)
         else:
             return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+=======
+
+    def forward(self, x: torch.Tensor):
+        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+>>>>>>> 664a65d18f9ae53580c24ad1a1d3e163304f2cc8
 
 
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:

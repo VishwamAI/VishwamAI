@@ -41,6 +41,21 @@ class VishwamAIPretrainer(Trainer):
                 mixed_precision=True
             )
 
+    def initialize_components():
+        print("Initializing model and components...")
+        clear_gpu_memory()
+
+        # Initialize main model with 8-bit quantization for T4
+        model_args = ModelArgs(**model_config)
+        model = Transformer(model_args)
+        
+        # Initialize memory transformer with revised parameters
+        memory_module = ReasoningMemoryTransformer(
+            hidden_size=model_config["dim"],  # This will now work correctly
+            num_heads=model_config["n_heads"],
+            dropout=0.1
+        )
+
     def compute_loss(self, model: PreTrainedModel, inputs: Dict[str, torch.Tensor], return_outputs=False):
         """Custom loss computation incorporating memory, tree search and cache."""
         

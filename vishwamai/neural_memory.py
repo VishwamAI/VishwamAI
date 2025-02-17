@@ -1,111 +1,141 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
 import math
-from dataclasses import dataclass
-from typing import Optional
 
-@dataclass
-class MemoryConfig:
-    hidden_size: int = 8192
-    memory_size: int = 2048
-    num_memory_layers: int = 3
-    num_attention_heads: int = 32
-    intermediate_size: int = 16384
-    dropout: float = 0.1
-
-class ReasoningMemoryTransformer(nn.Module):
-    """Neural memory implementation using transformer architecture for structured reasoning."""
-    
-    def __init__(self, config: Optional[MemoryConfig] = None):
+class NeuralMemory(nn.Module):
+    def __init__(self, memory_size: int, hidden_dim: int = 768):
         super().__init__()
-        self.config = config or MemoryConfig()
         
-        # Memory embeddings
-        self.memory_embeddings = nn.Parameter(
-            torch.randn(self.config.memory_size, self.config.hidden_size)
-        )
+        self.memory_size = memory_size
+        self.hidden_dim = hidden_dim
         
-        # Multi-head attention layers
-        self.memory_layers = nn.ModuleList([
-            nn.MultiheadAttention(
-                embed_dim=self.config.hidden_size,
-                num_heads=self.config.num_attention_heads,
-                dropout=self.config.dropout,
-                batch_first=True
-            )
-            for _ in range(self.config.num_memory_layers)
-        ])
+        # Memory components
+        self.memory_keys = nn.Parameter(torch.randn(memory_size, hidden_dim))
+        self.memory_values = nn.Parameter(torch.randn(memory_size, hidden_dim))
         
-        # Layer norms and feedforward networks
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(self.config.hidden_size)
-            for _ in range(self.config.num_memory_layers * 2)
-        ])
+        # Memory update components
+        self.key_transform = nn.Linear(hidden_dim, hidden_dim)
+        self.value_transform = nn.Linear(hidden_dim, hidden_dim)
+        self.query_transform = nn.Linear(hidden_dim, hidden_dim)
         
-        self.ffns = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.config.hidden_size, self.config.intermediate_size),
-                nn.GELU(),
-                nn.Dropout(self.config.dropout),
-                nn.Linear(self.config.intermediate_size, self.config.hidden_size),
-                nn.Dropout(self.config.dropout)
-            )
-            for _ in range(self.config.num_memory_layers)
-        ])
+        # Memory control gates
+        self.write_gate = nn.Linear(hidden_dim * 2, 1)
+        self.read_gate = nn.Linear(hidden_dim * 2, 1)
         
-        # Output projection
-        self.output_projection = nn.Linear(
-            self.config.hidden_size, self.config.hidden_size, bias=False
-        )
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self._init_parameters()
         
-        self.dropout = nn.Dropout(self.config.dropout)
+    def _init_parameters(self):
+        """Initialize memory parameters"""
+        nn.init.normal_(self.memory_keys, mean=0.0, std=0.02)
+        nn.init.normal_(self.memory_values, mean=0.0, std=0.02)
         
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Process hidden states through memory-augmented layers."""
-        batch_size = hidden_states.size(0)
-        
-        # Expand memory embeddings for batch
-        memory = self.memory_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Process through memory layers
-        for i in range(self.config.num_memory_layers):
-            # Self attention
-            normed_memory = self.layer_norms[i*2](memory)
-            attn_output, _ = self.memory_layers[i](
-                query=normed_memory,
-                key=normed_memory,
-                value=normed_memory
-            )
-            memory = memory + self.dropout(attn_output)
+        # Initialize transformation matrices
+        for module in [self.key_transform, self.value_transform, self.query_transform]:
+            nn.init.normal_(module.weight, std=0.02)
+            nn.init.zeros_(module.bias)
             
-            # Feedforward
-            normed_memory = self.layer_norms[i*2 + 1](memory)
-            ff_output = self.ffns[i](normed_memory)
-            memory = memory + ff_output
-            
-        # Cross attention with input hidden states
-        output, _ = self.memory_layers[-1](
-            query=hidden_states,
-            key=memory,
-            value=memory
-        )
+        # Initialize gates
+        for gate in [self.write_gate, self.read_gate]:
+            nn.init.normal_(gate.weight, std=0.02)
+            nn.init.zeros_(gate.bias)
+    
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        update_memory: bool = True
+    ) -> torch.Tensor:
+        """Process inputs through neural memory"""
         
-        # Project outputs
-        output = self.output_projection(output)
+        batch_size = inputs.size(0)
+        
+        # Transform inputs
+        queries = self.query_transform(inputs)
+        keys = self.key_transform(inputs)
+        values = self.value_transform(inputs)
+        
+        # Memory attention
+        memory_scores = torch.matmul(queries, self.memory_keys.T)
+        memory_scores = memory_scores / math.sqrt(self.hidden_dim)
+        memory_attention = F.softmax(memory_scores, dim=-1)
+        
+        # Read from memory
+        read_values = torch.matmul(memory_attention, self.memory_values)
+        
+        # Apply read gate
+        read_gate_input = torch.cat([inputs, read_values], dim=-1)
+        read_gate = torch.sigmoid(self.read_gate(read_gate_input))
+        gated_read = read_values * read_gate
+        
+        # Update memory if required
+        if update_memory and self.training:
+            self._update_memory(keys, values, memory_attention)
+        
+        # Combine with input
+        output = self.layer_norm(inputs + gated_read)
         
         return output
     
-    def save_pretrained(self, save_path: str):
-        """Save memory components."""
-        torch.save({
-            'config': self.config,
-            'state_dict': self.state_dict()
-        }, f"{save_path}/neural_memory.pt")
+    def _update_memory(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attention_weights: torch.Tensor
+    ):
+        """Update memory with new information"""
         
-    @classmethod
-    def from_pretrained(cls, load_path: str):
-        """Load memory components."""
-        checkpoint = torch.load(f"{load_path}/neural_memory.pt")
-        model = cls(config=checkpoint['config'])
-        model.load_state_dict(checkpoint['state_dict'])
-        return model
+        # Calculate update strength
+        update_gate = torch.sigmoid(self.write_gate(
+            torch.cat([keys, values], dim=-1)
+        ))
+        
+        # Calculate memory updates
+        key_update = torch.matmul(attention_weights.transpose(1, 0), keys)
+        value_update = torch.matmul(attention_weights.transpose(1, 0), values)
+        
+        # Apply updates
+        key_update = key_update * update_gate
+        value_update = value_update * update_gate
+        
+        self.memory_keys.data = self.memory_keys * (1 - update_gate) + key_update
+        self.memory_values.data = self.memory_values * (1 - update_gate) + value_update
+    
+    def reset_memory(self):
+        """Reset memory to initial state"""
+        nn.init.normal_(self.memory_keys, mean=0.0, std=0.02)
+        nn.init.normal_(self.memory_values, mean=0.0, std=0.02)
+    
+    def get_memory_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return current memory state"""
+        return self.memory_keys.detach(), self.memory_values.detach()
+    
+    def set_memory_state(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor
+    ):
+        """Set memory state to provided values"""
+        assert keys.size() == self.memory_keys.size()
+        assert values.size() == self.memory_values.size()
+        
+        self.memory_keys.data.copy_(keys)
+        self.memory_values.data.copy_(values)
+    
+    def state_dict(self, *args, **kwargs):
+        """Save memory state"""
+        state_dict = super().state_dict(*args, **kwargs)
+        state_dict['memory_size'] = self.memory_size
+        state_dict['hidden_dim'] = self.hidden_dim
+        return state_dict
+    
+    def load_state_dict(self, state_dict):
+        """Load memory state"""
+        memory_size = state_dict.pop('memory_size')
+        hidden_dim = state_dict.pop('hidden_dim')
+        
+        assert memory_size == self.memory_size
+        assert hidden_dim == self.hidden_dim
+        
+        super().load_state_dict(state_dict)

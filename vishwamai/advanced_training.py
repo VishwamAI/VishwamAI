@@ -10,9 +10,10 @@ from .neural_memory import NeuralMemory
 from .cache_augmentation import CacheAugmentation
 from .MoE import MoEConfig, create_moe_layer
 from .tree_of_thoughts import TreeOfThoughts, TreeConfig, RewardConfig
+from .curriculum import CurriculumScheduler, CurriculumConfig
 
 class AdvancedTrainer:
-    """Advanced trainer implementing MoE, neural memory, and cache augmentation."""
+    """Advanced trainer implementing MoE, neural memory, cache augmentation, and curriculum learning."""
     
     def __init__(
         self,
@@ -22,7 +23,8 @@ class AdvancedTrainer:
         memory_size: int = 1024,
         cache_size: int = 512,
         tot_config: Optional[TreeConfig] = None,
-        reward_config: Optional[RewardConfig] = None
+        reward_config: Optional[RewardConfig] = None,
+        curriculum_config: Optional[CurriculumConfig] = None
     ):
         """
         Initialize the advanced trainer.
@@ -33,19 +35,26 @@ class AdvancedTrainer:
             device: Device to train on
             memory_size: Size of neural memory
             cache_size: Size of cache
+            tot_config: Tree of Thoughts configuration
+            reward_config: Reward configuration
+            curriculum_config: Curriculum learning configuration
         """
         self.model = model
         self.config = config
         self.device = device
         
-        # Initialize Tree of Thoughts
+        # Initialize Tree of Thoughts and Curriculum Learning
         self.tot_config = tot_config or TreeConfig()
         self.reward_config = reward_config or RewardConfig()
+        self.curriculum_config = curriculum_config or CurriculumConfig()
+        
         self.tot = TreeOfThoughts(
             model=model,
             config=self.tot_config,
             reward_config=self.reward_config
         ).to(device)
+        
+        self.curriculum_scheduler = CurriculumScheduler(self.curriculum_config)
         
         # Initialize memory and cache with hierarchical structure
         self.memory = NeuralMemory(
@@ -152,33 +161,303 @@ class AdvancedTrainer:
             num_training_steps=num_training_steps
         )
     
-    def _collect_expert_metrics(self) -> Dict:
+    def train_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        gradient_accumulation: bool = True
+    ) -> Dict[str, Any]:
         """
-        Collect MoE expert usage and balance metrics.
+        Execute single training step with MoE support and curriculum learning.
         
+        Args:
+            batch: Training batch
+            gradient_accumulation: Whether to use gradient accumulation
+            
         Returns:
-            Dict containing expert usage statistics and load balancing metrics
+            Dict containing training statistics
         """
-        expert_metrics = {}
-        
-        for name, module in self.model.named_modules():
-            if hasattr(module, 'gate') and hasattr(module.gate, 'expert_counts'):
-                expert_counts = module.gate.expert_counts.detach().cpu()
-                total_tokens = expert_counts.sum().item()
-                expert_usage = expert_counts / total_tokens
+        try:
+            # Get inputs and estimate difficulty
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            labels = batch.get('labels')
+            if labels is not None:
+                labels = labels.to(self.device)
                 
-                # Calculate load balancing metrics
-                cv = torch.std(expert_usage) / torch.mean(expert_usage)
+            # Estimate task difficulty and apply curriculum constraints
+            difficulty_score, difficulty_metrics = self.curriculum_scheduler.estimate_task_difficulty(
+                input_ids, attention_mask
+            )
+            curriculum_params = self.curriculum_scheduler.get_curriculum_params()
+            
+            # Apply curriculum constraints
+            max_length = curriculum_params['sequence_length']
+            if input_ids.size(1) > max_length:
+                input_ids = input_ids[:, :max_length]
+                attention_mask = attention_mask[:, :max_length]
+                if labels is not None:
+                    labels = labels[:, :max_length]
+                    
+            # Adjust Tree of Thoughts depth based on curriculum
+            self.tot_config.max_depth = curriculum_params['reasoning_steps']
+            
+            # Enable gradient checkpointing if configured
+            if self.gradient_checkpointing:
+                self.model.gradient_checkpointing_enable()
                 
-                expert_metrics[f'{name}_metrics'] = {
-                    'usage_std': torch.std(expert_usage).item(),
-                    'usage_cv': cv.item(),
-                    'max_usage': torch.max(expert_usage).item(),
-                    'min_usage': torch.min(expert_usage).item(),
-                    'expert_counts': expert_counts.tolist()
-                }
+            # Clear gradients
+            self.optimizer.zero_grad()
+            self.memory_optimizer.zero_grad()
+            
+            # Forward pass with deep calculation and memory management
+            with torch.cuda.amp.autocast() if self.mixed_precision else nullcontext():
+                loss, logits = self.deep_calculation_step(
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    difficulty_score
+                )
+            
+            # Handle loss scaling and backward pass
+            self._handle_backward_pass(loss, gradient_accumulation)
+            
+            # Update training state
+            self.training_steps += 1
+            self._update_batch_size(loss.item())
+            
+            # Collect metrics and update curriculum
+            stats = self._collect_training_stats(loss, logits)
+            stats.update({
+                'difficulty_score': difficulty_score,
+                'curriculum_level': self.curriculum_scheduler.get_current_difficulty(),
+                'difficulty_metrics': difficulty_metrics
+            })
+            
+            # Update curriculum based on performance
+            curriculum_advanced = self.curriculum_scheduler.update({
+                'loss': loss.item(),
+                'accuracy': (logits.argmax(-1) == labels).float().mean().item() if labels is not None else 0.0
+            })
+            
+            stats['curriculum_advanced'] = curriculum_advanced
+            return stats
+            
+        except Exception as e:
+            print(f"Error in training step: {str(e)}")
+            raise
+
+    def deep_calculation_step(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        difficulty_score: float = 0.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Perform deep calculation step with MoE support.
         
-        return expert_metrics
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            labels: Optional labels
+            difficulty_score: Task difficulty score from curriculum
+            
+        Returns:
+            Tuple of (total_loss, logits)
+        """
+        # Tree of thoughts exploration
+        thoughts = self._explore_thoughts(input_ids, attention_mask)
+        
+        # Neural memory augmentation
+        memory_output = self.memory(input_ids)
+        augmented_input = self._augment_with_memory(input_ids, memory_output)
+        
+        # Get initial hidden states
+        with torch.no_grad():
+            initial_hidden = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            ).hidden_states[-1]
+        
+        # Process through Tree of Thoughts with difficulty-aware reasoning
+        tot_hidden, reasoning_steps = self._process_with_tot(
+            initial_hidden, 
+            attention_mask,
+            max_steps=int(self.tot_config.max_depth * (1 + difficulty_score))
+        )
+        
+        # Cache-based knowledge integration
+        cache_info = self.cache.retrieve(input_ids)
+        enriched_input = self._integrate_cache_knowledge(tot_hidden, cache_info)
+        
+        try:
+            # Forward pass with advanced attention
+            outputs = self.model(
+                input_ids=enriched_input,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_attentions=True,
+                output_hidden_states=True
+            )
+            
+            # Loss calculation with difficulty-aware weighting
+            base_loss = outputs.loss
+            memory_loss = self._calculate_memory_loss(memory_output, outputs.hidden_states[-1])
+            cache_loss = self._calculate_cache_loss(cache_info, outputs.hidden_states[-1])
+            thought_loss = self._calculate_thought_loss(thoughts, outputs.logits)
+            
+            # Scale loss components based on difficulty
+            memory_scale = 1.0 + 0.5 * difficulty_score
+            cache_scale = 1.0 + 0.3 * difficulty_score
+            thought_scale = 1.0 + 0.7 * difficulty_score
+            
+            # Tree of Thoughts loss
+            tot_loss = torch.tensor(0.0, device=self.device)
+            if reasoning_steps:
+                tot_rewards = [self.tot.reward_function(step['state'], step['operation']) 
+                             for step in reasoning_steps]
+                tot_loss = -torch.mean(torch.stack(tot_rewards))
+            
+            # MoE auxiliary loss
+            moe_loss = self._calculate_moe_loss()
+            
+            # Combined loss with curriculum-aware scaling
+            total_loss = (
+                base_loss +
+                memory_loss * memory_scale +
+                cache_loss * cache_scale +
+                thought_loss * thought_scale +
+                moe_loss +
+                tot_loss * self.tot_config.reward_gamma
+            )
+            
+            return total_loss, outputs.logits
+            
+        except RuntimeError as e:
+            print(f"Error in deep calculation step: {str(e)}")
+            raise
+
+    def _collect_training_stats(
+        self,
+        loss: torch.Tensor,
+        logits: torch.Tensor
+    ) -> Dict[str, Any]:
+        """Collect comprehensive training statistics with curriculum metrics."""
+        expert_metrics = self._collect_expert_metrics()
+        self.expert_usage_history.append(expert_metrics)
+        
+        stats = {
+            'loss': loss.item(),
+            'logits': logits,
+            'lr': self.scheduler.get_last_lr()[0],
+            'batch_size': self.current_batch_size,
+            'memory_usage': self._get_memory_usage(),
+            'moe_metrics': expert_metrics,
+            'memory_stats': self.memory.get_memory_state(),
+            'cache_stats': self.cache.get_cache_stats(),
+            'training_step': self.training_steps,
+            'gradient_norm': self._get_gradient_norm(),
+            'curriculum_stats': {
+                'current_difficulty': self.curriculum_scheduler.get_current_difficulty(),
+                'samples_at_level': self.curriculum_scheduler.samples_at_level,
+                'performance_history': self.curriculum_scheduler.performance_history[-5:]
+            },
+            'tot_stats': {
+                'num_nodes': len(list(self.tot._get_leaf_nodes([]))),
+                'avg_depth': sum(n.depth for n in self.tot._get_leaf_nodes([])) / 
+                           max(1, len(list(self.tot._get_leaf_nodes([])))),
+                'avg_uncertainty': sum(n.uncertainty for n in self.tot._get_leaf_nodes([])) /
+                                max(1, len(list(self.tot._get_leaf_nodes([]))))
+            }
+        }
+        
+        if hasattr(self.model, 'moe_loss'):
+            stats['moe_loss'] = self.model.moe_loss.item()
+            
+        return stats
+
+    def _calculate_moe_loss(self) -> torch.Tensor:
+        """Calculate MoE-specific losses."""
+        moe_loss = torch.tensor(0.0, device=self.device)
+        
+        if hasattr(self.model, 'moe_loss') and self.model.moe_loss is not None:
+            moe_loss = self.model.moe_loss * self.moe_aux_loss_weight
+            
+            # Add expert load balancing loss
+            expert_metrics = self._collect_expert_metrics()
+            if expert_metrics:
+                avg_cv = np.mean([m['usage_cv'] for m in expert_metrics.values()])
+                load_balance_loss = avg_cv * self.expert_load_balance_weight
+                moe_loss += load_balance_loss
+                
+        return moe_loss
+
+    def _handle_backward_pass(self, loss: torch.Tensor, gradient_accumulation: bool):
+        """Handle backward pass with mixed precision support."""
+        if gradient_accumulation:
+            loss = loss / self.gradient_accumulation_steps
+            
+        if self.mixed_precision:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            self._clip_gradients()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self._clip_gradients()
+            self.optimizer.step()
+            
+        self.memory_optimizer.step()
+        self.scheduler.step()
+
+    def _clip_gradients(self):
+        """Apply gradient clipping."""
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.config.get('max_grad_norm', 1.0)
+        )
+
+    def _get_memory_usage(self) -> Dict[str, float]:
+        """Get current GPU memory usage."""
+        return {
+            'allocated': torch.cuda.memory_allocated(self.device) / 1024**2,  # MB
+            'cached': torch.cuda.memory_reserved(self.device) / 1024**2,  # MB
+            'max_allocated': torch.cuda.max_memory_allocated(self.device) / 1024**2  # MB
+        }
+
+    def _get_gradient_norm(self) -> float:
+        """Calculate total gradient norm."""
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        return math.sqrt(total_norm)
+
+    def _process_with_tot(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_steps: Optional[int] = None
+    ) -> Tuple[torch.Tensor, List[Dict]]:
+        """
+        Process hidden states through Tree of Thoughts reasoning.
+        
+        Args:
+            hidden_states: Input hidden states
+            attention_mask: Attention mask
+            max_steps: Optional maximum number of reasoning steps
+            
+        Returns:
+            Tuple of (processed hidden states, reasoning steps)
+        """
+        outputs = self.tot(hidden_states)
+        best_nodes = self.tot._get_leaf_nodes(outputs)
+        if best_nodes:
+            best_node = max(best_nodes, key=lambda x: x.score)
+            return best_node.state, best_node.reasoning_steps
+        return hidden_states, []
 
     def _explore_thoughts(
         self,
@@ -312,250 +591,9 @@ class AdvancedTrainer:
                 self.batch_size_history.append(self.current_batch_size)
                 self.last_batch_size_update = self.training_steps
 
-    def _process_with_tot(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, List[Dict]]:
-        """Process hidden states through Tree of Thoughts reasoning."""
-        outputs = self.tot(hidden_states)
-        best_nodes = self.tot._get_leaf_nodes(outputs)
-        if best_nodes:
-            best_node = max(best_nodes, key=lambda x: x.score)
-            return best_node.state, best_node.reasoning_steps
-        return hidden_states, []
-
-    def deep_calculation_step(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Perform deep calculation step with MoE support.
-        
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            labels: Optional labels
-            
-        Returns:
-            Tuple of (total_loss, logits)
-        """
-        # Tree of thoughts exploration
-        thoughts = self._explore_thoughts(input_ids, attention_mask)
-        
-        # Neural memory augmentation
-        memory_output = self.memory(input_ids)
-        augmented_input = self._augment_with_memory(input_ids, memory_output)
-        
-        # Get initial hidden states
-        with torch.no_grad():
-            initial_hidden = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            ).hidden_states[-1]
-        
-        # Process through Tree of Thoughts
-        tot_hidden, reasoning_steps = self._process_with_tot(initial_hidden, attention_mask)
-        
-        # Cache-based knowledge integration
-        cache_info = self.cache.retrieve(input_ids)
-        enriched_input = self._integrate_cache_knowledge(tot_hidden, cache_info)
-        
-        try:
-            # Forward pass with advanced attention
-            outputs = self.model(
-                input_ids=enriched_input,
-                attention_mask=attention_mask,
-                labels=labels,
-                output_attentions=True,
-                output_hidden_states=True
-            )
-            
-            # Loss calculation
-            base_loss = outputs.loss
-            memory_loss = self._calculate_memory_loss(memory_output, outputs.hidden_states[-1])
-            cache_loss = self._calculate_cache_loss(cache_info, outputs.hidden_states[-1])
-            thought_loss = self._calculate_thought_loss(thoughts, outputs.logits)
-            
-            # Tree of Thoughts loss
-            tot_loss = torch.tensor(0.0, device=self.device)
-            if reasoning_steps:
-                tot_rewards = [self.tot.reward_function(step['state'], step['operation']) 
-                             for step in reasoning_steps]
-                tot_loss = -torch.mean(torch.stack(tot_rewards))
-            
-            # MoE auxiliary loss
-            moe_loss = self._calculate_moe_loss()
-            
-            # Combined loss
-            total_loss = (
-                base_loss +
-                memory_loss +
-                cache_loss +
-                thought_loss +
-                moe_loss +
-                tot_loss * self.tot_config.reward_gamma
-            )
-            
-            return total_loss, outputs.logits
-            
-        except RuntimeError as e:
-            print(f"Error in deep calculation step: {str(e)}")
-            raise
-
-    def _calculate_moe_loss(self) -> torch.Tensor:
-        """Calculate MoE-specific losses."""
-        moe_loss = torch.tensor(0.0, device=self.device)
-        
-        if hasattr(self.model, 'moe_loss') and self.model.moe_loss is not None:
-            moe_loss = self.model.moe_loss * self.moe_aux_loss_weight
-            
-            # Add expert load balancing loss
-            expert_metrics = self._collect_expert_metrics()
-            if expert_metrics:
-                avg_cv = np.mean([m['usage_cv'] for m in expert_metrics.values()])
-                load_balance_loss = avg_cv * self.expert_load_balance_weight
-                moe_loss += load_balance_loss
-                
-        return moe_loss
-
-    def train_step(
-        self,
-        batch: Dict[str, torch.Tensor],
-        gradient_accumulation: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Execute single training step with MoE support.
-        
-        Args:
-            batch: Training batch
-            gradient_accumulation: Whether to use gradient accumulation
-            
-        Returns:
-            Dict containing training statistics
-        """
-        try:
-            # Get inputs
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            labels = batch.get('labels')
-            if labels is not None:
-                labels = labels.to(self.device)
-                
-            # Enable gradient checkpointing if configured
-            if self.gradient_checkpointing:
-                self.model.gradient_checkpointing_enable()
-                
-            # Clear gradients
-            self.optimizer.zero_grad()
-            self.memory_optimizer.zero_grad()
-            
-            # Forward pass with deep calculation and memory management
-            with torch.cuda.amp.autocast() if self.mixed_precision else nullcontext():
-                loss, logits = self.deep_calculation_step(
-                    input_ids,
-                    attention_mask,
-                    labels
-                )
-            
-            # Handle loss scaling and backward pass
-            self._handle_backward_pass(loss, gradient_accumulation)
-            
-            # Update training state
-            self.training_steps += 1
-            self._update_batch_size(loss.item())
-            
-            # Collect metrics
-            stats = self._collect_training_stats(loss, logits)
-            
-            return stats
-            
-        except Exception as e:
-            print(f"Error in training step: {str(e)}")
-            raise
-
-    def _handle_backward_pass(self, loss: torch.Tensor, gradient_accumulation: bool):
-        """Handle backward pass with mixed precision support."""
-        if gradient_accumulation:
-            loss = loss / self.gradient_accumulation_steps
-            
-        if self.mixed_precision:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            self._clip_gradients()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            self._clip_gradients()
-            self.optimizer.step()
-            
-        self.memory_optimizer.step()
-        self.scheduler.step()
-
-    def _clip_gradients(self):
-        """Apply gradient clipping."""
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.config.get('max_grad_norm', 1.0)
-        )
-
-    def _collect_training_stats(
-        self,
-        loss: torch.Tensor,
-        logits: torch.Tensor
-    ) -> Dict[str, Any]:
-        """Collect comprehensive training statistics."""
-        expert_metrics = self._collect_expert_metrics()
-        self.expert_usage_history.append(expert_metrics)
-        
-        stats = {
-            'loss': loss.item(),
-            'logits': logits,
-            'lr': self.scheduler.get_last_lr()[0],
-            'batch_size': self.current_batch_size,
-            'memory_usage': self._get_memory_usage(),
-            'moe_metrics': expert_metrics,
-            'memory_stats': self.memory.get_memory_state(),
-            'cache_stats': self.cache.get_cache_stats(),
-            'training_step': self.training_steps,
-            'gradient_norm': self._get_gradient_norm(),
-            'tot_stats': {
-                'num_nodes': len(list(self.tot._get_leaf_nodes([]))),
-                'avg_depth': sum(n.depth for n in self.tot._get_leaf_nodes([])) / 
-                           max(1, len(list(self.tot._get_leaf_nodes([])))),
-                'avg_uncertainty': sum(n.uncertainty for n in self.tot._get_leaf_nodes([])) /
-                                max(1, len(list(self.tot._get_leaf_nodes([]))))
-            }
-        }
-        
-        if hasattr(self.model, 'moe_loss'):
-            stats['moe_loss'] = self.model.moe_loss.item()
-            
-        return stats
-
-    def _get_memory_usage(self) -> Dict[str, float]:
-        """Get current GPU memory usage."""
-        return {
-            'allocated': torch.cuda.memory_allocated(self.device) / 1024**2,  # MB
-            'cached': torch.cuda.memory_reserved(self.device) / 1024**2,  # MB
-            'max_allocated': torch.cuda.max_memory_allocated(self.device) / 1024**2  # MB
-        }
-
-    def _get_gradient_norm(self) -> float:
-        """Calculate total gradient norm."""
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        return math.sqrt(total_norm)
-
     def save_checkpoint(self, path: str):
         """
-        Save training checkpoint with MoE state.
+        Save training checkpoint with MoE state and curriculum state.
         
         Args:
             path: Path to save checkpoint
@@ -568,8 +606,12 @@ class AdvancedTrainer:
                 'memory_state': self.memory.state_dict(),
                 'cache_state': self.cache.state_dict(),
                 'tot_state': self.tot.state_dict(),
+                'curriculum_state': self.curriculum_scheduler.state_dict(),
                 'scaler_state': self.scaler.state_dict() if self.mixed_precision else None,
-                'config': self.config,
+                'config': {
+                    **self.config,
+                    'curriculum_config': self.curriculum_config.__dict__
+                },
                 'training_state': {
                     'steps': self.training_steps,
                     'loss_history': self.loss_history,
@@ -585,7 +627,7 @@ class AdvancedTrainer:
 
     def load_checkpoint(self, path: str):
         """
-        Load training checkpoint with MoE state.
+        Load training checkpoint with MoE state and curriculum state.
         
         Args:
             path: Path to load checkpoint from
@@ -600,10 +642,18 @@ class AdvancedTrainer:
             self.cache.load_state_dict(checkpoint['cache_state'])
             self.tot.load_state_dict(checkpoint['tot_state'])
             
+            if 'curriculum_state' in checkpoint:
+                self.curriculum_scheduler.load_state_dict(checkpoint['curriculum_state'])
+            
             if self.mixed_precision and checkpoint['scaler_state']:
                 self.scaler.load_state_dict(checkpoint['scaler_state'])
                 
-            self.config.update(checkpoint['config'])
+            if 'config' in checkpoint:
+                self.config.update(checkpoint['config'])
+                if 'curriculum_config' in checkpoint['config']:
+                    self.curriculum_config = CurriculumConfig(
+                        **checkpoint['config']['curriculum_config']
+                    )
             
             # Restore training state
             training_state = checkpoint.get('training_state', {})

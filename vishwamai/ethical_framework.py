@@ -294,3 +294,70 @@ class EthicalFramework(nn.Module):
         self.decision_history = []
         self.ethical_violations = []
         self.intervention_history = []
+    
+    def integrate_with_trainer(self, trainer):
+        """Integrate ethical framework with advanced trainer."""
+        self.trainer = trainer
+        self.trainer.ethical_framework = self
+
+    def update_forward(self, decision_state: torch.Tensor, context: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Updated forward method to include new advancements.
+        
+        Args:
+            decision_state: Current decision state tensor
+            context: Optional context information
+            
+        Returns:
+            Tuple of (modified state, ethical metrics)
+        """
+        batch_size = decision_state.size(0)
+        
+        # Evaluate each ethical principle
+        principle_scores = {}
+        for principle in EthicalPrinciple:
+            score = self.ethical_evaluator[principle.name](decision_state)
+            principle_scores[principle.name] = score
+            
+        # Check value alignment
+        alignment_scores = self.value_alignment_checker(decision_state)
+        
+        # Generate explanation if transparency is needed
+        explanation = None
+        if self._needs_explanation(principle_scores):
+            explanation_context = torch.cat([
+                decision_state,
+                context if context is not None else torch.zeros_like(decision_state)
+            ], dim=-1)
+            explanation = self.explanation_generator(explanation_context)
+            
+        # Calculate overall ethical score
+        weighted_scores = [
+            score.mean() * self.config.principle_weights[principle]
+            for principle, score in zip(EthicalPrinciple, principle_scores.values())
+        ]
+        ethical_score = torch.stack(weighted_scores).sum()
+        
+        # Track decision
+        self._track_decision(ethical_score, principle_scores)
+        
+        # Check if intervention is needed
+        needs_intervention = ethical_score < self.config.intervention_threshold
+        if needs_intervention:
+            decision_state = self._intervene(decision_state, principle_scores)
+            self.intervention_history.append({
+                'state': decision_state.detach(),
+                'scores': {k: v.item() for k, v in principle_scores.items()},
+                'step': len(self.decision_history)
+            })
+            
+        metrics = {
+            'ethical_score': ethical_score.item(),
+            'principle_scores': {k: v.mean().item() for k, v in principle_scores.items()},
+            'alignment_score': alignment_scores.mean().item(),
+            'needs_intervention': needs_intervention,
+            'has_explanation': explanation is not None,
+            'num_violations': len(self.ethical_violations)
+        }
+        
+        return decision_state, metrics

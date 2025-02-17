@@ -115,6 +115,19 @@ inference:
         - "kv_cache_hit_rate"
         - "memory_importance_scores"
         - "cache_promotion_rate"
+        - "generation_progress"
+        - "batch_throughput"
+        - "model_performance"
+        - "expert_utilization"
+      performance_tracking:
+        enabled: true
+        interval: 5  # seconds
+        metrics:
+          - "throughput"
+          - "latency"
+          - "gpu_utilization"
+          - "memory_usage"
+          - "cache_hit_rate"
     profiling:
       enabled: true
       granularity: "op_level"
@@ -131,6 +144,8 @@ inference:
       port: 8000
       rate_limit: 1000
       timeout: 30
+      batch_size_limit: 32
+      progress_tracking: true
     grpc:
       port: 8001
       max_message_size: 100MB
@@ -138,12 +153,26 @@ inference:
       enabled: true
       max_connections: 1000
 
+  generation:
+    max_steps: 100
+    eos_token_id: 2  # End of sequence token ID
+    progress_tracking:
+      enabled: true
+      update_interval: 1  # steps
+      websocket_enabled: true
+    batch_processing:
+      enabled: true
+      max_batch_size: 32
+      dynamic_batching: true
+      timeout: 100  # ms
+      
   optimization:
     compiler_flags:
       - "fast_math"
       - "loop_unroll"
       - "vectorize"
       - "flash_attention"
+      - "batch_gemm"
     memory_planning:
       strategy: "dynamic"
       prefetch: true

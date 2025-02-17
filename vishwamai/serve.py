@@ -94,7 +94,7 @@ class RateLimiter:
 
 class InferenceRequest(BaseModel):
     """Request model for inference."""
-    text: str
+    text: str | List[str]  # Support batch inference
     max_length: int = Field(default=2048, le=4096)
     temperature: float = Field(default=0.7, gt=0, le=1)
     top_p: float = Field(default=0.9, gt=0, le=1)
@@ -102,6 +102,7 @@ class InferenceRequest(BaseModel):
     stream: bool = Field(default=False)
     use_cache: bool = Field(default=True)
     secure_compute: bool = Field(default=False)
+    return_progress: bool = Field(default=False)  # Return generation progress
     
     @validator('text')
     def validate_text(cls, v):
@@ -114,11 +115,13 @@ class InferenceRequest(BaseModel):
 
 class InferenceResponse(BaseModel):
     """Response model for inference."""
-    generated_text: str
+    generated_text: str | List[str]  # Support batch inference
     metrics: InferenceMetrics
     secure_enclave_verified: Optional[bool] = None
     request_id: str
     cached: bool = False
+    progress: Optional[float] = None  # Generation progress (0-1)
+    performance_stats: Optional[Dict[str, float]] = None  # Model performance stats
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -293,20 +296,28 @@ async def health_check():
             detail="Health check failed"
         )
 
-@app.get("/config")
-async def get_config():
+@app.get("/model/config")
+async def get_model_config():
     """
     Get model and server configuration.
     
     Returns:
         Dict containing configuration details
     """
+    # Get model stats
+    model_stats = {
+        "type": "VishwamAI",
+        "size": f"{sum(p.numel() for p in app.state.model.parameters())/1e9:.1f}B parameters",
+        "version": "1.0.0",
+        "performance": {
+            "throughput": REQUEST_COUNT._value.get() / max(time.time() - app.state.start_time, 1),
+            "avg_latency": REQUEST_LATENCY._sum.get() / max(REQUEST_LATENCY._count.get(), 1),
+            "cache_hit_rate": app.state.engine.get_cache_hit_rate()
+        }
+    }
+    
     return {
-        "model": {
-            "type": "VishwamAI",
-            "size": f"{sum(p.numel() for p in app.state.model.parameters())/1e9:.1f}B parameters",
-            "version": "1.0.0"
-        },
+        "model": model_stats,
         "features": {
             "secure_compute": app.state.engine.config["inference"]["security"]["confidential_computing"]["enabled"],
             "streaming": True,

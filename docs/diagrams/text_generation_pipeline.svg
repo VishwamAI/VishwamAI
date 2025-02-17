@@ -1,0 +1,158 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900">
+    <!-- Definitions for gradients and filters -->
+    <defs>
+        <!-- Gradients for sections -->
+        <linearGradient id="inputGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#e3f2fd;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#bbdefb;stop-opacity:1" />
+        </linearGradient>
+        <linearGradient id="reasoningGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#f3e5f5;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#e1bee7;stop-opacity:1" />
+        </linearGradient>
+        <linearGradient id="generationGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#ffebee;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#ffcdd2;stop-opacity:1" />
+        </linearGradient>
+        
+        <!-- Drop shadow filter -->
+        <filter id="dropShadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+            <feOffset dx="2" dy="2" result="offsetblur"/>
+            <feComponentTransfer>
+                <feFuncA type="linear" slope="0.2"/>
+            </feComponentTransfer>
+            <feMerge>
+                <feMergeNode/>
+                <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+        </filter>
+
+        <!-- Arrow marker with gradient -->
+        <marker id="arrowhead" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto">
+            <path d="M0,0 L12,4 L0,8" fill="#2196f3"/>
+        </marker>
+    </defs>
+
+    <!-- Background -->
+    <rect width="1200" height="900" fill="#fafafa"/>
+
+    <!-- Title with modern typography -->
+    <text x="600" y="60" font-family="Arial, sans-serif" font-size="32" fill="#1a237e" text-anchor="middle" font-weight="bold" filter="url(#dropShadow)">
+        VishwamAI Text Generation Pipeline
+    </text>
+
+    <!-- Input Processing Section -->
+    <g transform="translate(50, 100)">
+        <text x="20" y="30" font-family="Arial, sans-serif" font-size="20" fill="#1565c0" font-weight="600">Input Processing</text>
+        <rect x="20" y="50" width="240" height="100" rx="15" fill="url(#inputGradient)" filter="url(#dropShadow)"/>
+        <text x="140" y="100" font-family="Arial, sans-serif" font-size="18" fill="#1565c0" text-anchor="middle">
+            Tokenization
+            <tspan x="140" y="125" font-size="14">Text to Token Conversion</tspan>
+        </text>
+        
+        <rect x="300" y="50" width="240" height="100" rx="15" fill="url(#inputGradient)" filter="url(#dropShadow)"/>
+        <text x="420" y="100" font-family="Arial, sans-serif" font-size="18" fill="#1565c0" text-anchor="middle">
+            Context Embedding
+            <tspan x="420" y="125" font-size="14">Semantic Encoding</tspan>
+        </text>
+    </g>
+
+    <!-- Reasoning Pipeline -->
+    <g transform="translate(50, 270)">
+        <text x="20" y="30" font-family="Arial, sans-serif" font-size="20" fill="#4a148c" font-weight="600">Reasoning Pipeline</text>
+        <rect x="20" y="50" width="240" height="120" rx="15" fill="url(#reasoningGradient)" filter="url(#dropShadow)"/>
+        <text x="140" y="100" font-family="Arial, sans-serif" font-size="18" fill="#4a148c" text-anchor="middle">
+            Tree Search
+            <tspan x="140" y="125" font-size="14">Multi-path Exploration</tspan>
+            <tspan x="140" y="145" font-size="14">Thought Generation</tspan>
+        </text>
+
+        <rect x="300" y="50" width="240" height="120" rx="15" fill="url(#reasoningGradient)" filter="url(#dropShadow)"/>
+        <text x="420" y="100" font-family="Arial, sans-serif" font-size="18" fill="#4a148c" text-anchor="middle">
+            Memory Lookup
+            <tspan x="420" y="125" font-size="14">Context Retrieval</tspan>
+            <tspan x="420" y="145" font-size="14">Pattern Matching</tspan>
+        </text>
+
+        <rect x="580" y="50" width="240" height="120" rx="15" fill="url(#reasoningGradient)" filter="url(#dropShadow)"/>
+        <text x="700" y="100" font-family="Arial, sans-serif" font-size="18" fill="#4a148c" text-anchor="middle">
+            Expert Selection
+            <tspan x="700" y="125" font-size="14">MoE Routing</tspan>
+            <tspan x="700" y="145" font-size="14">Specialized Processing</tspan>
+        </text>
+    </g>
+
+    <!-- Generation Process -->
+    <g transform="translate(50, 460)">
+        <text x="20" y="30" font-family="Arial, sans-serif" font-size="20" fill="#b71c1c" font-weight="600">Generation Process</text>
+        <rect x="20" y="50" width="280" height="140" rx="15" fill="url(#generationGradient)" filter="url(#dropShadow)"/>
+        <text x="160" y="100" font-family="Arial, sans-serif" font-size="18" fill="#b71c1c" text-anchor="middle">
+            Token Generation
+            <tspan x="160" y="125" font-size="14">Autoregressive Decoding</tspan>
+            <tspan x="160" y="145" font-size="14">Beam Search</tspan>
+        </text>
+
+        <rect x="340" y="50" width="280" height="140" rx="15" fill="url(#generationGradient)" filter="url(#dropShadow)"/>
+        <text x="480" y="100" font-family="Arial, sans-serif" font-size="18" fill="#b71c1c" text-anchor="middle">
+            Response Refinement
+            <tspan x="480" y="125" font-size="14">Quality Filtering</tspan>
+            <tspan x="480" y="145" font-size="14">Coherence Check</tspan>
+        </text>
+    </g>
+
+    <!-- Output Processing -->
+    <g transform="translate(50, 670)">
+        <text x="20" y="30" font-family="Arial, sans-serif" font-size="20" fill="#1a237e" font-weight="600">Output Processing</text>
+        <rect x="20" y="50" width="280" height="120" rx="15" fill="url(#inputGradient)" filter="url(#dropShadow)"/>
+        <text x="160" y="100" font-family="Arial, sans-serif" font-size="18" fill="#1a237e" text-anchor="middle">
+            Text Formatting
+            <tspan x="160" y="125" font-size="14">Structure Alignment</tspan>
+            <tspan x="160" y="145" font-size="14">Style Application</tspan>
+        </text>
+
+        <rect x="340" y="50" width="280" height="120" rx="15" fill="url(#inputGradient)" filter="url(#dropShadow)"/>
+        <text x="480" y="100" font-family="Arial, sans-serif" font-size="18" fill="#1a237e" text-anchor="middle">
+            Quality Assurance
+            <tspan x="480" y="125" font-size="14">Validation Checks</tspan>
+            <tspan x="480" y="145" font-size="14">Confidence Scoring</tspan>
+        </text>
+    </g>
+
+    <!-- Connecting Arrows -->
+    <!-- Vertical Connections -->
+    <path d="M140,250 L140,320" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M420,250 L420,320" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M140,440 L140,510" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M420,440 L420,510" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M700,440 L700,510" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M160,650 L160,720" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M480,650 L480,720" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+
+    <!-- Horizontal Connections -->
+    <path d="M260,150 L300,150" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M260,370 L300,370" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M540,370 L580,370" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M300,580 L340,580" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+    <path d="M300,780 L340,780" stroke="#2196f3" stroke-width="3" marker-end="url(#arrowhead)" fill="none"/>
+
+    <!-- Modern Legend -->
+    <g transform="translate(850, 460)">
+        <rect x="0" y="0" width="300" height="300" rx="15" fill="white" filter="url(#dropShadow)"/>
+        <text x="20" y="40" font-family="Arial, sans-serif" font-size="18" fill="#1a237e" font-weight="600">Pipeline Components</text>
+        
+        <g transform="translate(20, 60)">
+            <rect x="0" y="10" width="30" height="30" rx="5" fill="url(#inputGradient)"/>
+            <text x="45" y="30" font-family="Arial, sans-serif" font-size="14">Input Processing</text>
+            
+            <rect x="0" y="50" width="30" height="30" rx="5" fill="url(#reasoningGradient)"/>
+            <text x="45" y="70" font-family="Arial, sans-serif" font-size="14">Reasoning</text>
+            
+            <rect x="0" y="90" width="30" height="30" rx="5" fill="url(#generationGradient)"/>
+            <text x="45" y="110" font-family="Arial, sans-serif" font-size="14">Generation</text>
+            
+            <rect x="0" y="130" width="30" height="30" rx="5" fill="url(#inputGradient)"/>
+            <text x="45" y="150" font-family="Arial, sans-serif" font-size="14">Output Processing</text>
+        </g>
+    </g>
+</svg>

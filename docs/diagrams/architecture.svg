@@ -1,117 +1,145 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg width="1200" height="800" xmlns="http://www.w3.org/2000/svg">
-    <!-- Background -->
-    <rect width="1200" height="800" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900">
+    <!-- Enhanced styling with modern gradients -->
+    <defs>
+        <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#ffffff;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#f8fafc;stop-opacity:1" />
+        </linearGradient>
+        
+        <!-- Improved shadow effects -->
+        <filter id="shadowEffect" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="3" dy="3" stdDeviation="4" flood-opacity="0.08"/>
+            <feDropShadow dx="2" dy="2" stdDeviation="2" flood-opacity="0.05"/>
+        </filter>
+        
+        <!-- Gradient for cards -->
+        <linearGradient id="cardGradient1" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#f0f9ff;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#e0f2fe;stop-opacity:1" />
+        </linearGradient>
+        <linearGradient id="cardGradient2" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#f0fdf4;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#dcfce7;stop-opacity:1" />
+        </linearGradient>
+        <linearGradient id="cardGradient3" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#fdf4ff;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#fae8ff;stop-opacity:1" />
+        </linearGradient>
+    </defs>
     
-    <!-- Title -->
-    <text x="600" y="50" font-family="Arial" font-size="24" fill="#333333" text-anchor="middle" font-weight="bold">
+    <!-- Modern background -->
+    <rect width="1200" height="900" fill="url(#bgGradient)"/>
+    
+    <!-- Enhanced title with modern typography -->
+    <text x="600" y="80" font-family="Arial, sans-serif" font-size="36" fill="#0f172a" text-anchor="middle" font-weight="bold">
         VishwamAI Architecture
+        <tspan x="600" y="120" font-size="16" fill="#64748b" font-weight="normal">Next Generation AI System Design</tspan>
     </text>
-
-    <!-- Core Components Section -->
-    <g transform="translate(100, 100)">
-        <!-- Section Title -->
-        <text x="0" y="0" font-family="Arial" font-size="18" fill="#666666">Core Components</text>
-        
-        <!-- Tree of Thoughts -->
-        <rect x="50" y="20" width="200" height="100" rx="10" fill="#e1f5fe" stroke="#01579b" stroke-width="2"/>
-        <text x="150" y="70" font-family="Arial" font-size="16" fill="#01579b" text-anchor="middle">
-            Tree of Thoughts
-            <tspan x="150" y="90" font-size="12">Reasoning &amp; Search</tspan>
-        </text>
-        
-        <!-- Neural Memory -->
-        <rect x="300" y="20" width="200" height="100" rx="10" fill="#f3e5f5" stroke="#4a148c" stroke-width="2"/>
-        <text x="400" y="70" font-family="Arial" font-size="16" fill="#4a148c" text-anchor="middle">
-            Neural Memory
-            <tspan x="400" y="90" font-size="12">Context Management</tspan>
-        </text>
-        
-        <!-- Cache Augmentation -->
-        <rect x="550" y="20" width="200" height="100" rx="10" fill="#e8f5e9" stroke="#1b5e20" stroke-width="2"/>
-        <text x="650" y="70" font-family="Arial" font-size="16" fill="#1b5e20" text-anchor="middle">
-            Cache Augmentation
-            <tspan x="650" y="90" font-size="12">Knowledge Storage</tspan>
-        </text>
-    </g>
-
-    <!-- Training System Section -->
-    <g transform="translate(100, 300)">
-        <!-- Section Title -->
-        <text x="0" y="0" font-family="Arial" font-size="18" fill="#666666">Training System</text>
-        
-        <!-- Advanced Trainer -->
-        <rect x="50" y="20" width="300" height="120" rx="10" fill="#fff3e0" stroke="#e65100" stroke-width="2"/>
-        <text x="200" y="60" font-family="Arial" font-size="16" fill="#e65100" text-anchor="middle">
-            Advanced Trainer
-            <tspan x="200" y="80" font-size="12">Component Integration</tspan>
-            <tspan x="200" y="100" font-size="12">Mixed Precision &amp; Distributed Training</tspan>
-        </text>
-        
-        <!-- Curriculum Learning -->
-        <rect x="400" y="20" width="300" height="120" rx="10" fill="#ffebee" stroke="#b71c1c" stroke-width="2"/>
-        <text x="550" y="60" font-family="Arial" font-size="16" fill="#b71c1c" text-anchor="middle">
-            Curriculum Learning
-            <tspan x="550" y="80" font-size="12">Progressive Difficulty</tspan>
-            <tspan x="550" y="100" font-size="12">Dynamic Task Selection</tspan>
-        </text>
-    </g>
-
-    <!-- Reward System Section -->
-    <g transform="translate(100, 500)">
-        <!-- Section Title -->
-        <text x="0" y="0" font-family="Arial" font-size="18" fill="#666666">Reward System</text>
-        
-        <!-- SLAP -->
-        <rect x="50" y="20" width="250" height="100" rx="10" fill="#e3f2fd" stroke="#0d47a1" stroke-width="2"/>
-        <text x="175" y="70" font-family="Arial" font-size="16" fill="#0d47a1" text-anchor="middle">
-            SLAP
-            <tspan x="175" y="90" font-size="12">Scaled Learning through Action Prediction</tspan>
-        </text>
-        
-        <!-- Math Reasoning -->
-        <rect x="350" y="20" width="250" height="100" rx="10" fill="#fce4ec" stroke="#880e4f" stroke-width="2"/>
-        <text x="475" y="70" font-family="Arial" font-size="16" fill="#880e4f" text-anchor="middle">
-            Math Reasoning
-            <tspan x="475" y="90" font-size="12">Step Validation &amp; Operation Scoring</tspan>
-        </text>
-    </g>
-
-    <!-- Connection Lines -->
-    <!-- Core Components Connections -->
-    <line x1="350" y1="170" x2="500" y2="170" stroke="#666666" stroke-width="2" stroke-dasharray="5,5"/>
-    <line x1="600" y1="170" x2="750" y2="170" stroke="#666666" stroke-width="2" stroke-dasharray="5,5"/>
     
-    <!-- Vertical Connections -->
-    <line x1="250" y1="220" x2="250" y2="320" stroke="#666666" stroke-width="2" stroke-dasharray="5,5"/>
-    <line x1="550" y1="220" x2="550" y2="320" stroke="#666666" stroke-width="2" stroke-dasharray="5,5"/>
-    <line x1="400" y1="440" x2="400" y2="520" stroke="#666666" stroke-width="2" stroke-dasharray="5,5"/>
+    <!-- Model Foundation - Updated styling -->
+    <g transform="translate(50, 160)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="22" fill="#0f172a" font-weight="600">Model Foundation</text>
+        
+        <rect x="50" y="20" width="240" height="100" rx="16" fill="url(#cardGradient1)" filter="url(#shadowEffect)"/>
+        <text x="170" y="70" font-family="Arial, sans-serif" font-size="20" fill="#0369a1" text-anchor="middle" font-weight="500">Base LLM
+            <tspan x="170" y="95" font-size="15" fill="#0284c7">Transformer Architecture</tspan>
+        </text>
+        
+        <rect x="340" y="20" width="240" height="100" rx="16" fill="url(#cardGradient2)" filter="url(#shadowEffect)"/>
+        <text x="460" y="70" font-family="Arial, sans-serif" font-size="20" fill="#166534" text-anchor="middle" font-weight="500">Mixture of Experts
+            <tspan x="460" y="95" font-size="15" fill="#16a34a">Specialized Processing</tspan>
+        </text>
+    </g>
 
-    <!-- Data Flow Arrows -->
+    <!-- Core Components - Enhanced design -->
+    <g transform="translate(50, 320)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="22" fill="#0f172a" font-weight="600">Core Components</text>
+        
+        <rect x="50" y="20" width="240" height="120" rx="16" fill="url(#cardGradient1)" filter="url(#shadowEffect)"/>
+        <text x="170" y="80" font-family="Arial, sans-serif" font-size="20" fill="#0369a1" text-anchor="middle" font-weight="500">Tree of Thoughts
+            <tspan x="170" y="105" font-size="15" fill="#0284c7">Reasoning &amp; Search</tspan>
+        </text>
+        
+        <rect x="340" y="20" width="240" height="120" rx="16" fill="url(#cardGradient3)" filter="url(#shadowEffect)"/>
+        <text x="460" y="80" font-family="Arial, sans-serif" font-size="20" fill="#9333ea" text-anchor="middle" font-weight="500">Neural Memory
+            <tspan x="460" y="105" font-size="15" fill="#a855f7">Context Management</tspan>
+        </text>
+        
+        <rect x="630" y="20" width="240" height="120" rx="16" fill="url(#cardGradient2)" filter="url(#shadowEffect)"/>
+        <text x="750" y="80" font-family="Arial, sans-serif" font-size="20" fill="#166534" text-anchor="middle" font-weight="500">Cache Augmentation
+            <tspan x="750" y="105" font-size="15" fill="#16a34a">Knowledge Storage</tspan>
+        </text>
+    </g>
+
+    <!-- Training System - Modern layout -->
+    <g transform="translate(50, 500)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="22" fill="#0f172a" font-weight="600">Training System</text>
+        
+        <rect x="50" y="20" width="400" height="140" rx="16" fill="#fff7ed" filter="url(#shadowEffect)"/>
+        <text x="250" y="70" font-family="Arial, sans-serif" font-size="20" fill="#c2410c" text-anchor="middle" font-weight="500">Advanced Trainer
+            <tspan x="250" y="95" font-size="15" fill="#ea580c">Component Integration</tspan>
+            <tspan x="250" y="120" font-size="15" fill="#ea580c">Mixed Precision &amp; Distributed Training</tspan>
+        </text>
+        
+        <rect x="500" y="20" width="400" height="140" rx="16" fill="#fef2f2" filter="url(#shadowEffect)"/>
+        <text x="700" y="70" font-family="Arial, sans-serif" font-size="20" fill="#dc2626" text-anchor="middle" font-weight="500">Curriculum Learning
+            <tspan x="700" y="95" font-size="15" fill="#ef4444">Progressive Difficulty</tspan>
+            <tspan x="700" y="120" font-size="15" fill="#ef4444">Dynamic Task Selection</tspan>
+        </text>
+    </g>
+
+    <!-- Reward System - Updated design -->
+    <g transform="translate(50, 680)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="22" fill="#0f172a" font-weight="600">Reward System</text>
+        
+        <rect x="50" y="20" width="300" height="120" rx="16" fill="url(#cardGradient1)" filter="url(#shadowEffect)"/>
+        <text x="200" y="80" font-family="Arial, sans-serif" font-size="20" fill="#0369a1" text-anchor="middle" font-weight="500">SLAP
+            <tspan x="200" y="105" font-size="15" fill="#0284c7">Scaled Learning through Action Prediction</tspan>
+        </text>
+        
+        <rect x="400" y="20" width="300" height="120" rx="16" fill="#fce7f3" filter="url(#shadowEffect)"/>
+        <text x="550" y="80" font-family="Arial, sans-serif" font-size="20" fill="#be185d" text-anchor="middle" font-weight="500">Math Reasoning
+            <tspan x="550" y="105" font-size="15" fill="#db2777">Step Validation &amp; Operation Scoring</tspan>
+        </text>
+    </g>
+
+    <!-- Modern Legend -->
+    <g transform="translate(850, 680)">
+        <rect x="0" y="0" width="300" height="180" rx="16" fill="white" filter="url(#shadowEffect)"/>
+        <text x="20" y="40" font-family="Arial, sans-serif" font-size="18" fill="#0f172a" font-weight="600">Components</text>
+        
+        <g transform="translate(20, 60)">
+            <circle cx="10" cy="0" r="6" fill="#0369a1"/>
+            <text x="30" y="5" font-family="Arial, sans-serif" font-size="14" fill="#334155">Base Model</text>
+            
+            <circle cx="10" cy="30" r="6" fill="#166534"/>
+            <text x="30" y="35" font-family="Arial, sans-serif" font-size="14" fill="#334155">MoE Processing</text>
+            
+            <circle cx="10" cy="60" r="6" fill="#9333ea"/>
+            <text x="30" y="65" font-family="Arial, sans-serif" font-size="14" fill="#334155">Memory System</text>
+            
+            <circle cx="10" cy="90" r="6" fill="#c2410c"/>
+            <text x="30" y="95" font-family="Arial, sans-serif" font-size="14" fill="#334155">Training System</text>
+            
+            <circle cx="10" cy="120" r="6" fill="#be185d"/>
+            <text x="30" y="125" font-family="Arial, sans-serif" font-size="14" fill="#334155">Reward System</text>
+        </g>
+    </g>
+
+    <!-- Enhanced connecting arrows -->
     <defs>
         <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#666666"/>
+            <polygon points="0 0, 10 3.5, 0 7" fill="#94a3b8"/>
         </marker>
     </defs>
-    <path d="M250,270 Q400,270 400,320" stroke="#666666" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/>
-    <path d="M550,270 Q400,270 400,320" stroke="#666666" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/>
-
-    <!-- Legend -->
-    <g transform="translate(850, 600)">
-        <rect x="0" y="0" width="300" height="150" rx="5" fill="#ffffff" stroke="#cccccc" stroke-width="1"/>
-        <text x="10" y="30" font-family="Arial" font-size="14" fill="#333333">Legend:</text>
-        
-        <!-- Legend Items -->
-        <circle cx="20" y="50" r="5" fill="#01579b"/>
-        <text x="35" y="55" font-family="Arial" font-size="12" fill="#333333">Core Processing</text>
-        
-        <circle cx="20" y="80" r="5" fill="#4a148c"/>
-        <text x="35" y="85" font-family="Arial" font-size="12" fill="#333333">Memory Management</text>
-        
-        <circle cx="20" y="110" r="5" fill="#1b5e20"/>
-        <text x="35" y="115" font-family="Arial" font-size="12" fill="#333333">Knowledge Storage</text>
-        
-        <line x1="150" y1="50" x2="200" y2="50" stroke="#666666" stroke-width="2" stroke-dasharray="5,5"/>
-        <text x="210" y="55" font-family="Arial" font-size="12" fill="#333333">Data Flow</text>
+    
+    <g stroke="#94a3b8" stroke-width="2" stroke-dasharray="4" fill="none">
+        <path d="M170,280 L170,340" marker-end="url(#arrowhead)"/>
+        <path d="M460,280 L460,340" marker-end="url(#arrowhead)"/>
+        <path d="M170,460 Q170,520 250,520" marker-end="url(#arrowhead)"/>
+        <path d="M460,460 Q460,520 460,520" marker-end="url(#arrowhead)"/>
+        <path d="M750,460 Q750,520 700,520" marker-end="url(#arrowhead)"/>
+        <path d="M250,660 L200,700" marker-end="url(#arrowhead)"/>
+        <path d="M700,660 L550,700" marker-end="url(#arrowhead)"/>
     </g>
 </svg>

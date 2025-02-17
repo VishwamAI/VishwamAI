@@ -4,10 +4,10 @@ import torch.distributed as dist
 from typing import Optional
 
 from .model import ModelArgs, world_size, rank, Linear, precompute_freqs_cis
-from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
-from .MLA import MLA
-from .MLP import MLP
-from .MoE import MoE
+from .experimental.parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
+from .experimental.MLA import MLA
+from .experimental.MLP import MLP
+from .experimental.MoE import MoE
 
 class Block(nn.Module):
     """Transformer block combining attention and feed-forward layers."""

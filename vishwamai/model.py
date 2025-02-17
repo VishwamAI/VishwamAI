@@ -4,7 +4,7 @@ import torch.distributed as dist
 from typing import Optional, Literal
 
 from .config import ModelArgs
-from .parallel import Linear, ColumnParallelLinear, RowParallelLinear, RMSNorm, ParallelEmbedding
+from .experimental.parallel import Linear, ColumnParallelLinear, RowParallelLinear, RMSNorm, ParallelEmbedding
 from .utils import precompute_freqs_cis
 
 # Global config variables
@@ -19,9 +19,9 @@ class Block(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         # Import here to avoid circular imports
-        from .MLA import MLA
-        from .MLP import MLP
-        from .MoE import MoE
+        from .experimental.MLA import MLA
+        from .experimental.MLP import MLP
+        from .experimental.MoE import MoE
         
         self.attn = MLA(args)
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)

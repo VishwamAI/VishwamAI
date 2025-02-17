@@ -17,7 +17,7 @@ from opentelemetry import trace, metrics
 from prometheus_client import Counter, Histogram, Gauge
 from stable_baselines3 import PPO
 
-from .MoE import MoEConfig, create_moe_layer
+from .experimental.MoE import MoE
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

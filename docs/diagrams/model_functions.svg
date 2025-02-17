@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900">
+    <!-- Background with subtle gradient -->
+    <defs>
+        <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#f8f9fa;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#f1f3f5;stop-opacity:1" />
+        </linearGradient>
+        <!-- Drop shadow filter -->
+        <filter id="dropShadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+            <feOffset dx="2" dy="2" result="offsetblur"/>
+            <feComponentTransfer>
+                <feFuncA type="linear" slope="0.2"/>
+            </feComponentTransfer>
+            <feMerge>
+                <feMergeNode/>
+                <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+        </filter>
+    </defs>
+
+    <!-- Background -->
+    <rect width="1200" height="900" fill="url(#bgGradient)"/>
+    
+    <!-- Title with modern typography -->
+    <text x="600" y="60" font-family="Arial, sans-serif" font-size="32" fill="#2d3436" text-anchor="middle" font-weight="bold">
+        VishwamAI Model Functions Architecture
+    </text>
+    <line x1="400" y1="75" x2="800" y2="75" stroke="#6c5ce7" stroke-width="3" opacity="0.3"/>
+
+    <!-- Function Mode Controls -->
+    <g transform="translate(50, 120)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="20" fill="#2d3436" font-weight="600">Function Mode Controls</text>
+        
+        <!-- Training Mode -->
+        <g transform="translate(50, 20)" filter="url(#dropShadow)">
+            <rect width="220" height="120" rx="15" fill="#6c5ce7" opacity="0.1"/>
+            <rect x="0" y="0" width="220" height="120" rx="15" fill="#fff" stroke="#6c5ce7" stroke-width="2"/>
+            <text x="110" y="40" font-family="Arial, sans-serif" font-size="18" fill="#6c5ce7" text-anchor="middle" font-weight="600">Training Mode</text>
+            <text x="110" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Gradient Tracking</text>
+            <text x="110" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Dropout Active</text>
+        </g>
+
+        <!-- Inference Mode -->
+        <g transform="translate(300, 20)" filter="url(#dropShadow)">
+            <rect width="220" height="120" rx="15" fill="#00b894" opacity="0.1"/>
+            <rect x="0" y="0" width="220" height="120" rx="15" fill="#fff" stroke="#00b894" stroke-width="2"/>
+            <text x="110" y="40" font-family="Arial, sans-serif" font-size="18" fill="#00b894" text-anchor="middle" font-weight="600">Inference Mode</text>
+            <text x="110" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">No Gradient</text>
+            <text x="110" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Dropout Disabled</text>
+        </g>
+
+        <!-- Debug Mode -->
+        <g transform="translate(550, 20)" filter="url(#dropShadow)">
+            <rect width="220" height="120" rx="15" fill="#ffeaa7" opacity="0.3"/>
+            <rect x="0" y="0" width="220" height="120" rx="15" fill="#fff" stroke="#fdcb6e" stroke-width="2"/>
+            <text x="110" y="40" font-family="Arial, sans-serif" font-size="18" fill="#fdcb6e" text-anchor="middle" font-weight="600">Debug Mode</text>
+            <text x="110" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Full Logging</text>
+            <text x="110" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">State Inspection</text>
+        </g>
+    </g>
+
+    <!-- Error Handling -->
+    <g transform="translate(50, 300)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="20" fill="#2d3436" font-weight="600">Error Handling</text>
+        
+        <!-- Exception Management -->
+        <g transform="translate(50, 20)" filter="url(#dropShadow)">
+            <rect width="270" height="140" rx="15" fill="#ff7675" opacity="0.1"/>
+            <rect x="0" y="0" width="270" height="140" rx="15" fill="#fff" stroke="#ff7675" stroke-width="2"/>
+            <text x="135" y="40" font-family="Arial, sans-serif" font-size="18" fill="#ff7675" text-anchor="middle" font-weight="600">Exception Management</text>
+            <text x="135" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">OOM Protection</text>
+            <text x="135" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Gradient Overflow</text>
+            <text x="135" y="120" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Device Errors</text>
+        </g>
+
+        <!-- Recovery Mechanisms -->
+        <g transform="translate(350, 20)" filter="url(#dropShadow)">
+            <rect width="270" height="140" rx="15" fill="#a29bfe" opacity="0.1"/>
+            <rect x="0" y="0" width="270" height="140" rx="15" fill="#fff" stroke="#a29bfe" stroke-width="2"/>
+            <text x="135" y="40" font-family="Arial, sans-serif" font-size="18" fill="#a29bfe" text-anchor="middle" font-weight="600">Recovery Mechanisms</text>
+            <text x="135" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Checkpoint Recovery</text>
+            <text x="135" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">State Restoration</text>
+            <text x="135" y="120" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Fallback Options</text>
+        </g>
+    </g>
+
+    <!-- Model Functions -->
+    <g transform="translate(50, 480)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="20" fill="#2d3436" font-weight="600">Model Functions</text>
+        
+        <!-- Forward Pass -->
+        <g transform="translate(50, 20)" filter="url(#dropShadow)">
+            <rect width="220" height="140" rx="15" fill="#74b9ff" opacity="0.1"/>
+            <rect x="0" y="0" width="220" height="140" rx="15" fill="#fff" stroke="#74b9ff" stroke-width="2"/>
+            <text x="110" y="40" font-family="Arial, sans-serif" font-size="18" fill="#74b9ff" text-anchor="middle" font-weight="600">Forward Pass</text>
+            <text x="110" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Context Processing</text>
+            <text x="110" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">State Management</text>
+            <text x="110" y="120" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Function Selection</text>
+        </g>
+
+        <!-- Backward Pass -->
+        <g transform="translate(300, 20)" filter="url(#dropShadow)">
+            <rect width="220" height="140" rx="15" fill="#0984e3" opacity="0.1"/>
+            <rect x="0" y="0" width="220" height="140" rx="15" fill="#fff" stroke="#0984e3" stroke-width="2"/>
+            <text x="110" y="40" font-family="Arial, sans-serif" font-size="18" fill="#0984e3" text-anchor="middle" font-weight="600">Backward Pass</text>
+            <text x="110" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Gradient Computation</text>
+            <text x="110" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Memory Management</text>
+            <text x="110" y="120" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Loss Propagation</text>
+        </g>
+
+        <!-- State Updates -->
+        <g transform="translate(550, 20)" filter="url(#dropShadow)">
+            <rect width="220" height="140" rx="15" fill="#fd79a8" opacity="0.1"/>
+            <rect x="0" y="0" width="220" height="140" rx="15" fill="#fff" stroke="#fd79a8" stroke-width="2"/>
+            <text x="110" y="40" font-family="Arial, sans-serif" font-size="18" fill="#fd79a8" text-anchor="middle" font-weight="600">State Updates</text>
+            <text x="110" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Weight Updates</text>
+            <text x="110" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Cache Updates</text>
+            <text x="110" y="120" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Memory Updates</text>
+        </g>
+    </g>
+
+    <!-- Function Flow Control -->
+    <g transform="translate(50, 660)">
+        <text x="0" y="0" font-family="Arial, sans-serif" font-size="20" fill="#2d3436" font-weight="600">Function Flow Control</text>
+        
+        <!-- Flow Controls -->
+        <g transform="translate(50, 20)" filter="url(#dropShadow)">
+            <rect width="270" height="120" rx="15" fill="#55efc4" opacity="0.1"/>
+            <rect x="0" y="0" width="270" height="120" rx="15" fill="#fff" stroke="#55efc4" stroke-width="2"/>
+            <text x="135" y="40" font-family="Arial, sans-serif" font-size="18" fill="#55efc4" text-anchor="middle" font-weight="600">Flow Controls</text>
+            <text x="135" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Context Management</text>
+            <text x="135" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Mode Switching</text>
+        </g>
+
+        <!-- Monitoring -->
+        <g transform="translate(350, 20)" filter="url(#dropShadow)">
+            <rect width="270" height="120" rx="15" fill="#00cec9" opacity="0.1"/>
+            <rect x="0" y="0" width="270" height="120" rx="15" fill="#fff" stroke="#00cec9" stroke-width="2"/>
+            <text x="135" y="40" font-family="Arial, sans-serif" font-size="18" fill="#00cec9" text-anchor="middle" font-weight="600">Monitoring</text>
+            <text x="135" y="70" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Performance Metrics</text>
+            <text x="135" y="95" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" text-anchor="middle">Resource Usage</text>
+        </g>
+    </g>
+    
+    <!-- Legend with modern styling -->
+    <g transform="translate(850, 480)">
+        <rect x="0" y="0" width="300" height="300" rx="15" fill="#fff" filter="url(#dropShadow)"/>
+        <text x="20" y="40" font-family="Arial, sans-serif" font-size="18" fill="#2d3436" font-weight="600">Function Types</text>
+        
+        <!-- Legend items with modern colors -->
+        <g transform="translate(20, 60)">
+            <circle cx="10" cy="15" r="6" fill="#6c5ce7"/>
+            <text x="30" y="20" font-family="Arial, sans-serif" font-size="14" fill="#2d3436">Mode Control</text>
+            
+            <circle cx="10" cy="45" r="6" fill="#ff7675"/>
+            <text x="30" y="50" font-family="Arial, sans-serif" font-size="14" fill="#2d3436">Error Handling</text>
+            
+            <circle cx="10" cy="75" r="6" fill="#74b9ff"/>
+            <text x="30" y="80" font-family="Arial, sans-serif" font-size="14" fill="#2d3436">Core Functions</text>
+            
+            <circle cx="10" cy="105" r="6" fill="#fd79a8"/>
+            <text x="30" y="110" font-family="Arial, sans-serif" font-size="14" fill="#2d3436">State Management</text>
+            
+            <circle cx="10" cy="135" r="6" fill="#55efc4"/>
+            <text x="30" y="140" font-family="Arial, sans-serif" font-size="14" fill="#2d3436">Flow Control</text>
+            
+            <circle cx="10" cy="165" r="6" fill="#00cec9"/>
+            <text x="30" y="170" font-family="Arial, sans-serif" font-size="14" fill="#2d3436">Monitoring</text>
+        </g>
+
+        <!-- Additional legend information -->
+        <line x1="20" y1="200" x2="280" y2="200" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="20" y="230" font-family="Arial, sans-serif" font-size="14" fill="#2d3436" font-weight="600">Flow Direction:</text>
+        <g transform="translate(20, 240)">
+            <line x1="0" y1="10" x2="40" y2="10" stroke="#a0aec0" stroke-width="2" marker-end="url(#arrowhead)"/>
+            <text x="60" y="15" font-family="Arial, sans-serif" font-size="12" fill="#2d3436">Data/Control Flow</text>
+        </g>
+    </g>
+</svg>

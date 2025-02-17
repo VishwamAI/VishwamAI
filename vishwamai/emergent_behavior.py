@@ -207,3 +207,51 @@ class EmergentBehaviorModule(nn.Module):
                 self.config.curiosity_weight *= 0.95  # Reduce exploration
             
             self.config.curiosity_weight = max(0.1, min(0.9, self.config.curiosity_weight))
+    
+    def integrate_with_trainer(self, trainer):
+        """Integrate emergent behavior module with advanced trainer."""
+        self.trainer = trainer
+        self.trainer.emergent_behavior = self
+
+    def update_forward(self, current_state: torch.Tensor, action_history: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Updated forward method to include new advancements.
+        
+        Args:
+            current_state: Current hidden state tensor
+            action_history: History of previous actions
+            
+        Returns:
+            Tuple of (generated task embedding, metrics dictionary)
+        """
+        # Calculate novelty score
+        novelty_score = self.detect_novelty(current_state)
+        
+        # Update experience buffer
+        if len(self.experience_buffer) >= self.config.self_play_buffer_size:
+            self.experience_buffer.pop(0)
+        self.experience_buffer.append(current_state.detach())
+        
+        # Generate new task based on current state and history
+        task_context = self._create_task_context(current_state, action_history)
+        generated_task = self.task_generator(task_context)
+        
+        # Update exploration rate
+        self.current_exploration_rate *= self.config.exploration_decay
+        
+        # Calculate complexity metrics
+        complexity_score = self._calculate_complexity(current_state)
+        self.complexity_curve.append(complexity_score)
+        
+        # Calculate intrinsic reward
+        intrinsic_reward = self.generate_intrinsic_reward(current_state, action_history[-1] if action_history else torch.zeros_like(current_state), generated_task)
+        
+        metrics = {
+            'novelty_score': novelty_score.item(),
+            'complexity_score': complexity_score,
+            'exploration_rate': self.current_exploration_rate,
+            'buffer_size': len(self.experience_buffer),
+            'intrinsic_reward': intrinsic_reward.item()
+        }
+        
+        return generated_task, metrics

@@ -11,6 +11,8 @@ from .cache_augmentation import CacheAugmentation
 from .MoE import MoEConfig, create_moe_layer
 from .tree_of_thoughts import TreeOfThoughts, TreeConfig, RewardConfig
 from .curriculum import CurriculumScheduler, CurriculumConfig
+from .ethical_framework import EthicalFramework, EthicalConfig
+from .emergent_behavior import EmergentBehaviorModule, EmergentConfig
 
 class AdvancedTrainer:
     """Advanced trainer implementing MoE, neural memory, cache augmentation, and curriculum learning."""
@@ -24,7 +26,9 @@ class AdvancedTrainer:
         cache_size: int = 512,
         tot_config: Optional[TreeConfig] = None,
         reward_config: Optional[RewardConfig] = None,
-        curriculum_config: Optional[CurriculumConfig] = None
+        curriculum_config: Optional[CurriculumConfig] = None,
+        ethical_config: Optional[EthicalConfig] = None,
+        emergent_config: Optional[EmergentConfig] = None
     ):
         """
         Initialize the advanced trainer.
@@ -38,6 +42,8 @@ class AdvancedTrainer:
             tot_config: Tree of Thoughts configuration
             reward_config: Reward configuration
             curriculum_config: Curriculum learning configuration
+            ethical_config: Ethical framework configuration
+            emergent_config: Emergent behavior configuration
         """
         self.model = model
         self.config = config
@@ -68,6 +74,17 @@ class AdvancedTrainer:
             cache_size=cache_size,
             hidden_dim=config.get('hidden_dim', 768),
             num_heads=config.get('num_heads', 8)
+        ).to(device)
+        
+        # Initialize ethical framework and emergent behavior
+        self.ethical_framework = EthicalFramework(
+            hidden_dim=config.get('hidden_dim', 768),
+            config=ethical_config or EthicalConfig()
+        ).to(device)
+        
+        self.emergent_behavior = EmergentBehaviorModule(
+            hidden_dim=config.get('hidden_dim', 768),
+            config=emergent_config or EmergentConfig()
         ).to(device)
         
         # Advanced training parameters
@@ -132,7 +149,7 @@ class AdvancedTrainer:
             lr=self.config.get('memory_lr', 1e-4)
         )
 
-    def _create_parameter_groups(self) -> List[Dict[str, Any]]:
+    def _create_parameter_groups(self) -> List<Dict[str, Any]]:
         """Create parameter groups for optimization."""
         moe_params = []
         base_params = []
@@ -240,6 +257,21 @@ class AdvancedTrainer:
             })
             
             stats['curriculum_advanced'] = curriculum_advanced
+            
+            # Process ethical framework
+            ethical_state, ethical_metrics = self.ethical_framework(
+                input_ids,
+                context=attention_mask
+            )
+            stats.update(ethical_metrics)
+            
+            # Process emergent behavior
+            emergent_state, emergent_metrics = self.emergent_behavior(
+                input_ids,
+                batch.get('action_history', [])
+            )
+            stats.update(emergent_metrics)
+            
             return stats
             
         except Exception as e:
@@ -607,6 +639,8 @@ class AdvancedTrainer:
                 'cache_state': self.cache.state_dict(),
                 'tot_state': self.tot.state_dict(),
                 'curriculum_state': self.curriculum_scheduler.state_dict(),
+                'ethical_state': self.ethical_framework.state_dict(),
+                'emergent_state': self.emergent_behavior.state_dict(),
                 'scaler_state': self.scaler.state_dict() if self.mixed_precision else None,
                 'config': {
                     **self.config,
@@ -662,6 +696,12 @@ class AdvancedTrainer:
             self.expert_usage_history = training_state.get('expert_usage_history', [])
             self.batch_size_history = training_state.get('batch_size_history', [])
             self.current_batch_size = training_state.get('current_batch_size', self.initial_batch_size)
+            
+            if 'ethical_state' in checkpoint:
+                self.ethical_framework.load_state_dict(checkpoint['ethical_state'])
+                
+            if 'emergent_state' in checkpoint:
+                self.emergent_behavior.load_state_dict(checkpoint['emergent_state'])
             
         except Exception as e:
             print(f"Error loading checkpoint: {str(e)}")

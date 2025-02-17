@@ -1,156 +1,216 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict, Tuple
 import math
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
+import numpy as np
+from collections import OrderedDict
 
-@dataclass
-class CacheConfig:
-    """Configuration for differentiable cache module."""
-    hidden_size: int = 8192
-    num_heads: int = 8
-    max_cache_length: int = 65536
-    dropout: float = 0.1
-    retrieval_factor: float = 1.0  # Controls cache retrieval strength
-    update_freq: int = 100  # Update frequency for cache entries
-
-class DifferentiableCacheAugmentation(nn.Module):
-    """Differentiable cache augmentation for enhanced memory retrieval."""
-    
-    def __init__(self, config: Optional[CacheConfig] = None):
+class CacheAugmentation(nn.Module):
+    def __init__(
+        self,
+        cache_size: int,
+        hidden_dim: int = 768,
+        num_heads: int = 8,
+        dropout: float = 0.1
+    ):
         super().__init__()
-        self.config = config or CacheConfig()
+        
+        self.cache_size = cache_size
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
         
         # Cache storage
-        self.cache_keys = nn.Parameter(
-            torch.randn(self.config.max_cache_length, self.config.hidden_size)
-        )
-        self.cache_values = nn.Parameter(
-            torch.randn(self.config.max_cache_length, self.config.hidden_size)
-        )
+        self.cache_keys = nn.Parameter(torch.randn(cache_size, hidden_dim))
+        self.cache_values = nn.Parameter(torch.randn(cache_size, hidden_dim))
+        self.cache_age = nn.Parameter(torch.zeros(cache_size))
         
-        # Cache attention mechanism
-        self.cache_attention = nn.MultiheadAttention(
-            embed_dim=self.config.hidden_size,
-            num_heads=self.config.num_heads,
-            dropout=self.config.dropout,
-            batch_first=True
-        )
+        # Cache attention components
+        self.query_net = nn.Linear(hidden_dim, hidden_dim)
+        self.key_net = nn.Linear(hidden_dim, hidden_dim)
+        self.value_net = nn.Linear(hidden_dim, hidden_dim)
+        self.output_net = nn.Linear(hidden_dim, hidden_dim)
         
-        # Cache update networks
-        self.key_update_net = nn.Sequential(
-            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size),
-            nn.GELU(),
-            nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.hidden_size, self.config.hidden_size)
-        )
+        # Cache update components
+        self.update_gate = nn.Linear(hidden_dim * 2, 1)
+        self.relevance_score = nn.Linear(hidden_dim, 1)
         
-        self.value_update_net = nn.Sequential(
-            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size),
-            nn.GELU(),
-            nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.hidden_size, self.config.hidden_size)
-        )
+        # Normalization and dropout
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
         
-        # Learnable temperature parameter
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        self._init_parameters()
         
-        # Cache statistics
-        self.access_counts = torch.zeros(self.config.max_cache_length)
-        self.update_step = 0
+    def _init_parameters(self):
+        """Initialize cache parameters"""
+        # Initialize cache storage
+        nn.init.normal_(self.cache_keys, mean=0.0, std=0.02)
+        nn.init.normal_(self.cache_values, mean=0.0, std=0.02)
         
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Process hidden states through cache retrieval and update."""
-        batch_size = hidden_states.size(0)
-        device = hidden_states.device
-        
-        # Move cache to correct device
-        self._ensure_cache_on_device(device)
-        
-        # Retrieve from cache
-        enhanced_states = self._retrieve_from_cache(hidden_states)
-        
-        # Update cache if needed
-        if self.training and self.update_step % self.config.update_freq == 0:
-            self._update_cache(hidden_states)
+        # Initialize attention components
+        for module in [self.query_net, self.key_net, self.value_net, self.output_net]:
+            nn.init.normal_(module.weight, std=0.02)
+            nn.init.zeros_(module.bias)
             
-        self.update_step += 1
-        return enhanced_states
+        # Initialize update components
+        nn.init.normal_(self.update_gate.weight, std=0.02)
+        nn.init.zeros_(self.update_gate.bias)
+        nn.init.normal_(self.relevance_score.weight, std=0.02)
+        nn.init.zeros_(self.relevance_score.bias)
     
-    def _ensure_cache_on_device(self, device: torch.device):
-        """Ensure cache tensors are on the correct device."""
-        if self.cache_keys.device != device:
-            self.cache_keys.data = self.cache_keys.data.to(device)
-            self.cache_values.data = self.cache_values.data.to(device)
-            self.access_counts = self.access_counts.to(device)
-    
-    def _retrieve_from_cache(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Retrieve relevant information from cache using attention."""
-        # Compute attention scores
-        attn_output, attn_weights = self.cache_attention(
-            query=hidden_states,
-            key=self.cache_keys.unsqueeze(0).expand(hidden_states.size(0), -1, -1),
-            value=self.cache_values.unsqueeze(0).expand(hidden_states.size(0), -1, -1)
-        )
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        return_attention: bool = False
+    ) -> torch.Tensor:
+        """Process inputs through cache"""
+        batch_size = inputs.size(0)
         
-        # Update access statistics
-        if self.training:
-            self.access_counts += attn_weights.sum(dim=(0, 1)).detach()
+        # Transform inputs for attention
+        queries = self._split_heads(self.query_net(inputs))
+        cache_k = self._split_heads(self.cache_keys.unsqueeze(0).expand(batch_size, -1, -1))
+        cache_v = self._split_heads(self.cache_values.unsqueeze(0).expand(batch_size, -1, -1))
         
-        # Combine with input using learnable factor
-        enhanced = hidden_states + self.config.retrieval_factor * attn_output
-        return enhanced
-    
-    def _update_cache(self, hidden_states: torch.Tensor):
-        """Update cache entries based on current inputs."""
+        # Calculate attention scores
+        attention_scores = torch.matmul(queries, cache_k.transpose(-2, -1))
+        attention_scores = attention_scores / math.sqrt(self.head_dim)
+        
+        # Apply age penalty to attention scores
+        age_penalty = -0.1 * self.cache_age.unsqueeze(0).unsqueeze(0)
+        attention_scores = attention_scores + age_penalty
+        
+        # Get attention weights and weighted sum
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        
+        context = torch.matmul(attention_weights, cache_v)
+        context = self._combine_heads(context)
+        
+        # Transform and combine with input
+        output = self.layer_norm(inputs + self.output_net(context))
+        
+        # Update cache age
         with torch.no_grad():
-            # Find least accessed entries
+            self.cache_age.data += 1
+            
+            # Reset age for accessed entries
+            access_mask = (attention_weights.mean(dim=(0, 1)) > 0.01).float()
+            self.cache_age.data *= (1 - access_mask)
+        
+        if return_attention:
+            return output, attention_weights.detach()
+        return output
+    
+    def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Split tensor into attention heads"""
+        batch_size = tensor.size(0)
+        tensor = tensor.view(batch_size, -1, self.num_heads, self.head_dim)
+        return tensor.transpose(1, 2)
+    
+    def _combine_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Combine attention heads"""
+        tensor = tensor.transpose(1, 2)
+        batch_size = tensor.size(0)
+        return tensor.reshape(batch_size, -1, self.hidden_dim)
+    
+    def update_cache(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        relevance_threshold: float = 0.5
+    ):
+        """Update cache entries"""
+        with torch.no_grad():
+            # Calculate relevance scores for new entries
+            relevance = torch.sigmoid(self.relevance_score(values)).squeeze(-1)
+            
+            # Find cache entries to update (oldest first)
             _, update_indices = torch.topk(
-                self.access_counts, 
-                k=min(hidden_states.size(0), self.config.max_cache_length),
-                largest=False
+                self.cache_age,
+                k=min(keys.size(0), self.cache_size),
+                largest=True
             )
             
-            # Compute updates
-            new_keys = self.key_update_net(
-                torch.cat([
-                    hidden_states,
-                    self.cache_keys[update_indices].repeat(hidden_states.size(0), 1)
-                ], dim=-1)
-            )
-            
-            new_values = self.value_update_net(
-                torch.cat([
-                    hidden_states,
-                    self.cache_values[update_indices].repeat(hidden_states.size(0), 1)
-                ], dim=-1)
-            )
-            
-            # Update cache
-            self.cache_keys.data[update_indices] = new_keys.detach().mean(dim=0)
-            self.cache_values.data[update_indices] = new_values.detach().mean(dim=0)
-            self.access_counts[update_indices] = 0
+            # Update selected cache entries
+            for idx, key, value, rel in zip(
+                update_indices,
+                keys,
+                values,
+                relevance
+            ):
+                if rel > relevance_threshold:
+                    self.cache_keys.data[idx] = key
+                    self.cache_values.data[idx] = value
+                    self.cache_age.data[idx] = 0
     
-    def save_pretrained(self, save_path: str):
-        """Save cache components."""
-        torch.save({
-            'config': self.config,
-            'state_dict': self.state_dict(),
-            'access_counts': self.access_counts,
-            'update_step': self.update_step
-        }, f"{save_path}/cache_augmentation.pt")
+    def retrieve(
+        self,
+        query: torch.Tensor,
+        top_k: int = 5
+    ) -> Optional[torch.Tensor]:
+        """Retrieve most relevant cached information"""
+        with torch.no_grad():
+            # Calculate similarity scores
+            query_emb = self.query_net(query)
+            similarity = F.cosine_similarity(
+                query_emb.unsqueeze(1),
+                self.cache_keys.unsqueeze(0),
+                dim=-1
+            )
+            
+            # Get top-k relevant entries
+            values, indices = torch.topk(similarity, k=min(top_k, self.cache_size))
+            
+            if torch.max(values) < 0.5:  # Relevance threshold
+                return None
+                
+            retrieved = self.cache_values[indices]
+            
+            # Weight by similarity
+            weights = F.softmax(values, dim=-1).unsqueeze(-1)
+            weighted_sum = torch.sum(retrieved * weights, dim=1)
+            
+            return weighted_sum
     
-    @classmethod
-    def from_pretrained(cls, load_path: str):
-        """Load cache components."""
-        checkpoint = torch.load(f"{load_path}/cache_augmentation.pt")
-        model = cls(config=checkpoint['config'])
-        model.load_state_dict(checkpoint['state_dict'])
-        model.access_counts = checkpoint['access_counts']
-        model.update_step = checkpoint['update_step']
-        return model
-
-    def reset_statistics(self):
-        """Reset cache statistics."""
-        self.access_counts.zero_()
-        self.update_step = 0
+    def reset_cache(self):
+        """Reset cache to initial state"""
+        nn.init.normal_(self.cache_keys, mean=0.0, std=0.02)
+        nn.init.normal_(self.cache_values, mean=0.0, std=0.02)
+        nn.init.zeros_(self.cache_age)
+    
+    def get_cache_stats(self) -> Dict[str, float]:
+        """Get cache statistics"""
+        with torch.no_grad():
+            avg_age = torch.mean(self.cache_age).item()
+            max_age = torch.max(self.cache_age).item()
+            unused = torch.sum(self.cache_age >= 100).item()  # Long unused entries
+            
+            return {
+                'average_age': avg_age,
+                'max_age': max_age,
+                'unused_entries': unused,
+                'total_entries': self.cache_size
+            }
+    
+    def state_dict(self, *args, **kwargs):
+        """Save cache state"""
+        state_dict = super().state_dict(*args, **kwargs)
+        state_dict.update({
+            'cache_size': self.cache_size,
+            'hidden_dim': self.hidden_dim,
+            'num_heads': self.num_heads
+        })
+        return state_dict
+    
+    def load_state_dict(self, state_dict):
+        """Load cache state"""
+        cache_size = state_dict.pop('cache_size')
+        hidden_dim = state_dict.pop('hidden_dim')
+        num_heads = state_dict.pop('num_heads')
+        
+        assert cache_size == self.cache_size
+        assert hidden_dim == self.hidden_dim
+        assert num_heads == self.num_heads
+        
+        super().load_state_dict(state_dict)

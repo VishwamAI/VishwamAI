@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import gc
 from typing import Optional
 from .model import Transformer, ModelArgs
 
@@ -65,8 +66,17 @@ def load_model(
 def get_gpu_memory() -> float:
     """Get available GPU memory in GB."""
     if torch.cuda.is_available():
-        return torch.cuda.get_device_properties(0).total_memory / 1e9
-    return 0.0
+        with torch.cuda.device(0):
+            device = torch.cuda.current_device()
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            return total_memory / (1024 * 1024 * 1024)  # Convert to GB
+    return 0
+
+def clear_gpu_memory():
+    """Clear GPU memory cache"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def find_optimal_batch_size(
     model: Transformer,

@@ -1,9 +1,11 @@
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import triton
 import triton.language as tl
 from triton import Config
+import torch.nn.functional as F
+import math
 
 
 @triton.jit
@@ -51,6 +53,134 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+def optimize_kernel_layout(
+    weight: torch.Tensor,
+    block_size: int = 64,
+    transpose: bool = False
+) -> torch.Tensor:
+    """
+    Optimize kernel memory layout for efficient computation.
+    
+    Args:
+        weight: Input weight tensor
+        block_size: Block size for tiling
+        transpose: Whether to transpose the weight matrix
+        
+    Returns:
+        Optimized weight tensor
+    """
+    if transpose:
+        weight = weight.transpose(-2, -1)
+        
+    if weight.dim() < 2:
+        return weight
+        
+    original_shape = weight.shape
+    in_features = original_shape[-2]
+    out_features = original_shape[-1]
+    
+    # Ensure dimensions are multiples of block_size
+    pad_in = (block_size - in_features % block_size) % block_size
+    pad_out = (block_size - out_features % block_size) % block_size
+    
+    if pad_in > 0 or pad_out > 0:
+        weight = F.pad(weight, (0, pad_out, 0, pad_in))
+    
+    # Reshape into blocks
+    blocked_shape = weight.shape[:-2] + (
+        weight.shape[-2] // block_size,
+        block_size,
+        weight.shape[-1] // block_size,
+        block_size
+    )
+    weight = weight.reshape(blocked_shape)
+    
+    # Optimize layout
+    weight = weight.permute(
+        *range(weight.dim() - 4),
+        0, 2, 1, 3  # Reorder block dimensions
+    )
+    
+    # Restore original dimensions
+    final_shape = original_shape[:-2] + (
+        math.ceil(in_features / block_size) * block_size,
+        math.ceil(out_features / block_size) * block_size
+    )
+    weight = weight.reshape(final_shape)
+    
+    # Remove padding if added
+    if pad_in > 0 or pad_out > 0:
+        weight = weight[..., :in_features, :out_features]
+        
+    return weight
+
+def prepare_kernel(
+    weight: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    zero_point: Optional[torch.Tensor] = None,
+    quantize: bool = False
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Prepare kernel for optimized computation.
+    
+    Args:
+        weight: Input weight tensor
+        scale: Optional quantization scale
+        zero_point: Optional quantization zero point
+        quantize: Whether to quantize the weights
+        
+    Returns:
+        Tuple of (prepared weight tensor, optional quantization params)
+    """
+    # Optimize memory layout
+    weight = optimize_kernel_layout(weight)
+    
+    if not quantize:
+        return weight, None
+        
+    if scale is None:
+        # Calculate dynamic quantization parameters
+        weight_abs_max = weight.abs().max()
+        scale = weight_abs_max / 127.0  # For int8 quantization
+        zero_point = 0
+    
+    # Quantize weights
+    weight_quant = torch.quantize_per_tensor(
+        weight,
+        scale.item(),
+        zero_point,
+        torch.qint8
+    )
+    
+    return weight_quant, {"scale": scale, "zero_point": zero_point}
+
+def fuse_kernels(kernels: list) -> torch.Tensor:
+    """
+    Fuse multiple kernels into a single optimized kernel.
+    
+    Args:
+        kernels: List of kernel tensors to fuse
+        
+    Returns:
+        Fused kernel tensor
+    """
+    if not kernels:
+        raise ValueError("No kernels provided for fusion")
+        
+    # Ensure all kernels have compatible shapes
+    out_features = kernels[0].shape[-1]
+    in_features_total = sum(k.shape[-2] for k in kernels)
+    
+    # Optimize each kernel
+    optimized_kernels = [optimize_kernel_layout(k) for k in kernels]
+    
+    # Concatenate along input dimension
+    fused = torch.cat(optimized_kernels, dim=-2)
+    
+    # Final layout optimization
+    return optimize_kernel_layout(fused)
 
 
 fp8_gemm_configs = [

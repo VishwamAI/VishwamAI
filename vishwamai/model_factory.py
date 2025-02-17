@@ -2,15 +2,16 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional
 from dataclasses import dataclass
-from .experimental.emergent_behavior import EmergentBehaviorModule, EmergentConfig
-from .experimental.integrated_information import IntegratedInformationModule, IntegrationConfig
-from .experimental.ethical_framework import EthicalFramework, EthicalConfig
-from .experimental.hardware_adapter import HardwareAdapter, HardwareConfig
-from .experimental.open_ended_learning import OpenEndedLearning, OpenEndedConfig
-from .experimental.MoE import MoE
-from .model import Transformer
+from .base_layers import Linear
 from .config import ModelArgs
 from .tokenizer import VishwamAITokenizer, TokenizerConfig
+from .Transformer import Transformer
+from .MoE import MoE
+from .hardware_adapter import HardwareAdapter, HardwareConfig
+from .open_ended_learning import OpenEndedLearning, OpenEndedConfig
+from .emergent_behavior import EmergentBehaviorModule, EmergentConfig
+from .integrated_information import IntegratedInformationModule, IntegrationConfig
+from .ethical_framework import EthicalFramework, EthicalConfig
 
 @dataclass
 class AdvancedModelConfig:

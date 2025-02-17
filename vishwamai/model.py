@@ -4,8 +4,12 @@ import torch.distributed as dist
 from typing import Optional, Literal
 
 from .config import ModelArgs
-from .experimental.parallel import Linear, ColumnParallelLinear, RowParallelLinear, RMSNorm, ParallelEmbedding
+from .base_layers import Linear
+from .parallel import ColumnParallelLinear, RowParallelLinear, RMSNorm, ParallelEmbedding
 from .utils import precompute_freqs_cis
+from .MLA import MLA
+from .MLP import MLP
+from .MoE import MoE
 
 # Global config variables
 block_size = 128

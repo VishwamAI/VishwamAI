@@ -3,11 +3,16 @@ import torch.nn as nn
 import torch.distributed as dist
 from typing import Optional
 
-from .model import ModelArgs, world_size, rank, Linear, precompute_freqs_cis
-from .experimental.parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
-from .experimental.MLA import MLA
-from .experimental.MLP import MLP
-from .experimental.MoE import MoE
+from .config import ModelArgs
+from .utils import Linear, precompute_freqs_cis
+from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
+from .MLA import MLA
+from .MLP import MLP
+from .MoE import MoE
+
+# Default values for distributed training
+world_size = dist.get_world_size() if dist.is_initialized() else 1
+rank = dist.get_rank() if dist.is_initialized() else 0
 
 class Block(nn.Module):
     """Transformer block combining attention and feed-forward layers."""

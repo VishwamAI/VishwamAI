@@ -2,28 +2,42 @@
 Vishwamai - Advanced AI Training Framework
 =======================================
 
-A sophisticated training framework implementing advanced AI concepts:
-- Emergent behavior
-- Integrated information processing
-- Ethical compliance
-- Hardware optimization
+Key features:
+- Advanced neural architectures
+- Multi-task learning
+- Neural memory mechanisms
 - Curriculum learning
-- Open-ended learning
+- Ethical decision making
 """
 
-from .trainer_unified import UnifiedTrainer, UnifiedTrainerConfig
-from .model_factory import ModelFactory, AdvancedModelConfig
-from .curriculum import CurriculumConfig, CurriculumScheduler
-from .emergent_behavior import EmergentConfig, EmergentBehaviorModule
-from .integrated_information import IntegrationConfig, IntegratedInformationModule
-from .ethical_framework import EthicalConfig, EthicalFramework
-from .hardware_adapter import HardwareConfig, HardwareAdapter
-from .open_ended_learning import OpenEndedConfig, OpenEndedLearning
+# Core components
+from .config import ModelArgs
+from .constants import WORLD_SIZE, ATTN_IMPL, BLOCK_SIZE
+from .base_layers import Linear
+from .utils import precompute_freqs_cis
+from .tokenizer import VishwamAITokenizer, TokenizerConfig
+from .kernel import weight_dequant, optimize_kernel_layout
+from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
+from .model_factory import create_model
 
 __version__ = "0.1.1"
 __author__ = "Vishwamai Contributors"
 
 __all__ = [
+    'ModelArgs',
+    'WORLD_SIZE',
+    'ATTN_IMPL',
+    'BLOCK_SIZE',
+    'Linear',
+    'precompute_freqs_cis',
+    'VishwamAITokenizer',
+    'TokenizerConfig',
+    'weight_dequant',
+    'optimize_kernel_layout',
+    'ColumnParallelLinear',
+    'RMSNorm',
+    'ParallelEmbedding',
+    'create_model',
     'UnifiedTrainer',
     'UnifiedTrainerConfig',
     'ModelFactory',

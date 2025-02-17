@@ -24,49 +24,42 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
             y += bias
         return y
 
-class Linear(nn.Module):
-    """Custom linear layer with support for quantized weights and optional bias."""
-    dtype = torch.bfloat16
+from .base_layers import Linear as BaseLinear
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+class ParallelLinearMixin:
+    """Mixin for parallel linear layers with quantization support."""
+    def init_quantization(self, out_features: int, in_features: int):
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
         else:
             self.register_parameter("scale", None)
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
-        else:
-            self.register_parameter("bias", None)
+    
+    def parallel_linear(self, x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return linear(x, weight, bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.weight, self.bias)
-
-class ColumnParallelLinear(Linear):
+class ColumnParallelLinear(BaseLinear, ParallelLinearMixin):
     """Linear layer with column parallelism."""
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
         self.part_out_features = out_features // world_size
         super().__init__(in_features, self.part_out_features, bias, dtype)
+        self.init_quantization(self.part_out_features, in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = linear(x, self.weight, self.bias)
-        return y
+        return self.parallel_linear(x, self.weight, self.bias)
 
-class RowParallelLinear(Linear):
+class RowParallelLinear(BaseLinear, ParallelLinearMixin):
     """Linear layer with row parallelism."""
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
         self.part_in_features = in_features // world_size
         super().__init__(self.part_in_features, out_features, bias, dtype)
+        self.init_quantization(out_features, self.part_in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = linear(x, self.weight)
+        y = self.parallel_linear(x, self.weight)
         if world_size > 1:
             dist.all_reduce(y)
         if self.bias is not None:

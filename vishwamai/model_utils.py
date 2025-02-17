@@ -1,152 +1,121 @@
-import os
-import json
 import torch
-import gc
-from typing import Optional
-from .model import Transformer, ModelArgs
+import torch.nn.functional as F
 
-def load_model(
-    config_path: str,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    pretrained_path: Optional[str] = None,
-    use_cache: bool = True
-) -> Transformer:
-    """Load VishwamAI model with configuration."""
+def create_attention_mask(seq_length: int, device: torch.device) -> torch.Tensor:
+    """
+    Create causal attention mask for autoregressive generation.
     
-    # Load configuration
-    with open(config_path) as f:
-        config = json.load(f)
-    
-    # Create model arguments
-    model_args = ModelArgs(
-        max_batch_size=config.get("max_batch_size", 8),
-        max_seq_len=config.get("max_seq_len", 4096 * 4),
-        dtype=config.get("dtype", "bf16"),
-        vocab_size=config.get("vocab_size", 102400),
-        dim=config.get("dim", 2048),
-        inter_dim=config.get("inter_dim", 10944),
-        moe_inter_dim=config.get("moe_inter_dim", 1408),
-        n_layers=config.get("n_layers", 27),
-        n_dense_layers=config.get("n_dense_layers", 1),
-        n_heads=config.get("n_heads", 16),
-        n_routed_experts=config.get("n_routed_experts", 64),
-        n_shared_experts=config.get("n_shared_experts", 2),
-        n_activated_experts=config.get("n_activated_experts", 6),
-        n_expert_groups=config.get("n_expert_groups", 1),
-        n_limited_groups=config.get("n_limited_groups", 1),
-        score_func=config.get("score_func", "softmax"),
-        route_scale=config.get("route_scale", 1.0),
-        q_lora_rank=config.get("q_lora_rank", 0),
-        kv_lora_rank=config.get("kv_lora_rank", 512),
-        qk_nope_head_dim=config.get("qk_nope_head_dim", 128),
-        qk_rope_head_dim=config.get("qk_rope_head_dim", 64),
-        v_head_dim=config.get("v_head_dim", 128),
-        original_seq_len=config.get("original_seq_len", 4096),
-        rope_theta=config.get("rope_theta", 10000.0),
-        rope_factor=config.get("rope_factor", 40),
-        beta_fast=config.get("beta_fast", 32),
-        beta_slow=config.get("beta_slow", 1),
-        mscale=config.get("mscale", 1.0)
-    )
-    
-    # Initialize model
-    model = Transformer(model_args)
-    
-    # Load pretrained weights if available
-    if pretrained_path and os.path.exists(pretrained_path):
-        state_dict = torch.load(
-            pretrained_path,
-            map_location=device
-        )
-        model.load_state_dict(state_dict)
-    
-    model.to(device)
-    return model
-
-def get_gpu_memory() -> float:
-    """Get available GPU memory in GB."""
-    if torch.cuda.is_available():
-        with torch.cuda.device(0):
-            device = torch.cuda.current_device()
-            total_memory = torch.cuda.get_device_properties(device).total_memory
-            return total_memory / (1024 * 1024 * 1024)  # Convert to GB
-    return 0
-
-def clear_gpu_memory():
-    """Clear GPU memory cache"""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-def find_optimal_batch_size(
-    model: Transformer,
-    starting_batch_size: int = 8,
-    gpu_memory_threshold: float = 0.9,
-    sequence_length: int = 2048
-) -> int:
-    """Find optimal batch size for given model and GPU memory."""
-    if not torch.cuda.is_available():
-        return 1
+    Args:
+        seq_length: Length of input sequence
+        device: Device to create tensor on
         
-    total_memory = get_gpu_memory()
-    batch_size = starting_batch_size
+    Returns:
+        Attention mask tensor of shape (seq_length, seq_length)
+    """
+    # Create causal mask
+    mask = torch.full(
+        (seq_length, seq_length),
+        float("-inf"),
+        device=device
+    )
+    mask = torch.triu(mask, diagonal=1)
     
-    while True:
-        try:
-            # Test batch with random inputs
-            inputs = torch.randint(
-                0, model.embed.vocab_size,
-                (batch_size, sequence_length),
-                device="cuda"
-            )
-            
-            # Clear cache
-            torch.cuda.empty_cache()
-            
-            # Test forward pass
-            with torch.no_grad():
-                model(inputs)
-            
-            # Check memory usage
-            memory_used = torch.cuda.memory_allocated() / 1e9
-            if memory_used / total_memory > gpu_memory_threshold:
-                return batch_size // 2
-            
-            batch_size *= 2
-            
-        except RuntimeError:  # Out of memory
-            return batch_size // 2
+    return mask
 
-def save_checkpoint(
-    model: Transformer,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    loss: float,
-    save_path: str
-):
-    """Save model checkpoint."""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
+def apply_rope_rotation(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary positional embedding.
     
-    torch.save(checkpoint, save_path)
+    Args:
+        x: Input tensor of shape (batch, seq_len, dim)
+        freqs_cis: Complex rotation tensor
+        
+    Returns:
+        Rotated tensor
+    """
+    # Reshape for complex multiplication
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.reshape(*freqs_cis.shape[:2], 1, -1)
+    
+    # Apply rotation
+    x_rotated = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
+    
+    return x_rotated.type_as(x)
 
-def load_checkpoint(
-    checkpoint_path: str,
-    model: Transformer,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-) -> tuple:
-    """Load model checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+def precompute_freqs_cis(
+    dim: int,
+    end: int,
+    theta: float = 10000.0,
+    scaling_factor: float = 1.0
+) -> torch.Tensor:
+    """
+    Precompute frequencies for rotary embeddings.
     
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
+    Args:
+        dim: Hidden dimension
+        end: Sequence length
+        theta: Base for exponential
+        scaling_factor: RoPE scaling factor
     
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    Returns:
+        Complex rotation tensor
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end).float()
+    freqs = torch.outer(t, freqs) * scaling_factor
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+def get_slopes(n_heads: int) -> torch.Tensor:
+    """
+    Get slopes for ALiBi positional embedding.
     
-    return model, checkpoint['epoch'], checkpoint['loss']
+    Args:
+        n_heads: Number of attention heads
+        
+    Returns:
+        Tensor of slopes for each head
+    """
+    def get_slopes_power_of_2(n_heads: int) -> torch.Tensor:
+        start = 2 ** (-(2 ** -(torch.log2(torch.tensor(n_heads)) - 3)))
+        ratio = start
+        return torch.pow(ratio, torch.arange(1, n_heads + 1))
+
+    # Initialize slopes
+    if torch.log2(torch.tensor(n_heads)).is_integer():
+        slopes = get_slopes_power_of_2(n_heads)
+    else:
+        closest_power_of_2 = 2 ** torch.floor(torch.log2(torch.tensor(n_heads)))
+        slopes = get_slopes_power_of_2(closest_power_of_2)
+        extra_base = torch.tensor(1.0)
+        extra_steps = n_heads - closest_power_of_2
+        for _ in range(extra_steps):
+            extra_base = torch.sqrt(extra_base)
+            slopes = torch.cat([slopes, slopes[-1:] * extra_base])
+
+    return -torch.sort(-slopes)[0]  # Sort in descending order
+
+def maybe_cuda(t: torch.Tensor, cuda: bool = True) -> torch.Tensor:
+    """Move tensor to CUDA if available and requested."""
+    return t.cuda() if cuda and torch.cuda.is_available() else t
+
+def pad_to_multiple(x: torch.Tensor, multiple: int, dim: int = -1) -> torch.Tensor:
+    """Pad tensor to multiple along specified dimension."""
+    size = x.size(dim)
+    pad_size = (multiple - (size % multiple)) % multiple
+    if pad_size == 0:
+        return x
+    pad_shape = list(x.shape)
+    pad_shape[dim] = pad_size
+    return torch.cat([x, torch.zeros(pad_shape, device=x.device, dtype=x.dtype)], dim=dim)
+
+def get_activation_fn(name: str):
+    """Get activation function by name."""
+    if name == "gelu":
+        return F.gelu
+    elif name == "relu":
+        return F.relu
+    elif name == "silu":
+        return F.silu
+    else:
+        raise ValueError(f"Activation function {name} not supported")

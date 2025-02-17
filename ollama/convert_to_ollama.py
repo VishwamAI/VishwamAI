@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 def convert_to_ollama_format(
-    input_dir: str = "./final_model",
+    input_dir: str = "./model",
     output_dir: str = "./ollama_model",
     model_name: str = "vishwamai"
 ) -> None:
@@ -137,7 +137,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Convert VishwamAI model to Ollama format")
-    parser.add_argument("--input-dir", default="./final_model", help="Input model directory")
+    parser.add_argument("--input-dir", default="./model", help="Input model directory")
     parser.add_argument("--output-dir", default="./ollama_model", help="Output directory")
     parser.add_argument("--model-name", default="vishwamai", help="Model name")
     

@@ -13,7 +13,7 @@ command -v python3 >/dev/null 2>&1 || { echo -e "${RED}Error: Python3 is not ins
 
 # Convert model to Ollama format
 echo -e "\n${GREEN}Converting model to Ollama format...${NC}"
-python3 convert_to_ollama.py --input-dir ../final_model --output-dir ./ollama_model
+python3 convert_to_ollama.py --input-dir ../model --output-dir ./ollama_model
 
 # Check if conversion was successful
 if [ $? -ne 0 ]; then

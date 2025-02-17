@@ -2,7 +2,7 @@ import os
 import time
 import yaml
 import logging
-from typing import Dict, Any, Optional, Union, List, Generator
+from typing import Dict, Any, Optional, Union, List, Generator, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +33,8 @@ class InferenceMetrics:
     batch_size: int
     expert_usage: Optional[Dict[str, float]] = None
     token_routing_efficiency: Optional[float] = None
+    generation_progress: Optional[float] = None
+    performance_stats: Optional[Dict[str, float]] = None
 
 class KVCache:
     """Optimized KV cache with pruning capabilities."""
@@ -41,6 +43,8 @@ class KVCache:
         self.cache = {}
         self.access_counts = {}
         self.last_access = {}
+        self.hits = 0
+        self.misses = 0
         
     def prune(self, threshold: float = 0.1):
         """Prune least used cache entries."""
@@ -64,8 +68,15 @@ class KVCache:
         if key in self.cache:
             self.access_counts[key] = self.access_counts.get(key, 0) + 1
             self.last_access[key] = time.time()
+            self.hits += 1
             return self.cache[key]
+        self.misses += 1
         return None
+    
+    def get_hit_rate(self) -> float:
+        """Get cache hit rate."""
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0
         
     def set(self, key: str, value: torch.Tensor):
         """Add or update cache entry."""
@@ -122,22 +133,30 @@ class AutoscalingPolicy:
             "cache_size": int(action[1] * 8192),
             "expert_capacity": int(action[2] * self.expert_capacity)
         }
+    
+    def update(self, metrics: InferenceMetrics) -> Dict[str, Any]:
+        """Update policy and get new configuration."""
+        self.metrics_history.append(metrics)
+        if self.rl_model:
+            state = self._get_current_state()
+            action, _ = self.rl_model.predict(state)
+            return self._action_to_config(action)
+        return {"batch_size": self.current_batch_size}
 
 class HardwareOptimizer:
     """Hardware-specific optimizations using TVM."""
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.tvm_target = self._get_tvm_target()
+        self.tvm_target = "cuda" if torch.cuda.is_available() else "llvm"
         self.enable_moe_fusion = config.get("optimization", {}).get("moe_fusion", True)
-        
-    def optimize_model(self, model: torch.nn.Module, input_shape: List[int]):
+    
+    def optimize_model(self, model: torch.nn.Module, input_shape: List[int]) -> torch.nn.Module:
         """Optimize model using TVM with MoE support."""
         try:
             traced_model = torch.jit.trace(model, torch.randn(*input_shape))
             mod, params = relay.frontend.from_pytorch(traced_model, input_shape)
             
             if self.enable_moe_fusion:
-                # Apply MoE-specific optimizations
                 mod = self._apply_moe_optimizations(mod)
             
             with tvm.transform.PassContext(opt_level=3):
@@ -150,7 +169,6 @@ class HardwareOptimizer:
     def _apply_moe_optimizations(self, mod):
         """Apply MoE-specific optimizations."""
         try:
-            # Custom pass to fuse MoE operations
             from tvm.relay import transform
             seq = transform.Sequential([
                 transform.FuseMoEPatterns(),
@@ -169,6 +187,7 @@ class InferenceEngine:
         self.hardware_optimizer = HardwareOptimizer(self.config["inference"]["hardware"])
         self.autoscaling = AutoscalingPolicy(self.config["inference"]["scaling"])
         self.current_batch_size = 1
+        self.start_time = time.time()
         
         # Initialize caches
         self.kv_cache = KVCache(
@@ -187,6 +206,15 @@ class InferenceEngine:
         self.expert_parallelism = self.config["inference"]["optimization"].get(
             "expert_parallelism", True
         )
+    
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """Load configuration from YAML file."""
+        try:
+            with open(config_path) as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load config from {config_path}: {e}")
+            return {}
     
     def _init_metrics(self):
         """Initialize metrics including MoE-specific ones."""
@@ -240,32 +268,45 @@ class InferenceEngine:
         """Enable parallel execution of experts."""
         for module in model.modules():
             if hasattr(module, "experts"):
-                # Set experts for parallel execution
                 module.parallel_experts = True
     
+    def get_cache_hit_rate(self) -> float:
+        """Get the current cache hit rate."""
+        return self.kv_cache.get_hit_rate()
+
+    def _get_performance_stats(self) -> Dict[str, float]:
+        """Get detailed performance statistics."""
+        return {
+            "throughput": self.throughput._value.get() / max(time.time() - self.start_time, 1),
+            "avg_latency": self.latency_histogram._sum.get() / max(self.latency_histogram._count.get(), 1),
+            "gpu_utilization": torch.cuda.utilization() if torch.cuda.is_available() else 0,
+            "memory_usage": torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0,
+            "cache_hit_rate": self.get_cache_hit_rate()
+        }
+
+    def _process_batch_outputs(self, outputs: List[torch.Tensor]) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Process outputs from batch inference."""
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
+
     @torch.cuda.amp.autocast()
     def _run_inference(
         self, 
         model: torch.nn.Module, 
-        inputs: torch.Tensor,
+        inputs: Union[torch.Tensor, List[torch.Tensor]],
         batch_size: Optional[int] = None
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Run inference with automatic mixed precision and MoE tracking."""
         with nvtx.range("inference"):
-            if batch_size:
-                inputs = inputs.chunk(batch_size)
+            if isinstance(inputs, list):
                 outputs = []
-                expert_usage = {}
-                
                 for batch in inputs:
                     with self.latency_histogram.time():
                         output = model(batch)
-                        
-                        # Collect MoE statistics
                         self._update_moe_metrics(model)
-                        
                     outputs.append(output)
-                return torch.cat(outputs)
+                return self._process_batch_outputs(outputs)
             else:
                 with self.latency_histogram.time():
                     output = model(inputs)
@@ -289,53 +330,93 @@ class InferenceEngine:
                     self.routing_efficiency.set(
                         module.gate.routing_efficiency.item()
                     )
-    
+
     def run(
         self, 
         model: torch.nn.Module,
-        inputs: Union[torch.Tensor, np.ndarray],
-        stream: bool = False
-    ) -> Union[torch.Tensor, np.ndarray]:
-        """Run inference with automatic optimization."""
+        inputs: Union[torch.Tensor, np.ndarray, List[Union[torch.Tensor, np.ndarray]]],
+        stream: bool = False,
+        return_progress: bool = False,
+        **kwargs
+    ) -> Union[torch.Tensor, np.ndarray, Dict[str, Any]]:
+        """Run inference with automatic optimization and progress tracking."""
         start_time = time.time()
-        
-        # Convert inputs if necessary
-        if isinstance(inputs, np.ndarray):
-            inputs = torch.from_numpy(inputs).cuda()
-        
-        # Get optimal configuration from autoscaler
-        metrics = InferenceMetrics(
-            latency=time.time() - start_time,
-            throughput=self.throughput._value.get(),
-            gpu_utilization=torch.cuda.utilization(),
-            memory_usage=torch.cuda.memory_allocated() / 1024**3,
-            batch_size=self.current_batch_size,
-            expert_usage=self._get_expert_usage(model),
-            token_routing_efficiency=self._get_routing_efficiency(model)
-        )
-        
-        scaling_config = self.autoscaling.update(metrics)
-        batch_size = scaling_config.get("batch_size", None)
-        self.current_batch_size = batch_size if batch_size else self.current_batch_size
-        
-        # Update KV cache configuration
-        if "cache_size" in scaling_config:
-            self.kv_cache.max_size = scaling_config["cache_size"]
-        
-        # Run inference
+
+        # Handle batch inputs and convert if necessary
+        if isinstance(inputs, list):
+            inputs = [
+                torch.from_numpy(x).cuda() if isinstance(x, np.ndarray) else x.cuda() if torch.is_tensor(x) else x
+                for x in inputs
+            ]
+            batch_size = len(inputs)
+        else:
+            inputs = torch.from_numpy(inputs).cuda() if isinstance(inputs, np.ndarray) else inputs.cuda() if torch.is_tensor(inputs) else inputs
+            batch_size = 1
+
+        # Run inference with progress tracking
         try:
             with torch.inference_mode():
-                outputs = self._run_inference(model, inputs, batch_size)
+                outputs = []
+                num_steps = 0
+                max_steps = self.config["inference"]["generation"].get("max_steps", 100)
                 
-            # Update metrics
-            self._update_metrics(start_time)
-            self.throughput.inc()
-            
-            return outputs.cpu().numpy() if isinstance(inputs, np.ndarray) else outputs
-            
+                for i in range(max_steps):
+                    num_steps = i + 1
+                    current_output = self._run_inference(model, inputs, batch_size)
+                    outputs.append(current_output)
+                    
+                    if return_progress:
+                        progress = (i + 1) / max_steps
+                        self._update_progress(progress)
+                    
+                    if self._is_generation_complete(current_output):
+                        break
+
+                final_output = self._process_outputs(outputs)
+                
+                # Update metrics
+                self._update_metrics(start_time, num_steps)
+                self.throughput.inc()
+
+                if return_progress:
+                    return {
+                        "output": final_output.cpu().numpy() if isinstance(inputs, np.ndarray) else final_output,
+                        "progress": 1.0,
+                        "performance_stats": self._get_performance_stats()
+                    }
+
+                return final_output.cpu().numpy() if isinstance(inputs, np.ndarray) else final_output
+
         except Exception as e:
             logger.error(f"Inference failed: {str(e)}")
             raise RuntimeError("Inference failed") from e
+
+    def _is_generation_complete(self, output: torch.Tensor) -> bool:
+        """Check if text generation is complete."""
+        # Check for EOS token in the output
+        eos_token_id = self.config["inference"]["generation"].get("eos_token_id")
+        if eos_token_id and (output == eos_token_id).any():
+            return True
+        return False
+
+    def _process_outputs(self, outputs: List[torch.Tensor]) -> torch.Tensor:
+        """Process and combine generation outputs."""
+        return torch.cat(outputs, dim=-1)
+
+    def _update_progress(self, progress: float):
+        """Update generation progress metric."""
+        logger.debug(f"Generation progress: {progress:.2%}")
+    
+    def _update_metrics(self, start_time: float, num_steps: int):
+        """Update inference metrics."""
+        end_time = time.time()
+        latency = end_time - start_time
+        self.latency_histogram.observe(latency)
+        
+        if torch.cuda.is_available():
+            self.gpu_utilization.set(torch.cuda.utilization())
+        
+        self.cache_hit_rate.set(self.get_cache_hit_rate())
 
     def _get_expert_usage(self, model: torch.nn.Module) -> Dict[str, float]:
         """Get expert usage statistics."""
@@ -355,3 +436,7 @@ class InferenceEngine:
             if hasattr(module, "gate") and hasattr(module.gate, "routing_efficiency"):
                 efficiencies.append(module.gate.routing_efficiency.item())
         return np.mean(efficiencies) if efficiencies else None
+
+    def shutdown(self):
+        """Clean up resources."""
+        self.thread_pool.shutdown(wait=True)

@@ -7,12 +7,12 @@ import numpy as np
 from contextlib import nullcontext
 from .model_utils import create_attention_mask
 from .neural_memory import NeuralMemory
-from .experimental.cache_augmentation import CacheAugmentation
-from .experimental.MoE import MoEConfig, create_moe_layer
+from .cache_augmentation import CacheAugmentation
+from .MoE import MoE
 from .tree_of_thoughts import TreeOfThoughts, TreeConfig, RewardConfig
 from .curriculum import CurriculumScheduler, CurriculumConfig
-from .experimental.ethical_framework import EthicalFramework, EthicalConfig
-from .experimental.emergent_behavior import EmergentBehaviorModule, EmergentConfig
+from .ethical_framework import EthicalFramework, EthicalConfig
+from .emergent_behavior import EmergentBehaviorModule, EmergentConfig
 from typing import List, Dict, Any  # Import List, Dict, Any
 
 class AdvancedTrainer:

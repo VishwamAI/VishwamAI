@@ -5,33 +5,52 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers import PreTrainedModel, Trainer, TrainingArguments
-from typing import Dict, Union, Any, Optional
-from .neural_memory import ReasoningMemoryTransformer
+from typing import Dict, Union, Any, Optional, Tuple
+import gc
+
+from .model import Transformer, ModelArgs
+from .neural_memory import NeuralMemory
 from .tree_of_thoughts import TreeOfThoughts
-from .cache_augmentation import DifferentiableCacheAugmentation
+from .cache_augmentation import CacheAugmentation
 from .reward_function import RewardConfig, RewardNetwork, SLAP, RewardTrainer
+
+def clear_gpu_memory():
+    """Clear GPU memory cache"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 class VishwamAIPretrainer(Trainer):
     def __init__(self, 
-                 memory_module: Optional[ReasoningMemoryTransformer] = None,
+                 model_config: Dict[str, Any],
+                 memory_module: Optional[NeuralMemory] = None,
                  tree_module: Optional[TreeOfThoughts] = None,
-                 cache_module: Optional[DifferentiableCacheAugmentation] = None,
+                 cache_module: Optional[CacheAugmentation] = None,
                  reward_config: Optional[RewardConfig] = None,
                  **kwargs):
+        """Initialize trainer with model and components."""
         super().__init__(**kwargs)
+        
+        self.model_config = model_config
+        self.initialize_components()
         
         # Initialize modules
         self.memory_module = memory_module
         self.tree_module = tree_module 
         self.cache_module = cache_module
         
-        # Initialize reward components
-        reward_net = RewardNetwork(reward_config)
-        self.slap_module = SLAP(reward_net)
-        self.reward_trainer = RewardTrainer(self.slap_module)
+        # Initialize reward components if config provided
+        if reward_config is not None:
+            reward_net = RewardNetwork(reward_config)
+            self.slap_module = SLAP(reward_net)
+            self.reward_trainer = RewardTrainer(self.slap_module)
+        else:
+            self.slap_module = None
+            self.reward_trainer = None
         
         self.scaler = GradScaler()
         self.gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
+        self.steps = 0  # Initialize step counter
         
         # Enable FSDP if in distributed training
         if dist.is_initialized():
@@ -41,22 +60,16 @@ class VishwamAIPretrainer(Trainer):
                 mixed_precision=True
             )
 
-    def initialize_components():
+    def initialize_components(self):
+        """Initialize model and components with proper configuration."""
         print("Initializing model and components...")
         clear_gpu_memory()
 
-        # Initialize main model with 8-bit quantization for T4
-        model_args = ModelArgs(**model_config)
-        model = Transformer(model_args)
-        
-        # Initialize memory transformer with revised parameters
-        memory_module = ReasoningMemoryTransformer(
-            hidden_size=model_config["dim"],  # This will now work correctly
-            num_heads=model_config["n_heads"],
-            dropout=0.1
-        )
+        # Initialize main model with provided configuration
+        model_args = ModelArgs(**self.model_config)
+        self.model = Transformer(model_args)
 
-    def compute_loss(self, model: PreTrainedModel, inputs: Dict[str, torch.Tensor], return_outputs=False):
+    def compute_loss(self, model: PreTrainedModel, inputs: Dict[str, torch.Tensor], return_outputs: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         """Custom loss computation incorporating memory, tree search and cache."""
         
         # Get base model outputs
@@ -106,21 +119,16 @@ class VishwamAIPretrainer(Trainer):
         return contrastive_loss.mean() + reg_loss
 
     def training_step(self, model: PreTrainedModel, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Custom training step that ensures proper device placement."""
+        """Custom training step that ensures proper device placement and gradient scaling."""
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        if self.memory_module is not None:
-            self.memory_module.train()
-            self.memory_module.to(inputs[list(inputs.keys())[0]].device)
-            
-        if self.tree_module is not None:
-            self.tree_module.train()
-            self.tree_module.to(inputs[list(inputs.keys())[0]].device)
-            
-        if self.cache_module is not None:
-            self.cache_module.train()
-            self.cache_module.to(inputs[list(inputs.keys())[0]].device)
+        # Move auxiliary modules to correct device if available
+        device = inputs[list(inputs.keys())[0]].device
+        for module in [self.memory_module, self.tree_module, self.cache_module]:
+            if module is not None:
+                module.train()
+                module.to(device)
 
         # Enable automatic mixed precision training
         with autocast():
@@ -138,7 +146,8 @@ class VishwamAIPretrainer(Trainer):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
-            
+        
+        self.steps += 1
         return loss.detach()
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):

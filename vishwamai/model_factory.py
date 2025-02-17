@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from dataclasses import dataclass
 from .base_layers import Linear
 from .config import ModelArgs
@@ -24,59 +24,68 @@ class AdvancedModelConfig:
     open_ended_config: Optional[OpenEndedConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
 
-def create_model(config: dict) -> nn.Module:
+def create_model(config: Union[dict, ModelArgs]) -> nn.Module:
     """
     Create a model instance based on configuration.
+    Args:
+        config: Either a dictionary with model configuration or a ModelArgs instance
     """
-    is_moe = config.get("model_type") == "moe"
-    
-    model_args = ModelArgs(
-        dim=config["hidden_size"],
-        n_layers=config["num_hidden_layers"],
-        n_heads=config["num_attention_heads"],
-        vocab_size=config.get("vocab_size", 102400),
-        n_dense_layers=0 if is_moe else config["num_hidden_layers"],
-        inter_dim=config["intermediate_size"],
-        max_seq_len=config.get("max_position_embeddings", 32768),  # Extended for 7B
-        
-        # MoE specific parameters
-        n_routed_experts=config.get("num_experts", 128) if is_moe else 0,
-        n_shared_experts=config.get("num_shared_experts", 4) if is_moe else 0,
-        n_activated_experts=config.get("num_activated_experts", 8) if is_moe else 0,
-        n_expert_groups=config.get("num_expert_groups", 2),
-        moe_inter_dim=config.get("moe_intermediate_size", 2048),
-        
-        # Advanced features
-        dtype="fp8" if config.get("mixed_precision") == "fp8" else "bf16",
-        gradient_checkpointing=config.get("gradient_checkpointing", True),
-        use_alibi=config.get("use_alibi", True),
-        use_rope_scaling=config.get("use_rope_scaling", True),
-        parallel_attn=True,
-        
-        # Attention dimensions
-        qk_nope_head_dim=config.get("qk_nope_head_dim", 256),
-        qk_rope_head_dim=config.get("qk_rope_head_dim", 128),
-        v_head_dim=config.get("v_head_dim", 256),
-        
-        # Scaling parameters
-        rope_theta=config.get("rope_theta", 20000.0),
-        rope_factor=config.get("rope_factor", 80),
-        mscale=config.get("mscale", 1.5),
-        rope_condense_ratio=config.get("rope_condense_ratio", 1.2)
-    )
-    
+    # First try to use the input directly as ModelArgs
+    if isinstance(config, ModelArgs):
+        model_args = config
+        is_moe = model_args.n_routed_experts > 0
+    # If it's a dictionary, convert to ModelArgs
+    else:
+        is_moe = config.get("model_type") == "moe"
+        model_args = ModelArgs(
+            dim=config["hidden_size"],
+            n_layers=config["num_hidden_layers"],
+            n_heads=config["num_attention_heads"],
+            vocab_size=config.get("vocab_size", 102400),
+            n_dense_layers=0 if is_moe else config["num_hidden_layers"],
+            inter_dim=config["intermediate_size"],
+            max_seq_len=config.get("max_position_embeddings", 32768),  # Extended for 7B
+            
+            # MoE specific parameters
+            n_routed_experts=config.get("num_experts", 128) if is_moe else 0,
+            n_shared_experts=config.get("num_shared_experts", 4) if is_moe else 0,
+            n_activated_experts=config.get("num_activated_experts", 8) if is_moe else 0,
+            n_expert_groups=config.get("num_expert_groups", 2),
+            moe_inter_dim=config.get("moe_intermediate_size", 2048),
+            
+            # Advanced features
+            dtype="fp8" if config.get("mixed_precision") == "fp8" else "bf16",
+            gradient_checkpointing=config.get("gradient_checkpointing", True),
+            use_alibi=config.get("use_alibi", True),
+            use_rope_scaling=config.get("use_rope_scaling", True),
+            parallel_attn=True,
+            
+            # Attention dimensions
+            qk_nope_head_dim=config.get("qk_nope_head_dim", 256),
+            qk_rope_head_dim=config.get("qk_rope_head_dim", 128),
+            v_head_dim=config.get("v_head_dim", 256),
+            
+            # Scaling parameters
+            rope_theta=config.get("rope_theta", 20000.0),
+            rope_factor=config.get("rope_factor", 80),
+            mscale=config.get("mscale", 1.5),
+            rope_condense_ratio=config.get("rope_condense_ratio", 1.2)
+        )
+
+    # Create model
     model = Transformer(model_args)
-    
     if is_moe:
         model = MoE(model)
     
+    # Create tokenizer from ModelArgs
     tokenizer = VishwamAITokenizer(TokenizerConfig(
-        vocab_size=config.get("vocab_size", 102400),
-        max_sentence_length=config.get("max_position_embeddings", 32768)
+        vocab_size=model_args.vocab_size,
+        max_sentence_length=model_args.max_seq_len
     ))
     
+    # Create advanced config from ModelArgs
     advanced_config = AdvancedModelConfig(
-        hidden_dim=config["hidden_size"],
+        hidden_dim=model_args.dim,
         tokenizer_config=tokenizer.config
     )
     

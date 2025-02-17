@@ -36,3 +36,8 @@ class ModelArgs:
     gradient_checkpointing: bool = True
     parallel_attn: bool = True  # Parallel attention computation
     rope_condense_ratio: float = 1.0
+    ethical_framework_enabled: bool = True  # Enable ethical framework
+    emergent_behavior_enabled: bool = True  # Enable emergent behavior
+    curriculum_learning_enabled: bool = True  # Enable curriculum learning
+    cache_augmentation_enabled: bool = True  # Enable cache augmentation
+    integrated_information_enabled: bool = True  # Enable integrated information processing

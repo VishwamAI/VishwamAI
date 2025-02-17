@@ -161,8 +161,13 @@ class CurriculumScheduler:
             vocab_diff = (torch.unique(input_ids).size(0) / (input_ids.max().item() + 1))
             metrics['vocabulary'] = min(1.0, max(0.0, vocab_diff))
         
+        # Reasoning steps difficulty
+        reasoning_steps = input_ids.size(1) // 10  # Example heuristic
+        reasoning_diff = (reasoning_steps - self.config.min_reasoning_steps) / self.reasoning_steps_range
+        metrics['reasoning_steps'] = min(1.0, max(0.0, reasoning_diff))
+        
         # Overall difficulty score (weighted average)
-        weights = {'sequence_length': 0.6, 'vocabulary': 0.4}
+        weights = {'sequence_length': 0.4, 'vocabulary': 0.3, 'reasoning_steps': 0.3}
         difficulty_score = sum(
             metric * weights[name] for name, metric in metrics.items()
         )

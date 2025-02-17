@@ -2,8 +2,8 @@
 
 VishwamAI is a state-of-the-art language model enhanced with structured reasoning capabilities through neural memory, tree of thoughts, and differentiable cache components.
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+[![Python 3.10+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://vishwamai.readthedocs.io)
 [![Downloads](https://pepy.tech/badge/vishwamai)](https://pepy.tech/project/vishwamai)
 
@@ -98,13 +98,7 @@ trainer.train()
 - **Storage**: 1TB+ SSD
 
 ## Model Performance
-
-| Benchmark | Score | Component Impact |
-|-----------|-------|-----------------|
-| MMLU      | 92.4% | Memory: +7.8%   |
-| GSM8K     | 94.7% | Tree: +6.4%     |
-| HumanEval | 88.9% | Cache: +4.2%    |
-| MATH      | 89.2% | Combined: +18.4% |
+coming soon 
 
 ## Examples
 

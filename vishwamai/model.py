@@ -7,25 +7,21 @@ from .config import ModelArgs
 from .base_layers import Linear
 from .parallel import ColumnParallelLinear, RowParallelLinear, RMSNorm, ParallelEmbedding
 from .utils import precompute_freqs_cis
-from .MLA import MLA
-from .MLP import MLP
-from .MoE import MoE
+from .shared_constants import world_size, rank
 
 # Global config variables
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
-world_size = 1
-rank = 0
 
 class Block(nn.Module):
     """Transformer block combining attention and feed-forward layers."""
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         # Import here to avoid circular imports
-        from .experimental.MLA import MLA
-        from .experimental.MLP import MLP
-        from .experimental.MoE import MoE
+        from .MLA import MLA
+        from .MLP import MLP
+        from .MoE import MoE
         
         self.attn = MLA(args)
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)

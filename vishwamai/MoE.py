@@ -3,8 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from .model import ModelArgs, world_size, rank
-from .parallel import Linear
+from .config import ModelArgs
+from .shared_constants import world_size, rank
+from .base_layers import Linear
 import torch.nn as nn
 from .MLP import MLP
 from typing import Tuple

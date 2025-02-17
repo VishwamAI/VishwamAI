@@ -1,23 +1,16 @@
 """
 Vishwamai - Advanced AI Training Framework
-=======================================
-
-Key features:
-- Advanced neural architectures
-- Multi-task learning
-- Neural memory mechanisms
-- Curriculum learning
-- Ethical decision making
 """
 
-# Core components
+# Core components with fixed import order to avoid circular dependencies 
 from .config import ModelArgs
 from .constants import WORLD_SIZE, ATTN_IMPL, BLOCK_SIZE
 from .base_layers import Linear
 from .utils import precompute_freqs_cis
 from .tokenizer import VishwamAITokenizer, TokenizerConfig
-from .kernel import weight_dequant, optimize_kernel_layout
 from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
+from .Transformer import Transformer
+# Move model_factory import after all core components
 from .model_factory import create_model
 
 __version__ = "0.1.1"
@@ -25,35 +18,18 @@ __author__ = "Vishwamai Contributors"
 
 __all__ = [
     'ModelArgs',
-    'WORLD_SIZE',
+    'WORLD_SIZE', 
     'ATTN_IMPL',
     'BLOCK_SIZE',
     'Linear',
     'precompute_freqs_cis',
     'VishwamAITokenizer',
-    'TokenizerConfig',
-    'weight_dequant',
-    'optimize_kernel_layout',
+    'TokenizerConfig', 
     'ColumnParallelLinear',
     'RMSNorm',
     'ParallelEmbedding',
-    'create_model',
-    'UnifiedTrainer',
-    'UnifiedTrainerConfig',
-    'ModelFactory',
-    'AdvancedModelConfig',
-    'CurriculumConfig',
-    'CurriculumScheduler',
-    'EmergentConfig',
-    'EmergentBehaviorModule',
-    'IntegrationConfig',
-    'IntegratedInformationModule',
-    'EthicalConfig',
-    'EthicalFramework',
-    'HardwareConfig',
-    'HardwareAdapter',
-    'OpenEndedConfig',
-    'OpenEndedLearning',
+    'Transformer',
+    'create_model'
 ]
 
 # Module level metadata

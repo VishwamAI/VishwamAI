@@ -8,7 +8,8 @@ from .config import ModelArgs
 from .constants import WORLD_SIZE, ATTN_IMPL, BLOCK_SIZE
 from .kernel import weight_dequant
 from .utils import apply_rotary_emb
-from .parallel import ColumnParallelLinear, RowParallelLinear, Linear, RMSNorm
+from .base_layers import Linear
+from .parallel import ColumnParallelLinear, RowParallelLinear, RMSNorm
 
 class MLA(nn.Module):
     """Multi-Headed Attention Layer."""

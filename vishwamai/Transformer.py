@@ -26,13 +26,16 @@ class Block(nn.Module):
         self.attn = MLA(args)
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
         
-        # Use transformer_engine layers if available
-        if TRANSFORMER_ENGINE_AVAILABLE and getattr(args, 'use_transformer_engine', True):
-            self.attn_norm = TransformerEngine.convert_module(RMSNorm(args.dim))
-            self.ffn_norm = TransformerEngine.convert_module(RMSNorm(args.dim))
-        else:
-            self.attn_norm = RMSNorm(args.dim)
-            self.ffn_norm = RMSNorm(args.dim)
+        # Initialize normalization layers
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
+        
+        # Apply TransformerEngine conversion if available and enabled
+        if (TRANSFORMER_ENGINE_AVAILABLE and 
+            getattr(args, 'use_transformer_engine', True) and 
+            hasattr(TransformerEngine, 'convert_module')):
+            self.attn_norm = TransformerEngine.convert_module(self.attn_norm)
+            self.ffn_norm = TransformerEngine.convert_module(self.ffn_norm)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
         # Ensure consistent dtype throughout block
@@ -55,7 +58,9 @@ class Transformer(nn.Module):
         # Store configuration
         self.args = args
         self.device = device
-        self.use_te = TRANSFORMER_ENGINE_AVAILABLE and getattr(args, 'use_transformer_engine', True)
+        self.use_te = (TRANSFORMER_ENGINE_AVAILABLE and 
+                      getattr(args, 'use_transformer_engine', True) and 
+                      hasattr(TransformerEngine, 'convert_module'))
         
         # Set up distributed training
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -74,7 +79,10 @@ class Transformer(nn.Module):
         ])
         
         # Initialize output layers
-        self.norm = TransformerEngine.convert_module(RMSNorm(args.dim)) if self.use_te else RMSNorm(args.dim)
+        self.norm = RMSNorm(args.dim)
+        if self.use_te:
+            self.norm = TransformerEngine.convert_module(self.norm)
+        
         self.head = self._create_output_head()
         
         # Initialize positional embeddings
@@ -112,7 +120,9 @@ class Transformer(nn.Module):
             device=self.device,
             dtype=self.dtype
         )
-        return TransformerEngine.convert_module(embed) if self.use_te else embed
+        if self.use_te:
+            embed = TransformerEngine.convert_module(embed)
+        return embed
         
     def _create_output_head(self) -> nn.Module:
         """Create output projection with proper configuration."""
@@ -123,7 +133,9 @@ class Transformer(nn.Module):
             device=self.device,
             dtype=self.dtype
         )
-        return TransformerEngine.convert_module(head) if self.use_te else head
+        if self.use_te:
+            head = TransformerEngine.convert_module(head)
+        return head
         
     def _init_positional_embeddings(self):
         """Initialize positional embeddings."""
@@ -155,7 +167,7 @@ class Transformer(nn.Module):
 
     def _forward_impl(self, tokens: torch.Tensor, start_pos: int = 0):
         seqlen = tokens.size(1)
-        tokens = tokens.to(self.dtype)  # Ensure input is in correct dtype
+        tokens = tokens.to(dtype=torch.long)  # Input tokens should be integers
         h = self.embed(tokens)
         h = h.to(self.dtype)  # Ensure embeddings are in correct dtype
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]

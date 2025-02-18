@@ -41,10 +41,17 @@ class ParallelLinearMixin:
 
 class ColumnParallelLinear(BaseLinear, ParallelLinearMixin):
     """Linear layer with column parallelism."""
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None
+    ):
         assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
         self.part_out_features = out_features // world_size
-        super().__init__(in_features, self.part_out_features, bias, dtype)
+        super().__init__(in_features, self.part_out_features, bias=bias, device=device, dtype=dtype)
         self.init_quantization(self.part_out_features, in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -52,10 +59,17 @@ class ColumnParallelLinear(BaseLinear, ParallelLinearMixin):
 
 class RowParallelLinear(BaseLinear, ParallelLinearMixin):
     """Linear layer with row parallelism."""
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None
+    ):
         assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
         self.part_in_features = in_features // world_size
-        super().__init__(self.part_in_features, out_features, bias, dtype)
+        super().__init__(self.part_in_features, out_features, bias=bias, device=device, dtype=dtype)
         self.init_quantization(out_features, self.part_in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -79,7 +93,13 @@ class RMSNorm(nn.Module):
 
 class ParallelEmbedding(nn.Module):
     """Embedding layer with parallelism support across distributed processes."""
-    def __init__(self, vocab_size: int, dim: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -87,7 +107,7 @@ class ParallelEmbedding(nn.Module):
         self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if world_size > 1:

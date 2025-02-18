@@ -38,12 +38,24 @@ class Transformer(nn.Module):
         self.device = device
         super().__init__()
         self.max_seq_len = args.max_seq_len
-        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        dtype = torch.get_default_dtype()
+        self.embed = ParallelEmbedding(
+            vocab_size=args.vocab_size,
+            dim=args.dim,
+            device=device,
+            dtype=dtype
+        )
         self.layers = torch.nn.ModuleList()
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
-        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        self.head = ColumnParallelLinear(
+            in_features=args.dim,
+            out_features=args.vocab_size,
+            bias=True,
+            device=device,
+            dtype=torch.get_default_dtype()
+        )
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
         self.gradient_checkpointing = args.gradient_checkpointing
         

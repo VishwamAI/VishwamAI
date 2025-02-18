@@ -4,7 +4,8 @@ import torch.distributed as dist
 from typing import Optional
 
 from .config import ModelArgs
-from .utils import Linear, precompute_freqs_cis
+from .base_layers import Linear
+from .utils import precompute_freqs_cis as _precompute_freqs_cis
 from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
 from .MLA import MLA
 from .MLP import MLP
@@ -56,7 +57,7 @@ class Transformer(nn.Module):
             device=device,
             dtype=torch.get_default_dtype()
         )
-        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        self.register_buffer("freqs_cis", _precompute_freqs_cis(dim=args.dim, end=args.max_seq_len), persistent=False)
         self.gradient_checkpointing = args.gradient_checkpointing
         
         # Add ALiBi slopes if enabled

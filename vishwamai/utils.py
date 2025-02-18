@@ -4,10 +4,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Union, Any, Optional
+from typing import Union, Any, Optional, Tuple
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """Precompute frequencies for positional embeddings."""
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """
+    Precompute frequencies for positional embeddings.
+    
+    Args:
+        dim: Hidden dimension size
+        end: Maximum sequence length
+        theta: Angular frequency scale (default: 10000.0)
+    
+    Returns:
+        torch.Tensor: Complex tensor containing precomputed frequencies
+    """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()

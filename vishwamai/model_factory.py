@@ -35,6 +35,7 @@ def create_model(config: Union[dict, ModelArgs], device: Optional[torch.device] 
         # Map dict keys to ModelArgs attributes
         key_mapping = {
             'hidden_size': 'dim',
+            'dim': 'dim',  # Allow both hidden_size and dim
             'num_hidden_layers': 'n_layers',
             'num_attention_heads': 'n_heads',
             'intermediate_size': 'inter_dim'
@@ -64,38 +65,38 @@ def create_model(config: Union[dict, ModelArgs], device: Optional[torch.device] 
         config_dict.setdefault("inter_dim", config_dict.get("dim", 2048) * 4)  # Common ratio for transformer
         
         model_args = ModelArgs(
-            dim=config_dict["dim"],
+            dim=config_dict.get("dim", config_dict.get("hidden_size", 2048)),
             n_layers=config_dict["n_layers"],
             n_heads=config_dict["n_heads"],
             vocab_size=config_dict.get("vocab_size", 102400),
             n_dense_layers=0 if is_moe else config_dict["n_layers"],
             inter_dim=config_dict["inter_dim"],
-            max_seq_len=config.get("max_position_embeddings", 32768),  # Extended for 7B
+            max_seq_len=config_dict.get("max_seq_len", config_dict.get("max_position_embeddings", 32768)),  # Extended for 7B
             
             # MoE specific parameters
-            n_routed_experts=config.get("num_experts", 128) if is_moe else 0,
-            n_shared_experts=config.get("num_shared_experts", 4) if is_moe else 0,
-            n_activated_experts=config.get("num_activated_experts", 8) if is_moe else 0,
-            n_expert_groups=config.get("num_expert_groups", 2),
-            moe_inter_dim=config.get("moe_intermediate_size", 2048),
+            n_routed_experts=config_dict.get("num_experts", 128) if is_moe else 0,
+            n_shared_experts=config_dict.get("num_shared_experts", 4) if is_moe else 0,
+            n_activated_experts=config_dict.get("num_activated_experts", 8) if is_moe else 0,
+            n_expert_groups=config_dict.get("num_expert_groups", 2),
+            moe_inter_dim=config_dict.get("moe_intermediate_size", 2048),
             
             # Advanced features
-            dtype=torch.bfloat16 if config.get("mixed_precision") != "fp8" else torch.float8_e4m3fn,
-            gradient_checkpointing=config.get("gradient_checkpointing", True),
-            use_alibi=config.get("use_alibi", True),
-            use_rope_scaling=config.get("use_rope_scaling", True),
+            dtype=torch.bfloat16 if config_dict.get("mixed_precision") != "fp8" else torch.float8_e4m3fn,
+            gradient_checkpointing=config_dict.get("gradient_checkpointing", True),
+            use_alibi=config_dict.get("use_alibi", True),
+            use_rope_scaling=config_dict.get("use_rope_scaling", True),
             parallel_attn=True,
             
             # Attention dimensions
-            qk_nope_head_dim=config.get("qk_nope_head_dim", 256),
-            qk_rope_head_dim=config.get("qk_rope_head_dim", 128),
-            v_head_dim=config.get("v_head_dim", 256),
+            qk_nope_head_dim=config_dict.get("qk_nope_head_dim", 256),
+            qk_rope_head_dim=config_dict.get("qk_rope_head_dim", 128),
+            v_head_dim=config_dict.get("v_head_dim", 256),
             
             # Scaling parameters
-            rope_theta=config.get("rope_theta", 20000.0),
-            rope_factor=config.get("rope_factor", 80),
-            mscale=config.get("mscale", 1.5),
-            rope_condense_ratio=config.get("rope_condense_ratio", 1.2)
+            rope_theta=config_dict.get("rope_theta", 20000.0),
+            rope_factor=config_dict.get("rope_factor", 80),
+            mscale=config_dict.get("mscale", 1.5),
+            rope_condense_ratio=config_dict.get("rope_condense_ratio", 1.2)
         )
 
     # Create model with device

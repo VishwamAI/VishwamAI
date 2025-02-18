@@ -5,7 +5,8 @@ from typing import Optional
 
 from .config import ModelArgs
 from .base_layers import Linear
-from .utils import precompute_freqs_cis as _precompute_freqs_cis
+# Import the function directly from utils
+from .utils import precompute_freqs_cis
 from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
 from .MLA import MLA
 from .MLP import MLP
@@ -32,13 +33,19 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     """Transformer model with positional embeddings, multiple layers, and output projection."""
     def __init__(self, args: ModelArgs, device: Optional[torch.device] = None):
+        super().__init__()  # Call super first to ensure proper initialization
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" and hasattr(torch, 'float8_e4m3fn') else torch.bfloat16
+        
+        # Store input arguments
+        self.args = args
         self.device = device
-        super().__init__()
         self.max_seq_len = args.max_seq_len
+        self.dim = args.dim
+        
+        # Initialize components
         dtype = torch.get_default_dtype()
         self.embed = ParallelEmbedding(
             vocab_size=args.vocab_size,
@@ -46,9 +53,13 @@ class Transformer(nn.Module):
             device=device,
             dtype=dtype
         )
+        
+        # Initialize layers
         self.layers = torch.nn.ModuleList()
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
+            
+        # Initialize normalization and output layers
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(
             in_features=args.dim,
@@ -57,12 +68,40 @@ class Transformer(nn.Module):
             device=device,
             dtype=torch.get_default_dtype()
         )
-        self.register_buffer("freqs_cis", _precompute_freqs_cis(dim=args.dim, end=args.max_seq_len), persistent=False)
+        
+        # Compute positional embeddings
+        try:
+            # Ensure attributes are integers
+            dim = int(self.dim)
+            max_seq_len = int(self.max_seq_len)
+            
+            # Log the values for debugging
+            print(f"Computing frequencies with dim={dim}, max_seq_len={max_seq_len}")
+            
+            # Compute frequencies with explicit parameters
+            freqs_cis = precompute_freqs_cis(
+                dim=dim,
+                end=max_seq_len,
+                theta=10000.0
+            )
+            self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+            print("Successfully computed frequencies")
+        except Exception as e:
+            print(f"Error computing frequencies in Transformer.__init__:")
+            print(f"  dim={self.dim} (type: {type(self.dim)})")
+            print(f"  max_seq_len={self.max_seq_len} (type: {type(self.max_seq_len)})")
+            raise e
+        
+        # Store other configuration
         self.gradient_checkpointing = args.gradient_checkpointing
         
         # Add ALiBi slopes if enabled
         if args.use_alibi:
             self.alibi_slopes = self._get_alibi_slopes()
+            
+        # Move to device if specified
+        if device is not None:
+            self.to(device)
 
     def _get_alibi_slopes(self):
         """Generate ALiBi attention slopes."""

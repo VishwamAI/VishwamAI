@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, Tuple
 from dataclasses import dataclass
 from .base_layers import Linear
 from .config import ModelArgs
@@ -24,11 +24,14 @@ class AdvancedModelConfig:
     open_ended_config: Optional[OpenEndedConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
 
-def create_model(config: Union[dict, ModelArgs], device: Optional[torch.device] = None) -> nn.Module:
+def create_model(config: Union[dict, ModelArgs], device: Optional[torch.device] = None) -> Tuple[nn.Module, VishwamAITokenizer]:
     """
     Create a model instance based on configuration.
     Args:
         config: Either a dictionary with model configuration or a ModelArgs instance
+        device: Optional device to place the model on
+    Returns:
+        Tuple of (model, tokenizer)
     """
     # Convert dict keys to match ModelArgs attributes
     def _convert_dict_to_model_args(config_dict):
@@ -100,12 +103,12 @@ def create_model(config: Union[dict, ModelArgs], device: Optional[torch.device] 
         )
 
     # Create model with device
-    model = Transformer(model_args, device=device)
+    model = Transformer(args=model_args, device=device)
     if is_moe:
         model = MoE(model)
     
     # Move model to device if specified
-    if device is not None:
+    if device is not None and model is not None:
         model = model.to(device)
     
     # Create tokenizer from ModelArgs

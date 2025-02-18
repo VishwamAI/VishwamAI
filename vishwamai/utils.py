@@ -13,20 +13,31 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     Args:
         dim: Hidden dimension size
         end: Maximum sequence length
-        theta: Angular frequency scale (default: 10000.0)
-    
+        theta: Angular frequency scale
+        
     Returns:
         torch.Tensor: Complex tensor containing precomputed frequencies
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    return torch.polar(torch.ones_like(freqs), freqs)
+    try:
+        # Input validation
+        if not isinstance(dim, int) or not isinstance(end, int):
+            raise TypeError("dim and end must be integers")
+        if dim <= 0 or end <= 0:
+            raise ValueError("dim and end must be positive integers")
+            
+        # Compute frequency bands
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs).float()
+        
+        # Create complex-valued tensor
+        return torch.polar(torch.ones_like(freqs), freqs)
+    except Exception as e:
+        print(f"Error in precompute_freqs_cis: dim={dim}, end={end}, theta={theta}")
+        raise e
 
 class Linear(nn.Module):
-    """
-    A custom Linear layer implementation with QK optimization and optional quantization.
-    """
+    """A custom Linear layer implementation with QK optimization and optional quantization."""
     def __init__(
         self,
         in_features: int,
@@ -91,7 +102,7 @@ class Linear(nn.Module):
                 f'bias={self.bias is not None}, '
                 f'quantize={self.quantize}')
 
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary embeddings to input tensors using the given frequency tensor."""
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))

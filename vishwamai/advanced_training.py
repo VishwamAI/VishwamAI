@@ -40,6 +40,8 @@ class AdvancedTrainer:
     ):
         self.model = model
         self.device = device
+        self.memory_size = memory_size  # Store memory_size as instance variable
+        self.cache_size = cache_size
         
         # Convert ModelArgs to dict if necessary
         if isinstance(config, ModelArgs):
@@ -74,7 +76,6 @@ class AdvancedTrainer:
         # Initialize training state
         self.current_step = 0
         self.memory_cache = {}
-        self.cache_size = cache_size
         self.best_loss = float('inf')
         self.steps_since_improve = 0
         
@@ -87,26 +88,35 @@ class AdvancedTrainer:
 
     def _initialize_components(self):
         """Initialize trainer components after configuration setup."""
-        # Initialize optimizer
-        self.optimizer = self._create_optimizer()
-        self.scheduler = self._create_scheduler()
-        
-        # Initialize neural memory if not provided
-        if self.neural_memory is None:
-            self.neural_memory = NeuralMemory(
-                memory_size=self.memory_size,
-                hidden_dim=getattr(self.model, 'dim', 2048),
-                num_memory_heads=4
-            ).to(self.device)
-        
-        # Initialize tracking states
-        self.current_difficulty = 0.0
-        self.curriculum_scores = []
-        self.thought_buffer = []
-        self.best_thoughts = []
-        self.eval_history = []
-        self.loss_history = []
-        
+        try:
+            # Initialize optimizer
+            self.optimizer = self._create_optimizer()
+            self.scheduler = self._create_scheduler()
+            
+            # Initialize neural memory if not provided
+            if self.neural_memory is None:
+                model_dim = getattr(self.model, 'dim', None)
+                if model_dim is None:
+                    model_dim = self.config.get('dim', 2048)
+                
+                self.neural_memory = NeuralMemory(
+                    memory_size=self.memory_size,
+                    hidden_dim=model_dim,
+                    num_memory_heads=4
+                ).to(self.device)
+            
+            # Initialize tracking states
+            self.current_difficulty = 0.0
+            self.curriculum_scores = []
+            self.thought_buffer = []
+            self.best_thoughts = []
+            self.eval_history = []
+            self.loss_history = []
+            
+        except Exception as e:
+            print(f"Error initializing components: {str(e)}")
+            raise
+
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer with parameter groups."""
         # Separate parameters for different optimization strategies

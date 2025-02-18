@@ -88,6 +88,17 @@ def initialize_model_and_trainer(
             model, tokenizer = create_model(model_args, device=device)
             start_step = 0
 
+        # Handle model precision
+        try:
+            if hasattr(model_args, 'dtype') and model_args.dtype == 'bf16':
+                model = model.to(dtype=torch.bfloat16)
+            elif hasattr(model_args, 'dtype') and model_args.dtype == 'fp8':
+                from .fp8_cast_bf16 import main
+                main(model)
+        except Exception as e:
+            print(f"Warning: Precision casting failed: {str(e)}")
+            print("Continuing with default precision")
+
         model = model.to(device)
         neural_memory = neural_memory.to(device)
         main(model)  # Apply FP8/BF16 optimizations

@@ -70,6 +70,11 @@ class ModelArgs:
     batch_size: int = 32
     accumulation_steps: int = 1
     
+    # Add gradient checkpointing configuration
+    enable_gradient_checkpointing: bool = True
+    gradient_checkpointing_ratio: float = 0.5
+    use_memory_efficient_attention: bool = True
+
     def __post_init__(self):
         """Validate and convert attributes after initialization."""
         # Ensure integer types
@@ -103,3 +108,11 @@ class ModelArgs:
     # Optional: Add a helper to check if attribute exists
     def has(self, key):
         return hasattr(self, key)
+
+    def validate(self):
+        """Validate configuration parameters."""
+        # Validate gradient checkpointing settings
+        if not isinstance(self.enable_gradient_checkpointing, bool):
+            raise ValueError("enable_gradient_checkpointing must be a boolean")
+        if not 0.0 <= self.gradient_checkpointing_ratio <= 1.0:
+            raise ValueError("gradient_checkpointing_ratio must be between 0 and 1")

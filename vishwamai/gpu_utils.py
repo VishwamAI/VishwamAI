@@ -2,7 +2,7 @@ import torch
 import math
 import logging
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,33 @@ class GPUManager:
             torch.cuda.empty_cache()
             # Use 95% of available memory
             torch.cuda.set_per_process_memory_fraction(0.95)
+            
+    def optimize_memory_settings(self, model_args: Any) -> None:
+        """Configure memory optimization settings based on GPU capabilities."""
+        if not torch.cuda.is_available():
+            return
+            
+        cuda_capability = torch.cuda.get_device_capability()[0]
+        available_memory = torch.cuda.get_device_properties(0).total_memory
+        
+        # Adjust gradient checkpointing based on available memory
+        if available_memory < 16e9:  # Less than 16GB
+            model_args.enable_gradient_checkpointing = True
+            model_args.gradient_checkpointing_ratio = 0.8
+        elif available_memory < 32e9:  # Less than 32GB
+            model_args.enable_gradient_checkpointing = True
+            model_args.gradient_checkpointing_ratio = 0.5
+            
+        # Enable memory efficient attention for newer GPUs
+        model_args.use_memory_efficient_attention = cuda_capability >= 7.5
+        
+        # Set optimal training precision
+        if cuda_capability >= 8.0:  # Ampere and newer
+            model_args.dtype = "bfloat16"
+        elif cuda_capability >= 7.0:  # Volta/Turing
+            model_args.dtype = "float16"
+        else:
+            model_args.dtype = "float32"
             
     def get_optimal_config(self) -> Dict:
         """Get optimal configuration based on GPU."""

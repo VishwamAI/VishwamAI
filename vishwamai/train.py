@@ -38,7 +38,9 @@ def initialize_training(
         )
         
         # Apply memory optimizations
-        if hasattr(model, "gradient_checkpointing_enable"):
+        if hasattr(model, "enable_gradient_checkpointing"):
+            model.enable_gradient_checkpointing()
+        elif hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
             
         if hasattr(model, "enable_mem_efficient_attention"):
@@ -61,25 +63,43 @@ def initialize_training(
 
 def main():
     """Main training entry point."""
-    # Define configurations
-    model_args = ModelArgs()  # Add your model args here
-    tot_config = TreeConfig()  # Add your tree config here
-    reward_config = RewardConfig()  # Add your reward config here  
-    curriculum_config = CurriculumConfig()  # Add your curriculum config here
-    
-    checkpoint_dir = os.getenv('CHECKPOINT_DIR', './checkpoints')
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    try:
+        # Define configurations
+        model_args = ModelArgs()  # Add your model args here
+        tot_config = TreeConfig()  # Add your tree config here
+        reward_config = RewardConfig()  # Add your reward config here  
+        curriculum_config = CurriculumConfig()  # Add your curriculum config here
+        
+        checkpoint_dir = os.getenv('CHECKPOINT_DIR', './checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Execute initialization
-    model, trainer, start_step = initialize_training(
-        model_args=model_args,
-        checkpoint_dir=checkpoint_dir,
-        tot_config=tot_config,
-        reward_config=reward_config,
-        curriculum_config=curriculum_config
-    )
-    
-    return model, trainer, start_step
-
+        # Execute initialization
+        model, trainer, start_step = initialize_training(
+            model_args=model_args,
+            checkpoint_dir=checkpoint_dir,
+            tot_config=tot_config,
+            reward_config=reward_config,
+            curriculum_config=curriculum_config
+        )
+        
+        # Initialize training loop
+        training_loop = TrainingLoop(
+            trainer=trainer,
+            model_args=model_args,
+            checkpoint_dir=checkpoint_dir,
+            performance_dir=DRIVE_DIR,
+            save_every=1000,
+            eval_every=5000
+        )
+        
+        # Execute training
+        training_loop.train()
+        
+        print("Training complete!")
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise
+        
 if __name__ == "__main__":
     main()

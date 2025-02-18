@@ -21,7 +21,8 @@ def initialize_model_and_trainer(
     tot_config: Optional[TreeConfig] = None,
     reward_config: Optional[Dict] = None,
     curriculum_config: Optional[CurriculumConfig] = None,
-    neural_memory: NeuralMemory = None
+    neural_memory: NeuralMemory = None,
+    device: Optional[torch.device] = None
 ) -> Tuple[torch.nn.Module, AdvancedTrainer, int]:
     """
     Initialize model and trainer with proper configuration and checkpoint handling.
@@ -32,7 +33,14 @@ def initialize_model_and_trainer(
     # Ensure checkpoint directory exists
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Validate device and get compute capabilities
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if device.type == "cuda":
+        # Get GPU compute capability
+        compute_capability = torch.cuda.get_device_capability(device)
+        model_args.use_memory_efficient_attention = compute_capability >= (7, 5)
     
     print("Validating model arguments...")
     print(f"Dimension: {model_args.dim}")
@@ -62,6 +70,19 @@ def initialize_model_and_trainer(
     try:
         # Create model - this will handle precision settings internally
         model, tokenizer = create_model(model_args, device=device)
+        
+        # Enable memory optimizations
+        if model_args.enable_gradient_checkpointing:
+            if hasattr(model, "enable_gradient_checkpointing"):
+                model.enable_gradient_checkpointing()
+            else:
+                print("Warning: Model does not support gradient checkpointing")
+                
+        if model_args.use_memory_efficient_attention:
+            if hasattr(model, "enable_mem_efficient_attention"):
+                model.enable_mem_efficient_attention()
+            else:
+                print("Warning: Model does not support memory efficient attention")
         
         # Load from checkpoint if available
         if latest_checkpoint:

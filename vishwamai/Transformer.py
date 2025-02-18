@@ -52,6 +52,9 @@ class Transformer(nn.Module):
         self.args = args
         self.device = device
         
+        # Add gradient checkpointing flag
+        self.gradient_checkpointing = False
+        
         # Initialize dtype based on args and hardware support
         self.dtype = self._get_optimal_dtype()
         print(f"Using dtype: {self.dtype}")  # Debug info
@@ -122,6 +125,22 @@ class Transformer(nn.Module):
         except Exception as e:
             print(f"Error computing frequencies: {str(e)}")
             raise
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.gradient_checkpointing = True
+        # Enable for all transformer blocks
+        for layer in self.layers:
+            if hasattr(layer, 'gradient_checkpointing'):
+                layer.gradient_checkpointing = True
+    
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+        # Disable for all transformer blocks
+        for layer in self.layers:
+            if hasattr(layer, 'gradient_checkpointing'):
+                layer.gradient_checkpointing = False
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):

@@ -35,8 +35,12 @@ class Block(nn.Module):
             self.ffn_norm = RMSNorm(args.dim)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        x = x + self.ffn(self.ffn_norm(x))
+        # Ensure consistent dtype throughout block
+        x = x.to(dtype=next(self.parameters()).dtype)
+        attn_out = self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        x = x + attn_out.to(x.dtype)
+        ffn_out = self.ffn(self.ffn_norm(x))
+        x = x + ffn_out.to(x.dtype)
         return x
 
 class Transformer(nn.Module):
@@ -82,12 +86,23 @@ class Transformer(nn.Module):
             
     def _get_optimal_dtype(self) -> torch.dtype:
         """Determine optimal dtype based on hardware and configuration."""
+        if hasattr(self.args, 'dtype'):
+            dtype_str = self.args.dtype
+            if dtype_str == "bf16" and torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            elif dtype_str == "fp8" and self.use_te and hasattr(torch, 'float8_e4m3fn'):
+                return torch.float8_e4m3fn
+            # If requested dtype is not supported, warn and fallback
+            warnings.warn(f"Requested dtype {dtype_str} not supported, falling back to automatic selection")
+            
+        # Automatic selection based on hardware support
         if self.use_te and hasattr(torch, 'float8_e4m3fn'):
             return torch.float8_e4m3fn
         elif torch.cuda.is_bf16_supported():
             return torch.bfloat16
-        else:
+        elif torch.cuda.is_available():
             return torch.float16
+        return torch.float32
             
     def _create_embeddings(self) -> nn.Module:
         """Create embedding layer with proper configuration."""
@@ -140,7 +155,9 @@ class Transformer(nn.Module):
 
     def _forward_impl(self, tokens: torch.Tensor, start_pos: int = 0):
         seqlen = tokens.size(1)
+        tokens = tokens.to(self.dtype)  # Ensure input is in correct dtype
         h = self.embed(tokens)
+        h = h.to(self.dtype)  # Ensure embeddings are in correct dtype
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
         if seqlen > 1:

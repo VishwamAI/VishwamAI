@@ -176,10 +176,13 @@ class AdvancedTrainer:
                 # Generate synthetic batch if none provided
                 batch_size = self.config.get('batch_size', 4)
                 seq_len = self.config.get('max_seq_len', 2048)
+                # Get model's dtype from its parameters
+                model_dtype = next(self.model.parameters()).dtype
                 dummy_input = torch.randint(
                     0, self.config.get('vocab_size', 32000),
                     (batch_size, seq_len),
-                    device=self.device
+                    device=self.device,
+                    dtype=torch.long  # Input tokens should be integers
                 )
                 outputs = self.model(dummy_input)
             

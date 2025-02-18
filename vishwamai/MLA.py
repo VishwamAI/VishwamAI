@@ -42,7 +42,8 @@ class MLA(nn.Module):
         """
         batch_size, seq_len, _ = x.shape
         
-        # Project to q, k, v
+        # Project to q, k, v (ensure dtype matches)
+        x = x.to(self.wq.weight.dtype)  # Cast input to match weight dtype
         xq = self.wq(x)
         xk = self.wk(x)
         xv = self.wv(x)

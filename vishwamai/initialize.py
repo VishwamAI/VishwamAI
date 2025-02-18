@@ -11,10 +11,32 @@ import wandb
 from .model_factory import create_model
 from .fp8_cast_bf16 import main
 from .neural_memory import NeuralMemory
+from .fp8_cast_bf16 import setup_model_precision, get_optimal_precision
 
 # Define default paths
 DEFAULT_CHECKPOINT_DIR = os.path.join(os.path.expanduser('~'), 'VishwamAI', 'checkpoints')
 CHECKPOINT_DIR = os.getenv('VISHWAMAI_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
+
+def setup_precision(model: torch.nn.Module, model_args: ModelArgs, device: torch.device) -> torch.nn.Module:
+    """Setup model precision based on configuration."""
+    try:
+        if hasattr(model_args, 'dtype'):
+            if model_args.dtype == "fp8":
+                from .fp8_cast_bf16 import main as fp8_cast
+                # Create a temporary directory for BF16 conversion
+                bf16_dir = Path(os.path.join(os.getcwd(), 'bf16_temp'))
+                bf16_dir.mkdir(exist_ok=True)
+                model = fp8_cast(model, str(bf16_dir))
+            elif model_args.dtype == "bf16":
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                    model = model.to(dtype=torch.bfloat16)
+                else:
+                    print("Warning: BF16 not supported, using default precision")
+    except Exception as e:
+        print(f"Warning: Precision casting failed: {str(e)}")
+        print("Continuing with default precision")
+    
+    return model.to(device)
 
 def initialize_model_and_trainer(
     model_args: ModelArgs,
@@ -88,20 +110,19 @@ def initialize_model_and_trainer(
             model, tokenizer = create_model(model_args, device=device)
             start_step = 0
 
-        # Handle model precision
-        try:
-            if hasattr(model_args, 'dtype') and model_args.dtype == 'bf16':
-                model = model.to(dtype=torch.bfloat16)
-            elif hasattr(model_args, 'dtype') and model_args.dtype == 'fp8':
-                from .fp8_cast_bf16 import main
-                main(model)
-        except Exception as e:
-            print(f"Warning: Precision casting failed: {str(e)}")
-            print("Continuing with default precision")
-
+        # Setup model precision
+        precision = model_args.dtype if hasattr(model_args, 'dtype') else "auto"
+        weights_dir = os.path.join(checkpoint_dir, 'precision_weights')
+        
+        print(f"Setting up model precision: {precision}")
+        model = setup_model_precision(
+            model=model,
+            precision=precision,
+            save_path=weights_dir
+        )
         model = model.to(device)
+
         neural_memory = neural_memory.to(device)
-        main(model)  # Apply FP8/BF16 optimizations
 
         # Convert ModelArgs to dictionary for trainer
         config_dict = asdict(model_args)

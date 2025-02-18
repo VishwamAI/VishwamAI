@@ -4,6 +4,18 @@ from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm
 
+try:
+    import transformer_engine as te
+    TE_AVAILABLE = True
+    TE_ERROR = te.ErrorCode
+    TE = te
+    FP8Calibrator = te.common.recipe.DelayedScaling
+except ImportError:
+    TE_AVAILABLE = False
+    TE_ERROR = None
+    TE = None
+    FP8Calibrator = None
+
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -78,4 +90,3 @@ if __name__ == "__main__":
     parser.add_argument("--output-bf16-hf-path", type=str, required=True)
     args = parser.parse_args()
     main(args.input_fp8_hf_path, args.output_bf16_hf_path)
-    

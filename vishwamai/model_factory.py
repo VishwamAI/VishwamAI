@@ -2,11 +2,35 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Union, Tuple
 from dataclasses import dataclass
-from .base_layers import Linear
 from .config import ModelArgs
 from .tokenizer import VishwamAITokenizer, TokenizerConfig
 from .Transformer import Transformer
-from .MoE import MoE
+from .fp8_cast_bf16 import setup_model_precision
+import warnings
+
+def _create_fresh_model(args: ModelArgs, device: Optional[torch.device] = None) -> nn.Module:
+    """Create a fresh model instance with proper initialization."""
+    print(f"Creating model with configuration:")
+    print(f"  dim: {args.dim}")
+    print(f"  max_seq_len: {args.max_seq_len}")
+    print(f"  n_layers: {args.n_layers}")
+    print(f"  n_heads: {args.n_heads}")
+    print(f"  n_routed_experts: {args.n_routed_experts}")
+
+    # Create base transformer model
+    model = Transformer(args=args, device=device)
+
+    # Apply precision settings
+    try:
+        if hasattr(args, 'dtype'):
+            model = setup_model_precision(model, precision=args.dtype)
+        else:
+            model = setup_model_precision(model, precision="auto")
+    except Exception as e:
+        warnings.warn(f"Error setting model precision: {str(e)}")
+        # Continue with default precision
+
+    return model
 
 def create_model(args: Union[dict, ModelArgs], device: Optional[torch.device] = None) -> Tuple[nn.Module, VishwamAITokenizer]:
     """
@@ -46,28 +70,9 @@ def create_model(args: Union[dict, ModelArgs], device: Optional[torch.device] = 
         else:
             raise TypeError("args must be either a dictionary or ModelArgs instance")
 
-    # Print configuration for debugging
-    print(f"Creating model with configuration:")
-    print(f"  dim: {args.dim}")
-    print(f"  max_seq_len: {args.max_seq_len}")
-    print(f"  n_layers: {args.n_layers}")
-    print(f"  n_heads: {args.n_heads}")
-    print(f"  n_routed_experts: {args.n_routed_experts}")
-
-    # Determine if we're using MoE
-    is_moe = args.n_routed_experts > 0
-
-    # Create base transformer model
-    model = Transformer(args=args, device=device)
+    # Create model and tokenizer
+    model = _create_fresh_model(args, device)
     
-    # Store args in model for later use
-    model.args = args
-    
-    # Wrap with MoE if needed
-    if is_moe:
-        print("Creating MoE wrapper...")
-        model = MoE(model=model, args=args)
-
     # Create tokenizer
     tokenizer = VishwamAITokenizer(TokenizerConfig(
         vocab_size=args.vocab_size,

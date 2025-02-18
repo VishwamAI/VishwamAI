@@ -3,90 +3,129 @@ import json
 from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm
-
-try:
-    import transformer_engine as te
-    TE_AVAILABLE = True
-    TE_ERROR = te.ErrorCode
-    TE = te
-    FP8Calibrator = te.common.recipe.DelayedScaling
-except ImportError:
-    TE_AVAILABLE = False
-    TE_ERROR = None
-    TE = None
-    FP8Calibrator = None
-
 import torch
+import warnings
 from safetensors.torch import load_file, save_file
 
-from .kernel import weight_dequant
+from .kernel import (
+    act_quant,
+    weight_dequant,
+    optimize_kernel_layout,
+    prepare_kernel,
+    fuse_kernels
+)
 
-def main(fp8_path, bf16_path):
-    torch.set_default_dtype(torch.bfloat16)
-    os.makedirs(bf16_path, exist_ok=True)
-    model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
-    with open(model_index_file, "r") as f:
-        model_index = json.load(f)
-    weight_map = model_index["weight_map"]
-    
-    # Cache for loaded safetensor files
-    loaded_files = {}
-    fp8_weight_names = []
-
-    # Helper function to get tensor from the correct file
-    def get_tensor(tensor_name):
-        file_name = weight_map[tensor_name]
-        if file_name not in loaded_files:
-            file_path = os.path.join(fp8_path, file_name)
-            loaded_files[file_name] = load_file(file_path, device="cuda")
-        return loaded_files[file_name][tensor_name]
-
-    safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
-    safetensor_files.sort()
-    for safetensor_file in tqdm(safetensor_files):
-        file_name = os.path.basename(safetensor_file)
-        current_state_dict = load_file(safetensor_file, device="cuda")
-        loaded_files[file_name] = current_state_dict
-        
-        new_state_dict = {}
-        for weight_name, weight in current_state_dict.items():
-            if weight_name.endswith("_scale_inv"):
-                continue
-            elif weight.element_size() == 1:  # FP8 weight
-                scale_inv_name = f"{weight_name}_scale_inv"
-                try:
-                    # Get scale_inv from the correct file
-                    scale_inv = get_tensor(scale_inv_name)
-                    fp8_weight_names.append(weight_name)
-                    new_state_dict[weight_name] = weight_dequant(weight, scale_inv)
-                except KeyError:
-                    print(f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
-                    new_state_dict[weight_name] = weight
+def setup_model_precision(model: torch.nn.Module, precision: str = "auto", save_path: str = None) -> torch.nn.Module:
+    """Setup model precision based on hardware capabilities."""
+    try:
+        if precision == "bf16":
+            if torch.cuda.is_bf16_supported():
+                model = model.to(dtype=torch.bfloat16)
             else:
-                new_state_dict[weight_name] = weight
-                
-        new_safetensor_file = os.path.join(bf16_path, file_name)
-        save_file(new_state_dict, new_safetensor_file)
-        
-        # Memory management: keep only the 2 most recently used files
-        if len(loaded_files) > 2:
-            oldest_file = next(iter(loaded_files))
-            del loaded_files[oldest_file]
-            torch.cuda.empty_cache()
+                warnings.warn("BF16 not supported, falling back to FP32")
+                model = model.to(dtype=torch.float32)
+        elif precision == "fp16":
+            if torch.cuda.is_available():
+                model = model.to(dtype=torch.float16)
+            else:
+                warnings.warn("FP16 not supported, falling back to FP32")
+                model = model.to(dtype=torch.float32)
+        elif precision == "fp8":
+            if hasattr(torch, 'float8_e4m3fn'):
+                # Apply kernel optimizations for FP8
+                for name, param in model.named_parameters():
+                    if param.dim() >= 2:  # Only process matrices
+                        param.data = optimize_kernel_layout(param.data)
+                        if save_path:
+                            prepared_weight, quant_params = prepare_kernel(param.data, quantize=True)
+                            param.data = prepared_weight
+                model = model.to(dtype=torch.float8_e4m3fn)
+            else:
+                warnings.warn("FP8 not supported, falling back to BF16/FP16")
+                return setup_model_precision(model, "auto", save_path)
+        elif precision == "auto":
+            if torch.cuda.is_bf16_supported():
+                model = model.to(dtype=torch.bfloat16)
+            elif torch.cuda.is_available():
+                model = model.to(dtype=torch.float16)
+            else:
+                model = model.to(dtype=torch.float32)
+        else:
+            warnings.warn(f"Unknown precision {precision}, using FP32")
+            model = model.to(dtype=torch.float32)
+    except Exception as e:
+        warnings.warn(f"Error setting precision: {str(e)}, falling back to FP32")
+        model = model.to(dtype=torch.float32)
     
-    # Update model index
-    new_model_index_file = os.path.join(bf16_path, "model.safetensors.index.json")
-    for weight_name in fp8_weight_names:
-        scale_inv_name = f"{weight_name}_scale_inv"
-        if scale_inv_name in weight_map:
-            weight_map.pop(scale_inv_name)
-    with open(new_model_index_file, "w") as f:
-        json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
+    return model
+
+def get_optimal_precision(hardware_info: dict = None) -> str:
+    """Determine optimal precision based on hardware info."""
+    try:
+        if hasattr(torch, 'float8_e4m3fn'):
+            return "fp8"
+        if torch.cuda.is_bf16_supported():
+            return "bf16"
+        elif torch.cuda.is_available():
+            return "fp16"
+    except Exception as e:
+        warnings.warn(f"Error determining optimal precision: {str(e)}")
+    return "fp32"
+
+def load_and_process_weights(input_path: str, output_path: str = None):
+    """Load weights and process them with kernel optimizations."""
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input path {input_path} does not exist")
         
+    if output_path:
+        os.makedirs(output_path, exist_ok=True)
+    
+    weights = {}
+    try:
+        weights = load_file(input_path)
+        
+        # Apply kernel optimizations
+        for name, weight in weights.items():
+            if weight.dim() >= 2:  # Only process matrices
+                weight = optimize_kernel_layout(weight)
+                if hasattr(torch, 'float8_e4m3fn'):
+                    # Quantize to FP8 if supported
+                    weight_quant, _ = prepare_kernel(weight, quantize=True)
+                    weights[name] = weight_quant
+                else:
+                    weights[name] = weight
+                    
+        if output_path:
+            save_file(weights, output_path)
+            
+    except Exception as e:
+        warnings.warn(f"Error processing weights: {str(e)}")
+        
+    return weights
+
+def main(model=None, save_path=None):
+    """Process model or weights with kernel optimizations."""
+    if model is None:
+        return None
+        
+    try:
+        # Apply kernel optimizations
+        for name, param in model.named_parameters():
+            if param.dim() >= 2:  # Only process matrices
+                param.data = optimize_kernel_layout(param.data)
+                
+        # Convert to optimal precision
+        precision = get_optimal_precision()
+        model = setup_model_precision(model, precision, save_path)
+        
+    except Exception as e:
+        warnings.warn(f"Error in model processing: {str(e)}")
+        
+    return model
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--input-fp8-hf-path", type=str, required=True)
-    parser.add_argument("--output-bf16-hf-path", type=str, required=True)
+    parser.add_argument("--input-path", type=str, required=True)
+    parser.add_argument("--output-path", type=str)
     args = parser.parse_args()
-    main(args.input_fp8_hf_path, args.output_bf16_hf_path)
+    load_and_process_weights(args.input_path, args.output_path)

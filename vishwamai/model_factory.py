@@ -30,20 +30,46 @@ def create_model(config: Union[dict, ModelArgs]) -> nn.Module:
     Args:
         config: Either a dictionary with model configuration or a ModelArgs instance
     """
-    # First try to use the input directly as ModelArgs
+    # Convert dict keys to match ModelArgs attributes
+    def _convert_dict_to_model_args(config_dict):
+        # Map dict keys to ModelArgs attributes
+        key_mapping = {
+            'hidden_size': 'dim',
+            'num_hidden_layers': 'n_layers',
+            'num_attention_heads': 'n_heads',
+            'intermediate_size': 'inter_dim'
+        }
+        
+        # Convert input dict to match ModelArgs attribute names
+        converted = {}
+        for k, v in config_dict.items():
+            if k in key_mapping:
+                converted[key_mapping[k]] = v
+            else:
+                converted[k] = v
+        return converted
+
+    # Handle input types
     if isinstance(config, ModelArgs):
         model_args = config
         is_moe = model_args.n_routed_experts > 0
-    # If it's a dictionary, convert to ModelArgs
     else:
-        is_moe = config.get("model_type") == "moe"
+        # Convert dictionary keys to match ModelArgs attributes
+        config_dict = _convert_dict_to_model_args(config)
+        is_moe = config_dict.get("model_type") == "moe"
+        
+        # Set default values for missing keys
+        config_dict.setdefault("vocab_size", 102400)
+        config_dict.setdefault("max_seq_len", 32768)
+        config_dict.setdefault("inter_dim", config_dict.get("dim", 2048) * 4)  # Common ratio for transformer
+        
         model_args = ModelArgs(
-            dim=config["hidden_size"],
-            n_layers=config["num_hidden_layers"],
-            n_heads=config["num_attention_heads"],
-            vocab_size=config.get("vocab_size", 102400),
-            n_dense_layers=0 if is_moe else config["num_hidden_layers"],
-            inter_dim=config["intermediate_size"],
+            dim=config_dict["dim"],
+            n_layers=config_dict["n_layers"],
+            n_heads=config_dict["n_heads"],
+            vocab_size=config_dict.get("vocab_size", 102400),
+            n_dense_layers=0 if is_moe else config_dict["n_layers"],
+            inter_dim=config_dict["inter_dim"],
             max_seq_len=config.get("max_position_embeddings", 32768),  # Extended for 7B
             
             # MoE specific parameters

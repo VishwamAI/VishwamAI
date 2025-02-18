@@ -6,8 +6,16 @@ from .model_factory import create_model
 from .advanced_training import AdvancedTrainer
 from .fp8_cast_bf16 import main
 from .config import ModelArgs
+from .neural_memory import NeuralMemory
 
-def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot_config, reward_config, curriculum_config):
+def initialize_model_and_trainer(
+    model_args: ModelArgs,
+    checkpoint_dir: str,
+    tot_config,
+    reward_config,
+    curriculum_config,
+    neural_memory: NeuralMemory = None
+):
     """Initialize model and trainer with proper configuration."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -18,6 +26,15 @@ def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot
     # Validate model_args
     if not hasattr(model_args, 'dim') or not hasattr(model_args, 'max_seq_len'):
         raise ValueError("model_args must have 'dim' and 'max_seq_len' attributes")
+    
+    # Create neural memory if not provided
+    if neural_memory is None:
+        print("Initializing default neural memory...")
+        neural_memory = NeuralMemory(
+            args=model_args,
+            memory_size=512,
+            num_memory_heads=4
+        )
     
     # Check for latest checkpoint
     checkpoint_dir = Path(checkpoint_dir)
@@ -36,6 +53,8 @@ def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot
             model, tokenizer = create_model(model_args, device=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             start_step = checkpoint.get('step', 0)
+            if 'neural_memory_state' in checkpoint:
+                neural_memory.load_state_dict(checkpoint['neural_memory_state'])
         else:
             # Fresh start
             print("Starting fresh training...")
@@ -44,6 +63,7 @@ def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot
             start_step = 0
 
         model = model.to(device)
+        neural_memory = neural_memory.to(device)
         main(model)  # Apply FP8/BF16 optimizations
 
         # Initialize trainer
@@ -55,7 +75,8 @@ def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot
             cache_size=256,
             tot_config=tot_config,
             reward_config=reward_config,
-            curriculum_config=curriculum_config
+            curriculum_config=curriculum_config,
+            neural_memory=neural_memory  # Pass neural memory to trainer
         )
 
         if latest_checkpoint:
@@ -75,7 +96,11 @@ def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot
                 config={
                     "model": model_args.__dict__,
                     "curriculum": curriculum_config.__dict__,
-                    "tot": tot_config.__dict__
+                    "tot": tot_config.__dict__,
+                    "memory": {
+                        "size": neural_memory.memory_size,
+                        "num_heads": neural_memory.num_memory_heads
+                    }
                 }
             )
             os.environ['WANDB_RUN_ID'] = wandb.run.id
@@ -83,9 +108,7 @@ def initialize_model_and_trainer(model_args: ModelArgs, checkpoint_dir: str, tot
         print(f"Model initialized on {device}")
         print(f"Memory usage: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
         print(f"Starting from step: {start_step}")
-        print(f"Model parameters:")
-        print(f"  Dimension: {model_args.dim}")
-        print(f"  Sequence length: {model_args.max_seq_len}")
+        print(f"Neural memory size: {neural_memory.memory_size}")
 
         return model, trainer, start_step
 

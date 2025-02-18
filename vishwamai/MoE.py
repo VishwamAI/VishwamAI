@@ -1,92 +1,96 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
-
+import torch.nn.functional as F
+from typing import Optional, Tuple
 from .config import ModelArgs
-from .shared_constants import world_size, rank
-from .base_layers import Linear
-import torch.nn as nn
-from .MLP import MLP
-from typing import Tuple
-class Gate(nn.Module):
-    """Gating mechanism for routing inputs in a mixture-of-experts model."""
+from .parallel import ColumnParallelLinear, RowParallelLinear
+
+# Default values for distributed training
+world_size = dist.get_world_size() if dist.is_initialized() else 1
+rank = dist.get_rank() if dist.is_initialized() else 0
+
+def create_local_experts(base_expert: nn.Module, num_experts: int) -> nn.ModuleList:
+    """Create local experts by deepcopying base expert."""
+    return nn.ModuleList([base_expert for _ in range(num_experts)])
+
+class MoELayer(nn.Module):
+    """Mixture of Experts Layer."""
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
         self.dim = args.dim
-        self.topk = args.n_activated_experts
-        self.n_groups = args.n_expert_groups
-        self.topk_groups = args.n_limited_groups
-        self.score_func = args.score_func
-        self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        scores = F.linear(x, self.weight)
-        if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
-        else:
-            scores = scores.sigmoid()
-        original_scores = scores
-        if self.bias is not None:
-            scores = scores + self.bias
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-            scores = (scores * mask.unsqueeze(-1)).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
-        if self.score_func == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
-        return weights.type_as(x), indices
-
-class Expert(nn.Module):
-    """Expert layer for Mixture-of-Experts models."""
-    def __init__(self, dim: int, inter_dim: int):
-        super().__init__()
-        self.w1 = Linear(dim, inter_dim)
-        self.w2 = Linear(inter_dim, dim)
-        self.w3 = Linear(dim, inter_dim)
+        self.moe_inter_dim = args.moe_inter_dim
+        
+        # Ensure number of experts is valid
+        assert args.n_routed_experts % world_size == 0
+        self.num_local_experts = args.n_routed_experts // world_size
+        
+        # Create experts
+        self.w1 = ColumnParallelLinear(self.dim, self.moe_inter_dim, bias=False)
+        self.w2 = RowParallelLinear(self.moe_inter_dim, self.dim, bias=False)
+        self.w3 = ColumnParallelLinear(self.dim, self.moe_inter_dim, bias=False)
+        
+        # Create expert routing
+        self.router = nn.Linear(self.dim, args.n_routed_experts, bias=False)
+        self.gate = nn.Softmax(dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        """Forward pass with expert routing."""
+        batch_size, seq_len, hidden_dim = x.shape
+        x_reshaped = x.view(-1, hidden_dim)
+        
+        # Get routing scores
+        route_logits = self.router(x_reshaped)
+        route_probs = self.gate(route_logits)
+        
+        # Select top-k experts
+        top_k = min(self.args.n_activated_experts, self.num_local_experts)
+        routes_k, indices_k = torch.topk(route_probs, top_k, dim=-1)
+        
+        # Normalize selected probabilities
+        routes_k_norm = routes_k / routes_k.sum(dim=-1, keepdim=True)
+        
+        # Expert computation
+        expert_outputs = torch.zeros_like(x_reshaped)
+        for idx, gate in zip(indices_k.t(), routes_k_norm.t()):
+            h = F.silu(self.w1(x_reshaped))
+            h = self.w3(h)
+            h = F.silu(h)
+            h = self.w2(h)
+            expert_outputs.scatter_add_(0, idx.unsqueeze(1).expand(-1, hidden_dim), gate.unsqueeze(1) * h)
+        
+        return expert_outputs.view(batch_size, seq_len, hidden_dim)
 
 class MoE(nn.Module):
-    """Mixture-of-Experts module."""
-    def __init__(self, args: ModelArgs):
+    """Mixture of Experts wrapper for transformer."""
+    def __init__(self, model: nn.Module, args: Optional[ModelArgs] = None):
         super().__init__()
+        # Save the base model
+        self.base_model = model
+        
+        # Get config from either args or base model
+        if args is None:
+            if hasattr(model, 'args'):
+                args = model.args
+            else:
+                raise ValueError("Either args must be provided or base model must have args attribute")
+        
+        # Store configuration
+        self.args = args
         self.dim = args.dim
-        assert args.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
-        self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // world_size
-        self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(args)
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
-                                      for i in range(self.n_routed_experts)])
-        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        weights, indices = self.gate(x)
-        y = torch.zeros_like(x)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
-        z = self.shared_experts(x)
-        if world_size > 1:
-            dist.all_reduce(y)
-        return (y + z).view(shape)
+        
+        # Create MoE layer
+        self.moe = MoELayer(args)
+        
+    def forward(self, *args, **kwargs):
+        """Forward pass through base model and MoE layer."""
+        # Get base model output
+        base_output = self.base_model(*args, **kwargs)
+        
+        # Apply MoE layer
+        if isinstance(base_output, tuple):
+            output = self.moe(base_output[0])
+            return (output,) + base_output[1:]
+        else:
+            return self.moe(base_output)

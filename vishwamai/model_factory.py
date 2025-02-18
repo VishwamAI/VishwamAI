@@ -46,16 +46,27 @@ def create_model(args: Union[dict, ModelArgs], device: Optional[torch.device] = 
         else:
             raise TypeError("args must be either a dictionary or ModelArgs instance")
 
+    # Print configuration for debugging
+    print(f"Creating model with configuration:")
+    print(f"  dim: {args.dim}")
+    print(f"  max_seq_len: {args.max_seq_len}")
+    print(f"  n_layers: {args.n_layers}")
+    print(f"  n_heads: {args.n_heads}")
+    print(f"  n_routed_experts: {args.n_routed_experts}")
+
     # Determine if we're using MoE
     is_moe = args.n_routed_experts > 0
 
     # Create base transformer model
-    print(f"Creating model with dim={args.dim}, max_seq_len={args.max_seq_len}")
     model = Transformer(args=args, device=device)
+    
+    # Store args in model for later use
+    model.args = args
     
     # Wrap with MoE if needed
     if is_moe:
-        model = MoE(model)
+        print("Creating MoE wrapper...")
+        model = MoE(model=model, args=args)
 
     # Create tokenizer
     tokenizer = VishwamAITokenizer(TokenizerConfig(

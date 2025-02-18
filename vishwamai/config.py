@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Any, Dict, Optional, Union
 
 @dataclass
 class ModelArgs:
@@ -60,6 +60,16 @@ class ModelArgs:
     # Training configuration
     max_steps: int = field(default=100000)
     
+    # Training specific parameters
+    early_stop_patience: int = 1000
+    learning_rate: float = 1e-4
+    min_learning_rate: float = 1e-5
+    warmup_steps: int = 2000
+    weight_decay: float = 0.01
+    gradient_clip: float = 1.0
+    batch_size: int = 32
+    accumulation_steps: int = 1
+    
     def __post_init__(self):
         """Validate and convert attributes after initialization."""
         # Ensure integer types
@@ -76,3 +86,20 @@ class ModelArgs:
         assert self.n_layers > 0, "n_layers must be positive"
         assert self.n_heads > 0, "n_heads must be positive"
         assert self.vocab_size > 0, "vocab_size must be positive"
+    
+    # Override dictionary-style access
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dictionary-style access with defaults."""
+        return getattr(self, key, default)
+    
+    def __getitem__(self, key: str) -> Any:
+        """Support dictionary-style access."""
+        return getattr(self, key)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert ModelArgs to dictionary."""
+        return {k: v for k, v in self.__dict__.items()}
+
+    # Optional: Add a helper to check if attribute exists
+    def has(self, key):
+        return hasattr(self, key)

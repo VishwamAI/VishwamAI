@@ -1,22 +1,48 @@
-import torch
 import os
+import torch
 from pathlib import Path
+from typing import Tuple, Optional, Dict, Any
+from dataclasses import asdict
+from .config import ModelArgs
+from .advanced_training import AdvancedTrainer
+from .tree_of_thoughts import TreeConfig
+from .curriculum import CurriculumConfig
 import wandb
 from .model_factory import create_model
-from .advanced_training import AdvancedTrainer
 from .fp8_cast_bf16 import main
-from .config import ModelArgs
 from .neural_memory import NeuralMemory
+
+# Define default paths
+DEFAULT_CHECKPOINT_DIR = os.path.join(os.path.expanduser('~'), 'VishwamAI', 'checkpoints')
+CHECKPOINT_DIR = os.getenv('VISHWAMAI_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
 
 def initialize_model_and_trainer(
     model_args: ModelArgs,
-    checkpoint_dir: str,
-    tot_config,
-    reward_config,
-    curriculum_config,
+    checkpoint_dir: Optional[str] = None,
+    tot_config: Optional[TreeConfig] = None,
+    reward_config: Optional[Dict] = None,
+    curriculum_config: Optional[CurriculumConfig] = None,
     neural_memory: NeuralMemory = None
-):
-    """Initialize model and trainer with proper configuration."""
+) -> Tuple[torch.nn.Module, AdvancedTrainer, int]:
+    """
+    Initialize model and trainer with proper configuration and checkpoint handling.
+    
+    Args:
+        model_args: Model configuration
+        checkpoint_dir: Directory for checkpoints (defaults to CHECKPOINT_DIR)
+        tot_config: Tree of Thoughts configuration
+        reward_config: Reward configuration
+        curriculum_config: Curriculum learning configuration
+    
+    Returns:
+        Tuple of (model, trainer, start_step)
+    """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
+    
+    # Ensure checkpoint directory exists
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print("Validating model arguments...")
@@ -66,10 +92,13 @@ def initialize_model_and_trainer(
         neural_memory = neural_memory.to(device)
         main(model)  # Apply FP8/BF16 optimizations
 
+        # Convert ModelArgs to dictionary for trainer
+        config_dict = asdict(model_args)
+
         # Initialize trainer
         trainer = AdvancedTrainer(
             model=model,
-            config=model_args.__dict__,  # Convert ModelArgs to dict for trainer
+            config=config_dict,  # Use dictionary instead of ModelArgs
             device=device,
             memory_size=512,
             cache_size=256,
@@ -115,3 +144,9 @@ def initialize_model_and_trainer(
     except Exception as e:
         print(f"Error during initialization: {str(e)}")
         raise
+
+# Optional convenience function
+def get_checkpoint_dir() -> str:
+    """Get the checkpoint directory, creating it if necessary."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    return CHECKPOINT_DIR

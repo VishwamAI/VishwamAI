@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple, Union
+from dataclasses import dataclass, asdict
 import math
 import numpy as np
 from .neural_memory import NeuralMemory
 from .tree_of_thoughts import TreeConfig
 from .curriculum import CurriculumConfig
+from .config import ModelArgs
 
 @dataclass
 class TrainingStats:
@@ -28,7 +29,7 @@ class AdvancedTrainer:
     def __init__(
         self,
         model: nn.Module,
-        config: Dict[str, Any],
+        config: Union[Dict[str, Any], ModelArgs],
         device: torch.device,
         memory_size: int = 512,
         cache_size: int = 256,
@@ -38,8 +39,31 @@ class AdvancedTrainer:
         neural_memory: Optional[NeuralMemory] = None
     ):
         self.model = model
-        self.config = config
         self.device = device
+        
+        # Convert ModelArgs to dict if necessary
+        if isinstance(config, ModelArgs):
+            self.config = asdict(config)
+        else:
+            self.config = config
+            
+        # Default training parameters
+        defaults = {
+            'early_stop_patience': 1000,
+            'learning_rate': 1e-4,
+            'min_learning_rate': 1e-5,
+            'warmup_steps': 2000,
+            'max_steps': 100000,
+            'batch_size': 32,
+            'accumulation_steps': 1,
+            'weight_decay': 0.01,
+            'gradient_clip': 1.0,
+            'lr_decay_steps': 50000
+        }
+        
+        # Initialize parameters with defaults
+        for key, default in defaults.items():
+            setattr(self, key, self.config.get(key, default))
         
         # Initialize components
         self.neural_memory = neural_memory
@@ -47,20 +71,22 @@ class AdvancedTrainer:
         self.reward_config = reward_config
         self.curriculum_config = curriculum_config
         
-        # Training state
+        # Initialize training state
         self.current_step = 0
         self.memory_cache = {}
         self.cache_size = cache_size
         self.best_loss = float('inf')
         self.steps_since_improve = 0
-        self.early_stop_patience = config.get('early_stop_patience', 1000)
         
         # Learning rate scheduling
-        self.warmup_steps = config.get('warmup_steps', 2000)
-        self.base_lr = float(config.get('learning_rate', 1e-4))
-        self.min_lr = float(config.get('min_learning_rate', 1e-5))
-        self.lr_decay_steps = config.get('lr_decay_steps', 50000)
+        self.base_lr = float(self.learning_rate)
+        self.min_lr = float(self.min_learning_rate)
         
+        # Initialize optimizer and other components
+        self._initialize_components()
+
+    def _initialize_components(self):
+        """Initialize trainer components after configuration setup."""
         # Initialize optimizer
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
@@ -68,20 +94,16 @@ class AdvancedTrainer:
         # Initialize neural memory if not provided
         if self.neural_memory is None:
             self.neural_memory = NeuralMemory(
-                args=model.args,
-                memory_size=memory_size,
+                memory_size=self.memory_size,
+                hidden_dim=getattr(self.model, 'dim', 2048),
                 num_memory_heads=4
-            ).to(device)
+            ).to(self.device)
         
-        # Curriculum learning state
+        # Initialize tracking states
         self.current_difficulty = 0.0
         self.curriculum_scores = []
-        
-        # Tree of Thoughts state
         self.thought_buffer = []
         self.best_thoughts = []
-        
-        # Performance tracking
         self.eval_history = []
         self.loss_history = []
         

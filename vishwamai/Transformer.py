@@ -108,11 +108,13 @@ class Transformer(nn.Module):
         """Initialize positional embeddings."""
         try:
             print(f"Computing frequencies with dim={self.args.dim}, max_seq_len={self.args.max_seq_len}")
+            # Call with correct parameters
             freqs_cis = precompute_freqs_cis(
                 dim=self.args.dim,
-                end=self.args.max_seq_len,
-                dtype=self.dtype
+                end=self.args.max_seq_len
             )
+            # Convert to model's dtype after creation
+            freqs_cis = freqs_cis.to(device=self.device, dtype=self.dtype)
             self.register_buffer("freqs_cis", freqs_cis, persistent=False)
             print("Successfully computed frequencies")
             

@@ -8,33 +8,30 @@ from typing import Union, Any, Optional, Tuple
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
-    Precompute frequencies for positional embeddings.
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
     
     Args:
-        dim: Hidden dimension size
+        dim: Feature dimension
         end: Maximum sequence length
-        theta: Angular frequency scale
+        theta: Base value for frequency computation (default: 10000.0)
         
     Returns:
-        torch.Tensor: Complex tensor containing precomputed frequencies
+        Precomputed frequency tensor
     """
-    try:
-        # Input validation
-        if not isinstance(dim, int) or not isinstance(end, int):
-            raise TypeError("dim and end must be integers")
-        if dim <= 0 or end <= 0:
-            raise ValueError("dim and end must be positive integers")
-            
-        # Compute frequency bands
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-        t = torch.arange(end, device=freqs.device)
-        freqs = torch.outer(t, freqs).float()
+    # Ensure dim is even for complex number pairs
+    if dim % 2 != 0:
+        raise ValueError(f"Feature dimension {dim} must be divisible by 2")
         
-        # Create complex-valued tensor
-        return torch.polar(torch.ones_like(freqs), freqs)
-    except Exception as e:
-        print(f"Error in precompute_freqs_cis: dim={dim}, end={end}, theta={theta}")
-        raise e
+    # Create position tensor
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)
+    
+    # Compute complex exponentials
+    freqs_cos = torch.cos(freqs)  # Real part
+    freqs_sin = torch.sin(freqs)  # Imaginary part
+    
+    return torch.stack([freqs_cos, freqs_sin], dim=-1)
 
 class Linear(nn.Module):
     """A custom Linear layer implementation with QK optimization and optional quantization."""

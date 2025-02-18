@@ -1,163 +1,88 @@
+"""Multi-head Locality-sensitive Attention implementation."""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
 from typing import Optional
-
-from .config import ModelArgs
-from .constants import WORLD_SIZE, ATTN_IMPL, BLOCK_SIZE
-from .kernel import weight_dequant
-from .utils import apply_rotary_emb
 from .base_layers import Linear
-from .parallel import ColumnParallelLinear, RowParallelLinear, RMSNorm
+from .config import ModelArgs
+from .utils import apply_rotary_emb
 
 class MLA(nn.Module):
-    """Multi-Headed Attention Layer."""
+    """Multi-head Locality-sensitive Attention module."""
+    
     def __init__(self, args: ModelArgs):
         super().__init__()
+        # Store configuration
         self.dim = args.dim
         self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // WORLD_SIZE
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
+        
+        # Compute head dimensions
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
-
-        if self.q_lora_rank == 0:
-            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
-        else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
-            self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
-            
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         
-        self.softmax_scale = self.qk_head_dim ** -0.5
-        if args.max_seq_len > args.original_seq_len:
-            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
-            self.softmax_scale = self.softmax_scale * mscale * mscale
+        # Initialize projection matrices
+        self.wq = Linear(self.dim, self.n_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim), bias=False)
+        self.wk = Linear(self.dim, self.n_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim), bias=False)
+        self.wv = Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
+        self.wo = Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
 
-        if ATTN_IMPL == "naive":
-            self.register_buffer(
-                "k_cache", 
-                torch.zeros(
-                    args.max_batch_size, 
-                    args.max_seq_len, 
-                    self.n_local_heads, 
-                    self.qk_head_dim
-                ),
-                persistent=False
-            )
-            self.register_buffer(
-                "v_cache", 
-                torch.zeros(
-                    args.max_batch_size, 
-                    args.max_seq_len, 
-                    self.n_local_heads, 
-                    self.v_head_dim
-                ),
-                persistent=False
-            )
-        else:
-            self.register_buffer(
-                "kv_cache", 
-                torch.zeros(
-                    args.max_batch_size, 
-                    args.max_seq_len, 
-                    self.kv_lora_rank
-                ),
-                persistent=False
-            )
-            self.register_buffer(
-                "pe_cache", 
-                torch.zeros(
-                    args.max_batch_size, 
-                    args.max_seq_len, 
-                    self.qk_rope_head_dim
-                ),
-                persistent=False
-            )
-
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
-        bsz, seqlen, _ = x.size()
-        end_pos = start_pos + seqlen
-
-        # Query processing
-        if self.q_lora_rank == 0:
-            q = self.wq(x)
-        else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-
-        # Key-Value processing
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-
-        if ATTN_IMPL == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass through the attention layer.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, dim)
+            start_pos: Starting position for relative attention
+            freqs_cis: Precomputed frequency tensor for rotary embeddings
+            mask: Optional attention mask
             
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            
-            scores = torch.einsum(
-                "bshd,bthd->bsht", 
-                q, 
-                self.k_cache[:bsz, :end_pos]
-            ) * self.softmax_scale
-        else:
-            wkv_b = self.wkv_b.weight
-            if self.wkv_b.scale is not None:
-                wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale, BLOCK_SIZE)
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            
-            q_nope = torch.einsum(
-                "bshd,hdc->bshc", 
-                q_nope, 
-                wkv_b[:, :self.qk_nope_head_dim]
-            )
-            
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            
-            scores = (
-                torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
-            ) * self.softmax_scale
-
+        Returns:
+            Output tensor of same shape as input
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Project to q, k, v
+        xq = self.wq(x)
+        xk = self.wk(x)
+        xv = self.wv(x)
+        
+        # Split heads and dimensions
+        qnope, qrope = xq.split([
+            self.n_heads * self.qk_nope_head_dim,
+            self.n_heads * self.qk_rope_head_dim
+        ], dim=-1)
+        knope, krope = xk.split([
+            self.n_heads * self.qk_nope_head_dim,
+            self.n_heads * self.qk_rope_head_dim
+        ], dim=-1)
+        
+        # Reshape for attention computation
+        qnope = qnope.view(batch_size, seq_len, self.n_heads, self.qk_nope_head_dim)
+        knope = knope.view(batch_size, seq_len, self.n_heads, self.qk_nope_head_dim)
+        qrope = qrope.view(batch_size, seq_len, self.n_heads, self.qk_rope_head_dim)
+        krope = krope.view(batch_size, seq_len, self.n_heads, self.qk_rope_head_dim)
+        xv = xv.view(batch_size, seq_len, self.n_heads, self.v_head_dim)
+        
+        # Apply rotary embeddings to RoPE parts
+        qrope, krope = apply_rotary_emb(qrope, krope, freqs_cis=freqs_cis)
+        
+        # Concatenate NoRoPE and RoPE parts
+        q = torch.cat([qnope, qrope], dim=-1)
+        k = torch.cat([knope, krope], dim=-1)
+        
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(q.size(-1), dtype=q.dtype))
+        
         if mask is not None:
-            scores = scores + mask.unsqueeze(1)
+            scores = scores + mask
             
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-
-        if ATTN_IMPL == "naive":
-            x = torch.einsum(
-                "bsht,bthd->bshd",
-                scores,
-                self.v_cache[:bsz, :end_pos]
-            )
-        else:
-            x = torch.einsum(
-                "bsht,btc->bshc",
-                scores,
-                self.kv_cache[:bsz, :end_pos]
-            )
-            x = torch.einsum(
-                "bshc,hdc->bshd",
-                x,
-                wkv_b[:, -self.v_head_dim:]
-            )
-            
-        x = self.wo(x.flatten(2))
-        return x
+        # Apply attention
+        attn = torch.softmax(scores.float(), dim=-1).type_as(scores)
+        out = torch.matmul(attn, xv)
+        
+        # Reshape and project output
+        out = out.reshape(batch_size, seq_len, -1)
+        out = self.wo(out)
+        
+        return out

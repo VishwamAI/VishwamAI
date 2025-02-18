@@ -5,7 +5,6 @@ from typing import Optional
 
 from .config import ModelArgs
 from .base_layers import Linear
-# Import the function directly from utils
 from .utils import precompute_freqs_cis
 from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
 from .MLA import MLA
@@ -34,83 +33,72 @@ class Transformer(nn.Module):
     """Transformer model with positional embeddings, multiple layers, and output projection."""
     def __init__(self, args: ModelArgs, device: Optional[torch.device] = None):
         super().__init__()  # Call super first to ensure proper initialization
+        
+        # Validate args type
+        if not isinstance(args, ModelArgs):
+            raise TypeError("args must be an instance of ModelArgs")
+            
+        # Initialize distributed settings
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        # Set dtype
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" and hasattr(torch, 'float8_e4m3fn') else torch.bfloat16
         
-        # Store input arguments
-        self.args = args
+        # Store configuration as instance variables
         self.device = device
         self.max_seq_len = args.max_seq_len
+        self.n_heads = args.n_heads
         self.dim = args.dim
+        self.vocab_size = args.vocab_size
+        self.gradient_checkpointing = args.gradient_checkpointing
         
-        # Initialize components
+        # Initialize embeddings
         dtype = torch.get_default_dtype()
         self.embed = ParallelEmbedding(
-            vocab_size=args.vocab_size,
-            dim=args.dim,
+            vocab_size=self.vocab_size,
+            dim=self.dim,
             device=device,
             dtype=dtype
         )
         
-        # Initialize layers
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(args.n_layers):
-            self.layers.append(Block(layer_id, args))
-            
-        # Initialize normalization and output layers
-        self.norm = RMSNorm(args.dim)
+        # Initialize transformer blocks
+        self.layers = nn.ModuleList([
+            Block(layer_id, args) for layer_id in range(args.n_layers)
+        ])
+        
+        # Initialize normalization and output projection
+        self.norm = RMSNorm(self.dim)
         self.head = ColumnParallelLinear(
-            in_features=args.dim,
-            out_features=args.vocab_size,
+            in_features=self.dim,
+            out_features=self.vocab_size,
             bias=True,
             device=device,
-            dtype=torch.get_default_dtype()
+            dtype=dtype
         )
         
         # Compute positional embeddings
         try:
-            # Ensure attributes are integers
-            dim = int(self.dim)
-            max_seq_len = int(self.max_seq_len)
-            
-            # Log the values for debugging
-            print(f"Computing frequencies with dim={dim}, max_seq_len={max_seq_len}")
-            
-            # Compute frequencies with explicit parameters
-            freqs_cis = precompute_freqs_cis(
-                dim=dim,
-                end=max_seq_len,
-                theta=10000.0
-            )
+            print(f"Computing frequencies with dim={self.dim}, max_seq_len={self.max_seq_len}")
+            freqs_cis = precompute_freqs_cis(dim=self.dim, end=self.max_seq_len)
             self.register_buffer("freqs_cis", freqs_cis, persistent=False)
             print("Successfully computed frequencies")
         except Exception as e:
-            print(f"Error computing frequencies in Transformer.__init__:")
-            print(f"  dim={self.dim} (type: {type(self.dim)})")
-            print(f"  max_seq_len={self.max_seq_len} (type: {type(self.max_seq_len)})")
+            print(f"Error computing frequencies: dim={self.dim}, max_seq_len={self.max_seq_len}")
             raise e
         
-        # Store other configuration
-        self.gradient_checkpointing = args.gradient_checkpointing
-        
-        # Add ALiBi slopes if enabled
+        # Initialize alibi slopes if enabled
         if args.use_alibi:
-            self.alibi_slopes = self._get_alibi_slopes()
-            
+            slopes = torch.arange(1 - self.n_heads, 1, 2, dtype=torch.float32)
+            self.register_buffer("alibi_slopes", -torch.abs(slopes), persistent=False)
+        
         # Move to device if specified
         if device is not None:
             self.to(device)
 
-    def _get_alibi_slopes(self):
-        """Generate ALiBi attention slopes."""
-        slopes = torch.arange(1 - self.n_heads, 1, 2, dtype=torch.float32)
-        return -torch.abs(slopes)
-
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
-        # Enable gradient checkpointing during training
         if self.training and self.gradient_checkpointing:
             return torch.utils.checkpoint.checkpoint(
                 self._forward_impl, tokens, start_pos, use_reentrant=False

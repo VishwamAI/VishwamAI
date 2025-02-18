@@ -8,6 +8,8 @@ from typing import Optional
 
 class Linear(nn.Module):
     """Linear layer with optional quantization support."""
+    dtype = None  # Class-level dtype
+
     def __init__(
         self,
         in_features: int,
@@ -21,10 +23,14 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
+        # Use class-level dtype if no dtype provided
+        if dtype is None:
+            dtype = self.dtype if self.dtype is not None else torch.get_default_dtype()
+
         # Initialize weights and bias
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), dtype=dtype, device=device))
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=dtype, device=device))
         else:
             self.register_parameter('bias', None)
         

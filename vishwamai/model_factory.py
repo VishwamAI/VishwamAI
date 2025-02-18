@@ -24,7 +24,7 @@ class AdvancedModelConfig:
     open_ended_config: Optional[OpenEndedConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
 
-def create_model(config: Union[dict, ModelArgs]) -> nn.Module:
+def create_model(config: Union[dict, ModelArgs], device: Optional[torch.device] = None) -> nn.Module:
     """
     Create a model instance based on configuration.
     Args:
@@ -80,7 +80,7 @@ def create_model(config: Union[dict, ModelArgs]) -> nn.Module:
             moe_inter_dim=config.get("moe_intermediate_size", 2048),
             
             # Advanced features
-            dtype="fp8" if config.get("mixed_precision") == "fp8" else "bf16",
+            dtype=torch.bfloat16 if config.get("mixed_precision") != "fp8" else torch.float8_e4m3fn,
             gradient_checkpointing=config.get("gradient_checkpointing", True),
             use_alibi=config.get("use_alibi", True),
             use_rope_scaling=config.get("use_rope_scaling", True),
@@ -98,10 +98,14 @@ def create_model(config: Union[dict, ModelArgs]) -> nn.Module:
             rope_condense_ratio=config.get("rope_condense_ratio", 1.2)
         )
 
-    # Create model
-    model = Transformer(model_args)
+    # Create model with device
+    model = Transformer(model_args, device=device)
     if is_moe:
         model = MoE(model)
+    
+    # Move model to device if specified
+    if device is not None:
+        model = model.to(device)
     
     # Create tokenizer from ModelArgs
     tokenizer = VishwamAITokenizer(TokenizerConfig(

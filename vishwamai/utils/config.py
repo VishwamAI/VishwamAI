@@ -120,6 +120,15 @@ def save_config(config: ModelConfig, config_path: str):
     with open(config_path, 'w') as f:
         yaml.dump(config_dict, f)
 
+def update_config(config: ModelConfig, updates: Dict[str, Any]) -> ModelConfig:
+    """Update configuration with new values."""
+    config_dict = {
+        k: v for k, v in config.__dict__.items()
+        if not k.startswith('_')
+    }
+    config_dict.update(updates)
+    return ModelConfig(**config_dict)
+
 def merge_configs(base_config: ModelConfig, override_config: Dict[str, Any]) -> ModelConfig:
     """Merge base configuration with override values."""
     config_dict = {

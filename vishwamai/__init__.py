@@ -1,70 +1,49 @@
 """
-Vishwamai - Advanced AI Training Framework
+VishwamAI: Advanced Language Model Framework
+===========================================
+
+VishwamAI is a modular implementation of advanced machine learning components,
+focusing on transformer-based models with specialized architectures and training methods.
+
+Main Components:
+- Models: Transformer architectures and specialized neural networks
+- Training: Advanced training routines and initialization methods
+- Utils: Configuration, tokenization, and helper functions
+- Extensions: Specialized modules for behavior analysis, ethics, and memory
 """
 
-# Core components with fixed import order to avoid circular dependencies 
-from .config import ModelArgs
-from .constants import WORLD_SIZE, ATTN_IMPL, BLOCK_SIZE
-from .base_layers import Linear
-from .utils import precompute_freqs_cis
-from .tokenizer import VishwamAITokenizer, TokenizerConfig
-from .parallel import ColumnParallelLinear, RMSNorm, ParallelEmbedding
-from .Transformer import Transformer
-# Move model_factory import after all core components
-from .model_factory import create_model
+from . import models
+from . import training
+from . import utils
+from . import extensions
 
-__version__ = "0.1.1"
-__author__ = "Vishwamai Contributors"
+# Version information
+__version__ = "0.1.0"
+__author__ = "VishwamAI Team"
+
+# Expose key functionality at package level
+from .models import Transformer, create_model, load_model
+from .training import train_model, initialize_model
+from .utils import load_config
+from .extensions import generate_text
 
 __all__ = [
-    'ModelArgs',
-    'WORLD_SIZE', 
-    'ATTN_IMPL',
-    'BLOCK_SIZE',
-    'Linear',
-    'precompute_freqs_cis',
-    'VishwamAITokenizer',
-    'TokenizerConfig', 
-    'ColumnParallelLinear',
-    'RMSNorm',
-    'ParallelEmbedding',
+    # Main packages
+    'models',
+    'training',
+    'utils',
+    'extensions',
+    
+    # Key functionality
     'Transformer',
-    'create_model'
+    'create_model',
+    'load_model',
+    'train_model',
+    'initialize_model',
+    'load_config',
+    'generate_text',
+    
+    # Version info
+    '__version__',
+    '__author__',
 ]
-
-# Module level metadata
-_metadata = {
-    'framework_name': 'Vishwamai',
-    'description': 'Advanced AI Training Framework',
-    'license': 'MIT',
-    'requires_python': '>=3.8',
-    'maintainers': ['Vishwamai Contributors'],
-    'repository': 'https://github.com/yourusername/vishwamai',
-    'documentation': 'https://vishwamai.readthedocs.io',
-    'components': {
-        'curriculum': 'Adaptive curriculum learning and task progression',
-        'emergent': 'Self-organizing behavior and novelty detection',
-        'integration': 'Consciousness-inspired information processing',
-        'ethical': 'Ethical decision making and monitoring',
-        'hardware': 'Hardware-specific optimizations and adaptations',
-        'open_ended': 'Continuous evolution and task generation'
-    }
-}
-
-def get_framework_info() -> dict:
-    """Get information about the Vishwamai framework."""
-    return _metadata.copy()
-
-def print_framework_info():
-    """Print formatted information about the Vishwamai framework."""
-    info = get_framework_info()
-    print(f"\n{info['framework_name']} v{__version__}")
-    print("=" * (len(info['framework_name']) + len(__version__) + 3))
-    print(f"\n{info['description']}")
-    print("\nComponents:")
-    for component, desc in info['components'].items():
-        print(f"- {component}: {desc}")
-    print(f"\nPython required: {info['requires_python']}")
-    print(f"License: {info['license']}")
-    print(f"\nDocumentation: {info['documentation']}")
-    print(f"Repository: {info['repository']}")

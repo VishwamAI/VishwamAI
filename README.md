@@ -41,6 +41,24 @@ pip install -e .
 
 ## Quick Start
 
+1. Clone the repository:
+```bash
+git clone https://github.com/VishwamAI/VishwamAI.git
+cd VishwamAI
+```
+
+2. Run installation script:
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+3. Set up environment variables:
+```bash
+export HF_TOKEN="your_huggingface_token"
+export WANDB_API_KEY="your_wandb_key"
+```
+
 ```python
 from vishwamai import EnhancedVishwamAI
 
@@ -62,9 +80,60 @@ response = model.generate_response(
 print(response)
 ```
 
+## Repository Structure
+
+```
+VishwamAI/
+├── vishwamai/              # Main package
+│   ├── models/            # Model architecture
+│   ├── training/          # Training utilities
+│   ├── evaluation/        # Evaluation scripts
+│   ├── utils/            # Helper functions
+│   └── extensions/        # Advanced features
+├── configs/               # Configuration files
+├── notebooks/            # Training notebooks
+├── tests/               # Unit tests
+└── scripts/             # Utility scripts
+```
+
+## Development Setup
+
+1. Create development branch:
+```bash
+git checkout -b feature/your-feature-name
+```
+
+2. Enable pre-commit hooks:
+```bash
+pre-commit install
+```
+
+3. Update dependencies:
+```bash
+pip install -e ".[dev]"
+```
+
 ## Training
 
 Refer to our [Training Guide](TRAINING.md) for detailed instructions on training and fine-tuning.
+
+1. Prepare environment:
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Verify GPU setup
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+2. Start training:
+```bash
+# Local training
+python scripts/train.py --config configs/pretrain_config.yaml
+
+# Or use notebook
+jupyter lab notebooks/vishwamai_colab_pretrain.ipynb
+```
 
 ```python
 from vishwamai.trainer import VishwamAIPretrainer
@@ -88,6 +157,18 @@ trainer = VishwamAIPretrainer(
 
 # Start training
 trainer.train()
+```
+
+## Model Checkpoints
+
+Checkpoints are automatically uploaded to HuggingFace Hub:
+https://huggingface.co/VishwamAI/VishwamAI
+
+To download latest checkpoint:
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(repo_id="VishwamAI/VishwamAI", local_dir="checkpoints")
 ```
 
 ## Hardware Requirements
@@ -120,25 +201,26 @@ See the `examples/` directory for:
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
 1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+2. Create feature branch
+3. Commit changes
+4. Push to branch
+5. Create Pull Request
+
+## License
+
+MIT License - see LICENSE file for details
 
 ## Citation
 
 ```bibtex
-@article{vishwamai2025enhanced,
-  title={VishwamAI: Enhanced Language Model with Neural Memory and Tree of Thoughts},
-  author={Sarma, Kasinadh and Team, VishwamAI},
-  journal={arXiv preprint arXiv:2502.00000},
-  year={2025}
+@software{vishwamai2024,
+  author = {Kasinadhsarma},
+  title = {VishwamAI: Enhanced Transformer with Advanced Reasoning Capabilities},
+  year = {2024},
+  publisher = {GitHub},
+  url = {https://github.com/VishwamAI/VishwamAI}
 }
 ```
-
-## License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
 ## Contact
 

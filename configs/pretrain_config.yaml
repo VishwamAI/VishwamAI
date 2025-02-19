@@ -1,0 +1,109 @@
+experiment:
+  name: vishwamai_pretrain
+  version: "1.0"
+  tracking:
+    platform: wandb
+    project: vishwamai
+    entity: vishwamai-team
+
+hardware:
+  gpu_type: A100
+  num_gpus: 8
+  gpu_memory: 80GB
+  nvlink: true
+  cpu_cores: 96
+  ram: 1TB
+
+model:
+  total_params: 671B
+  activation_checkpointing: true
+  zero_optimization_stage: 3
+  mixed_precision: fp8
+  gradient_accumulation: 32
+  throughput_optimization:
+    kernel_fusion: true
+    flash_attention: true
+    memory_efficient_attention: true
+  checkpoint_handling:
+    format: safetensors  # More efficient than PT format
+    compression: true
+    shard_size: 1GB  # Split large checkpoints
+    quantization:
+      enabled: true
+      bits: 8  # Use 8-bit quantization for storage
+    pruning:
+      enabled: true
+      sparsity: 0.3  # Reduce model size
+
+training:
+  epochs: 10
+  batch_size: 32
+  learning_rate:
+    initial: 1e-4
+    warmup_steps: 2000
+    scheduler: cosine
+  weight_decay: 0.1
+  gradient_clipping: 1.0
+  
+datasets:
+  primary:
+    - name: openai/gsm8k
+      split: main
+      weight: 0.15
+    - name: cais/mmlu
+      split: all
+      weight: 0.15
+    - name: TIGER-Lab/MMLU-Pro
+      split: main
+      weight: 0.15
+    - name: deepmind/math_dataset
+      split: algebra
+      weight: 0.1
+  auxiliary:
+    - name: wikimedia/wikipedia
+      split: 20231101.en
+      weight: 0.15
+    - name: HuggingFace/c4
+      split: en
+      weight: 0.15
+    - name: sentence-transformers/codesearchnet
+      split: all
+      weight: 0.15
+
+evaluation:
+  datasets:
+    - MMMU/MMMU
+    - google/IFEval
+    - microsoft/SCBench
+    - princeton-nlp/SWE-bench
+  metrics:
+    - accuracy
+    - perplexity
+    - calibration_error
+    - reasoning_score
+
+distillation:
+  temperature: 2.0
+  alpha: 0.5
+  teacher_model: "checkpoints/model_epoch_10.pt"
+  student_compression:
+    layers_reduction: 0.5
+    hidden_size_reduction: 0.5
+
+huggingface:
+  repo_id: "VishwamAI/VishwamAI"  # Updated organization/repo path
+  upload_frequency: 2
+  keep_local_checkpoints: 2
+  repository:
+    public: true
+    description: "VishwamAI: Advanced Language Model with Enhanced Reasoning Capabilities"
+    tags:
+      - vishwamai
+      - language-model
+      - transformer
+      - mixture-of-experts
+      - tree-of-thoughts
+  metrics_tracking:
+    enabled: true
+    upload_format: "json"
+    include_plots: true

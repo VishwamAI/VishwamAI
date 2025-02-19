@@ -1,137 +1,132 @@
+"""
+Example usage of VishwamAI model demonstrating various features and capabilities.
+"""
+
 import torch
-from transformers import AutoTokenizer
-from ..model import VishwamAIModel
-from ..neural_memory import ReasoningMemoryTransformer, MemoryConfig
-from ..tree_of_thoughts import TreeOfThoughts, TreeConfig
-from ..cache_augmentation import DifferentiableCacheAugmentation, CacheConfig
-from typing import Optional, Dict, List
+from vishwamai import VishwamAI, ModelConfig
+from vishwamai.extensions.ethical_framework import EthicalConfig
+from vishwamai.extensions.tree_of_thoughts import TreeConfig, RewardConfig
 
-class EnhancedVishwamAI:
-    """Enhanced VishwamAI model with memory, tree search, and cache components."""
-    
-    def __init__(self, 
-                 model_path: str,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
-                 use_memory: bool = True,
-                 use_tree: bool = True,
-                 use_cache: bool = True):
-        
-        # Load base model
-        self.model = VishwamAIModel.from_pretrained(model_path)
-        self.model.to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.device = device
-        
-        # Initialize enhancement components
-        if use_memory:
-            self.memory = ReasoningMemoryTransformer.from_pretrained(model_path)
-            self.memory.to(device)
-        else:
-            self.memory = None
-            
-        if use_tree:
-            self.tree = TreeOfThoughts.from_pretrained(model_path, model=self.model)
-            self.tree.to(device)
-        else:
-            self.tree = None
-            
-        if use_cache:
-            self.cache = DifferentiableCacheAugmentation.from_pretrained(model_path)
-            self.cache.to(device)
-        else:
-            self.cache = None
-            
-    def generate_response(self, 
-                         prompt: str,
-                         max_length: int = 2048,
-                         temperature: float = 0.7,
-                         num_beams: int = 4,
-                         **kwargs) -> str:
-        """Generate enhanced response using all components."""
-        
-        # Tokenize input
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Generate with enhancements
-        with torch.inference_mode():
-            # Get base model hidden states
-            outputs = self.model(**inputs, output_hidden_states=True)
-            hidden_states = outputs.hidden_states[-1]
-            
-            # Apply memory enhancement
-            if self.memory is not None:
-                hidden_states = self.memory(hidden_states)
-                
-            # Apply tree of thoughts
-            if self.tree is not None:
-                hidden_states = self.tree(hidden_states)
-                
-            # Apply cache augmentation
-            if self.cache is not None:
-                hidden_states = self.cache(hidden_states)
-            
-            # Generate final output
-            enhanced_outputs = self.model.generate(
-                inputs["input_ids"],
-                max_length=max_length,
-                temperature=temperature,
-                num_beams=num_beams,
-                past_key_values=outputs.past_key_values,
-                hidden_states=hidden_states,
-                **kwargs
-            )
-            
-        response = self.tokenizer.decode(enhanced_outputs[0], skip_special_tokens=True)
-        return response
-    
-    def batch_generate(self, 
-                      prompts: List[str],
-                      **kwargs) -> List[str]:
-        """Generate responses for multiple prompts."""
-        return [self.generate_response(prompt, **kwargs) for prompt in prompts]
+def main():
+    # Basic model configuration
+    config = ModelConfig(
+        vocab_size=50257,
+        hidden_size=2048,
+        num_layers=24,
+        num_heads=16,
+        use_mla=True,  # Enable Multi-Level Attention
+        use_memory=True,  # Enable Neural Memory
+        memory_size=1024,
+        use_moe=True,  # Enable Mixture of Experts
+        num_experts=8,
+        expert_capacity=128,
+        use_ethical_framework=True,
+        enable_emergent=True,
+        tree_search_depth=3,
+        # Additional configurations
+        ethical_config={
+            'safety_threshold': 0.8,
+            'content_filtering': True,
+            'bias_detection': True
+        },
+        tree_config={
+            'beam_width': 5,
+            'max_steps_per_thought': 3
+        }
+    )
 
-def example_usage():
-    """Example usage of the enhanced model."""
-    
     # Initialize model
-    model = EnhancedVishwamAI(
-        model_path="kasinadhsarma/vishwamai-model",
-        use_memory=True,
-        use_tree=True,
-        use_cache=True
-    )
+    model = VishwamAI(config)
     
-    # Single response generation
-    prompt = """
-    Solve this complex mathematical problem step by step:
-    A company's profit increased by 20% in the first year and decreased by 10% in the second year.
-    If the final profit is $108,000, what was the initial profit?
-    """
+    # Example input
+    input_text = "In this paper, we propose a novel approach to"
+    tokenizer = get_tokenizer()  # Assume we have a tokenizer
+    input_ids = tokenizer(input_text, return_tensors='pt')['input_ids']
     
-    response = model.generate_response(
-        prompt,
-        max_length=512,
+    print("Generating with standard autoregressive mode...")
+    output_standard = model.generate(
+        input_ids=input_ids,
+        max_length=100,
         temperature=0.7,
-        num_beams=4
+        top_k=50,
+        top_p=0.9,
+        repetition_penalty=1.2
     )
-    print(f"Problem:\n{prompt}\n\nSolution:\n{response}\n")
+    print(tokenizer.decode(output_standard[0]))
     
-    # Batch generation
-    prompts = [
-        "Explain quantum entanglement to a high school student.",
-        "Write a recursive Python function to calculate the nth Fibonacci number.",
-        "Describe three key differences between supervised and unsupervised learning."
-    ]
-    
-    responses = model.batch_generate(
-        prompts,
-        max_length=256,
-        temperature=0.8
+    print("\nGenerating with Tree of Thoughts search...")
+    output_tot = model.generate(
+        input_ids=input_ids,
+        max_length=100,
+        temperature=0.7,
+        use_tree_search=True,
+        num_return_sequences=3,
+        reward_config={
+            'coherence_weight': 0.4,
+            'novelty_weight': 0.3,
+            'relevance_weight': 0.3
+        }
     )
     
-    for prompt, response in zip(prompts, responses):
-        print(f"Prompt: {prompt}\nResponse: {response}\n")
+    print("\nMultiple completions from Tree of Thoughts:")
+    for i, sequence in enumerate(output_tot):
+        print(f"\nCompletion {i+1}:")
+        print(tokenizer.decode(sequence))
+
+def demonstrate_advanced_features(model, input_text):
+    """Demonstrate advanced model features like MoE and ethical framework."""
+    tokenizer = get_tokenizer()
+    input_ids = tokenizer(input_text, return_tensors='pt')['input_ids']
+    
+    # Get model outputs with all features
+    outputs = model.forward(
+        input_ids=input_ids,
+        attention_mask=None,
+        use_tree_search=False
+    )
+    
+    # Display various model outputs
+    print("\nModel Analysis:")
+    print("--------------")
+    
+    if 'ethical_scores' in outputs:
+        print("\nEthical Analysis:")
+        ethical_scores = outputs['ethical_scores']
+        print(f"Safety Score: {ethical_scores['safety']:.2f}")
+        print(f"Bias Score: {ethical_scores['bias']:.2f}")
+    
+    if 'emergent_patterns' in outputs:
+        print("\nEmergent Behavior Analysis:")
+        patterns = outputs['emergent_patterns']
+        print(f"Detected Patterns: {patterns['detected_patterns']}")
+        print(f"Complexity Score: {patterns['complexity_score']:.2f}")
+    
+    if 'memory_states' in outputs:
+        print("\nMemory Analysis:")
+        memory = outputs['memory_states']
+        print(f"Memory Usage: {memory['usage_stats']}")
+        print(f"Memory Retrieval Score: {memory['retrieval_score']:.2f}")
+
+def get_tokenizer():
+    """
+    Helper function to get the tokenizer.
+    In practice, you would initialize this with your actual tokenizer.
+    """
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained("gpt2")
 
 if __name__ == "__main__":
-    example_usage()
+    # Run the demonstration
+    main()
+    
+    # Note: The above example assumes you have:
+    # 1. Trained the model or loaded pretrained weights
+    # 2. Set up the tokenizer
+    # 3. Have sufficient GPU memory for the model size
+    # 
+    # For production use, you would want to:
+    # 1. Add error handling
+    # 2. Implement proper logging
+    # 3. Add model parameter validation
+    # 4. Implement proper resource management
+    # 5. Add progress callbacks for long generations

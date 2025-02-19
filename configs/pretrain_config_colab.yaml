@@ -1,0 +1,42 @@
+experiment:
+  name: vishwamai_pretrain_colab
+  version: "1.0"
+  platform: colab_pro
+
+hardware:
+  gpu_type: A100
+  gpu_memory: 40GB
+  ram: 52GB
+  runtime_restrictions: true
+
+model:
+  # Reduced size for Colab Pro
+  total_params: 7B  # Reduced from 70B
+  hidden_size: 2048  # Reduced from 8192
+  num_layers: 32    # Reduced from 120
+  num_heads: 16     # Reduced from 64
+  sequence_length: 2048  # Reduced from 32768
+  
+  optimization:
+    gradient_checkpointing: true
+    activation_checkpointing: true
+    cpu_offloading: true
+    mixed_precision: "fp8"
+    quantization:
+      enabled: true
+      bits: 4  # Aggressive quantization
+    memory_efficient_attention: true
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 64
+  checkpoint_frequency: 100  # More frequent checkpoints
+  max_runtime_hours: 11  # Colab Pro limit
+  
+  recovery:
+    save_interval_minutes: 30
+    backup_to_drive: true
+    resume_training: true
+
+distillation:
+  enabled: false  # Disable for resource constraints

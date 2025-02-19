@@ -95,6 +95,52 @@ groups:
         summary: High cache eviction rate
         description: Cache eviction rate exceeds 100 per second for 5 minutes
 
+    # Training-specific alerts
+    - alert: TrainingStall
+      expr: rate(training_step_count[15m]) == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Training has stalled
+        description: No training steps completed in the last 15 minutes
+
+    - alert: LossSpike
+      expr: training_loss > 2 * avg_over_time(training_loss[1h])
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: Unusual loss spike detected
+        description: Training loss has more than doubled compared to 1-hour average
+
+    - alert: CheckpointFailure
+      expr: rate(checkpoint_failure_count[1h]) > 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Checkpoint creation failed
+        description: One or more checkpoints failed to save in the last hour
+
+    - alert: LearningRateStuck
+      expr: rate(learning_rate[1h]) == 0 and training_step_count > 1000
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: Learning rate not changing
+        description: Learning rate has remained constant for 30 minutes after warm-up
+
+    - alert: GPUMemoryLeak
+      expr: rate(gpu_memory_used_bytes[1h]) > 0 and rate(training_step_count[1h]) > 0
+      for: 2h
+      labels:
+        severity: warning
+      annotations:
+        summary: Potential GPU memory leak
+        description: GPU memory usage is steadily increasing during training
+
     # System health alerts
     - alert: HighSystemLoad
       expr: system_load5 > 3

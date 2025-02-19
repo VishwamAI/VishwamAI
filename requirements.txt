@@ -1,91 +1,33 @@
-# Core ML dependencies
+# Core ML Framework
 torch>=2.0.0
-torchvision==0.16.0
-torchaudio==2.1.0
-transformers==4.34.0
 accelerate==0.27.0
-bitsandbytes>=0.41.1
-deepspeed==0.12.3
-datasets==2.16.1
-apache-tvm==0.14.dev273
-stable-baselines3==2.1.0
-flash-attn==2.7.4  # Flash Attention implementation
-rotary-embedding-torch==2.1.0  # Improved RoPE implementation
-einops>=0.7.0  # Required for attention operations
-xformers>=0.0.23  # Efficient attention implementations
+transformers==4.34.0
+safetensors>=0.4.0  # For secure model weights handling
 
-# Hugging Face
+# Training Optimizations
+bitsandbytes>=0.41.1  # For 8-bit training
+deepspeed==0.12.3    # For distributed training
+flash-attn==2.7.4    # Flash Attention implementation
+einops>=0.7.0        # Required for attention operations
+triton>=2.1.0        # For custom CUDA kernels
+
+# Data Processing
+datasets==2.16.1      # Hugging Face datasets
+numpy>=1.19.0
+pandas>=2.1.0
+pyarrow>=14.0.1      # For efficient data handling
+
+# Monitoring and Visualization
+matplotlib>=3.7.1     # For plotting training metrics
+seaborn>=0.12.2      # For enhanced visualizations
+tensorboard==2.15.1   # For training monitoring
+tqdm>=4.50.0         # Progress bars
+
+# Hugging Face Integration
 huggingface-hub==0.20.3
 tokenizers==0.15.1
 
-# Visualization and Analysis
-matplotlib>=3.7.1  # For plotting training metrics
-seaborn>=0.12.2   # For enhanced visualizations
-wandb==0.16.2
-tensorboard==2.15.1
-
-# Monitoring and metrics
-prometheus-client==0.19.0
-grafana-api==1.0.3
-opentelemetry-api==1.21.0
-opentelemetry-sdk==1.21.0
-opentelemetry-instrumentation-fastapi==0.42b0
-
-# FP8 Training Support
-transformer-engine>=0.10.0  # Required for FP8 training
-nvfuser>=0.0.5  # For CUDA kernel fusion
-
-# Security and optimization
-intel-sgx-ra==1.0.0
-cryptography==41.0.7
-triton>=2.1.0  # Required for custom CUDA kernels
-apex>=0.9.10dev  # NVIDIA Apex for mixed precision
-
-# Web serving
-fastapi==0.109.0
-uvicorn[standard]==0.27.0.post1
-python-multipart==0.0.6
-pydantic==2.6.1
-starlette==0.36.3
-websockets==12.0
-
-# Cache and Memory Management
-lmdb>=1.4.1  # For efficient key-value storage
-pyarrow>=14.0.1  # For efficient data serialization
-redis>=5.0.1  # For distributed caching
-msgpack>=1.0.7  # For efficient data serialization
-
-# Data Processing and Analysis
-numpy>=1.19.0
-scipy>=1.11.0
-pandas>=2.1.0
-tqdm>=4.50.0
-pillow>=10.0.0
-
-# Configuration and I/O
-PyYAML>=6.0.1
-requests>=2.31.0
-aiohttp>=3.9.1
-psutil>=5.9.0
+# Utilities
+pyyaml>=6.0.1        # For config files
 typing-extensions>=4.9.0
-sentencepiece>=0.1.99  # For tokenization
-safetensors>=0.4.0  # For secure model weights
-
-# Development tools
-pytest>=7.4.0
-pytest-asyncio>=0.23.0
-hypothesis>=6.98.0
-black>=23.12.1
-isort>=5.13.2
-mypy>=1.8.0
-memory-profiler>=0.61.0  # For memory usage analysis
-torch-tb-profiler>=0.4.3  # For PyTorch profiling
-
-# Documentation
-sphinx>=7.1.0
-sphinx-rtd-theme>=2.0.0
-
-# Required for inference optimizations
-onnx==1.15.0
-onnxruntime-gpu==1.16.3
-torch-tensorrt>=1.4.0  # For TensorRT integration
+psutil>=5.9.0        # For system monitoring

@@ -7,7 +7,6 @@ safetensors>=0.4.0  # For secure model weights handling
 # Training Optimizations
 bitsandbytes>=0.41.1  # For 8-bit training
 deepspeed==0.12.3    # For distributed training
-flash-attn==2.7.4    # Flash Attention implementation
 einops>=0.7.0        # Required for attention operations
 triton>=2.1.0        # For custom CUDA kernels
 

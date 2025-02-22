@@ -1,235 +1,146 @@
-# VishwamAI: Enhanced Language Model with Neural Memory and Tree of Thoughts
+# Vishwamai: Efficient T4-Optimized Machine Learning Model
 
-VishwamAI is a state-of-the-art language model enhanced with structured reasoning capabilities through neural memory, tree of thoughts, and differentiable cache components.
+Vishwamai is a PyTorch-based machine learning framework optimized for NVIDIA T4 GPUs, featuring:
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-[![Python 3.10+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://vishwamai.readthedocs.io)
-[![Downloads](https://pepy.tech/badge/vishwamai)](https://pepy.tech/project/vishwamai)
+- Flexible precision modes (FP16, FP32, BF16, TF32)
+- Mixed precision training with automatic optimization
+- Flash Attention and kernel optimizations
+- Mixture of Experts (MoE) support
+- Tree-based planning capabilities
 
 ## Features
 
-### 1. Neural Memory Module
-- Persistent memory for long-term information retention
-- Multi-head attention for memory access
-- Structured reasoning patterns
-- Dynamic memory updates
+### Precision Modes
 
-### 2. Tree of Thoughts
-- Tree-structured reasoning for complex problems
-- Beam search with pruning
-- State refinement and evaluation
-- Dynamic path selection
+```python
+from vishwamai.model import create_model, ModelArgs
 
-### 3. Differentiable Cache
-- Efficient information retrieval
-- Learnable cache updates
-- Access pattern optimization
-- Memory-efficient storage
+# Create model with FP16 mixed precision
+model = create_model(
+    ModelArgs(
+        dtype="fp16",
+        use_mixed_precision=True,
+        use_flash_attention=True
+    )
+)
+```
+
+### Model Presets
+
+```python
+from vishwamai.model import (
+    create_tiny_model,
+    create_base_model,
+    create_efficient_model,
+    create_expert_model
+)
+
+# Create different model variants
+tiny_model = create_tiny_model(dtype="fp16")
+base_model = create_base_model(dtype="bf16")
+efficient_model = create_efficient_model()
+expert_model = create_expert_model(num_experts=8)
+```
+
+### Available Configurations
+
+- **VISHWAMAI_TINY**: Small model for quick experiments
+- **VISHWAMAI_BASE**: Standard balanced model
+- **VISHWAMAI_LARGE**: Larger model with enhanced capacity
+- **VISHWAMAI_XL**: Extra large model for complex tasks
+- **VISHWAMAI_EXPERT**: Model with Mixture of Experts
+- **VISHWAMAI_EFFICIENT**: Memory and compute optimized model
+- **VISHWAMAI_QUANTIZED**: Quantization-aware training model
+- **VISHWAMAI_EXTENDED**: Long sequence model with dynamic scaling
 
 ## Installation
 
 ```bash
-# From PyPI
-pip install vishwamai
-
-# From source
-git clone https://github.com/VishwamAI/VishwamAI.git
-cd VishwamAI
-pip install -e .
+pip install -r requirements.txt
 ```
 
 ## Quick Start
 
-1. Clone the repository:
-```bash
-git clone https://github.com/VishwamAI/VishwamAI.git
-cd VishwamAI
-```
-
-2. Run installation script:
-```bash
-chmod +x install.sh
-./install.sh
-```
-
-3. Set up environment variables:
-```bash
-export HF_TOKEN="your_huggingface_token"
-export WANDB_API_KEY="your_wandb_key"
-```
-
 ```python
-from vishwamai import EnhancedVishwamAI
+import torch
+from vishwamai.model import create_model, ModelArgs
 
-# Initialize model with all components
-model = EnhancedVishwamAI(
-    model_path="kasinadhsarma/vishwamai-model",
-    use_memory=True,
-    use_tree=True,
-    use_cache=True
+# Configure model
+config = ModelArgs(
+    hidden_size=768,
+    num_attention_heads=12,
+    num_hidden_layers=12,
+    dtype="fp16",
+    use_mixed_precision=True
 )
 
-# Generate response
-response = model.generate_response(
-    "Explain quantum entanglement and provide a mathematical proof.",
-    max_length=512,
-    temperature=0.7
-)
-
-print(response)
+# Create and use model
+model = create_model(config=config)
+inputs = {
+    "input_ids": torch.randint(0, config.vocab_size, (1, 128)),
+    "attention_mask": torch.ones(1, 128)
+}
+outputs = model(**inputs)
 ```
 
-## Repository Structure
+## T4 Optimizations
 
-```
-VishwamAI/
-├── vishwamai/              # Main package
-│   ├── models/            # Model architecture
-│   ├── training/          # Training utilities
-│   ├── evaluation/        # Evaluation scripts
-│   ├── utils/            # Helper functions
-│   └── extensions/        # Advanced features
-├── configs/               # Configuration files
-├── notebooks/            # Training notebooks
-├── tests/               # Unit tests
-└── scripts/             # Utility scripts
-```
+The framework includes several T4-specific optimizations:
 
-## Development Setup
+1. Automatic precision selection based on hardware capabilities
+2. Flash Attention support for memory-efficient attention
+3. Gradient checkpointing for large models
+4. Kernel fusion optimizations
+5. Memory-efficient mixed precision training
 
-1. Create development branch:
+## Development
+
+### Testing
+
 ```bash
-git checkout -b feature/your-feature-name
+# Run precision tests
+cd tests
+./setup_tests.sh  # or setup_tests.bat on Windows
+./run_precision_tests.sh
 ```
 
-2. Enable pre-commit hooks:
+### Benchmarking
+
 ```bash
-pre-commit install
-```
-
-3. Update dependencies:
-```bash
-pip install -e ".[dev]"
-```
-
-## Training
-
-Refer to our [Training Guide](TRAINING.md) for detailed instructions on training and fine-tuning.
-
-1. Prepare environment:
-```bash
-# Activate virtual environment
-source venv/bin/activate
-
-# Verify GPU setup
-python -c "import torch; print(torch.cuda.is_available())"
-```
-
-2. Start training:
-```bash
-# Local training
-python scripts/train.py --config configs/pretrain_config.yaml
-
-# Or use notebook
-jupyter lab notebooks/vishwamai_colab_pretrain.ipynb
-```
-
-```python
-from vishwamai.trainer import VishwamAIPretrainer
-from vishwamai.neural_memory import ReasoningMemoryTransformer
-from vishwamai.tree_of_thoughts import TreeOfThoughts
-from vishwamai.cache_augmentation import DifferentiableCacheAugmentation
-
-# Initialize components
-model = load_model(config_path)
-memory = ReasoningMemoryTransformer()
-tree = TreeOfThoughts(model)
-cache = DifferentiableCacheAugmentation()
-
-# Configure trainer
-trainer = VishwamAIPretrainer(
-    model=model,
-    memory_module=memory,
-    tree_module=tree,
-    cache_module=cache
-)
-
-# Start training
-trainer.train()
-```
-
-## Model Checkpoints
-
-Checkpoints are automatically uploaded to HuggingFace Hub:
-https://huggingface.co/VishwamAI/VishwamAI
-
-To download latest checkpoint:
-```python
-from huggingface_hub import snapshot_download
-
-snapshot_download(repo_id="VishwamAI/VishwamAI", local_dir="checkpoints")
+cd examples
+python benchmark_precision.py
 ```
 
 ## Hardware Requirements
 
-- **Recommended**: NVIDIA A100 GPU (80GB)
-- **Minimum**: NVIDIA V100 GPU (32GB)
-- **RAM**: 64GB+
-- **Storage**: 1TB+ SSD
-
-## Model Performance
-coming soon 
-
-## Examples
-
-See the `examples/` directory for:
-- Model usage examples
-- Training scripts
-- Component demonstrations
-- Performance benchmarks
-
-## Documentation
-
-- [Model Card](MODEL_CARD.md)
-- [Training Guide](TRAINING.md)
-- [Setup Guide](SETUP.md)
-- [API Reference](https://vishwamai.readthedocs.io)
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-1. Fork the repository
-2. Create feature branch
-3. Commit changes
-4. Push to branch
-5. Create Pull Request
-
-## License
-
-MIT License - see LICENSE file for details
+- NVIDIA T4 GPU (recommended)
+- CUDA 11.0+
+- 16GB+ GPU memory for large models
+- 32GB+ system RAM recommended
 
 ## Citation
 
+If you use Vishwamai in your research, please cite:
+
 ```bibtex
-@software{vishwamai2024,
-  author = {Kasinadhsarma},
-  title = {VishwamAI: Enhanced Transformer with Advanced Reasoning Capabilities},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/VishwamAI/VishwamAI}
+@software{vishwamai2025,
+  title={Vishwamai: T4-Optimized Machine Learning Model},
+  author={Vishwamai Team},
+  year={2025},
+  url={https://github.com/yourusername/vishwamai}
 }
 ```
 
-## Contact
+## License
 
-- **GitHub Issues**: For bug reports and feature requests
-- **Email**: [contact@vishwamai.ai](mailto:contact@vishwamai.ai)
-- **Twitter**: [@VishwamAI](https://twitter.com/VishwamAI)
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+Contributions are welcome! Please read our [contributing guidelines](CONTRIBUTING.md) to get started.
 
 ## Acknowledgments
 
-- Thanks to the open-source community
-- Special thanks to our contributors
-- Powered by PyTorch and Transformers
+- NVIDIA for T4 GPU support
+- PyTorch team for the deep learning framework
+- HuggingFace team for transformer architecture inspirations

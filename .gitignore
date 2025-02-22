@@ -16,12 +16,56 @@ parts/
 sdist/
 var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environment
 .env
 .venv
 env/
@@ -37,118 +81,49 @@ venv.bak/
 *.swo
 *~
 
-# Jupyter Notebook
-.ipynb_checkpoints
-*.ipynb_checkpoints/
-*.ipynb-meta
-
-# Training artifacts
-pretrain_output/
-runs/
-logs/
+# Project specific
 checkpoints/
+runs/
+outputs/
+logs/
+wandb/
+*.pkl
 *.pt
 *.pth
-*.bin
 *.ckpt
-wandb/
-lightning_logs/
+*.bin
+*.model
+*.log
 
 # Model files
-neural_memory.pt
-tree_of_thoughts.pt
-cache_augmentation.pt
-*.model
-*.safetensors
+tokenizer.model
+vocab.txt
+config.json
 
 # Data
-data/
+data/*
+!data/.gitkeep
 datasets/
-*.csv
-*.json
-*.jsonl
-*.txt
-!requirements.txt
-*.pkl
-*.h5
-*.hdf5
+raw_data/
 
 # Documentation
-_build/
-_static/
-_templates/
+docs/_build/
+docs/_static/
+docs/_templates/
 
-# System
+# OS generated files
 .DS_Store
-.directory
+.DS_Store?
+._*
 .Spotlight-V100
 .Trashes
 ehthumbs.db
 Thumbs.db
 
-# Logs
-*.log
-*.log.*
-*.out
-*.err
-*.pid
-*.bak
-
-# Configuration
-*.env
-*.cfg
-config.ini
-!configs/*.json
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
-
-# Distribution
-*.tar.gz
-*.zip
-*.rar
-*.7z
-
-# Cache
-.cache/
-.hypothesis/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Local development
-*.local
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Hugging Face
-hub/
-.huggingface/
-
 # CUDA
-*.nvvp
-*.nsys-rep
-*.qdrep
-*.sqlite
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-*.temp
-
-# Custom project files
-*.vishwamai
-experimental/
-archive/
-debug/
-gms8k/
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin

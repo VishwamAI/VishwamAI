@@ -38,9 +38,6 @@ venv.bak/
 *.iml
 .vs/
 
-# Jupyter Notebook
-.ipynb_checkpoints
-*.ipynb
 
 # Training artifacts
 checkpoints/

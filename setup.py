@@ -40,6 +40,11 @@ install_requires = [
     'huggingface-hub>=0.16.4',
     'scipy>=1.10.0',
     'matplotlib>=3.7.1',
+    'jax',
+    'jaxlib',
+    'flax',
+    'optax',
+    'safetensors',
 ]
 
 # Extra requirements for development
@@ -68,10 +73,10 @@ extras_require = {
 setup(
     name='vishwamai',
     version=get_version(),
-    description='A Mixture-of-Experts language model with Multi-Level Attention',
+    description='VishwamAI language model',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
-    author='Research Team',
+    author='KasinadhSarma',
     author_email='research@example.com',
     url='https://github.com/organization/vishwamai',
     packages=find_packages(exclude=['tests*', 'docs*', 'examples*']),

@@ -1,0 +1,45 @@
+graph TD
+    subgraph Project Overview
+        A[ML Training Pipeline] --> B[Data Processing]
+        A --> C[Model Architecture]
+        A --> D[Training Infrastructure]
+        A --> E[Deployment & Monitoring]
+    end
+    
+    subgraph Data Processing
+        B --> B1[Data Collection]
+        B --> B2[Preprocessing & Cleaning]
+        B --> B3[Tokenization]
+        B --> B4[Data Loading & Augmentation]
+        B --> B5[Reasoning Data Preparation]
+        B1 --> B1_1[MMLU, MMMU, GSM8K]
+        B5 --> B5_1[Chain-of-Thought Annotations]
+    end
+    
+    subgraph Model Architecture
+        C --> C1[Embedding Layers]
+        C --> C2[Transformer Backbone]
+        C --> C3[MoE & MLA Blocks]
+        C --> C4[Output Head]
+        C2 --> C2_1[Self-Attention, FFN, Layer Norm]
+        C3 --> C3_1[Expert Modules]
+        C3 --> C3_2[Router & Gating Mechanisms]
+    end
+    
+    subgraph Training Infrastructure
+        D --> D1[TPU Setup & XLA]
+        D --> D2[Distributed Training]
+        D --> D3[Optimization & Scheduling]
+        D --> D4[Monitoring & Profiling]
+        D --> D5[Initialization Strategies]
+        D3 --> D3_1[AdamW, LR Scheduler]
+        D3 --> D3_2[Hyperparameter Search]
+        D4 --> D4_1[Metrics & Logging]
+        D5 --> D5_1[Weight Initialization Methods]
+    end
+    
+    subgraph Deployment & Monitoring
+        E --> E1[Model Export]
+        E --> E2[Serving Infrastructure]
+        E --> E3[Performance Tracking]
+    end

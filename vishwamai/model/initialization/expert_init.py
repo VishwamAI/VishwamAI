@@ -1,123 +1,133 @@
-"""Expert weight initialization functions for MoE layers."""
+"""Expert weight initialization functions for MoE layers in JAX."""
 from typing import Optional, Union
 import math
-import torch
-import torch.nn as nn
-
-from .weight_init import scaled_init
+import jax
+import jax.numpy as jnp
+from jax import random
 
 def init_expert_weights(
-    expert: nn.Module,
+    expert: dict,
+    rng_key: jax.random.PRNGKey,
     init_method: str = 'scaled_normal',
     init_std: float = 0.02,
     num_experts: int = 1,
     capacity_factor: float = 1.0,
     expert_scale: Optional[float] = None
-) -> None:
-    """Initialize expert module weights.
+) -> dict:
+    """Initialize expert module weights in JAX.
     
     Args:
-        expert: Expert module to initialize
+        expert: Dictionary containing expert parameters
+        rng_key: JAX random key for initialization
         init_method: Initialization method ['scaled_normal', 'kaiming', 'xavier']
         init_std: Standard deviation for normal initialization
         num_experts: Number of experts in MoE layer
         capacity_factor: Expert capacity multiplier
         expert_scale: Optional explicit scaling factor for expert weights
+    
+    Returns:
+        Dictionary with initialized parameters
     """
-    # Calculate expert-specific scaling based on capacity and number of experts
     if expert_scale is None:
-        # Scale based on number of experts and capacity
         expert_scale = math.sqrt(capacity_factor / num_experts)
     
-    if init_method == 'scaled_normal':
-        # Scale normal initialization by expert-specific factor
-        for module in expert.modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                scaled_init(
-                    module,
-                    std=init_std,
-                    scale_factor=expert_scale
-                )
+    params = {}
+    subkey = rng_key
+    
+    for name, param in expert.items():
+        if 'weight' in name.lower():
+            shape = param.shape
+            
+            if init_method == 'scaled_normal':
+                params[name] = random.normal(subkey, shape) * init_std * expert_scale
                 
-    elif init_method == 'kaiming':
-        # Kaiming initialization with expert scaling
-        for module in expert.modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                if hasattr(module, 'weight') and module.weight is not None:
-                    fan = nn.init._calculate_correct_fan(module.weight, 'fan_in')
-                    gain = nn.init.calculate_gain('relu')
-                    std = gain / math.sqrt(fan)
-                    with torch.no_grad():
-                        module.weight.normal_(0, std * expert_scale)
-                if hasattr(module, 'bias') and module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                    
-    elif init_method == 'xavier':
-        # Xavier initialization with expert scaling
-        for module in expert.modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                if hasattr(module, 'weight') and module.weight is not None:
-                    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(module.weight)
-                    std = expert_scale * math.sqrt(2.0 / (fan_in + fan_out))
-                    with torch.no_grad():
-                        module.weight.normal_(0, std)
-                if hasattr(module, 'bias') and module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                    
-    else:
-        raise ValueError(f"Unknown initialization method: {init_method}")
-        
+            elif init_method == 'kaiming':
+                fan_in = shape[-1]  # Assume last dim is input features
+                gain = math.sqrt(2.0)  # ReLU gain
+                std = gain / math.sqrt(fan_in)
+                params[name] = random.normal(subkey, shape) * std * expert_scale
+                
+            elif init_method == 'xavier':
+                fan_in, fan_out = shape[-1], shape[-2]  # Linear layer convention
+                std = expert_scale * math.sqrt(2.0 / (fan_in + fan_out))
+                params[name] = random.normal(subkey, shape) * std
+                
+            else:
+                raise ValueError(f"Unknown initialization method: {init_method}")
+                
+            subkey, _ = random.split(subkey)
+            
+        elif 'bias' in name.lower():
+            params[name] = jnp.zeros_like(param)
+            
+    return params
+
 def init_expert_biases(
-    expert: nn.Module,
+    expert: dict,
+    rng_key: jax.random.PRNGKey,
     bias_init: Union[float, str] = 0.0
-) -> None:
-    """Initialize expert module biases.
+) -> dict:
+    """Initialize expert module biases in JAX.
     
     Args:
-        expert: Expert module to initialize
+        expert: Dictionary containing expert parameters
+        rng_key: JAX random key for initialization
         bias_init: Bias initialization value or method
             - float: Use constant initialization
             - 'zero': Initialize to zeros
             - 'normal': Initialize from N(0, 0.02)
+    
+    Returns:
+        Dictionary with initialized biases
     """
-    for module in expert.modules():
-        if hasattr(module, 'bias') and module.bias is not None:
+    params = {}
+    subkey = rng_key
+    
+    for name, param in expert.items():
+        if 'bias' in name.lower():
             if isinstance(bias_init, (int, float)):
-                nn.init.constant_(module.bias, bias_init)
+                params[name] = jnp.full_like(param, bias_init)
             elif bias_init == 'zero':
-                nn.init.zeros_(module.bias)
+                params[name] = jnp.zeros_like(param)
             elif bias_init == 'normal':
-                nn.init.normal_(module.bias, mean=0.0, std=0.02)
+                params[name] = random.normal(subkey, param.shape) * 0.02
+                subkey, _ = random.split(subkey)
             else:
                 raise ValueError(f"Unknown bias initialization: {bias_init}")
-                
+        else:
+            params[name] = param  # Copy non-bias params unchanged
+            
+    return params
+
 def reset_failed_experts(
-    expert: nn.Module,
+    expert: dict,
+    rng_key: jax.random.PRNGKey,
     expert_idx: int,
     init_method: str = 'scaled_normal',
     init_std: float = 0.02,
     num_experts: int = 1,
     capacity_factor: float = 1.0
-) -> None:
-    """Re-initialize a failed expert's weights.
-    
-    This is used when an expert is detected to have failed (e.g., due to
-    consistently receiving no tokens or producing poor outputs).
+) -> dict:
+    """Re-initialize a failed expert's weights in JAX.
     
     Args:
-        expert: Expert module to re-initialize
+        expert: Dictionary containing expert parameters
+        rng_key: JAX random key for initialization
         expert_idx: Index of expert being reset
         init_method: Initialization method
         init_std: Standard deviation for normal initialization
         num_experts: Total number of experts
         capacity_factor: Expert capacity multiplier
+    
+    Returns:
+        Dictionary with re-initialized parameters
     """
-    # Calculate new scale factor - may want different scaling for resets
     reset_scale = math.sqrt(capacity_factor / num_experts)
     
     # Re-initialize weights
-    init_expert_weights(
+    params = init_expert_weights(
         expert,
+        rng_key,
         init_method=init_method,
         init_std=init_std,
         num_experts=num_experts,
@@ -125,5 +135,8 @@ def reset_failed_experts(
         expert_scale=reset_scale
     )
     
-    # Re-initialize biases
-    init_expert_biases(expert, bias_init='zero')
+    # Re-initialize biases to zero
+    subkey, _ = random.split(rng_key)
+    params = init_expert_biases(params, subkey, bias_init='zero')
+    
+    return params

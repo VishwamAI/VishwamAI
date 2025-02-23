@@ -1,230 +1,263 @@
-"""Transformer layer implementation managing block stacking."""
+"""Base transformer layer implementations."""
 
-from typing import Optional, Tuple, Dict, Any, List, Union
-from dataclasses import dataclass
-import math
+from typing import Optional, Dict, List, Tuple, Union, Any
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
+import torch
+import torch.nn as nn
 
-from .block import TransformerBlock
-from .moe_mla_block import MoEMLABlock
-
-@dataclass
-class LayerCache:
-    """Cache for transformer layer states."""
-    mla_caches: List[Dict[str, Any]]
-    layer_outputs: List[jnp.ndarray]
-    aux_outputs: List[Dict[str, Any]]
+from ..attention import SelfAttention, create_attention_mask
+from .config import TransformerConfig
 
 class TransformerLayer(nn.Module):
-    """Manages transformer blocks and their connections."""
+    """Base transformer layer with self-attention and FFN."""
     
-    # Architecture
-    hidden_size: int
-    num_attention_heads: int
-    num_layers: int
-    intermediate_size: Optional[int] = None
-    head_dim: Optional[int] = None
-    
-    # Block Configuration
-    num_moe_layers: int = 0
-    moe_layer_frequency: int = 2  # Add MoE every N layers
-    num_experts: int = 8
-    expert_capacity_factor: float = 1.25
-    num_experts_per_token: int = 2
-    expert_hidden_size: Optional[int] = None
-    
-    # MLA Configuration
-    use_mla: bool = True
-    num_prev_layers: int = 4
-    attention_window: int = 4
-    
-    # Common Configuration
-    activation: str = "gelu"
-    attention_dropout: float = 0.1
-    hidden_dropout: float = 0.1
-    drop_path: float = 0.0
-    use_flash_attention: bool = False
-    use_rope: bool = True
-    max_sequence_length: int = 2048
-    layer_norm_eps: float = 1e-5
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    deterministic: bool = False
-    
-    def setup(self):
-        """Initialize transformer layer components."""
-        # Determine layer types
-        self.layer_types = self._determine_layer_types()
-        
-        # Create layers
-        self.layers = []
-        for layer_idx, layer_type in enumerate(self.layer_types):
-            if layer_type == "moe":
-                layer = MoEMLABlock(
-                    hidden_size=self.hidden_size,
-                    num_attention_heads=self.num_attention_heads,
-                    num_experts=self.num_experts,
-                    expert_capacity_factor=self.expert_capacity_factor,
-                    num_experts_per_token=self.num_experts_per_token,
-                    expert_hidden_size=self.expert_hidden_size,
-                    head_dim=self.head_dim,
-                    num_prev_layers=self.num_prev_layers,
-                    attention_window=self.attention_window,
-                    layer_id=layer_idx,
-                    dropout_rate=self.hidden_dropout,
-                    attention_dropout=self.attention_dropout,
-                    use_rope=self.use_rope,
-                    max_sequence_length=self.max_sequence_length,
-                    dtype=self.dtype,
-                    param_dtype=self.param_dtype,
-                    deterministic=self.deterministic,
-                    name=f"moe_mla_block_{layer_idx}"
-                )
-            else:
-                layer = TransformerBlock(
-                    hidden_size=self.hidden_size,
-                    num_attention_heads=self.num_attention_heads,
-                    intermediate_size=self.intermediate_size,
-                    head_dim=self.head_dim,
-                    activation=self.activation,
-                    attention_dropout=self.attention_dropout,
-                    hidden_dropout=self.hidden_dropout,
-                    drop_path=self.drop_path,
-                    use_flash_attention=self.use_flash_attention,
-                    use_rope=self.use_rope,
-                    max_sequence_length=self.max_sequence_length,
-                    layer_norm_eps=self.layer_norm_eps,
-                    dtype=self.dtype,
-                    param_dtype=self.param_dtype,
-                    deterministic=self.deterministic,
-                    name=f"transformer_block_{layer_idx}"
-                )
-            self.layers.append(layer)
-            
-    def _determine_layer_types(self) -> List[str]:
-        """Determine the type of each layer.
-        
-        Returns:
-            List of layer types ("moe" or "transformer")
-        """
-        layer_types = ["transformer"] * self.num_layers
-        
-        if self.num_moe_layers > 0:
-            # Add MoE layers at specified frequency
-            moe_positions = list(range(
-                self.moe_layer_frequency - 1,
-                self.num_layers,
-                self.moe_layer_frequency
-            ))[:self.num_moe_layers]
-            
-            for pos in moe_positions:
-                layer_types[pos] = "moe"
-                
-        return layer_types
-        
-    def init_cache(self) -> LayerCache:
-        """Initialize layer cache.
-        
-        Returns:
-            Initialized layer cache
-        """
-        mla_caches = []
-        for layer_idx, layer_type in enumerate(self.layer_types):
-            if layer_type == "moe":
-                mla_caches.append(self.layers[layer_idx].init_cache())
-            else:
-                mla_caches.append({})
-                
-        return LayerCache(
-            mla_caches=mla_caches,
-            layer_outputs=[],
-            aux_outputs=[]
-        )
-        
-    def __call__(self,
-                 hidden_states: jnp.ndarray,
-                 cache: Optional[LayerCache] = None,
-                 attention_mask: Optional[jnp.ndarray] = None,
-                 deterministic: Optional[bool] = None,
-                 output_hidden_states: bool = False,
-                 output_attentions: bool = False) -> Tuple[jnp.ndarray, LayerCache, Dict[str, Any]]:
-        """Apply transformer layers to input.
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_idx: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """Initialize transformer layer.
         
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            cache: Optional layer cache
-            attention_mask: Optional attention mask
-            deterministic: Whether to run in deterministic mode
-            output_hidden_states: Whether to return all layer outputs
-            output_attentions: Whether to return attention weights
+            config: Transformer configuration
+            layer_idx: Index of this layer
+            device: Device to create tensors on
+            dtype: Data type for parameters
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        
+        # Layer normalization
+        self.pre_attention_norm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_eps,
+            **factory_kwargs
+        )
+        self.pre_ffn_norm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_eps,
+            **factory_kwargs
+        )
+        
+        # Self-attention
+        self.attention = SelfAttention(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            dropout_prob=config.attention_dropout_prob,
+            max_position_embeddings=config.max_position_embeddings,
+            use_rotary=config.position_embedding_type == "rotary",
+            bias=True,
+            **factory_kwargs
+        )
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(config.hidden_size, config.intermediate_size, **factory_kwargs),
+            self._get_activation(config.hidden_act),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.intermediate_size, config.hidden_size, **factory_kwargs),
+            nn.Dropout(config.hidden_dropout_prob)
+        )
+        
+        # Initialize weights
+        self._init_weights(config)
+        
+    def _init_weights(self, config: TransformerConfig):
+        """Initialize layer weights.
+        
+        Args:
+            config: Transformer configuration
+        """
+        # Initialize FFN weights
+        for module in self.ffn.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=config.initializer_range)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                    
+    def _get_activation(self, activation: Union[str, nn.Module]) -> nn.Module:
+        """Get activation function.
+        
+        Args:
+            activation: Activation function name or module
             
         Returns:
-            Tuple of:
-                - Output tensor
-                - Updated layer cache
-                - Dict of auxiliary outputs
+            Activation module
         """
-        deterministic = deterministic if deterministic is not None else self.deterministic
+        if isinstance(activation, str):
+            return {
+                "relu": nn.ReLU(),
+                "gelu": nn.GELU(),
+                "silu": nn.SiLU(),
+                "swish": nn.SiLU(),
+            }[activation]
+        return activation
         
-        # Initialize cache if needed
-        if cache is None:
-            cache = self.init_cache()
-            
-        # Initialize auxiliary outputs
-        all_hidden_states = [] if output_hidden_states else None
-        all_attentions = [] if output_attentions else None
-        all_aux_losses = []
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, ...]:
+        """Forward pass through transformer layer.
         
-        # Process each layer
-        for layer_idx, (layer, layer_type) in enumerate(zip(self.layers, self.layer_types)):
-            if output_hidden_states:
-                all_hidden_states.append(hidden_states)
-                
-            if layer_type == "moe":
-                # MoE-MLA block
-                hidden_states, aux_outputs = layer(
-                    hidden_states=hidden_states,
-                    mla_cache=cache.mla_caches[layer_idx],
-                    attention_mask=attention_mask,
-                    deterministic=deterministic
-                )
-                
-                # Update MLA cache
-                cache.mla_caches[layer_idx] = aux_outputs['mla_cache']
-                
-                # Collect auxiliary losses
-                if 'total_aux_loss' in aux_outputs:
-                    all_aux_losses.append(aux_outputs['total_aux_loss'])
-                    
-            else:
-                # Standard transformer block
-                hidden_states, aux_outputs = layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    deterministic=deterministic,
-                    output_attentions=output_attentions
-                )
-                
-            # Store layer outputs and auxiliary outputs
-            if output_hidden_states:
-                cache.layer_outputs.append(hidden_states)
-            cache.aux_outputs.append(aux_outputs)
+        Args:
+            hidden_states: Input tensor
+            attention_mask: Optional attention mask tensor
+            position_embeddings: Optional tuple of (cos, sin) rotary position embeddings
+            past_key_value: Optional tuple of cached (key, value) tensors
+            use_cache: Whether to return key/value tensors for incremental decoding
+            output_attentions: Whether to return attention weights
+            **kwargs: Additional arguments passed to attention module
             
-            if output_attentions and 'attention' in aux_outputs:
-                all_attentions.append(aux_outputs['attention'])
-                
-        # Final layer output
-        if output_hidden_states:
-            all_hidden_states.append(hidden_states)
-            
-        # Collect all outputs
-        aux_outputs = {
-            'hidden_states': all_hidden_states,
-            'attentions': all_attentions,
-            'aux_losses': jnp.mean(jnp.stack(all_aux_losses)) if all_aux_losses else None
-        }
+        Returns:
+            Tuple containing:
+            - Output tensor
+            - Optional tuple of cached (key, value) tensors
+            - Optional attention weights tensor
+        """
+        # Store residual
+        residual = hidden_states
         
-        return hidden_states, cache, aux_outputs
+        # Pre-attention normalization
+        hidden_states = self.pre_attention_norm(hidden_states)
+        
+        # Self-attention
+        attention_outputs = self.attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            **kwargs
+        )
+        hidden_states = attention_outputs[0]
+        
+        # Add residual connection
+        hidden_states = residual + hidden_states
+        
+        # Store residual
+        residual = hidden_states
+        
+        # Pre-FFN normalization
+        hidden_states = self.pre_ffn_norm(hidden_states)
+        
+        # FFN
+        hidden_states = self.ffn(hidden_states)
+        
+        # Add residual connection
+        hidden_states = residual + hidden_states
+        
+        # Prepare outputs
+        outputs = (hidden_states,)
+        
+        if use_cache:
+            outputs += (attention_outputs[1],)
+            
+        if output_attentions:
+            attention_weights = attention_outputs[2 if use_cache else 1]
+            outputs += (attention_weights,)
+            
+        return outputs
+    
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (
+            f"layer_idx={self.layer_idx}, "
+            f"hidden_size={self.hidden_size}, "
+            f"num_heads={self.num_attention_heads}"
+        )
+
+class PreNormTransformerLayer(TransformerLayer):
+    """Transformer layer with pre-normalization architecture."""
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, ...]:
+        """Forward pass through pre-norm transformer layer."""
+        # Store residual
+        residual = hidden_states
+        
+        # Pre-attention normalization
+        hidden_states = self.pre_attention_norm(hidden_states)
+        
+        # Self-attention
+        attention_outputs = self.attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            **kwargs
+        )
+        hidden_states = attention_outputs[0]
+        
+        # Add residual connection
+        hidden_states = residual + hidden_states
+        
+        # Store residual
+        residual = hidden_states
+        
+        # FFN with pre-normalization
+        hidden_states = self.pre_ffn_norm(hidden_states)
+        hidden_states = self.ffn(hidden_states)
+        
+        # Add residual connection
+        hidden_states = residual + hidden_states
+        
+        # Prepare outputs
+        outputs = (hidden_states,)
+        
+        if use_cache:
+            outputs += (attention_outputs[1],)
+            
+        if output_attentions:
+            outputs += (attention_outputs[2 if use_cache else 1],)
+            
+        return outputs
+
+def get_transformer_layer(
+    config: TransformerConfig,
+    layer_idx: int,
+    pre_norm: bool = True,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> TransformerLayer:
+    """Get appropriate transformer layer based on configuration.
+    
+    Args:
+        config: Transformer configuration
+        layer_idx: Layer index
+        pre_norm: Whether to use pre-normalization architecture
+        device: Device to create tensors on
+        dtype: Data type for parameters
+        
+    Returns:
+        Transformer layer instance
+    """
+    layer_class = PreNormTransformerLayer if pre_norm else TransformerLayer
+    return layer_class(
+        config=config,
+        layer_idx=layer_idx,
+        device=device,
+        dtype=dtype
+    )

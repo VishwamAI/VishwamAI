@@ -1,0 +1,70 @@
+# Include project files
+include LICENSE
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include QUICKSTART.md
+include requirements.txt
+
+# Include package configurations
+recursive-include vishwamai/configs *.yaml
+
+# Include documentation
+recursive-include docs *.md
+recursive-include docs *.mermaid
+recursive-include docs *.rst
+recursive-include docs *.py
+recursive-include docs *.ipynb
+recursive-include docs/images *
+
+# Include tests
+recursive-include tests *.py
+recursive-include tests/data *
+
+# Include examples
+recursive-include examples *.py
+recursive-include examples *.ipynb
+recursive-include examples/configs *.yaml
+
+# Include model configurations and tokenizer files
+recursive-include models *.json
+recursive-include models *.model
+recursive-include models *.vocab
+
+# Development files
+include .gitignore
+include setup.py
+include setup.cfg
+include pyproject.toml
+include tox.ini
+include .pre-commit-config.yaml
+
+# Exclude unnecessary files
+global-exclude *.py[cod]
+global-exclude __pycache__
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.egg
+global-exclude *.egg-info
+global-exclude *.pkl
+global-exclude *.pth
+global-exclude .git*
+global-exclude .ipynb_checkpoints
+global-exclude .pytest_cache
+global-exclude .coverage
+global-exclude .mypy_cache
+global-exclude .tox
+
+# Keep empty directories
+recursive-include vishwamai/data *
+recursive-include vishwamai/model *
+recursive-include vishwamai/training *
+recursive-include vishwamai/utils *
+recursive-include vishwamai/scripts *
+
+# Additional directories
+recursive-include benchmarks *.py
+recursive-include tools *.py
+recursive-include scripts *.sh
+recursive-include docker *

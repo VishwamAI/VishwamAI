@@ -1,0 +1,157 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+.vs/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Training artifacts
+checkpoints/
+runs/
+logs/
+*.pt
+*.ckpt
+*.bin
+*.model
+*.pth
+wandb/
+lightning_logs/
+profiler/
+traces/
+
+# Data
+data/
+*.txt
+*.csv
+*.tsv
+*.jsonl
+*.h5
+*.pkl
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.mmap
+*.cache/
+processed/
+raw/
+
+# Documentation
+docs/_build/
+docs/_static/
+docs/_templates/
+docs/api/
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+.tox/
+nosetests.xml
+.hypothesis/
+.mypy_cache/
+
+# TPU specific
+.gs/
+.tpu/
+.torch_xla/
+libtpu.so*
+
+# Model artifacts
+*.onnx
+*.tflite
+*.saved_model/
+*.mlmodel
+torchscript_model/
+optimized_model/
+quantized_model/
+exported_model/
+
+# Logs and monitoring
+*.log
+*.out
+nohup.out
+*.err
+events.out.tfevents.*
+profiler_output/
+memory_traces/
+core.*
+
+# Configurations
+configs/local/
+*.yaml.bak
+*.yml.bak
+
+# Environment and dependencies
+poetry.lock
+Pipfile.lock
+conda-env.yml
+
+# Development tools
+.pre-commit-config.yaml
+.flake8
+setup.cfg
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Large files and binary files
+*.gz
+*.tar
+*.zip
+*.rar
+*.7z
+*.iso
+
+# Project-specific
+local_configs/
+experiments/
+baselines/
+analysis/
+tmp/
+temp/
+scratch/
+*.bak

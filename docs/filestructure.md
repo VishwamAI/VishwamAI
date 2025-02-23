@@ -1,136 +1,183 @@
+# Project File Structure
+
+## Overview
+The Vishwamai project follows a modular structure organized by functionality. Below is a detailed breakdown of each directory and its purpose.
+
+```plaintext
 vishwamai/
-├── configs/
-│   ├── __init__.py                # Make configs a package (optional)
-│   ├── model_config.yaml          # Base model configuration
-│   ├── moe_config.yaml            # Mixture of Experts (MoE) settings
-│   ├── mla_config.yaml            # Multi-Layer Attention (MLA) settings
-│   ├── training_config.yaml       # Training hyperparameters
-│   └── data_config.yaml           # Dataset-specific configurations
+├── configs/              # Configuration files
+│   ├── model_config.yaml     # Model architecture settings
+│   ├── moe_config.yaml      # MoE-specific settings
+│   ├── mla_config.yaml      # Multi-Level Attention settings
+│   ├── training_config.yaml # Training parameters
+│   ├── data_config.yaml    # Data processing settings
+│   └── tpu_config.yaml     # TPU and distribution settings
 │
-├── data/
-│   ├── __init__.py
-│   ├── preprocessing.py           # Text cleaning, normalization, augmentation
-│   ├── tokenization.py            # SentencePiece tokenizer implementation
-│   ├── dataloader.py              # Efficient data loading pipeline
-│   ├── dataset/
-│   │   ├── __init__.py
-│   │   ├── base.py                # Base dataset class
-│   │   ├── implementations/
-│   │   │   ├── __init__.py
-│   │   │   ├── mmlu.py            # MMLU dataset loader
-│   │   │   ├── mmmu.py            # MMMU dataset loader
-│   │   │   └── gsm8k.py           # GSM8K dataset loader
-│   └── augmentation/
-│       ├── __init__.py
-│       └── text_augment.py        # Text augmentation strategies
+├── data/                # Data processing modules
+│   ├── preprocessing.py     # Text preprocessing utilities
+│   ├── tokenization.py     # Tokenizer implementation
+│   ├── dataloader.py       # Data loading utilities
+│   ├── dataset/            # Dataset implementations
+│   │   ├── base.py           # Base dataset class
+│   │   └── implementations/  # Specific dataset implementations
+│   │       ├── mmlu.py
+│   │       ├── mmmu.py
+│   │       └── gsm8k.py
+│   └── augmentation/      # Data augmentation utilities
+│       └── text_augment.py
 │
-├── model/
-│   ├── __init__.py
-│   ├── config.py                  # Loads model configurations
-│   ├── embeddings/
-│   │   ├── __init__.py
-│   │   ├── token_embedding.py     # Token embeddings
-│   │   └── positional.py          # Positional encodings
-│   ├── moe/
-│   │   ├── __init__.py
-│   │   ├── experts/
-│   │   │   ├── __init__.py
-│   │   │   ├── expert_layer.py    # Expert FFN implementation
-│   │   │   ├── expert_state.py    # Expert state management
-│   │   │   └── initialization.py  # Expert weight initialization
-│   │   ├── router/
-│   │   │   ├── __init__.py
-│   │   │   ├── top_k_router.py    # Top-k expert routing
-│   │   │   ├── balancing.py       # Load balancing logic
-│   │   │   └── dispatch.py        # Token-to-expert dispatch
+├── model/               # Model architecture components
+│   ├── attention/         # Attention mechanisms
+│   │   ├── self_attention.py
+│   │   ├── cross_attention.py
+│   │   └── flash_attention.py
+│   ├── moe/              # Mixture of Experts implementation
+│   │   ├── expert.py
+│   │   ├── router.py
+│   │   ├── moe_layer.py
 │   │   └── gating/
-│   │       ├── __init__.py
-│   │       ├── gates.py           # Gating mechanisms
-│   │       └── auxiliary.py       # Auxiliary loss for balance
-│   ├── mla/
-│   │   ├── __init__.py
-│   │   ├── attention/
-│   │   │   ├── __init__.py
-│   │   │   ├── self_attention.py  # Self-attention
-│   │   │   ├── cross_attention.py # Cross-layer attention
-│   │   │   └── multi_head.py      # Multi-head attention
-│   │   └── layers/
-│   │       ├── __init__.py
-│   │       ├── mla_block.py       # MLA integration
-│   │       └── layer_norm.py      # Layer normalization
-│   ├── transformer/
-│   │   ├── __init__.py
-│   │   ├── moe_mla_block.py       # MoE + MLA Transformer block
-│   │   └── residual.py            # Residual connections
-│   └── initialization/
-│       ├── __init__.py
-│       ├── weight_init.py       # General weight initialization
-│       ├── expert_init.py       # MoE expert weight init
-│       └── router_init.py       # Router-specific initialization
+│   │       └── __init__.py
+│   ├── mla/              # Multi-Level Attention
+│   │   ├── attention.py
+│   │   ├── layer_manager.py
+│   │   ├── mla_block.py
+│   │   └── residual.py
+│   ├── transformer/      # Transformer architecture
+│   │   ├── block.py
+│   │   ├── layer.py
+│   │   ├── config.py
+│   │   └── model.py
+│   ├── embeddings/       # Embedding layers
+│   │   ├── token_embedding.py
+│   │   └── positional.py
+│   └── initialization/   # Weight initialization
+│       ├── expert_init.py
+│       └── weight_init.py
 │
-├── training/
-│   ├── __init__.py
-│   ├── optimizer/
-│   │   ├── __init__.py
-│   │   ├── adamw.py             # AdamW optimizer
-│   │   └── fairscale.py         # FairScale sharded optimization
-│   ├── scheduling/
-│   │   ├── __init__.py
-│   │   ├── lr_scheduler.py      # Learning rate scheduler
-│   │   └── warmup.py            # Learning rate warmup
-│   ├── distributed/
-│   │   ├── __init__.py
-│   │   ├── tpu_utils.py         # TPU/XLA utilities
-│   │   ├── expert_sharding.py   # Expert parallelism
-│   │   └── comm_ops.py          # Communication ops for experts
-│   ├── trainer.py               # Main training loop
-│   ├── metrics.py               # Training metrics logging
-│   └── callbacks/
-│       ├── __init__.py
-│       ├── checkpoint.py        # Model checkpointing
-│       ├── early_stopping.py    # Early stopping
-│       └── lr_scheduler_cb.py   # LR scheduler callback
+├── training/            # Training utilities
+│   ├── optimizer/         # Optimization algorithms
+│   │   ├── adamw.py
+│   │   └── fairscale.py
+│   ├── scheduling/       # Learning rate scheduling
+│   │   ├── lr_scheduler.py
+│   │   └── warmup.py
+│   ├── distributed/      # Distributed training
+│   │   ├── tpu_utils.py
+│   │   ├── expert_sharding.py
+│   │   └── comm_ops.py
+│   └── callbacks/        # Training callbacks
+│       ├── checkpoint.py
+│       ├── early_stopping.py
+│       └── lr_scheduler_cb.py
 │
-├── utils/
-│   ├── __init__.py
-│   ├── xla_utils.py             # TPU compilation helpers
-│   ├── checkpoint.py            # Save/load checkpoints
-│   ├── logging.py               # Training logs
-│   ├── profiling/
-│   │   ├── __init__.py
-│   │   ├── memory.py          # Memory tracking
-│   │   └── performance.py     # Performance profiling
-│   └── visualization/
-│       ├── __init__.py
-│       ├── training_viz.py    # Training visualization
-│       ├── attention_viz.py   # Attention visualization
-│       └── expert_viz.py      # MoE expert routing visualization
+├── utils/               # Utility functions
+│   ├── logging.py         # Logging utilities
+│   ├── profiling/        # Performance profiling
+│   │   ├── memory.py
+│   │   └── performance.py
+│   └── visualization/    # Visualization tools
+│       ├── training_viz.py
+│       ├── attention_viz.py
+│       └── expert_viz.py
 │
-├── scripts/
-│   ├── preprocess_data.py       # Preprocess text
-│   ├── train_tokenizer.py       # Train SentencePiece tokenizer
-│   ├── train_model.py           # Train model
-│   ├── evaluate_model.py        # Evaluate on benchmarks
-│   └── deployment/
-│       ├── __init__.py
-│       ├── export_model.py      # Export model for serving
-│       └── convert_weights.py   # Convert weights
+├── scripts/             # Command-line scripts
+│   ├── preprocess_data.py  # Data preprocessing script
+│   ├── train_tokenizer.py  # Tokenizer training script
+│   ├── train_model.py      # Model training script
+│   ├── evaluate_model.py   # Model evaluation script
+│   ├── serve_model.py      # Model serving script
+│   └── export_model.py     # Model export script
 │
-├── tests/
-│   ├── __init__.py
-│   ├── test_data/               # Unit tests for data processing
-│   ├── test_model/              # Unit tests for model architecture
-│   ├── test_training/           # Unit tests for training components
-│   └── integration_tests/       # End-to-end testing
-│
-├── notebooks/
-│   ├── exploration/             # Data exploration
-│   ├── experiments/             # Hyperparameter tuning
-│   └── analysis/                # Results analysis
-│
-├── main.py                      # Entry point
-├── requirements.txt             # Python dependencies
-├── setup.py                     # Package setup
-├── Dockerfile                   # Containerized deployment
-├── .gitignore                   # Ignore files
-└── README.md                    # Documentation
+└── docs/                # Documentation
+    ├── technical.md       # Technical documentation
+    ├── architecture.mermaid # Architecture diagram
+    └── filestructure.md   # This file
+
+```
+
+## Key Components
+
+### 1. Configurations (`configs/`)
+Contains YAML configuration files for different aspects of the model and training process.
+
+### 2. Data Processing (`data/`)
+Modules for data preprocessing, tokenization, and dataset implementations.
+
+### 3. Model Architecture (`model/`)
+Core model components including attention mechanisms, MoE layers, and transformer blocks.
+
+### 4. Training (`training/`)
+Training utilities, optimizers, schedulers, and distributed training components.
+
+### 5. Utilities (`utils/`)
+Helper functions for logging, profiling, and visualization.
+
+### 6. Scripts (`scripts/`)
+Command-line tools for various tasks in the training pipeline.
+
+### 7. Documentation (`docs/`)
+Project documentation and technical details.
+
+## Organization Principles
+
+1. **Modularity**:
+   - Each component is self-contained
+   - Clear separation of concerns
+   - Minimal interdependencies
+
+2. **Configuration**:
+   - All parameters are configurable via YAML files
+   - Separate configs for different aspects
+   - Easy experiment management
+
+3. **Extensibility**:
+   - Base classes for key components
+   - Easy to add new implementations
+   - Pluggable architecture
+
+4. **Documentation**:
+   - Inline documentation
+   - Architecture diagrams
+   - Technical specifications
+
+## Adding New Components
+
+1. **New Dataset**:
+   ```plaintext
+   data/dataset/implementations/
+   └── new_dataset.py  # Implement BaseDataset
+   ```
+
+2. **New Expert Type**:
+   ```plaintext
+   model/moe/experts/
+   └── new_expert.py   # Implement BaseExpert
+   ```
+
+3. **New Attention Mechanism**:
+   ```plaintext
+   model/attention/
+   └── new_attention.py  # Implement BaseAttention
+   ```
+
+## Best Practices
+
+1. **Code Organization**:
+   - Follow the established directory structure
+   - Keep related files together
+   - Use appropriate subdirectories
+
+2. **Documentation**:
+   - Document all public interfaces
+   - Include examples in docstrings
+   - Keep documentation up-to-date
+
+3. **Configuration**:
+   - Add new parameters to appropriate config files
+   - Document configuration options
+   - Provide default values
+
+4. **Testing**:
+   - Add tests for new components
+   - Follow existing test patterns
+   - Include integration tests

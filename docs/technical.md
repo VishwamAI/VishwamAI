@@ -1,123 +1,235 @@
-# Developing Optimized Large Language Models on Limited Compute Resources
+# Technical Documentation
 
-**Kasinadhsarma**  
-Email: [kasinadhsarma@gmail.com](mailto:kasinadhsarma@gmail.com)
+## Model Architecture
 
----
+### Overview
+Vishwamai combines Mixture of Experts (MoE) with Multi-Level Attention (MLA) in a transformer-based architecture. This design enables both efficient processing of long sequences and adaptive computation based on input complexity.
 
-## Abstract
+### Key Components
 
-Large language models (LLMs) have demonstrated remarkable performance across various natural language tasks. However, training such models at scale requires immense computational resources, posing a significant challenge for researchers with limited hardware. This paper presents a comprehensive framework that integrates data-centric optimizations, compute efficiency techniques, and architectural innovations to enable high-quality LLM training on limited compute resources. Our theoretical analysis, based on TPU v5e1 with 100 compute units (approximately 100 hours of training), shows that it is feasible to pre-train a model with up to 10 billion parameters on a corpus of 100 million tokens over 3 epochs. We leverage sparsely-gated Mixture-of-Experts (MoE) layers, dynamic inference strategies, and mixed-precision training to potentially reduce training compute by up to 30% while preserving downstream task performance.
+#### 1. Mixture of Experts (MoE)
+- **Router Design**: Two-stage top-k routing system
+  ```python
+  scores = router(input_tokens)  # [batch_size, seq_len, num_experts]
+  top_k_scores, indices = select_top_k(scores, k=2)
+  ```
 
----
+- **Expert Architecture**:
+  - Feed-forward networks with configurable hidden dimensions
+  - Shared input/output projections
+  - Individual layer normalization and dropout
 
-## Introduction
+- **Load Balancing**:
+  ```python
+  # Auxiliary loss for load balancing
+  aux_loss = compute_load_balance_loss(
+      scores,      # Router scores
+      dispatch,    # Expert assignments
+      num_experts  # Total experts
+  )
+  ```
 
-Recent advances in LLMs have led to breakthrough performance in natural language processing tasks. Despite these successes, the escalating computational costs required for training LLMs present a barrier, especially for resource-constrained environments. This paper proposes a holistic framework aimed at reducing training compute without sacrificing model performance by combining:
-- Data-centric optimizations,
-- Compute efficiency techniques, and
-- Architectural enhancements.
+#### 2. Multi-Level Attention (MLA)
 
-Our work targets training on TPU v5e1, where 100 compute units (roughly 100 hours) are assumed to provide an effective throughput of 50 TFLOPS. We demonstrate through FLOPs analysis that under ideal conditions, a model with up to 10 billion parameters can be trained on 100 million tokens over 3 epochs.
+- **Hierarchical Processing**:
+  ```plaintext
+  Level 0 (Fine): Full sequence length, high resolution
+  Level 1 (Medium): 1/2 sequence length, medium resolution
+  Level 2 (Coarse): 1/4 sequence length, low resolution
+  ```
 
----
+- **Level Fusion**:
+  ```python
+  # Adaptive fusion of attention levels
+  fused_output = sum(
+      level_weights[i] * upsample(level_outputs[i])
+      for i in range(num_levels)
+  )
+  ```
 
-## Related Work
+- **Sparse Computation**:
+  - Efficient attention patterns at each level
+  - Progressive sparsification at higher levels
+  - Optimized memory usage through level-wise processing
 
-Scaling laws have shown that increased model size and compute lead to improved performance. Techniques such as model distillation and sparse architectures like MoE have been proposed to improve efficiency. Our framework builds upon these approaches by integrating dynamic inference strategies and targeted TPU optimizations.
+### Architecture Details
 
----
+#### Input Processing
+```plaintext
+Raw Text → Tokenization → Embedding → Positional Encoding
+```
 
-## Compute Budget and FLOPs Analysis
+#### Transformer Block Structure
+```plaintext
+Input
+  ↓
+Multi-Level Attention
+  ↓
+Expert Layer (MoE)
+  ↓
+Layer Normalization
+  ↓
+Feed Forward
+  ↓
+Output
+```
 
-### Compute Budget Calculation
+## Implementation Details
 
-Assuming TPU v5e1 has an effective throughput of:
-\[
-50 \times 10^{12} \text{ FLOPs/sec}
-\]
-and 1 compute unit equals 1 hour, then:
-- **FLOPs per hour:**
-  \[
-  50 \times 10^{12} \times 3600 \approx 1.8 \times 10^{17} \text{ FLOPs}
-  \]
-- **Total FLOPs for 100 hours:**
-  \[
-  1.8 \times 10^{17} \times 100 = 1.8 \times 10^{19} \text{ FLOPs}
-  \]
+### Memory Optimization
 
-### FLOPs Required for Training
+1. **Gradient Checkpointing**:
+```python
+def checkpointed_forward(self, x):
+    def custom_forward(*inputs):
+        return self.block_forward(*inputs)
+    return checkpoint.checkpoint(custom_forward, x)
+```
 
-Using the heuristic of 6 FLOPs per parameter per token (covering both forward and backward passes) for a dataset of:
-- \(T = 10^8\) tokens (100 million tokens)
-- \(E = 3\) epochs
+2. **Expert Sharding**:
+```python
+# Distribute experts across TPU devices
+expert_parallel_config = {
+    'strategy': 'uniform',
+    'num_experts_per_device': num_experts // num_devices
+}
+```
 
-The total FLOPs required is:
-\[
-\text{FLOPs}_{\text{required}} = 6 \times N \times T \times E = 18 \times N \times 10^8.
-\]
+3. **Attention Optimization**:
+```python
+# Flash Attention implementation
+attention_output = flash_attention(
+    query=q,
+    key=k,
+    value=v,
+    dropout_p=self.dropout,
+    causal=True
+)
+```
 
-Setting this equal to the available compute:
-\[
-18 \times N \times 10^8 = 1.8 \times 10^{19}
-\]
-we solve for \(N\):
-\[
-N = \frac{1.8 \times 10^{19}}{18 \times 10^8} = \frac{1.8 \times 10^{19}}{1.8 \times 10^9} = 10^{10} \text{ parameters}.
-\]
+### TPU Optimization
 
-Thus, theoretically, training a model with up to 10 billion parameters is feasible under these ideal conditions.
+1. **XLA Compilation**:
+```python
+@torch.jit.script
+def optimized_forward(self, x):
+    # TPU-optimized forward pass
+    return self.efficient_computation(x)
+```
 
----
+2. **Data Pipeline**:
+```python
+def create_tpu_dataloader(dataset, batch_size):
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal()
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=8
+    )
+```
 
-## Methodology
+### Training Methodology
 
-### Data-Centric Optimizations
+1. **Mixed Precision Training**:
+```python
+scaler = torch.cuda.amp.GradScaler()
+with torch.cuda.amp.autocast():
+    loss = model(input_ids, labels=labels)
+scaler.scale(loss).backward()
+```
 
-Our data pipeline includes:
-- **Advanced Filtering:** Deduplication and n-gram overlap filtering to eliminate low-quality data.
-- **Data Augmentation:** Using back-translation and text infilling to augment underrepresented domains.
-- **Tokenization:** Training a SentencePiece tokenizer with outputs stored in SafeTensors for efficient access.
+2. **Expert Load Balancing**:
+```python
+def compute_load_balance_loss(router_probs, assignments):
+    expert_counts = assignments.sum(dim=(0, 1))
+    target_count = assignments.sum() / num_experts
+    return torch.abs(expert_counts - target_count).mean()
+```
 
-### Compute Efficiency Techniques
+## Performance Considerations
 
-To reduce compute requirements, we implement:
-- **Mixed-Precision Training:** Leveraging BFloat16 and INT8 formats.
-- **Dynamic Batching:** Adjusting batch sizes and sequence lengths based on current compute availability.
-- **NUMA-Aware Memory Allocation:** Optimizing data distribution in multi-socket systems.
+### Memory Usage
 
-### Architectural Innovations
+- Expert Parameters: `num_experts * expert_size * 4 bytes`
+- Attention Memory: `batch_size * seq_len * hidden_size * 4 bytes`
+- Router Memory: `batch_size * seq_len * num_experts * 4 bytes`
 
-Our model architecture comprises:
-- A standard Transformer backbone with token and positional embeddings.
-- **Sparsely-Gated MoE Layers:** Enabling conditional computation to scale model capacity without proportional compute cost.
-- **Multi-Layer Attention (MLA):** Enhancing contextual representations via cross-layer attention.
-- **Dynamic Inference:** Incorporating adaptive early exiting to reduce inference computation.
+### Computational Complexity
 
-### TPU Execution and Distributed Training
+1. **Attention Complexity**:
+```plaintext
+Level 0: O(N^2 * d)
+Level 1: O((N/2)^2 * d)
+Level 2: O((N/4)^2 * d)
+Total: ~O(5/8 * N^2 * d)  # Reduced from O(N^2 * d)
+```
 
-Our framework leverages TPU v5e1 with XLA:
-- Distributed training is implemented via \texttt{jax.pmap} (or PyTorch XLA equivalents) for efficient parallelization.
-- Optimization is performed with AdamW, using a cosine learning rate schedule and warmup.
-- Optional integration of FairScale is available for sharded optimizer states if using PyTorch on TPU.
+2. **Router Complexity**:
+```plaintext
+Forward: O(batch_size * seq_len * num_experts)
+Expert Computation: O(batch_size * seq_len * expert_size / num_experts)
+```
 
----
+### Optimization Guidelines
 
-## Experimental Setup
+1. **TPU-Specific**:
+   - Use powers of 2 for dimensions
+   - Align memory accesses
+   - Minimize host-device transfers
 
-Our experimental plan targets models in the 500M to 1B parameter range as baselines. We compare:
-- **Dense Transformer architectures** versus those augmented with MoE and MLA.
-- Evaluation metrics include test loss, perplexity, downstream task performance, FLOPs per token, and energy consumption.
+2. **Expert Configuration**:
+   - Balance expert capacity and number
+   - Monitor load distribution
+   - Adjust routing temperature
 
----
+3. **Memory Management**:
+   - Use gradient checkpointing
+   - Implement smart caching
+   - Optimize attention patterns
 
-## Results and Discussion
+## Benchmarking
 
-Preliminary analysis indicates that our framework can potentially reduce compute requirements by 20% to 30% compared to dense architectures, with less than a 1% accuracy drop on downstream tasks. Our approach also demonstrates improved scalability in resource-constrained environments. Detailed experimental results, including ablation studies and performance profiling, will be presented in future work.
+### Memory Profiling
+```python
+def profile_memory():
+    torch.cuda.reset_peak_memory_stats()
+    model(input_ids)
+    peak_memory = torch.cuda.max_memory_allocated()
+    return peak_memory
+```
 
----
+### Speed Benchmarks
+```python
+def benchmark_forward_pass(model, input_batch, num_runs=100):
+    timings = []
+    for _ in range(num_runs):
+        start_time = time.time()
+        with torch.no_grad():
+            model(input_batch)
+        timings.append(time.time() - start_time)
+    return np.mean(timings), np.std(timings)
+```
 
-## Conclusion
+## Known Limitations and Future Work
 
-We have presented Vishwamai, a scalable framework for pre-training large language models on limited compute resources using TPU v5e1. Our integration of data-centric optimizations, compute efficiency techniques, and architectural innovations such as sparsely-gated MoE layers and dynamic inference shows that it is feasible to train models with up to 10 billion parameters on 100 million tokens over 3 epochs within a 100-hour compute budget. Future work will focus on experimental validation and further refinement of these methods.
+1. **Current Limitations**:
+   - Expert allocation overhead
+   - Memory requirements for large expert counts
+   - Router bottleneck in distributed setting
 
+2. **Future Improvements**:
+   - Dynamic expert count adjustment
+   - Improved load balancing strategies
+   - More efficient attention mechanisms
+   - Better expert parameter sharing
+
+3. **Research Directions**:
+   - Adaptive routing algorithms
+   - Hierarchical expert structures
+   - Improved fusion mechanisms
+   - Dynamic architecture adaptation

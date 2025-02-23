@@ -1,156 +1,274 @@
-"""Residual connections for Multi-Layer Attention blocks."""
+"""Residual connection handlers for MLA layers."""
 
-from typing import Optional, Tuple, Dict, Any
-import math
+from typing import Optional, Tuple, Dict, Union
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
+import torch
+import torch.nn as nn
 
 class MLAResidual(nn.Module):
-    """Gated residual connections for MLA blocks."""
+    """Multi-level residual connection handler."""
     
-    hidden_size: int
-    dropout_rate: float = 0.1
-    use_gate: bool = True
-    gate_init_eps: float = 0.1
-    layer_scale: bool = True
-    layer_scale_init_value: float = 0.1
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    deterministic: bool = False
-    
-    def setup(self):
-        """Initialize residual components."""
-        if self.use_gate:
-            # Gating mechanism
-            self.gate = nn.Dense(
-                2,  # Output dimension for both transform gate and cross-layer gate
-                use_bias=True,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                kernel_init=nn.initializers.zeros,
-                bias_init=lambda *_: jnp.array([1.0 - self.gate_init_eps,
-                                              self.gate_init_eps]),
-                name="gate"
-            )
-            
-        if self.layer_scale:
-            # Learned scaling parameters
-            self.layer_scale_1 = self.param(
-                'layer_scale_1',
-                nn.initializers.constant(self.layer_scale_init_value),
-                (self.hidden_size,)
-            )
-            self.layer_scale_2 = self.param(
-                'layer_scale_2',
-                nn.initializers.constant(self.layer_scale_init_value),
-                (self.hidden_size,)
-            )
-            
-    def _apply_gate(self, 
-                   x: jnp.ndarray,
-                   transformed: jnp.ndarray,
-                   cross_layer: Optional[jnp.ndarray] = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Apply gating mechanism to control information flow.
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_levels: int,
+        residual_scale: Optional[float] = None,
+        level_scale_factor: float = 0.5,
+        use_layer_scale: bool = True,
+        init_scale: float = 0.1,
+        dropout_prob: float = 0.1,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """Initialize MLA residual handler.
         
         Args:
-            x: Input tensor
-            transformed: Transformed input
-            cross_layer: Optional cross-layer input
+            hidden_size: Size of hidden dimension
+            num_attention_levels: Number of attention levels
+            residual_scale: Optional fixed scale for residuals
+            level_scale_factor: Scaling factor between attention levels
+            use_layer_scale: Whether to use learnable layer scaling
+            init_scale: Initial value for layer scale parameters
+            dropout_prob: Residual dropout probability
+            device: Device to create tensors on
+            dtype: Data type for parameters
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_attention_levels = num_attention_levels
+        self.residual_scale = residual_scale
+        self.level_scale_factor = level_scale_factor
+        self.use_layer_scale = use_layer_scale
+        
+        # Layer scaling parameters
+        if use_layer_scale:
+            self.layer_scale = nn.ParameterList([
+                nn.Parameter(
+                    torch.full(
+                        (hidden_size,),
+                        init_scale * (level_scale_factor ** level),
+                        **factory_kwargs
+                    )
+                )
+                for level in range(num_attention_levels)
+            ])
+        else:
+            self.layer_scale = None
+            
+        # Residual dropout
+        self.dropout = nn.Dropout(dropout_prob)
+        
+    def get_level_scale(self, level: int) -> float:
+        """Get scaling factor for attention level.
+        
+        Args:
+            level: Attention level index
             
         Returns:
-            Tuple of:
-                - Gated output
-                - Gate weights
+            Scaling factor for level
         """
-        # Global average pooling for gate computation
-        pooled = jnp.mean(x, axis=1, keepdims=True)  # [batch, 1, hidden]
-        
-        # Compute gate values
-        gate_logits = self.gate(pooled)  # [batch, 1, 2]
-        gate_weights = jax.nn.softmax(gate_logits, axis=-1)
-        
-        # Split gates for transform and cross-layer paths
-        transform_gate = gate_weights[..., 0:1]
-        cross_gate = gate_weights[..., 1:2]
-        
-        # Apply gates
-        if cross_layer is not None:
-            output = (transform_gate * transformed) + (cross_gate * cross_layer)
+        if self.residual_scale is not None:
+            return self.residual_scale
         else:
-            output = transform_gate * transformed
+            return self.level_scale_factor ** level
             
-        return output, gate_weights
-            
-    def __call__(self,
-                 x: jnp.ndarray,
-                 transformed: jnp.ndarray,
-                 cross_layer: Optional[jnp.ndarray] = None,
-                 deterministic: Optional[bool] = None) -> Tuple[jnp.ndarray, Dict[str, Any]]:
-        """Apply residual connection with optional gating and scaling.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        attention_level: int,
+        pre_norm: bool = True,
+        post_add: bool = False,
+    ) -> torch.Tensor:
+        """Apply residual connection with appropriate scaling.
         
         Args:
-            x: Input tensor [batch, seq_len, hidden_size]
-            transformed: Transformed input
-            cross_layer: Optional cross-layer input
-            deterministic: Whether to run in deterministic mode
+            hidden_states: Main path tensor
+            residual: Residual path tensor
+            attention_level: Current attention level
+            pre_norm: Whether this is a pre-norm residual
+            post_add: Whether to apply post-residual addition
             
         Returns:
-            Tuple of:
-                - Output tensor
-                - Dict of auxiliary outputs
+            Output tensor after residual connection
         """
-        deterministic = deterministic if deterministic is not None else self.deterministic
-        
-        # Apply layer scaling if enabled
-        if self.layer_scale:
-            transformed = transformed * self.layer_scale_1
-            if cross_layer is not None:
-                cross_layer = cross_layer * self.layer_scale_2
+        if not pre_norm:
+            # Apply layer scaling if enabled
+            if self.use_layer_scale:
+                hidden_states = hidden_states * self.layer_scale[attention_level].unsqueeze(0).unsqueeze(0)
                 
-        # Apply gating if enabled
-        if self.use_gate:
-            residual, curr_gate_weights = self._apply_gate(x, transformed, cross_layer)
+            # Apply dropout
+            hidden_states = self.dropout(hidden_states)
+            
+            # Add scaled residual
+            output = residual + hidden_states * self.get_level_scale(attention_level)
+            
+            # Apply post-residual addition if needed
+            if post_add:
+                output = output + hidden_states
+                
         else:
-            # Standard residual connection
-            residual = transformed
-            curr_gate_weights = None
-            if cross_layer is not None:
-                residual = residual + cross_layer
+            # For pre-norm, apply operations in different order
+            if self.use_layer_scale:
+                hidden_states = hidden_states * self.layer_scale[attention_level].unsqueeze(0).unsqueeze(0)
                 
-        # Apply dropout during training
-        if not deterministic:
-            residual = nn.Dropout(
-                rate=self.dropout_rate,
-                deterministic=deterministic
-            )(residual, deterministic=deterministic)
+            # Add scaled residual
+            output = hidden_states + residual * self.get_level_scale(attention_level)
             
-        # Add input (final residual)
-        output = x + residual
-        
-        # Collect auxiliary outputs
-        aux_outputs = {}
-        if self.use_gate:
-            aux_outputs['gate_weights'] = curr_gate_weights
+            # Apply dropout
+            output = self.dropout(output)
             
-        return output, aux_outputs
-        
-    def init_layer_scale(self, scale_factor: float = 1.0) -> None:
-        """Initialize layer scale parameters.
+            # Apply post-residual addition if needed
+            if post_add:
+                output = output + hidden_states * self.get_level_scale(attention_level)
+                
+        return output
+    
+    def merge_residuals(
+        self,
+        residuals: List[torch.Tensor],
+        attention_levels: List[int]
+    ) -> torch.Tensor:
+        """Merge multiple residual connections from different levels.
         
         Args:
-            scale_factor: Scaling factor for initialization
+            residuals: List of residual tensors
+            attention_levels: List of corresponding attention levels
+            
+        Returns:
+            Merged residual tensor
         """
-        if self.layer_scale:
-            init_value = self.layer_scale_init_value * scale_factor
-            self.layer_scale_1 = jnp.full(
-                (self.hidden_size,),
-                init_value,
-                dtype=self.dtype
-            )
-            self.layer_scale_2 = jnp.full(
-                (self.hidden_size,),
-                init_value,
-                dtype=self.dtype
-            )
+        assert len(residuals) == len(attention_levels), "Number of residuals must match number of levels"
+        
+        # Initialize output with first residual
+        output = residuals[0] * self.get_level_scale(attention_levels[0])
+        
+        # Add remaining scaled residuals
+        for residual, level in zip(residuals[1:], attention_levels[1:]):
+            scale = self.get_level_scale(level)
+            if self.use_layer_scale:
+                scale = scale * self.layer_scale[level]
+            output = output + residual * scale
+            
+        return output
+
+class AdaptiveResidual(MLAResidual):
+    """Residual handler with adaptive scaling."""
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_levels: int,
+        num_heads: int,
+        temperature: float = 1.0,
+        **kwargs
+    ):
+        """Initialize adaptive residual handler.
+        
+        Args:
+            hidden_size: Size of hidden dimension
+            num_attention_levels: Number of attention levels
+            num_heads: Number of attention heads
+            temperature: Temperature for attention scores
+            **kwargs: Additional arguments passed to parent
+        """
+        super().__init__(hidden_size, num_attention_levels, **kwargs)
+        
+        self.num_heads = num_heads
+        self.temperature = temperature
+        
+        # Adaptive scaling attention
+        self.scale_query = nn.Linear(hidden_size, num_heads, bias=False)
+        self.scale_key = nn.Linear(hidden_size, num_heads, bias=False)
+        
+        # Initialize weights
+        nn.init.normal_(self.scale_query.weight, std=0.02)
+        nn.init.normal_(self.scale_key.weight, std=0.02)
+        
+    def compute_adaptive_scale(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute adaptive scaling factor using attention mechanism.
+        
+        Args:
+            hidden_states: Main path tensor
+            residual: Residual path tensor
+            
+        Returns:
+            Scaling factor tensor
+        """
+        # Compute query and key
+        query = self.scale_query(hidden_states)  # [B, L, H]
+        key = self.scale_key(residual)  # [B, L, H]
+        
+        # Compute attention scores
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.num_heads)
+        
+        # Apply temperature and softmax
+        scale = torch.softmax(scores / self.temperature, dim=-1)
+        
+        return scale
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        attention_level: int,
+        pre_norm: bool = True,
+        post_add: bool = False,
+    ) -> torch.Tensor:
+        """Apply residual connection with adaptive scaling.
+        
+        Args:
+            hidden_states: Main path tensor
+            residual: Residual path tensor
+            attention_level: Current attention level
+            pre_norm: Whether this is a pre-norm residual
+            post_add: Whether to apply post-residual addition
+            
+        Returns:
+            Output tensor after residual connection
+        """
+        # Compute adaptive scale
+        adaptive_scale = self.compute_adaptive_scale(hidden_states, residual)
+        
+        # Get base scale for level
+        level_scale = self.get_level_scale(attention_level)
+        
+        # Combine scales
+        scale = adaptive_scale * level_scale
+        
+        if not pre_norm:
+            if self.use_layer_scale:
+                hidden_states = hidden_states * self.layer_scale[attention_level].unsqueeze(0).unsqueeze(0)
+                
+            hidden_states = self.dropout(hidden_states)
+            output = residual + hidden_states * scale
+            
+            if post_add:
+                output = output + hidden_states
+                
+        else:
+            if self.use_layer_scale:
+                hidden_states = hidden_states * self.layer_scale[attention_level].unsqueeze(0).unsqueeze(0)
+                
+            output = hidden_states + residual * scale
+            output = self.dropout(output)
+            
+            if post_add:
+                output = output + hidden_states * scale
+                
+        return output
+    
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (
+            f"hidden_size={self.hidden_size}, "
+            f"num_levels={self.num_attention_levels}, "
+            f"num_heads={self.num_heads}, "
+            f"temperature={self.temperature}"
+        )

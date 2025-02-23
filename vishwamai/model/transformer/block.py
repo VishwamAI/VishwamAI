@@ -1,180 +1,271 @@
-"""Base transformer block implementation."""
+"""Transformer block implementations."""
 
-from typing import Optional, Tuple, Dict, Any
-import math
+from typing import Optional, Dict, List, Tuple, Union, Any
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
+import torch
+import torch.nn as nn
 
-from ..attention import MultiHeadSelfAttention, FlashAttention
-
-def create_activation(name: str) -> Any:
-    """Create activation function by name."""
-    if name == "gelu":
-        return nn.gelu
-    elif name == "swiglu":
-        return lambda x: jax.nn.silu(x[..., ::2]) * x[..., 1::2]
-    elif name == "silu":
-        return nn.swish
-    else:
-        return nn.relu
+from .config import TransformerConfig
+from .layer import TransformerLayer, get_transformer_layer
 
 class TransformerBlock(nn.Module):
-    """Base transformer block with self-attention and feed-forward layers."""
+    """Base transformer block combining multiple layers."""
     
-    hidden_size: int
-    num_attention_heads: int
-    intermediate_size: Optional[int] = None
-    head_dim: Optional[int] = None
-    activation: str = "gelu"
-    attention_dropout: float = 0.1
-    hidden_dropout: float = 0.1
-    drop_path: float = 0.0
-    use_flash_attention: bool = False
-    use_rope: bool = True
-    max_sequence_length: int = 2048
-    layer_norm_eps: float = 1e-5
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    deterministic: bool = False
-    
-    def setup(self):
-        """Initialize transformer block components."""
-        # Compute actual dimensions
-        self.actual_head_dim = self.head_dim or self.hidden_size // self.num_attention_heads
-        self.actual_intermediate = self.intermediate_size or self.hidden_size * 4
-        
-        # Attention layer
-        attention_cls = FlashAttention if self.use_flash_attention else MultiHeadSelfAttention
-        self.attention = attention_cls(
-            hidden_size=self.hidden_size,
-            num_heads=self.num_attention_heads,
-            head_dim=self.actual_head_dim,
-            dropout_rate=self.hidden_dropout,
-            attention_dropout=self.attention_dropout,
-            use_rope=self.use_rope,
-            max_sequence_length=self.max_sequence_length,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            deterministic=self.deterministic
-        )
-        
-        # Feed-forward network
-        # For SwiGLU, double intermediate size for gating
-        actual_intermediate = (
-            self.actual_intermediate * 2 if self.activation == "swiglu"
-            else self.actual_intermediate
-        )
-        
-        self.ff_up = nn.Dense(
-            actual_intermediate,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="ff_up"
-        )
-        self.ff_down = nn.Dense(
-            self.hidden_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="ff_down"
-        )
-        
-        # Layer normalization
-        self.attention_norm = nn.LayerNorm(
-            epsilon=self.layer_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype
-        )
-        self.ff_norm = nn.LayerNorm(
-            epsilon=self.layer_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype
-        )
-        
-        # Get activation function
-        self.act_fn = create_activation(self.activation)
-        
-    def _drop_path(self,
-                  x: jnp.ndarray,
-                  deterministic: bool) -> jnp.ndarray:
-        """Apply drop path regularization.
+    def __init__(
+        self,
+        config: TransformerConfig,
+        block_idx: int,
+        num_layers: Optional[int] = None,
+        share_layers: bool = False,
+        pre_norm: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """Initialize transformer block.
         
         Args:
-            x: Input tensor
-            deterministic: Whether to run in deterministic mode
+            config: Transformer configuration
+            block_idx: Index of this block
+            num_layers: Optional number of layers (defaults to config value)
+            share_layers: Whether to share layer parameters
+            pre_norm: Whether to use pre-normalization architecture
+            device: Device to create tensors on
+            dtype: Data type for parameters
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        
+        self.block_idx = block_idx
+        self.num_layers = num_layers or config.num_hidden_layers
+        self.share_layers = share_layers
+        self.pre_norm = pre_norm
+        
+        # Create transformer layers
+        if share_layers:
+            # Create single shared layer
+            self.layer = get_transformer_layer(
+                config=config,
+                layer_idx=0,
+                pre_norm=pre_norm,
+                **factory_kwargs
+            )
+        else:
+            # Create multiple layers
+            self.layers = nn.ModuleList([
+                get_transformer_layer(
+                    config=config,
+                    layer_idx=i,
+                    pre_norm=pre_norm,
+                    **factory_kwargs
+                )
+                for i in range(self.num_layers)
+            ])
+            
+        # Optional final layer normalization
+        if not pre_norm:
+            self.final_norm = nn.LayerNorm(
+                config.hidden_size,
+                eps=config.layer_norm_eps,
+                **factory_kwargs
+            )
+        else:
+            self.final_norm = None
+            
+    def _get_layer(self, layer_idx: int) -> TransformerLayer:
+        """Get layer by index.
+        
+        Args:
+            layer_idx: Layer index
             
         Returns:
-            Output with drop path applied
+            Transformer layer
         """
-        if deterministic or self.drop_path == 0.0:
-            return x
+        if self.share_layers:
+            return self.layer
+        else:
+            return self.layers[layer_idx]
             
-        keep_prob = 1.0 - self.drop_path
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = jax.random.bernoulli(
-            self.make_rng('dropout'),
-            p=keep_prob,
-            shape=shape
-        )
-        return jnp.where(mask, x / keep_prob, 0)
-        
-    def __call__(self,
-                 hidden_states: jnp.ndarray,
-                 attention_mask: Optional[jnp.ndarray] = None,
-                 deterministic: Optional[bool] = None,
-                 output_attentions: bool = False) -> Tuple[jnp.ndarray, Dict[str, Any]]:
-        """Apply transformer block to input.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, ...]:
+        """Forward pass through transformer block.
         
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            attention_mask: Optional attention mask
-            deterministic: Whether to run in deterministic mode
+            hidden_states: Input tensor
+            attention_mask: Optional attention mask tensor
+            position_embeddings: Optional tuple of (cos, sin) rotary position embeddings
+            past_key_values: Optional list of cached (key, value) tensors per layer
+            use_cache: Whether to return key/value tensors for incremental decoding
             output_attentions: Whether to return attention weights
+            output_hidden_states: Whether to return all hidden states
+            **kwargs: Additional arguments passed to layers
             
         Returns:
-            Tuple of:
-                - Output tensor
-                - Dict of auxiliary outputs
+            Tuple containing:
+            - Output tensor
+            - Optional list of cached (key, value) tensors per layer
+            - Optional list of attention weights per layer
+            - Optional list of hidden states per layer
         """
-        deterministic = deterministic if deterministic is not None else self.deterministic
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        all_past_key_values = () if use_cache else None
         
-        # Self-attention with normalization and residual
-        normed = self.attention_norm(hidden_states)
-        attention_output, attention_aux = self.attention(
-            hidden_states=normed,
-            attention_mask=attention_mask,
-            deterministic=deterministic,
-            output_attentions=output_attentions
-        )
-        attention_output = self._drop_path(
-            attention_output,
-            deterministic=deterministic
-        )
-        hidden_states = hidden_states + attention_output
-        
-        # Feed-forward with normalization and residual
-        normed = self.ff_norm(hidden_states)
-        ff_output = self.ff_up(normed)
-        ff_output = self.act_fn(ff_output)
-        
-        if not deterministic:
-            ff_output = nn.Dropout(
-                rate=self.hidden_dropout,
-                deterministic=deterministic
-            )(ff_output, deterministic=deterministic)
+        # Process through layers
+        for i in range(self.num_layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+                
+            # Get past key/value states for this layer
+            past_key_value = past_key_values[i] if past_key_values is not None else None
             
-        ff_output = self.ff_down(ff_output)
-        ff_output = self._drop_path(
-            ff_output,
-            deterministic=deterministic
+            # Process through layer
+            layer_outputs = self._get_layer(i)(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                **kwargs
+            )
+            hidden_states = layer_outputs[0]
+            
+            # Cache key/values if needed
+            if use_cache:
+                all_past_key_values = all_past_key_values + (layer_outputs[1],)
+                
+            # Cache attention weights if needed
+            if output_attentions:
+                all_attentions = all_attentions + (layer_outputs[-1],)
+                
+        # Apply final normalization if needed
+        if self.final_norm is not None:
+            hidden_states = self.final_norm(hidden_states)
+            
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            
+        # Prepare outputs
+        outputs = (hidden_states,)
+        
+        if use_cache:
+            outputs += (all_past_key_values,)
+            
+        if output_hidden_states:
+            outputs += (all_hidden_states,)
+            
+        if output_attentions:
+            outputs += (all_attentions,)
+            
+        return outputs
+    
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (
+            f"block_idx={self.block_idx}, "
+            f"num_layers={self.num_layers}, "
+            f"shared={self.share_layers}, "
+            f"pre_norm={self.pre_norm}"
         )
-        hidden_states = hidden_states + ff_output
+
+class ParallelTransformerBlock(TransformerBlock):
+    """Transformer block optimized for parallel computation."""
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, ...]:
+        """Forward pass with parallel layer computation where possible."""
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        all_past_key_values = () if use_cache else None
         
-        aux_outputs = {
-            'attention': attention_aux
-        }
+        # Compute shared components once
+        if self.share_layers:
+            # Use single layer for all positions
+            all_outputs = []
+            for i in range(self.num_layers):
+                past_key_value = past_key_values[i] if past_key_values is not None else None
+                layer_outputs = self.layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    **kwargs
+                )
+                all_outputs.append(layer_outputs)
+                hidden_states = layer_outputs[0]
+                
+            # Process outputs
+            for i, layer_outputs in enumerate(all_outputs):
+                if output_hidden_states and i < len(all_outputs) - 1:
+                    all_hidden_states = all_hidden_states + (layer_outputs[0],)
+                    
+                if use_cache:
+                    all_past_key_values = all_past_key_values + (layer_outputs[1],)
+                    
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[-1],)
+                    
+        else:
+            # Process through layers normally
+            for i in range(self.num_layers):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+                    
+                past_key_value = past_key_values[i] if past_key_values is not None else None
+                layer_outputs = self.layers[i](
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    **kwargs
+                )
+                hidden_states = layer_outputs[0]
+                
+                if use_cache:
+                    all_past_key_values = all_past_key_values + (layer_outputs[1],)
+                    
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[-1],)
+                    
+        # Apply final normalization if needed
+        if self.final_norm is not None:
+            hidden_states = self.final_norm(hidden_states)
+            
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            
+        # Prepare outputs
+        outputs = (hidden_states,)
         
-        return hidden_states, aux_outputs
+        if use_cache:
+            outputs += (all_past_key_values,)
+            
+        if output_hidden_states:
+            outputs += (all_hidden_states,)
+            
+        if output_attentions:
+            outputs += (all_attentions,)
+            
+        return outputs

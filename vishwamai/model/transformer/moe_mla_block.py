@@ -1,179 +1,203 @@
-"""Transformer block combining MoE and MLA mechanisms."""
+"""Combined MoE-MLA transformer block implementation."""
 
-from typing import Optional, Tuple, Dict, Any, List
-import math
+from typing import Optional, Dict, List, Tuple, Union, Any
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
+import torch
+import torch.nn as nn
 
-from ..moe import MoELayer
-from ..mla import MLABlock
+from ..moe import MoELayer, create_mla_block
+from ..mla import MLABlock, create_mla_block
 
 class MoEMLABlock(nn.Module):
-    """Transformer block with both MoE and MLA capabilities."""
+    """Transformer block combining MoE and MLA mechanisms."""
     
-    # Architecture
-    hidden_size: int
-    num_attention_heads: int
-    num_experts: int
-    expert_capacity_factor: float = 1.25
-    num_experts_per_token: int = 2
-    expert_hidden_size: Optional[int] = None
-    head_dim: Optional[int] = None
-    
-    # MLA Configuration
-    num_prev_layers: int = 4
-    attention_window: int = 4
-    layer_id: int = 0
-    
-    # MoE Configuration
-    expert_dropout: float = 0.1
-    router_jitter_noise: float = 0.1
-    router_dtype: Any = jnp.float32
-    gate_type: str = "top_k"
-    gate_temperature: float = 0.1
-    gate_noise_type: str = "multiplicative"
-    gate_noise_scale: float = 1.0
-    
-    # Common Configuration
-    dropout_rate: float = 0.1
-    attention_dropout: float = 0.1
-    use_rope: bool = True
-    max_sequence_length: int = 2048
-    use_gate: bool = True
-    gate_init_eps: float = 0.1
-    layer_scale: bool = True
-    layer_scale_init_value: float = 0.1
-    z_loss_scale: float = 0.01
-    load_balance_scale: float = 0.01
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    deterministic: bool = False
-    
-    def setup(self):
-        """Initialize block components."""
-        # MLA components
-        self.mla = MLABlock(
-            hidden_size=self.hidden_size,
-            num_heads=self.num_attention_heads,
-            head_dim=self.head_dim,
-            num_prev_layers=self.num_prev_layers,
-            attention_window=self.attention_window,
-            dropout_rate=self.dropout_rate,
-            attention_dropout=self.attention_dropout,
-            use_rope=self.use_rope,
-            max_sequence_length=self.max_sequence_length,
-            layer_id=self.layer_id,
-            use_gate=self.use_gate,
-            gate_init_eps=self.gate_init_eps,
-            layer_scale=self.layer_scale,
-            layer_scale_init_value=self.layer_scale_init_value,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            deterministic=self.deterministic
-        )
-        
-        # MoE components
-        self.moe = MoELayer(
-            hidden_size=self.hidden_size,
-            num_experts=self.num_experts,
-            expert_capacity_factor=self.expert_capacity_factor,
-            num_experts_per_token=self.num_experts_per_token,
-            expert_hidden_size=self.expert_hidden_size,
-            expert_dropout=self.expert_dropout,
-            router_jitter_noise=self.router_jitter_noise,
-            router_dtype=self.router_dtype,
-            gate_type=self.gate_type,
-            gate_temperature=self.gate_temperature,
-            gate_noise_type=self.gate_noise_type,
-            gate_noise_scale=self.gate_noise_scale,
-            z_loss_scale=self.z_loss_scale,
-            load_balance_scale=self.load_balance_scale,
-            deterministic=self.deterministic,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype
-        )
-        
-        # Layer normalization
-        self.pre_attention_norm = nn.LayerNorm(
-            epsilon=1e-5,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype
-        )
-        self.pre_moe_norm = nn.LayerNorm(
-            epsilon=1e-5,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype
-        )
-        
-    def __call__(self,
-                 hidden_states: jnp.ndarray,
-                 mla_cache: Dict[str, Any],
-                 attention_mask: Optional[jnp.ndarray] = None,
-                 deterministic: Optional[bool] = None) -> Tuple[jnp.ndarray, Dict[str, Any]]:
-        """Apply MoE-MLA block to input.
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_attention_levels: int = 3,
+        num_experts: int = 8,
+        expert_capacity_factor: float = 1.25,
+        moe_layer_position: str = "post_attention",
+        use_expert_choice: bool = True,
+        share_expert_params: bool = False,
+        intermediate_size: Optional[int] = None,
+        activation: Union[str, Callable] = "gelu",
+        attention_dropout_prob: float = 0.1,
+        hidden_dropout_prob: float = 0.1,
+        layer_norm_eps: float = 1e-5,
+        use_adaptive_residual: bool = True,
+        use_layer_scale: bool = True,
+        layer_scale_init: float = 0.1,
+        level_scale_factor: float = 0.5,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """Initialize MoE-MLA block.
         
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            mla_cache: MLA layer state cache
-            attention_mask: Optional attention mask
-            deterministic: Whether to run in deterministic mode
-            
-        Returns:
-            Tuple of:
-                - Output tensor
-                - Dict of auxiliary outputs
+            hidden_size: Size of hidden dimension
+            num_attention_heads: Number of attention heads
+            num_attention_levels: Number of attention levels
+            num_experts: Number of experts in MoE layer
+            expert_capacity_factor: Expert capacity factor
+            moe_layer_position: Position of MoE layer ('pre_attention' or 'post_attention')
+            use_expert_choice: Whether to use expert choice routing
+            share_expert_params: Whether to share expert parameters across levels
+            intermediate_size: Size of FFN intermediate dimension
+            activation: Activation function or name
+            attention_dropout_prob: Attention dropout probability
+            hidden_dropout_prob: Hidden state dropout probability
+            layer_norm_eps: Layer normalization epsilon
+            use_adaptive_residual: Whether to use adaptive residual connections
+            use_layer_scale: Whether to use layer scaling
+            layer_scale_init: Initial value for layer scale parameters
+            level_scale_factor: Scaling factor between attention levels
+            device: Device to create tensors on
+            dtype: Data type for parameters
         """
-        deterministic = deterministic if deterministic is not None else self.deterministic
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
         
-        # MLA with normalization
-        mla_normed = self.pre_attention_norm(hidden_states)
-        mla_output, mla_aux = self.mla(
-            hidden_states=mla_normed,
-            cache=mla_cache,
-            attention_mask=attention_mask,
-            deterministic=deterministic
-        )
-        hidden_states = hidden_states + mla_output
+        if intermediate_size is None:
+            intermediate_size = 4 * hidden_size
+            
+        self.hidden_size = hidden_size
+        self.moe_layer_position = moe_layer_position
+        self.share_expert_params = share_expert_params
         
-        # MoE with normalization
-        moe_normed = self.pre_moe_norm(hidden_states)
-        moe_output, moe_aux = self.moe(
-            hidden_states=moe_normed,
-            attention_mask=attention_mask,
-            deterministic=deterministic
-        )
-        hidden_states = hidden_states + moe_output
-        
-        # Combine auxiliary outputs
-        aux_outputs = {
-            'mla': mla_aux,
-            'moe': moe_aux,
-            'mla_cache': mla_aux['cache'],
-            'total_aux_loss': (
-                mla_aux.get('aux_loss', 0.0) +
-                moe_aux.get('aux_loss', 0.0)
-            )
+        # MLA block configuration
+        mla_config = {
+            "hidden_size": hidden_size,
+            "num_attention_heads": num_attention_heads,
+            "num_attention_levels": num_attention_levels,
+            "intermediate_size": intermediate_size,
+            "activation": activation,
+            "attention_dropout_prob": attention_dropout_prob,
+            "hidden_dropout_prob": hidden_dropout_prob,
+            "layer_norm_eps": layer_norm_eps,
+            "use_adaptive_residual": use_adaptive_residual,
+            "use_layer_scale": use_layer_scale,
+            "layer_scale_init": layer_scale_init,
+            "level_scale_factor": level_scale_factor,
         }
         
-        return hidden_states, aux_outputs
+        # Create MLA block
+        self.mla = create_mla_block(mla_config, device=device, dtype=dtype)
         
-    def init_cache(self) -> Dict[str, Any]:
-        """Initialize empty MLA cache.
+        # MoE layer configuration
+        moe_config = {
+            "hidden_size": hidden_size,
+            "num_experts": num_experts,
+            "expert_capacity_factor": expert_capacity_factor,
+            "use_expert_choice": use_expert_choice,
+            "intermediate_size": intermediate_size,
+            "dropout_prob": hidden_dropout_prob,
+            "router_z_loss_coef": 0.001,
+            "router_aux_loss_coef": 0.001,
+        }
         
-        Returns:
-            Empty cache dictionary
-        """
-        return self.mla.init_cache()
-        
-    def clear_cache(self, cache: Dict[str, Any]) -> Dict[str, Any]:
-        """Clear the MLA cache.
+        # Create MoE layers (one per attention level if not sharing)
+        if share_expert_params:
+            self.moe = MoELayer(**moe_config, **factory_kwargs)
+        else:
+            self.moe = nn.ModuleList([
+                MoELayer(**moe_config, **factory_kwargs)
+                for _ in range(num_attention_levels)
+            ])
+            
+        # Layer normalization
+        self.pre_moe_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps, **factory_kwargs)
+            
+    def _get_moe_layer(self, level: int) -> MoELayer:
+        """Get MoE layer for given attention level.
         
         Args:
-            cache: Cache to clear
+            level: Attention level index
             
         Returns:
-            Empty cache dictionary
+            MoE layer for level
         """
-        return self.mla.clear_cache(cache)
+        if self.share_expert_params:
+            return self.moe
+        else:
+            return self.moe[level]
+            
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        attention_level: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Forward pass through MoE-MLA block.
+        
+        Args:
+            hidden_states: Input tensor
+            attention_mask: Optional attention mask tensor
+            position_embeddings: Optional tuple of (cos, sin) rotary position embeddings
+            past_key_value: Optional tuple of cached (key, value) tensors
+            use_cache: Whether to return key/value tensors for incremental decoding
+            output_attentions: Whether to return attention weights
+            attention_level: Optional specific attention level to use
+            
+        Returns:
+            Tuple containing:
+            - Output tensor
+            - Optional dictionary of MLA auxiliary outputs
+            - Optional dictionary of MoE auxiliary outputs
+        """
+        # Pre-MoE processing
+        if self.moe_layer_position == "pre_attention":
+            residual = hidden_states
+            hidden_states = self.pre_moe_norm(hidden_states)
+            
+            # Process through MoE layer
+            moe_layer = self._get_moe_layer(attention_level or 0)
+            hidden_states, moe_aux = moe_layer(hidden_states)
+            
+            # Add residual
+            hidden_states = hidden_states + residual
+            
+        # Process through MLA block
+        mla_outputs = self.mla(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            attention_level=attention_level,
+        )
+        hidden_states = mla_outputs[0]
+        mla_aux = mla_outputs[-1] if len(mla_outputs) > 2 else None
+        
+        # Post-MLA MoE processing
+        if self.moe_layer_position == "post_attention":
+            residual = hidden_states
+            hidden_states = self.pre_moe_norm(hidden_states)
+            
+            # Process through MoE layer
+            moe_layer = self._get_moe_layer(attention_level or 0)
+            hidden_states, moe_aux = moe_layer(hidden_states)
+            
+            # Add residual
+            hidden_states = hidden_states + residual
+        
+        # Prepare outputs
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs += (mla_outputs[1],)
+            
+        return outputs + (mla_aux, moe_aux)
+    
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (
+            f"hidden_size={self.hidden_size}, "
+            f"moe_position={self.moe_layer_position}, "
+            f"shared_experts={self.share_expert_params}"
+        )

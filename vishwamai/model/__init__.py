@@ -1,116 +1,170 @@
-"""VishwamAI model architecture and components."""
+"""Model components for Vishwamai."""
 
-from .transformer import (
-    VishwamAIModel,
-    TransformerConfig,
-    TransformerLayer,
-    TransformerBlock,
-    MoEMLABlock,
-    LayerCache
+import torch
+import torch.nn as nn
+from typing import Dict, Optional, Union, List, Tuple
+
+# Import core model components
+from vishwamai.model.transformer.model import VishwamaiModel
+from vishwamai.model.transformer.config import VishwamaiConfig
+from vishwamai.model.transformer.block import TransformerBlock
+from vishwamai.model.transformer.layer import TransformerLayer
+from vishwamai.model.transformer.moe_mla_block import MoEMLABlock
+
+# Import attention mechanisms
+from vishwamai.model.attention import (
+    MultiHeadAttention,
+    FlashAttention,
+    CrossAttention
 )
 
-from .moe import (
+# Import MoE components
+from vishwamai.model.moe import (
     ExpertLayer,
-    ExpertRouter,
-    GatingMechanism,
-    MoELayer
+    Router,
+    MoELayer,
+    GatingNetwork
 )
 
-from .mla import (
+# Import MLA components
+from vishwamai.model.mla import (
+    MultiLevelAttention,
     MLABlock,
-    MLALayerManager,
-    MultiLayerAttention,
-    MLAResidual
+    LevelManager,
+    ResidualConnection
 )
 
-from .attention import (
-    MultiHeadSelfAttention,
-    CrossAttention,
-    FlashAttention
-)
-
-from .embeddings import (
+# Import embedding layers
+from vishwamai.model.embeddings import (
     TokenEmbedding,
-    PositionalEncoding,
-    RotaryPositionalEmbedding
+    PositionalEncoding
 )
 
-# Version
-__version__ = "0.1.0"
+# Import initialization utilities
+from vishwamai.model.initialization import (
+    initialize_weights,
+    initialize_experts,
+    initialize_router
+)
+
+def create_model(
+    config: Union[Dict, VishwamaiConfig],
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None
+) -> VishwamaiModel:
+    """Create a Vishwamai model instance.
+    
+    Args:
+        config: Model configuration dictionary or VishwamaiConfig instance
+        device: Target device for the model
+        dtype: Data type for model parameters
+        
+    Returns:
+        VishwamaiModel: Initialized model instance
+    """
+    if isinstance(config, dict):
+        config = VishwamaiConfig(**config)
+        
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    if dtype is None:
+        dtype = torch.float32 if device.type == "cpu" else torch.float16
+        
+    model = VishwamaiModel(config)
+    model.to(device=device, dtype=dtype)
+    
+    return model
+
+def load_pretrained(
+    path: str,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    **kwargs
+) -> VishwamaiModel:
+    """Load a pretrained Vishwamai model.
+    
+    Args:
+        path: Path to pretrained model weights
+        device: Target device for loaded model
+        dtype: Data type for model parameters
+        **kwargs: Additional arguments passed to model loading
+        
+    Returns:
+        VishwamaiModel: Loaded model instance
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    if dtype is None:
+        dtype = torch.float32 if device.type == "cpu" else torch.float16
+        
+    # Load model config and weights
+    config = VishwamaiConfig.from_pretrained(path)
+    model = create_model(config, device=device, dtype=dtype)
+    
+    # Load state dict
+    state_dict = torch.load(path, map_location=device)
+    if "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+    model.load_state_dict(state_dict)
+    
+    return model
+
+def get_model_size(model: nn.Module) -> Tuple[int, int, float]:
+    """Get model size statistics.
+    
+    Args:
+        model: PyTorch model
+        
+    Returns:
+        Tuple containing:
+        - Total number of parameters
+        - Number of trainable parameters  
+        - Model size in GB
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    size_gb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3
+    
+    return total_params, trainable_params, size_gb
 
 __all__ = [
-    # Main model
-    'VishwamAIModel',
-    'TransformerConfig',
-    'TransformerLayer',
-    'TransformerBlock',
-    'MoEMLABlock',
-    'LayerCache',
+    # Model creation
+    "create_model",
+    "load_pretrained",
+    "get_model_size",
     
-    # MoE components
-    'ExpertLayer',
-    'ExpertRouter',
-    'GatingMechanism',
-    'MoELayer',
+    # Core components
+    "VishwamaiModel",
+    "VishwamaiConfig",
+    "TransformerBlock",
+    "TransformerLayer",
+    "MoEMLABlock",
     
-    # MLA components
-    'MLABlock',
-    'MLALayerManager',
-    'MultiLayerAttention',
-    'MLAResidual',
+    # Attention
+    "MultiHeadAttention", 
+    "FlashAttention",
+    "CrossAttention",
     
-    # Attention mechanisms
-    'MultiHeadSelfAttention',
-    'CrossAttention',
-    'FlashAttention',
+    # MoE
+    "ExpertLayer",
+    "Router",
+    "MoELayer",
+    "GatingNetwork",
     
-    # Embedding layers
-    'TokenEmbedding',
-    'PositionalEncoding',
-    'RotaryPositionalEmbedding',
+    # MLA
+    "MultiLevelAttention",
+    "MLABlock", 
+    "LevelManager",
+    "ResidualConnection",
     
-    # Version
-    '__version__'
+    # Embeddings
+    "TokenEmbedding",
+    "PositionalEncoding",
+    
+    # Initialization
+    "initialize_weights",
+    "initialize_experts",
+    "initialize_router",
 ]
-
-# Device and backend configuration
-import jax
-import jax.numpy as jnp
-
-# Set default dtype
-jax.config.update("jax_enable_x64", False)
-jax.config.update("jax_default_dtype_bits", 32)
-
-# Function to get default device
-def get_device():
-    """Get default device (TPU/GPU/CPU)."""
-    return jax.devices()[0]
-
-# Function to get model configuration
-def get_config(config_path: str = None) -> TransformerConfig:
-    """Get model configuration.
-    
-    Args:
-        config_path: Optional path to config file
-        
-    Returns:
-        TransformerConfig instance
-    """
-    if config_path is None:
-        # Return default configuration
-        return TransformerConfig()
-    return TransformerConfig.from_yaml(config_path)
-    
-# Function to create model instance
-def create_model(config: TransformerConfig = None) -> VishwamAIModel:
-    """Create VishwamAI model instance.
-    
-    Args:
-        config: Optional model configuration
-        
-    Returns:
-        VishwamAIModel instance
-    """
-    if config is None:
-        config = get_config()
-    return VishwamAIModel(config)

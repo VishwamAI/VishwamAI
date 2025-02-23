@@ -1,175 +1,249 @@
-# Quickstart Guide
-
-This guide helps you get started with training models using the Vishwamai framework.
+# Quick Start Guide
 
 ## Installation
 
-First, install the required dependencies:
-
+### 1. Basic Installation
 ```bash
-pip install -r requirements.txt
+pip install vishwamai
 ```
 
-## Configuration
+### 2. Development Installation
+```bash
+git clone https://github.com/organization/vishwamai.git
+cd vishwamai
+pip install -e ".[dev]"
+```
 
-The training process is controlled by several YAML configuration files:
+### 3. TPU Setup
+```bash
+# Install TPU dependencies
+pip install torch-xla cloud-tpu-client
 
-1. `model_config.yaml` - Model architecture configuration
-2. `data_config.yaml` - Dataset and preprocessing configuration
-3. `training_config.yaml` - Training hyperparameters and settings
-4. `moe_config.yaml` (optional) - Mixture of Experts configuration
-5. `mla_config.yaml` (optional) - Multi-Level Attention configuration
+# Configure TPU
+export TPU_NAME="v4-8"
+export TPU_ZONE="us-central1-a"
+export PROJECT_ID="your-project-id"
+```
 
-Example configurations are provided in the `configs/` directory.
+## Basic Usage
 
-### Basic Model Configuration
+### 1. Training a Model
 
+#### a. Using Command Line
+```bash
+# Preprocess data
+vishwamai-preprocess \
+    --config configs/data_config.yaml \
+    --input-dir data/raw \
+    --output-dir data/processed
+
+# Train tokenizer
+vishwamai-tokenizer \
+    --config configs/data_config.yaml \
+    --input-dir data/processed \
+    --output-dir models/tokenizer
+
+# Train model
+vishwamai-train \
+    --model-config configs/model_config.yaml \
+    --training-config configs/training_config.yaml \
+    --data-config configs/data_config.yaml \
+    --tpu-config configs/tpu_config.yaml \
+    --tokenizer-path models/tokenizer \
+    --output-dir models/vishwamai
+```
+
+#### b. Using Python API
+```python
+from vishwamai.model import VishwamaiModel
+from vishwamai.training import Trainer
+from vishwamai.data import create_dataloaders
+from vishwamai.utils import load_config
+
+# Load configurations
+model_config = load_config("configs/model_config.yaml")
+training_config = load_config("configs/training_config.yaml")
+data_config = load_config("configs/data_config.yaml")
+
+# Initialize model
+model = VishwamaiModel(model_config)
+
+# Create dataloaders
+train_loader, val_loader = create_dataloaders(
+    train_path="data/train",
+    val_path="data/val",
+    config=data_config
+)
+
+# Initialize trainer
+trainer = Trainer(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    config=training_config
+)
+
+# Start training
+trainer.train()
+```
+
+### 2. Evaluation
+
+#### a. Command Line
+```bash
+vishwamai-eval \
+    --model-path models/vishwamai \
+    --data-dir data/test \
+    --output-dir results \
+    --benchmark mmlu
+```
+
+#### b. Python API
+```python
+from vishwamai.model import VishwamaiModel
+from vishwamai.utils import load_model, evaluate_model
+
+# Load model
+model = load_model("models/vishwamai")
+
+# Run evaluation
+results = evaluate_model(
+    model,
+    dataset="mmlu",
+    data_path="data/test",
+    batch_size=32
+)
+
+print(results)
+```
+
+### 3. Inference
+
+#### a. Command Line Service
+```bash
+# Start model server
+vishwamai-serve \
+    --model-path models/vishwamai \
+    --port 8000
+
+# Make request
+curl -X POST http://localhost:8000/generate \
+    -H "Content-Type: application/json" \
+    -d '{"text": "Your input text here"}'
+```
+
+#### b. Python API
+```python
+from vishwamai.model import VishwamaiModel
+from vishwamai.utils import load_model
+
+# Load model
+model = load_model("models/vishwamai")
+
+# Generate text
+output = model.generate(
+    "Your input text here",
+    max_length=100,
+    top_k=50,
+    top_p=0.9,
+    temperature=0.7
+)
+
+print(output)
+```
+
+## Common Tasks
+
+### 1. Fine-tuning on Custom Data
+```python
+from vishwamai.data import CustomDataset
+from vishwamai.training import Trainer
+from vishwamai.utils import load_model
+
+# Prepare custom dataset
+dataset = CustomDataset("path/to/data")
+
+# Load pre-trained model
+model = load_model("models/vishwamai")
+
+# Fine-tune
+trainer = Trainer(model)
+trainer.train(
+    train_dataset=dataset,
+    num_epochs=3,
+    learning_rate=1e-5
+)
+```
+
+### 2. Model Export
+```bash
+# Export model for deployment
+vishwamai-export \
+    --model-path models/vishwamai \
+    --format onnx \
+    --output-dir exported_model \
+    --quantize
+```
+
+### 3. TPU Training Configuration
 ```yaml
-# configs/model_config.yaml
-model_type: "transformer"
-hidden_size: 768
-num_layers: 12
-num_heads: 12
-mlp_ratio: 4
-dropout: 0.1
-attention_dropout: 0.1
-use_bias: true
-vocab_size: 50000
-max_position_embeddings: 2048
+# configs/tpu_config.yaml
+device:
+  num_cores: 8
+  topology: 2x2x2
+optimization:
+  batch_processing:
+    pipelining: true
+    prefetch_depth: 3
 ```
 
-### Data Configuration
+## Troubleshooting
 
-```yaml
-# configs/data_config.yaml
-dataset_type: "text"
-tokenizer_type: "bpe"
-vocab_file: "path/to/vocab.json"
-max_seq_length: 1024
-batch_size: 32
-num_workers: 4
+### 1. Memory Issues
+```python
+# Use gradient checkpointing
+model.enable_gradient_checkpointing()
+
+# Enable memory efficient attention
+model.config.use_flash_attention = True
 ```
 
-### Training Configuration
-
-```yaml
-# configs/training_config.yaml
-num_epochs: 100
-learning_rate: 1e-4
-weight_decay: 0.01
-warmup_steps: 1000
-gradient_accumulation_steps: 4
-early_stopping_patience: 3
-```
-
-## Training
-
-To train a basic transformer model:
-
+### 2. TPU Errors
 ```bash
-python -m vishwamai.train \
-    --model_config configs/model_config.yaml \
-    --data_config configs/data_config.yaml \
-    --training_config configs/training_config.yaml \
-    --train_data path/to/train.txt \
-    --val_data path/to/val.txt \
-    --output_dir experiments \
-    --experiment_name my_experiment
+# Check TPU status
+gcloud compute tpus tpu-vm describe $TPU_NAME --zone=$TPU_ZONE
+
+# SSH into TPU VM
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$TPU_ZONE
+
+# Monitor TPU metrics
+vishwamai-monitor --tpu-name=$TPU_NAME
 ```
 
-### Distributed Training
+## Resource Management
 
-To enable distributed training across multiple GPUs:
+### 1. Memory Profiling
+```python
+from vishwamai.utils.profiling import MemoryProfiler
 
-```bash
-python -m vishwamai.train \
-    --model_config configs/model_config.yaml \
-    --data_config configs/data_config.yaml \
-    --training_config configs/training_config.yaml \
-    --train_data path/to/train.txt \
-    --val_data path/to/val.txt \
-    --distributed \
-    --world_size 4 \
-    --output_dir experiments \
-    --experiment_name distributed_training
+with MemoryProfiler() as profiler:
+    model.train()
+    
+print(profiler.summary())
 ```
 
-### Training with MoE
+### 2. Performance Monitoring
+```python
+from vishwamai.utils.profiling import PerformanceTracker
 
-To train a Mixture of Experts model:
-
-```bash
-python -m vishwamai.train \
-    --model_config configs/model_config.yaml \
-    --moe_config configs/moe_config.yaml \
-    --data_config configs/data_config.yaml \
-    --training_config configs/training_config.yaml \
-    --train_data path/to/train.txt \
-    --val_data path/to/val.txt \
-    --distributed \
-    --world_size 8 \
-    --output_dir experiments \
-    --experiment_name moe_training
+tracker = PerformanceTracker()
+tracker.start()
+model.train()
+tracker.stop()
+tracker.plot_metrics()
 ```
 
-## Experiment Tracking
-
-Training logs and artifacts are saved in the specified output directory:
-
-```
-experiments/
-└── my_experiment/
-    ├── args.json              # Command line arguments
-    ├── model_config.yaml      # Model configuration
-    ├── data_config.yaml       # Data configuration  
-    ├── training_config.yaml   # Training configuration
-    ├── checkpoints/          # Model checkpoints
-    ├── tensorboard/         # TensorBoard logs
-    └── training.log         # Training logs
-```
-
-To monitor training progress:
-
-```bash
-# View training logs
-tail -f experiments/my_experiment/training.log
-
-# Launch TensorBoard
-tensorboard --logdir experiments/my_experiment/tensorboard
-```
-
-## Advanced Features
-
-### Mixed Precision Training
-
-Enable automatic mixed precision:
-
-```bash
-python -m vishwamai.train \
-    [...]  # Other arguments
-    --use_amp
-```
-
-### TPU Training
-
-Train on Cloud TPUs:
-
-```bash
-python -m vishwamai.train \
-    [...]  # Other arguments  
-    --use_tpu
-```
-
-### Resuming Training
-
-Resume training from a checkpoint:
-
-```bash
-python -m vishwamai.train \
-    [...]  # Other arguments
-    --resume_from experiments/my_experiment/checkpoints/checkpoint-latest.pt
-```
-
-## Configuration Reference
-
-See [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md) for detailed documentation of all configuration options.
+For more detailed information, please refer to:
+- [Technical Documentation](docs/technical.md)
+- [API Reference](docs/api.md)
+- [Configuration Guide](docs/configuration.md)

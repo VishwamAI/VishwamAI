@@ -1,73 +1,119 @@
 # Model architecture configuration
 
-# Core architecture
-hidden_size: 2048
-num_attention_heads: 32
-num_hidden_layers: 24
-head_dim: 64
-intermediate_size: 8192
-max_sequence_length: 4096
+# General model parameters
+model:
+  vocab_size: 32000
+  max_sequence_length: 2048
+  hidden_size: 4096
+  num_layers: 32
+  num_attention_heads: 32
+  intermediate_size: 11008
+  hidden_dropout_prob: 0.1
+  attention_dropout_prob: 0.1
+  layer_norm_eps: 1e-7
+  activation: gelu
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+  tie_word_embeddings: true
+  position_embedding_type: rotary
+  gradient_checkpointing: true
 
-# Mixture of Experts
-num_moe_layers: 4
-moe_layer_frequency: 2
-num_experts: 8
-expert_capacity_factor: 1.25
-num_experts_per_token: 2
-expert_hidden_size: 8192
-expert_dropout: 0.1
+# MoE parameters
+moe:
+  num_experts: 8
+  num_experts_per_token: 2
+  router_type: top_k
+  router_bias: true
+  router_eps: 1e-8
+  router_z_loss_coef: 0.01
+  expert_capacity_factor: 1.25
+  aux_loss_coef: 0.01
+  router_jitter_noise: 0.1
+  dropout_rate: 0.1
+  expert_initialization: truncated_normal
+  expert_placement:
+    strategy: uniform
+    expert_parallel: true
+    balance_load: true
 
-# Multi-Layer Attention
-use_mla: true
-num_prev_layers: 4
-attention_window: 4
-normalize_cached: true
-use_compressed_cache: false
-compression_dim: null
+# Multi-Level Attention parameters
+mla:
+  enabled: true
+  num_levels: 3
+  level_ratios: [1.0, 0.5, 0.25]
+  fusion_type: weighted_sum
+  attention_dropout: 0.1
+  level_dropout: 0.1
+  residual_connection: true
+  adaptive_weights: true
+  sparse_computation: true
 
-# Attention Configuration
-use_flash_attention: true
-use_rope: true
-attention_dropout: 0.1
-rope_scaling: 1.0
-rope_theta: 10000.0
+# Embeddings
+embeddings:
+  word_embedding_type: learned
+  position_embedding_type: rotary
+  token_type_embedding: false
+  layer_norm_eps: 1e-7
+  dropout: 0.1
+  embedding_size: 4096
+  padding_idx: 0
 
-# General Configuration
-hidden_dropout: 0.1
-drop_path: 0.0
-activation: "swiglu"  # Options: gelu, swiglu, silu
-layer_norm_eps: 1.0e-5
-initializer_range: 0.02
-use_bias: false
+# Optimization
+optimization:
+  use_flash_attention: true
+  use_fused_layernorm: true
+  use_kernel_optimizations: true
+  memory_efficient_backward: true
+  gradient_checkpointing: true
+  mixed_precision: true
+  amp_dtype: bfloat16
+  tp_degree: 1
+  pp_degree: 1
 
-# Precision
-dtype: "bfloat16"
-param_dtype: "bfloat16"
+# Architecture variants
+variants:
+  base:
+    hidden_size: 2048
+    num_layers: 24
+    num_attention_heads: 16
+    num_experts: 8
+  large:
+    hidden_size: 4096
+    num_layers: 32
+    num_attention_heads: 32
+    num_experts: 8
+  xl:
+    hidden_size: 5120
+    num_layers: 40
+    num_attention_heads: 40
+    num_experts: 16
+  xxl:
+    hidden_size: 6144
+    num_layers: 48
+    num_attention_heads: 48
+    num_experts: 16
 
-# Router Configuration
-router_jitter_noise: 0.1
-router_dtype: "float32"
-gate_type: "top_k"
-gate_temperature: 0.1
-gate_noise_type: "multiplicative"
-gate_noise_scale: 1.0
-z_loss_scale: 0.01
-load_balance_scale: 0.01
+# Expert configurations
+expert_configs:
+  ffn:
+    type: mlp
+    hidden_ratio: 4
+    activation: gelu
+    dropout: 0.1
+    layer_norm: true
+    bias: true
+  cross_expert:
+    enabled: true
+    num_shared_experts: 2
+    sharing_strategy: grad_sync
 
-# Embedding Configuration
-vocab_size: 32000
-factorized_embeddings: false
-factorized_dim: null
-tie_word_embeddings: true
-position_embedding_type: "rotary"
-position_embedding_scale: 1.0
-
-# Additional Parameters
-use_cache: true
-gradient_checkpointing: false
-pad_token_id: 0
-bos_token_id: 1
-eos_token_id: 2
-use_parallel_training: true
-use_pjit_attention: true
-use_scan_mlp: true
+# Monitor settings
+monitoring:
+  track_expert_capacity: true
+  track_balance_metrics: true
+  track_router_metrics: true
+  track_attention_patterns: true
+  log_interval: 100
+  profile_compute: true
+  profile_memory: true

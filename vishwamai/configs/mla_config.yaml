@@ -1,75 +1,142 @@
-# Multi-Layer Attention Configuration
+# Multi-Level Attention configuration
 
-# Core MLA Parameters
-use_mla: true
-num_prev_layers: 4  # Number of previous layers to attend to
-attention_window: 4  # Maximum number of layers back to look
-layer_selection_method: "dynamic"  # Options: dynamic, fixed, learned
+# Basic MLA settings
+mla:
+  enabled: true
+  num_levels: 3
+  fusion_type: weighted_sum  # {weighted_sum, gated, learned}
+  residual_connection: true
+  normalize_levels: true
+  level_dropout: 0.1
+  use_layer_norm: true
+  layer_norm_eps: 1e-7
 
-# Attention Configuration
-num_mla_heads: 32  # Number of attention heads for MLA
-head_dim: 64  # Dimension per attention head
-use_rope: true  # Whether to use rotary embeddings
-max_sequence_length: 4096
-attention_dropout: 0.1
-hidden_dropout: 0.1
-use_flash_attention: true
+# Level configurations
+levels:
+  ratios: [1.0, 0.5, 0.25]  # Progressive downsampling ratios
+  attention_heads: [32, 16, 8]  # Heads per level
+  head_dims: [128, 128, 128]  # Dimension per head
+  initializer:
+    type: truncated_normal
+    mean: 0.0
+    std: 0.02
+    min_val: -0.06
+    max_val: 0.06
 
-# Layer State Management
-normalize_cached: true  # Whether to normalize cached states
-use_compressed_cache: false  # Whether to use compressed caching
-compression_dim: null  # Dimension for compressed states
-compression_method: "linear"  # Options: linear, svd, random_projection
-eviction_policy: "lru"  # Options: lru, fifo, importance
-max_cache_size: 8  # Maximum number of cached layer states
+# Attention configurations
+attention:
+  dropout: 0.1
+  attention_dropout: 0.1
+  use_relative_positions: true
+  max_relative_position: 32
+  relative_attention_num_buckets: 32
+  use_bias: true
+  attention_type: flash  # {flash, standard, linear}
+  causal_mask: true
+  sliding_window: null
+  sparse_computation: true
 
-# Cross-Layer Gating
-use_gate: true  # Whether to use gating mechanism
-gate_type: "learnable"  # Options: learnable, fixed, adaptive
-gate_temperature: 0.1  # Temperature for gate softmax
-gate_init_eps: 0.1  # Initialization epsilon for gates
-min_gate_value: 0.0  # Minimum gate value
-max_gate_value: 1.0  # Maximum gate value
+# Level-wise fusion
+fusion:
+  type: weighted_sum  # {weighted_sum, gated, learned, adaptive}
+  initialization: uniform
+  learnable_weights: true
+  normalize_weights: true
+  temperature: 1.0
+  gating_network:
+    hidden_size: 256
+    activation: gelu
+    dropout: 0.1
+    num_layers: 2
 
-# Layer-wise Processing
-layer_norm_eps: 1.0e-5
-use_adaptive_layer_norm: false  # Whether to use adaptive layer norm
-use_parallel_attention: true  # Whether to process layers in parallel
-use_residual_connection: true  # Whether to use residual connections
-use_pre_layer_norm: true  # Whether to use pre-layer normalization
+# MLA-MoE integration
+moe_integration:
+  enabled: true
+  fusion_strategy: parallel  # {parallel, sequential, hybrid}
+  expert_attention_ratio: 0.5
+  shared_experts: true
+  expert_capacity_factor: 1.25
+  routing_strategy: joint  # {joint, independent}
+  balance_computation: true
 
-# Memory Management
-memory_efficient_attention: true  # Whether to use memory-efficient attention
-use_gradient_checkpointing: true  # Whether to use gradient checkpointing
-optimize_memory_usage: true  # Whether to optimize memory usage
-max_memory_size: null  # Maximum memory size in bytes (null = auto)
+# Hierarchical processing
+hierarchical:
+  downsampling:
+    method: strided  # {strided, pooling, learned}
+    pooling_type: max
+    kernel_size: 2
+    adaptive_pooling: false
+  upsampling:
+    method: interpolation  # {interpolation, transposed, learned}
+    mode: linear
+    align_corners: true
+  skip_connections: true
+  progressive_refinement: true
 
-# State Compression
-compression_ratio: 4  # Compression ratio for cached states
-use_quantization: false  # Whether to quantize cached states
-quantization_bits: 8  # Number of bits for quantization
-use_pruning: false  # Whether to prune cached states
-pruning_threshold: 0.01  # Threshold for pruning
+# Memory management
+memory:
+  efficient_attention: true
+  gradient_checkpointing: true
+  optimize_memory_use: true
+  activation_recomputation: selective
+  max_cache_size: null
+  attention_block_size: 1024
+  optimize_bandwidth: true
 
-# Training
-mla_learning_rate: 1.0e-4  # Learning rate for MLA components
-mla_weight_decay: 0.01  # Weight decay for MLA components
-gradient_clipping: 1.0  # Gradient clipping value
-warmup_steps: 1000  # Number of warmup steps
-enable_loss_scaling: true  # Whether to use loss scaling
-loss_scale: "dynamic"  # Options: dynamic, static
+# Computation optimization
+optimization:
+  use_flash_attention: true
+  fuse_operations: true
+  optimize_communication: true
+  jit_compile: true
+  kernel_fusion: true
+  recompute_threshold: 0.5
+  mixed_precision: true
+  quantization:
+    enabled: false
+    precision: int8
+    method: dynamic
 
-# Regularization
-attention_dropout_rate: 0.1  # Dropout rate for attention
-hidden_dropout_rate: 0.1  # Dropout rate for hidden states
-layer_dropout_rate: 0.0  # Dropout rate for layer selection
-use_stochastic_depth: false  # Whether to use stochastic depth
-path_dropout_rate: 0.0  # Dropout rate for residual paths
+# Level-specific settings
+level_configs:
+  level_0:  # Fine-grained
+    window_size: null
+    sparse_factor: 1.0
+    attention_type: full
+    num_heads: 32
+  level_1:  # Medium-grained
+    window_size: 256
+    sparse_factor: 0.5
+    attention_type: sparse
+    num_heads: 16
+  level_2:  # Coarse-grained
+    window_size: 512
+    sparse_factor: 0.25
+    attention_type: sparse
+    num_heads: 8
 
-# Monitoring
-monitor_attention_patterns: true  # Whether to monitor attention patterns
-monitor_gate_values: true  # Whether to monitor gate values
-monitor_cache_usage: true  # Whether to monitor cache usage
-profiling_frequency: 100  # Steps between profiling
-save_attention_maps: false  # Whether to save attention maps
-detailed_logging: true  # Whether to enable detailed logging
+# Monitoring and visualization
+monitoring:
+  track_attention_patterns: true
+  track_level_contributions: true
+  track_fusion_weights: true
+  track_memory_usage: true
+  save_attention_maps: false
+  visualization:
+    enabled: true
+    plot_attention_weights: true
+    plot_level_activations: true
+    plot_fusion_weights: true
+    max_samples: 10
+
+# Training dynamics
+training:
+  warmup_steps: 2000
+  adaptive_span: false
+  adaptive_dropout: false
+  layer_dropout: 0.1
+  gradient_clipping: 1.0
+  stabilize_training: true
+  regularization:
+    type: none
+    coefficient: 0.01

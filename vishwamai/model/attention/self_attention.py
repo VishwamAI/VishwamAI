@@ -1,222 +1,218 @@
-"""Self-attention module for VishwamAI using JAX/Flax."""
+"""Self-attention implementation with optimizations for TPU."""
 
-from typing import Optional, Tuple, Any, Callable
-from functools import partial
 import math
+from typing import Optional, Tuple
 
-import jax
-import jax.numpy as jnp
-from jax.nn import softmax
-import flax.linen as nn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from ..embeddings.positional import RotaryPositionalEmbedding
-
-def scaled_dot_product(query: jnp.ndarray,
-                      key: jnp.ndarray,
-                      value: jnp.ndarray,
-                      mask: Optional[jnp.ndarray] = None,
-                      attention_dropout: float = 0.0,
-                      deterministic: bool = True,
-                      dtype: jnp.dtype = jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute scaled dot-product attention.
+class SelfAttention(nn.Module):
+    """Multi-head self-attention with optimizations for TPU."""
     
-    Args:
-        query: Query tensor [batch, heads, q_length, d_k]
-        key: Key tensor [batch, heads, kv_length, d_k]
-        value: Value tensor [batch, heads, kv_length, d_v]
-        mask: Optional attention mask [batch, 1, q_length, kv_length]
-        attention_dropout: Dropout rate for attention weights
-        deterministic: Whether to apply dropout
-        dtype: Data type for computation
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        dropout_prob: float = 0.1,
+        attention_scale: Optional[float] = None,
+        causal: bool = True,
+        use_rotary: bool = False,
+        use_flash: bool = False,
+    ):
+        """Initialize self-attention module.
         
-    Returns:
-        Tuple of (attention output, attention weights)
-    """
-    d_k = query.shape[-1]
-    
-    # Compute attention scores
-    attention_scores = jnp.einsum('bhqd,bhkd->bhqk', query, key)
-    attention_scores = attention_scores / math.sqrt(d_k)
-    
-    # Apply mask if provided
-    if mask is not None:
-        attention_scores = jnp.where(mask, attention_scores, -1e9)
-    
-    # Apply softmax and dropout
-    attention_weights = softmax(attention_scores, axis=-1)
-    
-    if not deterministic and attention_dropout > 0:
-        rng = jax.random.PRNGKey(0)  # Should be passed from parent
-        attention_weights = nn.Dropout(
-            rate=attention_dropout,
-            deterministic=deterministic
-        )(attention_weights, deterministic=deterministic)
-    
-    # Compute attention output
-    attention_output = jnp.einsum('bhqk,bhkv->bhqv', attention_weights, value)
-    
-    return attention_output.astype(dtype), attention_weights.astype(dtype)
-
-class MultiHeadSelfAttention(nn.Module):
-    """Multi-head self-attention with optional rotary embeddings."""
-    
-    hidden_size: int
-    num_heads: int
-    head_dim: Optional[int] = None
-    dropout_rate: float = 0.1
-    attention_dropout: float = 0.1
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    use_rope: bool = True
-    max_sequence_length: int = 2048
-    rope_scaling: Optional[float] = None
-    
-    def setup(self):
-        """Initialize attention components."""
-        self.actual_head_dim = self.head_dim or self.hidden_size // self.num_heads
+        Args:
+            hidden_size: Size of hidden dimension
+            num_attention_heads: Number of attention heads
+            dropout_prob: Dropout probability
+            attention_scale: Optional custom attention scale factor
+            causal: Whether to use causal attention masking
+            use_rotary: Whether to use rotary position embeddings
+            use_flash: Whether to use flash attention when available
+        """
+        super().__init__()
         
-        # Projection matrices
-        self.q_proj = nn.Dense(
-            self.num_heads * self.actual_head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="q_proj"
-        )
-        self.k_proj = nn.Dense(
-            self.num_heads * self.actual_head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="k_proj"
-        )
-        self.v_proj = nn.Dense(
-            self.num_heads * self.actual_head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="v_proj"
-        )
-        self.o_proj = nn.Dense(
-            self.hidden_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="o_proj"
-        )
-        
-        # Rotary embeddings if enabled
-        if self.use_rope:
-            self.rotary_emb = RotaryPositionalEmbedding(
-                max_seq_length=self.max_sequence_length,
-                dim=self.actual_head_dim,
-                scale=bool(self.rope_scaling),
-                scale_base=self.rope_scaling if self.rope_scaling else 512.0
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                f"Hidden size ({hidden_size}) must be divisible by number of heads ({num_attention_heads})"
             )
             
-    def _split_heads(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Split hidden dim into multiple heads.
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = hidden_size // num_attention_heads
+        self.scale = attention_scale or 1.0 / math.sqrt(self.head_dim)
+        
+        # Projection layers
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout_prob)
+        
+        # Attention options
+        self.causal = causal
+        self.use_rotary = use_rotary
+        self.use_flash = use_flash
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize attention weights."""
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.o_proj.weight, gain=1.0)
+        
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Split hidden dimension into multiple attention heads.
         
         Args:
-            x: Input tensor [batch, seq_len, hidden_dim]
+            x: Input tensor of shape [batch_size, seq_len, hidden_size]
             
         Returns:
-            Reshaped tensor [batch, num_heads, seq_len, head_dim]
+            Tensor of shape [batch_size, num_heads, seq_len, head_dim]
         """
-        batch, seq_len, _ = x.shape
-        x = x.reshape(batch, seq_len, self.num_heads, self.actual_head_dim)
-        return jnp.transpose(x, (0, 2, 1, 3))
+        batch_size, seq_len, _ = x.size()
+        x = x.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        return x.transpose(1, 2)
         
-    def _merge_heads(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Merge multiple heads back into hidden dim.
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Merge attention heads back into hidden dimension.
         
         Args:
-            x: Input tensor [batch, num_heads, seq_len, head_dim]
+            x: Input tensor of shape [batch_size, num_heads, seq_len, head_dim]
             
         Returns:
-            Reshaped tensor [batch, seq_len, hidden_dim]
+            Tensor of shape [batch_size, seq_len, hidden_size]
         """
-        batch, _, seq_len, _ = x.shape
-        x = jnp.transpose(x, (0, 2, 1, 3))
-        return x.reshape(batch, seq_len, self.hidden_size)
+        batch_size, _, seq_len, _ = x.size()
+        x = x.transpose(1, 2)
+        return x.reshape(batch_size, seq_len, self.hidden_size)
         
-    def __call__(self,
-                 hidden_states: jnp.ndarray,
-                 attention_mask: Optional[jnp.ndarray] = None,
-                 position_ids: Optional[jnp.ndarray] = None,
-                 deterministic: bool = True,
-                 output_attentions: bool = False) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
-        """Apply self-attention to input.
+    def _apply_rotary_embeddings(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary position embeddings to queries and keys.
         
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_dim]
-            attention_mask: Optional attention mask [batch, 1, seq_len, seq_len]
-            position_ids: Optional position indices for RoPE
-            deterministic: Whether to apply dropout
-            output_attentions: Whether to return attention weights
+            q: Query tensor
+            k: Key tensor
+            cos: Cosine part of rotary embeddings
+            sin: Sine part of rotary embeddings
             
         Returns:
-            Tuple of (attention output, optional attention weights)
+            Tuple of transformed (query, key) tensors
         """
-        batch_size, seq_length = hidden_states.shape[:2]
+        # Split dimensions for rotation
+        q_split = q.view(*q.shape[:-1], -1, 2)
+        k_split = k.view(*k.shape[:-1], -1, 2)
         
-        # Project inputs to Q, K, V
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        # Apply rotation using einsum
+        q_rot = torch.stack(
+            [
+                q_split[..., 0] * cos - q_split[..., 1] * sin,
+                q_split[..., 1] * cos + q_split[..., 0] * sin
+            ],
+            dim=-1
+        ).flatten(-2)
         
-        # Split heads
-        query = self._split_heads(query)
-        key = self._split_heads(key)
-        value = self._split_heads(value)
+        k_rot = torch.stack(
+            [
+                k_split[..., 0] * cos - k_split[..., 1] * sin,
+                k_split[..., 1] * cos + k_split[..., 0] * sin
+            ],
+            dim=-1
+        ).flatten(-2)
         
-        # Apply rotary embeddings if enabled
-        if self.use_rope:
-            query = self.rotary_emb(query)
-            key = self.rotary_emb(key)
+        return q_rot, k_rot
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Compute self-attention over input hidden states.
+        
+        Args:
+            hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
+            attention_mask: Optional attention mask tensor
+            position_embeddings: Optional tuple of (cos, sin) rotary position embeddings
+            past_key_value: Optional tuple of cached (key, value) tensors
+            use_cache: Whether to return key/value tensors for incremental decoding
             
-        # Compute attention
-        attention_output, attention_weights = scaled_dot_product(
-            query=query,
-            key=key,
-            value=value,
-            mask=attention_mask,
-            attention_dropout=self.attention_dropout,
-            deterministic=deterministic,
-            dtype=self.dtype
+        Returns:
+            Tuple containing:
+            - Output tensor of shape [batch_size, seq_len, hidden_size]
+            - Optional tuple of cached (key, value) tensors
+        """
+        batch_size, seq_len, _ = hidden_states.size()
+        
+        # Project queries, keys and values
+        q = self._split_heads(self.q_proj(hidden_states))  # [B, H, L, D]
+        k = self._split_heads(self.k_proj(hidden_states))  # [B, H, L, D]  
+        v = self._split_heads(self.v_proj(hidden_states))  # [B, H, L, D]
+        
+        # Apply rotary embeddings if provided
+        if self.use_rotary and position_embeddings is not None:
+            cos, sin = position_embeddings
+            q, k = self._apply_rotary_embeddings(q, k, cos, sin)
+            
+        # Handle cached key-value pairs for incremental decoding
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+            
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, L, L]
+        
+        # Apply causal mask if needed
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones((seq_len, seq_len), dtype=torch.bool, device=scores.device),
+                diagonal=1
+            )
+            scores.masked_fill_(causal_mask, float("-inf"))
+            
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            scores = scores + attention_mask
+            
+        # Compute attention weights and apply dropout
+        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, v)  # [B, H, L, D]
+        attn_output = self._merge_heads(attn_output)  # [B, L, H*D]
+        
+        # Final projection
+        output = self.o_proj(attn_output)
+        
+        # Return key-value pair if using cache
+        if use_cache:
+            return output, (k, v)
+            
+        return output, None
+
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (
+            f"hidden_size={self.hidden_size}, "
+            f"num_heads={self.num_attention_heads}, "
+            f"head_dim={self.head_dim}, "
+            f"causal={self.causal}, "
+            f"rotary={self.use_rotary}, "
+            f"flash={self.use_flash}"
         )
-        
-        # Merge heads and project output
-        attention_output = self._merge_heads(attention_output)
-        attention_output = self.o_proj(attention_output)
-        
-        # Apply dropout
-        if not deterministic:
-            attention_output = nn.Dropout(
-                rate=self.dropout_rate,
-                deterministic=deterministic
-            )(attention_output, deterministic=deterministic)
-            
-        if output_attentions:
-            return attention_output, attention_weights
-        return attention_output, None
-        
-    def _create_causal_mask(self, batch_size: int, seq_length: int) -> jnp.ndarray:
-        """Create causal attention mask.
-        
-        Args:
-            batch_size: Batch size
-            seq_length: Sequence length
-            
-        Returns:
-            Causal mask [batch, 1, seq_len, seq_len]
-        """
-        # Create mask for lower triangular matrix
-        mask = jnp.triu(jnp.ones((seq_length, seq_length)), k=1)
-        mask = mask.astype(bool)
-        
-        # Expand dimensions for batch and heads
-        mask = jnp.expand_dims(mask, axis=(0, 1))
-        mask = jnp.repeat(mask, batch_size, axis=0)
-        
-        return mask

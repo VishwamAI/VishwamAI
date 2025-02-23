@@ -1,115 +1,106 @@
 # TPU Configuration
 
-# Hardware Configuration
-tpu_type: "v4-8"  # Options: v2-8, v3-8, v4-8
-num_tpu_cores: 8
-num_tpu_chips: 4
-device_type: "tpu"  # Options: tpu, gpu, cpu
-num_hosts: 1
-num_devices_per_host: 8
-topology: "2x2x2"
+# TPU Hardware Settings
+tpu:
+  # TPU pod settings
+  topology: "2x2"  # Options: "2x2", "2x2x2", "4x4", "4x4x4"
+  chips_per_host: 8
+  num_tpu_cores: 8
+  num_hosts: 1
+  host_bounds: "1,1,1"  # For pod configuration
+  
+  # Performance settings
+  use_bfloat16: true
+  compile_ahead: true
+  pjrt_distributed: true
+  enable_spmd: true
 
-# Memory Configuration
-memory_per_core: "32GiB"
-high_bandwidth_memory: true
-dynamic_memory_allocation: true
-memory_growth: false
-optimize_memory_use: true
-max_device_memory: null  # null = use all available memory
+# Data Sharding
+data_sharding:
+  strategy: "data_parallel"  # Options: "data_parallel", "model_parallel", "expert_parallel"
+  batch_partitioning: true
+  shuffle_buffer_size: 10000
+  prefetch_size: 2
 
-# Performance Optimization
-use_bfloat16: true
-use_dynamic_padding: true
-use_auto_sharding: true
-use_rematerialization: true
-use_model_parallelism: true
-use_pipeline_parallelism: false
-use_spatial_partitioning: true
-use_replicated_parameters: false
+# Expert Sharding (for MoE)
+expert_sharding:
+  enabled: true
+  strategy: "axis_0"  # Options: "axis_0", "axis_1", "replicated"
+  recompute_grad: true
+  balance_experts: true
+  local_dispatch: true
 
-# XLA Configuration
-enable_xla: true
-xla_auto_jit: true
-xla_fusion: true
-xla_cpu_fast_math: true
-xla_gpu_cuda_data_dir: null
-xla_gpu_strict_conv_algorithm_picker: true
+# Memory Optimization
+memory:
+  gradient_checkpointing: true
+  selective_checkpoint: true
+  rematerialization: true
+  dynamic_shape: true
+  optimize_tpu_kernel: true
 
-# Computation Layout
-computation_shape: [2, 2, 2]
-device_assignment_mode: "linear"  # Options: linear, mesh
-mesh_shape: ["data", "model"]
-layout_rules: ["batch", "vocab"]
-auto_layout: true
+# Compilation Options
+compilation:
+  xla_optimization_level: 3
+  enable_automatic_fusion: true
+  fast_math: true
+  shape_specialization: true
+  debug_mode: false
 
-# Data Pipeline
-num_input_pipelines: 8
-prefetch_size: 2
-tpu_input_queue_length: 8
-max_buffer_size: "8GiB"
-enable_async_prefetch: true
-use_parallel_reads: true
+# Training Optimizations
+training:
+  auto_batch_size: false
+  max_batch_size: 2048
+  dynamic_batch_size: false
+  batch_size_finder:
+    enabled: false
+    init_batch_size: 32
+    max_trials: 10
+    growth_factor: 1.1
 
-# Communication
-all_reduce_algorithm: "ring"  # Options: ring, recursive, binary_tree
-cross_replica_sync: true
-deterministic_ops: false
-collective_backend: "xla"
-replica_group_size: 8
+# Distribution Strategy
+distribution:
+  cross_replica_sync: true
+  all_reduce_alg: "ring"  # Options: "ring", "hierarchical"
+  gradient_clipping: "global"  # Options: "global", "local"
+  replicated_vars_init: "broadcast"
 
-# Optimization
-use_tpu_embeddings: true
-tpu_embedding_mode: "training"  # Options: training, inference
-use_dynamic_batch_size: true
-batch_size_per_core: 8
-steps_per_execution: 50
-pjit_barrier_on_output: true
+# Monitoring and Profiling
+monitoring:
+  profile_steps: 100
+  trace_steps: 1000
+  memory_profile: true
+  execution_profile: true
+  hlo_cost_analysis: true
 
-# Model Sharding
-parameter_sharding:
-  - rule: "model_axis_0"
-    tensor_split_dims: [0]
-  - rule: "data_parallel"
-    tensor_split_dims: [0]
-  - rule: "fully_sharded"
-    tensor_split_dims: [0, 1]
-
-# Training Features
-use_tpu_graphs: true
-compile_ahead_of_time: true
-preserve_spmd_sharding: true
-allow_soft_placement: true
-rewrite_options:
+# Performance Tuning
+performance:
   layout_optimizer: true
   constant_folding: true
   arithmetic_optimization: true
-  dependency_optimization: true
+  auto_mixed_precision: true
+  tensor_fusion_size: 10485760  # 10MB
 
-# Profiling and Debugging
-enable_tpu_profiling: true
-profile_execution: true
-tpu_profiler_port: 8466
-enable_tensor_tracer: false
-tensor_tracer_flags: null
-dump_graphs: false
-dump_debug_info: false
+# Expert Configuration (for MoE)
+expert_config:
+  local_expert_count: 2  # Number of experts per TPU core
+  expert_capacity_factor: 1.25
+  expert_routing:
+    jitter_noise: 0.1
+    load_balancing: true
+    capacity_factor: 1.5
+    dispatcher_algorithm: "gates"  # Options: "gates", "tokens"
 
-# Error Handling
-num_retries: 3
-retry_on_oom: true
-ignore_tpu_health_check: false
-fail_on_tpu_health_check: false
-report_tensor_allocations_upon_oom: true
+# Network and Communication
+network:
+  all_reduce_combine_threshold: 10485760  # 10MB
+  collective_backend: "xla"  # Options: "xla", "mpi"
+  enable_rewrite: true
+  enable_collective_fusion: true
 
-# Monitoring
-monitor_tpu_status: true
-monitor_memory_usage: true
-monitor_execution_time: true
-log_device_placement: false
-collect_performance_stats: true
-
-# Experimental Features
-use_spmd_partitioning: true
-experimental_external_spmd_autopartitioner: true
-experimental_xla_tensor_sharding: true
-experimental_allow_coordinate_descent: true
+# Debugging and Logging
+debug:
+  dump_hlo: false
+  dump_schedules: false
+  log_device_placement: false
+  verbosity_level: 0  # 0=ERROR, 1=WARNING, 2=INFO, 3=DEBUG
+  profile_dir: "tpu_profiles"

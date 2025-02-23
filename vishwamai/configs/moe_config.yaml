@@ -1,71 +1,151 @@
-# Mixture of Experts Configuration
+# Mixture of Experts configuration
 
-# Expert Network
-num_experts: 8
-expert_hidden_size: 8192  # Size of expert feed-forward layer
-expert_capacity_factor: 1.25  # Multiply by tokens-per-expert
-num_experts_per_token: 2  # Top-k experts to route each token to
-expert_dropout: 0.1
-expert_activation: "swiglu"  # Options: gelu, swiglu, silu
-expert_use_bias: false
+# Basic MoE settings
+moe:
+  num_experts: 8
+  experts_per_token: 2
+  expert_capacity_factor: 1.25
+  min_expert_capacity: 4
+  jitter_noise: 0.1
+  enable_overflow_tracking: true
+  load_balancing_strategy: balanced
+  training_mode: standard  # {standard, auxiliary, distillation}
+  enable_expert_dropout: true
 
-# Expert Distribution
-expert_distribution: "uniform"  # Options: uniform, power_law, learned
-min_expert_capacity: 4  # Minimum slots per expert
-max_expert_capacity: null  # Maximum slots (null = auto-compute)
-expert_capacity_warmup_steps: 10000
-dynamic_capacity_scaling: true
+# Expert network architecture
+expert_network:
+  hidden_size: 4096
+  intermediate_size: 11008
+  activation: gelu
+  layer_norm: true
+  bias: true
+  dropout: 0.1
+  expert_initialization:
+    method: truncated_normal
+    mean: 0.0
+    std: 0.02
+    min_value: -0.06
+    max_value: 0.06
 
-# Router Configuration
-router_dtype: "float32"  # Higher precision for routing
-router_z_loss_scale: 0.01  # Scale for router z-loss
-router_load_balance_scale: 0.01  # Scale for load balancing loss
-router_aux_loss_scale: 0.01  # Scale for auxiliary losses
-router_jitter_noise: 0.1  # Multiplicative noise scale
-router_dropout: 0.0  # Dropout on router logits
-router_ignore_padding_tokens: true
+# Router configuration
+router:
+  type: top_k
+  capacity_factor: 1.25
+  router_z_loss_coef: 0.01
+  load_balancing_loss_coef: 0.01
+  router_bias: true
+  normalize_router_logits: true
+  router_initialization:
+    method: uniform
+    a: -0.05
+    b: 0.05
+  noise:
+    add_bias_noise: true
+    noise_epsilon: 1e-2
+    multiply_by_gates: true
 
-# Gating Mechanism
-gate_type: "top_k"  # Options: top_k, multiplicative, mixture
-gate_temperature: 0.1  # Temperature for routing softmax
-gate_noise_type: "multiplicative"  # Options: multiplicative, additive
-gate_noise_scale: 1.0  # Scale factor for noise
-gate_init_eps: 0.01  # Initialization epsilon for gates
+# Token dispatching
+dispatch:
+  routing_strategy: top_k  # {top_k, sampling, threshold}
+  routing_temperature: 1.0
+  threshold: null
+  pad_to_capacity: true
+  drop_overflow_tokens: false
+  route_method: token  # {token, batch, sequence}
+  use_token_priority: true
 
-# Load Balancing
-load_balancing_type: "entropy"  # Options: entropy, cv, importance
-load_balancing_warmup_steps: 1000
-load_balancing_min_rate: 0.0
-load_balancing_max_rate: 1.0
-importance_weight_power: 0.5  # For importance-based balancing
-max_group_size: 4096  # Maximum token group size for balancing
+# Load balancing
+load_balancing:
+  enabled: true
+  strategy: auxiliary_loss  # {auxiliary_loss, dynamic_scaling, expert_replication}
+  aux_loss:
+    coefficient: 0.01
+    type: importance  # {importance, load}
+    normalize: true
+  balance_by:
+    - compute
+    - memory
+    - communication
+  monitor_imbalance: true
+  rebalance_interval: 1000
 
-# Initialization
-expert_init_type: "kaiming_uniform"  # Options: normal, kaiming_uniform, xavier
-expert_init_scale: 1.0  # Scale factor for expert initialization
-router_init_type: "normal"  # Options: normal, zeros, orthogonal
-router_init_scale: 0.02  # Scale factor for router initialization
+# Expert communication
+communication:
+  strategy: all_to_all  # {all_to_all, master_worker, hierarchical}
+  quantize_weights: false
+  gradient_compression: none
+  overlap_communication: true
+  async_communication: false
+  buffer_size: 1024
+  optimize_communication: true
 
-# Training
-expert_parallel_training: true  # Whether to parallelize expert training
-router_parallel_training: true  # Whether to parallelize router training
-expert_gradient_checkpointing: true  # Use gradient checkpointing for experts
-router_gradient_clipping: 1.0  # Clip router gradients
-expert_gradient_clipping: 1.0  # Clip expert gradients
+# Expert sharding
+sharding:
+  enabled: true
+  strategy: uniform  # {uniform, load_balanced, memory_optimized}
+  replicate_experts: false
+  min_experts_per_device: 1
+  balance_workload: true
+  recompute_experts: false
+  expert_mapping:
+    type: static  # {static, dynamic}
+    update_frequency: never  # {never, epoch, step}
+
+# Auxiliary losses
+auxiliary_losses:
+  z_loss:
+    enabled: true
+    coefficient: 0.01
+  load_balance_loss:
+    enabled: true
+    coefficient: 0.01
+    type: variance  # {variance, max_min, entropy}
+  expert_consistency_loss:
+    enabled: false
+    coefficient: 0.001
+
+# Expert streaming
+streaming:
+  enabled: false
+  chunk_size: 1024
+  overlap_computation: true
+  buffer_strategy: circular
+  max_stream_length: null
+  adaptive_chunking: true
+
+# Monitoring and debugging
+monitoring:
+  track_expert_assignment: true
+  track_load_balancing: true
+  track_capacity_usage: true
+  track_routing_patterns: true
+  track_expert_metrics:
+    - utilization
+    - load
+    - overflow
+    - computation_time
+  alert_thresholds:
+    load_imbalance: 0.3
+    overflow_rate: 0.1
+    expert_usage_min: 0.1
+
+# Expert checkpointing
+checkpointing:
+  save_experts_separately: true
+  checkpoint_interval: 1000
+  keep_last_k: 3
+  save_router_state: true
+  include_expert_metrics: true
+  validate_consistency: true
 
 # Optimization
-expert_learning_rate: 1.0e-4  # Base learning rate for experts
-router_learning_rate: 1.0e-4  # Base learning rate for routers
-expert_weight_decay: 0.01  # Weight decay for experts
-router_weight_decay: 0.01  # Weight decay for routers
-expert_beta1: 0.9  # Adam beta1 for experts
-expert_beta2: 0.999  # Adam beta2 for experts
-router_beta1: 0.9  # Adam beta1 for routers
-router_beta2: 0.999  # Adam beta2 for routers
-
-# Monitoring
-monitor_expert_utilization: true  # Track expert usage
-monitor_load_balancing: true  # Track load balancing
-monitor_routing_patterns: true  # Track routing decisions
-profiling_steps: 100  # Steps between profiling
-save_router_stats: true  # Save routing statistics
+optimization:
+  share_expert_weights: false
+  recompute_router_logits: true
+  fuse_expert_operations: true
+  optimize_communication: true
+  enable_expert_parallelism: true
+  training_optimizations:
+    gradient_checkpointing: true
+    selective_activation_checkpointing: true
+    expert_gradient_accumulation: true

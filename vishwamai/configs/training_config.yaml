@@ -1,130 +1,157 @@
-# Training Configuration
+# Training configuration
 
-# Basic Training Parameters
-max_steps: 1000000
-warmup_steps: 2000
-max_epochs: null  # If null, use max_steps
-eval_steps: 100
-save_steps: 1000
-logging_steps: 10
-gradient_accumulation_steps: 16
+# Basic training settings
+training:
+  num_epochs: 100
+  batch_size: 32
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  seed: 42
+  mixed_precision: true
+  deterministic: true
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
 
-# Optimization
-optimizer: "adamw"  # Options: adamw, adafactor, lion
-learning_rate: 1.0e-4
-weight_decay: 0.01
-adam_beta1: 0.9
-adam_beta2: 0.999
-adam_epsilon: 1.0e-8
-max_grad_norm: 1.0
-use_fused_adam: true
+# Optimizer settings
+optimizer:
+  name: adamw
+  params:
+    lr: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+  scheduler:
+    name: cosine_warmup
+    params:
+      warmup_steps: 2000
+      total_steps: 100000
+      min_lr: 1.0e-5
+  gradient_checkpointing: true
+  zero_stage: 2
 
-# Learning Rate Schedule
-lr_scheduler: "cosine"  # Options: cosine, linear, polynomial
-lr_warmup_method: "linear"  # Options: linear, constant
-min_lr_ratio: 0.1
-warmup_ratio: 0.01
-plateau_patience: 3
-plateau_factor: 0.5
-polynomial_power: 1.0
-constant_schedule_after_warmup: false
+# Loss settings
+loss:
+  label_smoothing: 0.1
+  aux_loss_weight: 0.01
+  z_loss_weight: 0.01
+  contrastive_loss_weight: 0.0
+  expert_balancing_weight: 0.01
 
-# Mixed Precision Training
-dtype: "bfloat16"
-param_dtype: "bfloat16"
-compute_dtype: "float32"
-use_dynamic_scale: true
-initial_scale: 2**15
-scale_growth_interval: 2000
+# Dataset settings
+dataset:
+  train_path: data/train
+  val_path: data/val
+  max_seq_length: 2048
+  num_workers: 4
+  prefetch_factor: 2
+  shuffle_buffer_size: 10000
+  cache_dir: .cache
+  preprocessing:
+    lowercase: false
+    remove_special_chars: false
+    normalize_unicode: true
 
-# TPU Specific
-num_tpu_cores: 8
-tpu_iterations_per_loop: 100
-use_two_step_grad: true
-use_pjit: true
-batch_size_per_device: 8
-total_batch_size: 128
-shard_batch: true
+# Distributed training
+distributed:
+  backend: nccl
+  world_size: 8
+  find_unused_parameters: false
+  ddp_timeout: 1800
+  sync_batch_norm: true
+  gradient_as_bucket_view: true
+  expert_parallel: true
+  pipeline_parallel_size: 1
+  tensor_parallel_size: 1
 
-# Memory Management
-use_gradient_checkpointing: true
-gradient_checkpointing_ratio: 0.5
-rematerialize_threshold: 1e9
-use_remat_scan: true
-activation_partitioning_dims: 2
-param_partitioning_dims: 1
+# TPU specific settings
+tpu:
+  enabled: true
+  num_cores: 8
+  topology: 2x2x2
+  optimization_level: 3
+  device_placement: balanced
+  profiler_port: 8466
 
-# Data Loading
-dataloader_num_workers: 8
-prefetch_factor: 2
-dataloader_pin_memory: true
-max_sequence_length: 4096
-pad_to_multiple_of: 8
-use_streaming: true
-dataset_preprocessing_num_proc: 16
-
-# Distributed Training
-use_mesh: true
-mesh_dim_order: ["data", "model"]
-fsdp_sharding: true
-zero_stage: 3  # Options: 1, 2, 3
-minimum_layer_for_fsdp: 0
-communication_dtype: "bfloat16"
-broadcast_buffers: true
-
-# Loss and Metrics
-loss_type: "cross_entropy"  # Options: cross_entropy, mse
-label_smoothing: 0.1
-aux_loss_factor: 0.01
-use_bias_correction: true
-perplexity_eval_steps: 100
-compute_memory_metrics: true
-compute_efficiency_metrics: true
-
-# Training Features
-use_activation_checkpointing: true
-use_memory_efficient_attention: true
-use_flash_attention: true
-use_fused_layernorm: true
-use_fused_softmax: true
-use_kernel_injection: true
-
-# Regularization
-dropout_rate: 0.1
-attention_dropout: 0.1
-activation_dropout: 0.0
-layer_drop_rate: 0.0
-weight_decay_exemptions: ["bias", "LayerNorm"]
-clip_grad_value: null
-stochastic_depth_rate: 0.0
+# Expert sharding settings
+expert_sharding:
+  strategy: uniform
+  recompute_experts: true
+  expert_capacity_factor: 1.25
+  min_expert_capacity: 4
+  expert_padding: none
+  load_balancing: true
+  jitter_noise: 0.1
+  expert_streaming: true
 
 # Checkpointing
-save_total_limit: 5
-save_strategy: "steps"
-save_safetensors: true
-save_optimizer: true
-save_metrics: true
-checkpoint_dir: "checkpoints"
-use_safe_serialization: true
+checkpointing:
+  save_path: checkpoints
+  save_top_k: 3
+  monitor: val_loss
+  mode: min
+  save_last: true
+  save_optimizer: true
+  backup_dir: gs://model-backups
 
-# Monitoring
-wandb_project: "vishwamai"
-wandb_run_name: null
-use_tensorboard: true
-profile_steps: [100, 200, 300]
-memory_profiling: true
-throughput_profiling: true
-save_model_card: true
+# Early stopping
+early_stopping:
+  enabled: true
+  monitor: val_loss
+  mode: min
+  patience: 5
+  min_delta: 1.0e-4
+  check_finite: true
 
-# Early Stopping
-early_stopping_patience: 5
-early_stopping_threshold: 0.01
-min_delta: 0.001
-patience_counter: 0
+# Logging
+logging:
+  path: logs
+  project: vishwamai
+  entity: research
+  log_level: INFO
+  monitor_memory: true
+  profile_steps: [100, 200]
+  save_code: true
+  metrics:
+    - loss
+    - perplexity
+    - expert_metrics
+    - memory_metrics
+    - throughput
 
-# Debug and Testing
-debug_mode: false
-detect_anomaly: false
-profile_memory: false
-dry_run_steps: 0
-benchmark_steps: 100
+# Debug settings
+debug:
+  enabled: false
+  detect_anomaly: false
+  profile_memory: false
+  trace_outputs: false
+  break_on_error: false
+  verbose: false
+
+# Profiling
+profiling:
+  enabled: true
+  trace_memory: true
+  trace_cuda: true
+  trace_cpu: true
+  export_chrome_trace: true
+  profile_Expert_routing: true
+  profile_attention: true
+  record_shapes: true
+  record_flops: true
+  warmup_steps: 10
+  active_steps: 100
+  repeat: 3
+
+# Hardware optimization
+hardware:
+  use_flash_attention: true
+  use_fused_adam: true
+  use_fused_layer_norm: true
+  use_kernel_optimizations: true
+  cudnn_benchmark: true
+  cudnn_deterministic: false
+  pin_memory: true
+  async_prefetch: true
+  optimize_memory_use: true
+  optimize_device_placement: true

@@ -1,142 +1,250 @@
-"""Expert weight initialization functions for MoE layers in JAX."""
-from typing import Optional, Union
+"""Initialization utilities for expert networks in MoE layers."""
+
 import math
-import jax
-import jax.numpy as jnp
-from jax import random
+from typing import Optional, Union, Tuple, List
 
-def init_expert_weights(
-    expert: dict,
-    rng_key: jax.random.PRNGKey,
-    init_method: str = 'scaled_normal',
-    init_std: float = 0.02,
-    num_experts: int = 1,
-    capacity_factor: float = 1.0,
-    expert_scale: Optional[float] = None
-) -> dict:
-    """Initialize expert module weights in JAX.
+import torch
+import torch.nn as nn
+
+from .weight_init import (
+    normal_init_,
+    xavier_uniform_init_,
+    kaiming_uniform_init_,
+    scaled_init_,
+    _calculate_fan_in_and_fan_out
+)
+
+def initialize_expert_weights(
+    expert_layer: nn.Module,
+    num_experts: int,
+    hidden_size: int,
+    expert_size: int,
+    method: str = "normal",
+    **kwargs
+) -> None:
+    """Initialize expert network weights.
     
     Args:
-        expert: Dictionary containing expert parameters
-        rng_key: JAX random key for initialization
-        init_method: Initialization method ['scaled_normal', 'kaiming', 'xavier']
-        init_std: Standard deviation for normal initialization
-        num_experts: Number of experts in MoE layer
-        capacity_factor: Expert capacity multiplier
-        expert_scale: Optional explicit scaling factor for expert weights
-    
-    Returns:
-        Dictionary with initialized parameters
+        expert_layer: Expert layer module
+        num_experts: Number of experts
+        hidden_size: Hidden dimension size
+        expert_size: Expert FFN dimension size
+        method: Weight initialization method
+        **kwargs: Additional initialization arguments
     """
-    if expert_scale is None:
-        expert_scale = math.sqrt(capacity_factor / num_experts)
-    
-    params = {}
-    subkey = rng_key
-    
-    for name, param in expert.items():
-        if 'weight' in name.lower():
-            shape = param.shape
+    # Up-projection weights (hidden -> expert)
+    if hasattr(expert_layer, "w1"):
+        if method == "normal":
+            std = kwargs.get("std", 0.02)
+            normal_init_(expert_layer.w1, std=std)
+        elif method == "xavier_uniform":
+            xavier_uniform_init_(expert_layer.w1)
+        elif method == "kaiming_uniform":
+            kaiming_uniform_init_(expert_layer.w1)
+        elif method == "scaled":
+            scale = kwargs.get("scale", 1.0)
+            scaled_init_(expert_layer.w1, scale=scale)
             
-            if init_method == 'scaled_normal':
-                params[name] = random.normal(subkey, shape) * init_std * expert_scale
-                
-            elif init_method == 'kaiming':
-                fan_in = shape[-1]  # Assume last dim is input features
-                gain = math.sqrt(2.0)  # ReLU gain
-                std = gain / math.sqrt(fan_in)
-                params[name] = random.normal(subkey, shape) * std * expert_scale
-                
-            elif init_method == 'xavier':
-                fan_in, fan_out = shape[-1], shape[-2]  # Linear layer convention
-                std = expert_scale * math.sqrt(2.0 / (fan_in + fan_out))
-                params[name] = random.normal(subkey, shape) * std
-                
-            else:
-                raise ValueError(f"Unknown initialization method: {init_method}")
-                
-            subkey, _ = random.split(subkey)
-            
-        elif 'bias' in name.lower():
-            params[name] = jnp.zeros_like(param)
-            
-    return params
+    # Down-projection weights (expert -> hidden)
+    if hasattr(expert_layer, "w2"):
+        if method == "normal":
+            std = kwargs.get("std", 0.02 / math.sqrt(2 * num_experts))
+            normal_init_(expert_layer.w2, std=std)
+        elif method == "xavier_uniform":
+            gain = 1.0 / math.sqrt(2 * num_experts)
+            xavier_uniform_init_(expert_layer.w2, gain=gain)
+        elif method == "kaiming_uniform":
+            kaiming_uniform_init_(expert_layer.w2)
+        elif method == "scaled":
+            scale = kwargs.get("scale", 1.0) / (2 * num_experts)
+            scaled_init_(expert_layer.w2, scale=scale)
 
-def init_expert_biases(
-    expert: dict,
-    rng_key: jax.random.PRNGKey,
-    bias_init: Union[float, str] = 0.0
-) -> dict:
-    """Initialize expert module biases in JAX.
+def initialize_expert_biases(
+    expert_layer: nn.Module,
+    init_val: float = 0.0
+) -> None:
+    """Initialize expert network biases.
     
     Args:
-        expert: Dictionary containing expert parameters
-        rng_key: JAX random key for initialization
-        bias_init: Bias initialization value or method
-            - float: Use constant initialization
-            - 'zero': Initialize to zeros
-            - 'normal': Initialize from N(0, 0.02)
-    
-    Returns:
-        Dictionary with initialized biases
+        expert_layer: Expert layer module
+        init_val: Initial bias value
     """
-    params = {}
-    subkey = rng_key
-    
-    for name, param in expert.items():
-        if 'bias' in name.lower():
-            if isinstance(bias_init, (int, float)):
-                params[name] = jnp.full_like(param, bias_init)
-            elif bias_init == 'zero':
-                params[name] = jnp.zeros_like(param)
-            elif bias_init == 'normal':
-                params[name] = random.normal(subkey, param.shape) * 0.02
-                subkey, _ = random.split(subkey)
-            else:
-                raise ValueError(f"Unknown bias initialization: {bias_init}")
-        else:
-            params[name] = param  # Copy non-bias params unchanged
-            
-    return params
+    if hasattr(expert_layer, "b1") and expert_layer.b1 is not None:
+        nn.init.constant_(expert_layer.b1, init_val)
+        
+    if hasattr(expert_layer, "b2") and expert_layer.b2 is not None:
+        nn.init.constant_(expert_layer.b2, init_val)
 
-def reset_failed_experts(
-    expert: dict,
-    rng_key: jax.random.PRNGKey,
-    expert_idx: int,
-    init_method: str = 'scaled_normal',
-    init_std: float = 0.02,
-    num_experts: int = 1,
-    capacity_factor: float = 1.0
-) -> dict:
-    """Re-initialize a failed expert's weights in JAX.
+def initialize_expert_layer_norm(
+    layer_norm: nn.LayerNorm,
+    eps: float = 1e-5
+) -> None:
+    """Initialize expert layer normalization.
     
     Args:
-        expert: Dictionary containing expert parameters
-        rng_key: JAX random key for initialization
-        expert_idx: Index of expert being reset
-        init_method: Initialization method
-        init_std: Standard deviation for normal initialization
-        num_experts: Total number of experts
-        capacity_factor: Expert capacity multiplier
-    
-    Returns:
-        Dictionary with re-initialized parameters
+        layer_norm: LayerNorm module
+        eps: Small constant for numerical stability
     """
-    reset_scale = math.sqrt(capacity_factor / num_experts)
+    if hasattr(layer_norm, "weight"):
+        nn.init.ones_(layer_norm.weight)
+        
+    if hasattr(layer_norm, "bias"):
+        nn.init.zeros_(layer_norm.bias)
+        
+    layer_norm.eps = eps
+
+def initialize_expert_gate_weights(
+    gate_weights: torch.Tensor,
+    num_experts: int,
+    hidden_size: int,
+    init_method: str = "normal",
+    **kwargs
+) -> None:
+    """Initialize expert gating weights.
     
-    # Re-initialize weights
-    params = init_expert_weights(
-        expert,
-        rng_key,
-        init_method=init_method,
-        init_std=init_std,
-        num_experts=num_experts,
-        capacity_factor=capacity_factor,
-        expert_scale=reset_scale
-    )
+    Args:
+        gate_weights: Gating weight tensor
+        num_experts: Number of experts
+        hidden_size: Hidden dimension size
+        init_method: Weight initialization method
+        **kwargs: Additional initialization arguments
+    """
+    if init_method == "normal":
+        std = kwargs.get("std", 0.02)
+        with torch.no_grad():
+            gate_weights.normal_(0.0, std)
+    elif init_method == "uniform":
+        a = kwargs.get("a", -0.05)
+        b = kwargs.get("b", 0.05)
+        with torch.no_grad():
+            gate_weights.uniform_(a, b)
+    elif init_method == "zero":
+        with torch.no_grad():
+            gate_weights.zero_()
+    else:
+        raise ValueError(f"Unknown gate initialization method: {init_method}")
+
+def add_jitter_to_expert_weights(
+    expert_weights: torch.Tensor,
+    jitter_noise: float = 0.1
+) -> None:
+    """Add random jitter to expert weights.
     
-    # Re-initialize biases to zero
-    subkey, _ = random.split(rng_key)
-    params = init_expert_biases(params, subkey, bias_init='zero')
+    Args:
+        expert_weights: Expert weight tensor
+        jitter_noise: Scale of noise to add
+    """
+    if jitter_noise > 0:
+        with torch.no_grad():
+            noise = torch.randn_like(expert_weights) * jitter_noise
+            expert_weights.add_(noise)
+
+def initialize_expert_dropout(
+    expert_layer: nn.Module,
+    dropout_prob: float = 0.1
+) -> None:
+    """Initialize expert dropout layers.
     
-    return params
+    Args:
+        expert_layer: Expert layer module
+        dropout_prob: Dropout probability
+    """
+    if hasattr(expert_layer, "dropout1"):
+        expert_layer.dropout1.p = dropout_prob
+        
+    if hasattr(expert_layer, "dropout2"):
+        expert_layer.dropout2.p = dropout_prob
+
+def initialize_expert_activation(
+    expert_layer: nn.Module,
+    activation_type: str = "gelu"
+) -> None:
+    """Initialize expert activation functions.
+    
+    Args:
+        expert_layer: Expert layer module
+        activation_type: Type of activation function
+    """
+    if activation_type == "gelu":
+        expert_layer.activation = nn.GELU()
+    elif activation_type == "relu":
+        expert_layer.activation = nn.ReLU()
+    elif activation_type == "swish":
+        expert_layer.activation = nn.SiLU()
+    else:
+        raise ValueError(f"Unknown activation type: {activation_type}")
+
+class ExpertInitializer:
+    """Helper class for expert initialization."""
+    
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        expert_size: int,
+        init_method: str = "normal",
+        eps: float = 1e-5,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        **kwargs
+    ):
+        """Initialize expert initializer.
+        
+        Args:
+            num_experts: Number of experts
+            hidden_size: Hidden dimension size
+            expert_size: Expert FFN dimension size
+            init_method: Weight initialization method
+            eps: LayerNorm epsilon
+            dropout: Dropout probability
+            activation: Activation function type
+            **kwargs: Additional initialization arguments
+        """
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.expert_size = expert_size
+        self.init_method = init_method
+        self.eps = eps
+        self.dropout = dropout
+        self.activation = activation
+        self.kwargs = kwargs
+        
+    def __call__(self, expert_layer: nn.Module) -> None:
+        """Initialize expert layer components.
+        
+        Args:
+            expert_layer: Expert layer to initialize
+        """
+        # Initialize weights
+        initialize_expert_weights(
+            expert_layer,
+            self.num_experts,
+            self.hidden_size,
+            self.expert_size,
+            self.init_method,
+            **self.kwargs
+        )
+        
+        # Initialize biases
+        initialize_expert_biases(expert_layer)
+        
+        # Initialize layer norm
+        if hasattr(expert_layer, "layer_norm"):
+            initialize_expert_layer_norm(expert_layer.layer_norm, self.eps)
+            
+        # Initialize dropout
+        initialize_expert_dropout(expert_layer, self.dropout)
+        
+        # Initialize activation
+        initialize_expert_activation(expert_layer, self.activation)
+
+__all__ = [
+    "initialize_expert_weights",
+    "initialize_expert_biases",
+    "initialize_expert_layer_norm",
+    "initialize_expert_gate_weights",
+    "add_jitter_to_expert_weights",
+    "initialize_expert_dropout",
+    "initialize_expert_activation",
+    "ExpertInitializer",
+]

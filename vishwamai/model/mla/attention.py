@@ -1,225 +1,255 @@
-"""Multi-Layer Attention module for cross-layer attention."""
+"""Multi-Level Attention mechanisms for MLA layers."""
 
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Union
+
 import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-
-from ..embeddings.positional import RotaryPositionalEmbedding
-
-class MultiLayerAttention(nn.Module):
-    """Attention mechanism for cross-layer communication."""
+class MLAAttention(nn.Module):
+    """Multi-Level Attention with grouped heads."""
     
-    hidden_size: int
-    num_heads: int
-    head_dim: Optional[int] = None
-    num_prev_layers: int = 4
-    attention_window: int = 4
-    dropout_rate: float = 0.1
-    attention_dropout: float = 0.1
-    use_rope: bool = True
-    max_sequence_length: int = 2048
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    deterministic: bool = False
-    
-    def setup(self):
-        """Initialize multi-layer attention components."""
-        self.actual_head_dim = self.head_dim or self.hidden_size // self.num_heads
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_attention_groups: int,
+        attention_dropout_prob: float = 0.1,
+        position_dropout_prob: float = 0.1,
+        attention_scale: Optional[float] = None,
+        use_rotary: bool = False,
+        max_position_embeddings: int = 2048,
+        bias: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """Initialize MLA attention.
         
-        # Query projection (for current layer)
-        self.q_proj = nn.Dense(
-            self.num_heads * self.actual_head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="q_proj"
-        )
+        Args:
+            hidden_size: Size of hidden dimension
+            num_attention_heads: Total number of attention heads
+            num_attention_groups: Number of attention head groups
+            attention_dropout_prob: Attention score dropout probability
+            position_dropout_prob: Position embedding dropout probability
+            attention_scale: Optional custom attention scale factor
+            use_rotary: Whether to use rotary position embeddings
+            max_position_embeddings: Maximum sequence length for positions
+            bias: Whether to use bias in projections
+            device: Device to create tensors on
+            dtype: Data type for parameters
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
         
-        # Key/Value projections (for previous layers)
-        self.k_proj = nn.Dense(
-            self.num_heads * self.actual_head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="k_proj"
-        )
-        self.v_proj = nn.Dense(
-            self.num_heads * self.actual_head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="v_proj"
-        )
-        
-        # Output projection
-        self.o_proj = nn.Dense(
-            self.hidden_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="o_proj"
-        )
-        
-        # Layer selection gate
-        self.layer_gate = nn.Dense(
-            self.num_prev_layers,
-            use_bias=False,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            name="layer_gate"
-        )
-        
-        # Rotary embeddings if enabled
-        if self.use_rope:
-            self.rotary_emb = RotaryPositionalEmbedding(
-                max_seq_length=self.max_sequence_length,
-                dim=self.actual_head_dim
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                f"Hidden size ({hidden_size}) must be divisible by number of heads ({num_attention_heads})"
             )
             
-    def _split_heads(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Split hidden dim into multiple heads.
+        if num_attention_heads % num_attention_groups != 0:
+            raise ValueError(
+                f"Number of heads ({num_attention_heads}) must be divisible by number of groups ({num_attention_groups})"
+            )
+            
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.num_attention_groups = num_attention_groups
+        self.heads_per_group = num_attention_heads // num_attention_groups
+        self.head_dim = hidden_size // num_attention_heads
+        self.scale = attention_scale or 1.0 / math.sqrt(self.head_dim)
+        self.use_rotary = use_rotary
+        
+        # Multi-level projections
+        self.q_projs = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size // num_attention_groups, bias=bias, **factory_kwargs)
+            for _ in range(num_attention_groups)
+        ])
+        
+        self.k_projs = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size // num_attention_groups, bias=bias, **factory_kwargs)
+            for _ in range(num_attention_groups)
+        ])
+        
+        self.v_projs = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size // num_attention_groups, bias=bias, **factory_kwargs)
+            for _ in range(num_attention_groups)
+        ])
+        
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=bias, **factory_kwargs)
+        
+        # Dropouts
+        self.attention_dropout = nn.Dropout(attention_dropout_prob)
+        self.position_dropout = nn.Dropout(position_dropout_prob)
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize attention weights."""
+        # Initialize Q projections
+        for proj in self.q_projs:
+            nn.init.xavier_uniform_(proj.weight, gain=1.0 / math.sqrt(2))
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+                
+        # Initialize K projections
+        for proj in self.k_projs:
+            nn.init.xavier_uniform_(proj.weight, gain=1.0 / math.sqrt(2))
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+                
+        # Initialize V projections
+        for proj in self.v_projs:
+            nn.init.xavier_uniform_(proj.weight, gain=1.0)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+                
+        # Initialize output projection
+        nn.init.xavier_uniform_(self.o_proj.weight)
+        if self.o_proj.bias is not None:
+            nn.init.zeros_(self.o_proj.bias)
+            
+    def _split_heads_for_group(
+        self,
+        x: torch.Tensor,
+        group_idx: int
+    ) -> torch.Tensor:
+        """Split hidden dimension into attention heads for a group.
         
         Args:
-            x: Input tensor [batch, seq_len, hidden_dim]
+            x: Input tensor of shape [batch_size, seq_length, hidden_size//num_groups]
+            group_idx: Index of attention group
             
         Returns:
-            Reshaped tensor [batch, num_heads, seq_len, head_dim]
+            Tensor of shape [batch_size, num_heads_per_group, seq_length, head_dim]
         """
-        batch, seq_len, _ = x.shape
-        x = x.reshape(batch, seq_len, self.num_heads, self.actual_head_dim)
-        return jnp.transpose(x, (0, 2, 1, 3))
+        batch_size, seq_length, _ = x.size()
+        x = x.view(batch_size, seq_length, self.heads_per_group, self.head_dim)
+        return x.transpose(1, 2)
         
-    def _merge_heads(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Merge multiple heads back into hidden dim.
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Merge attention heads back into hidden dimension.
         
         Args:
-            x: Input tensor [batch, num_heads, seq_len, head_dim]
+            x: Input tensor of shape [batch_size, num_heads, seq_length, head_dim]
             
         Returns:
-            Reshaped tensor [batch, seq_len, hidden_dim]
+            Tensor of shape [batch_size, seq_length, hidden_size]
         """
-        batch, _, seq_len, _ = x.shape
-        x = jnp.transpose(x, (0, 2, 1, 3))
-        return x.reshape(batch, seq_len, self.hidden_size)
+        batch_size, _, seq_length, _ = x.size()
+        x = x.transpose(1, 2)
+        return x.reshape(batch_size, seq_length, self.hidden_size)
         
-    def _compute_layer_weights(self, query_layer: jnp.ndarray) -> jnp.ndarray:
-        """Compute attention weights for different layers.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
+        """Compute multi-level attention over input hidden states.
         
         Args:
-            query_layer: Current layer representation [batch, seq_len, hidden_dim]
+            hidden_states: Input tensor of shape [batch_size, seq_length, hidden_size]
+            attention_mask: Optional attention mask tensor
+            position_embeddings: Optional tuple of (cos, sin) rotary position embeddings
+            past_key_value: Optional tuple of cached (key, value) tensors
+            use_cache: Whether to return key/value tensors for incremental decoding
+            output_attentions: Whether to return attention weights
             
         Returns:
-            Layer weights [batch, num_prev_layers]
+            Tuple containing:
+            - Output tensor of shape [batch_size, seq_length, hidden_size]
+            - Optional tuple of cached (key, value) tensors
+            - Optional attention weights tensor
         """
-        # Global average pooling over sequence length
-        pooled = jnp.mean(query_layer, axis=1)  # [batch, hidden_dim]
+        batch_size, seq_length, _ = hidden_states.size()
         
-        # Project to get layer weights
-        layer_logits = self.layer_gate(pooled)  # [batch, num_prev_layers]
+        # Process each attention group
+        group_outputs = []
+        group_attentions = []
         
-        # Apply softmax to get attention weights
-        layer_weights = jax.nn.softmax(layer_logits, axis=-1)
-        
-        return layer_weights
-        
-    def __call__(self,
-                 hidden_states: jnp.ndarray,
-                 prev_hidden_states: List[jnp.ndarray],
-                 attention_mask: Optional[jnp.ndarray] = None,
-                 deterministic: Optional[bool] = None) -> Tuple[jnp.ndarray, Dict[str, Any]]:
-        """Apply multi-layer attention.
-        
-        Args:
-            hidden_states: Current layer states [batch, seq_len, hidden_dim]
-            prev_hidden_states: Previous layer states list [[batch, seq, hidden], ...]
-            attention_mask: Optional attention mask
-            deterministic: Whether to run in deterministic mode
+        # Initialize cached key/value tensors
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            past_k = past_k.chunk(self.num_attention_groups, dim=2)
+            past_v = past_v.chunk(self.num_attention_groups, dim=2)
+        else:
+            past_k = [None] * self.num_attention_groups
+            past_v = [None] * self.num_attention_groups
             
-        Returns:
-            Tuple of:
-                - Output tensor [batch, seq_len, hidden_dim]
-                - Dict of auxiliary outputs
-        """
-        deterministic = deterministic if deterministic is not None else self.deterministic
-        batch_size, seq_length, _ = hidden_states.shape
-        
-        # Project current layer to queries
-        queries = self.q_proj(hidden_states)
-        queries = self._split_heads(queries)  # [batch, heads, seq, head_dim]
-        
-        if self.use_rope:
-            queries = self.rotary_emb(queries)
+        # Process each attention group
+        for group_idx in range(self.num_attention_groups):
+            # Project Q/K/V for this group
+            q = self.q_projs[group_idx](hidden_states)  # [B, L, H/G]
+            k = self.k_projs[group_idx](hidden_states)  # [B, L, H/G]
+            v = self.v_projs[group_idx](hidden_states)  # [B, L, H/G]
             
-        # Process previous layers
-        layer_outputs = []
-        all_attention_weights = []
-        
-        # Take most recent layers up to attention window
-        prev_states = prev_hidden_states[-self.attention_window:]
-        
-        for layer_idx, prev_states in enumerate(prev_states):
-            # Project previous layer to keys and values
-            keys = self.k_proj(prev_states)
-            values = self.v_proj(prev_states)
+            # Split heads
+            q = self._split_heads_for_group(q, group_idx)  # [B, H/G, L, D]
+            k = self._split_heads_for_group(k, group_idx)  # [B, H/G, L, D]
+            v = self._split_heads_for_group(v, group_idx)  # [B, H/G, L, D]
             
-            keys = self._split_heads(keys)
-            values = self._split_heads(values)
-            
-            if self.use_rope:
-                keys = self.rotary_emb(keys)
+            # Apply rotary embeddings if provided
+            if self.use_rotary and position_embeddings is not None:
+                cos, sin = position_embeddings
+                q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
+                
+            # Handle cached key/value tensors
+            if past_k[group_idx] is not None:
+                k = torch.cat([past_k[group_idx], k], dim=2)
+                v = torch.cat([past_v[group_idx], v], dim=2)
                 
             # Compute attention scores
-            attention_scores = jnp.einsum('bhqd,bhkd->bhqk', queries, keys)
-            attention_scores = attention_scores / math.sqrt(self.actual_head_dim)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H/G, L, L]
             
             # Apply attention mask if provided
             if attention_mask is not None:
-                attention_scores = jnp.where(attention_mask, attention_scores, -1e9)
+                scores = scores + attention_mask
                 
-            # Apply softmax and dropout
-            attention_weights = jax.nn.softmax(attention_scores, axis=-1)
-            if not deterministic:
-                attention_weights = nn.Dropout(
-                    rate=self.attention_dropout,
-                    deterministic=deterministic
-                )(attention_weights, deterministic=deterministic)
+            # Compute attention weights and apply dropout
+            attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
+            attn_weights = self.attention_dropout(attn_weights)
+            
+            # Compute attention output
+            group_output = torch.matmul(attn_weights, v)  # [B, H/G, L, D]
+            group_outputs.append(group_output)
+            
+            if output_attentions:
+                group_attentions.append(attn_weights)
                 
-            # Compute layer output
-            layer_output = jnp.einsum('bhqk,bhkd->bhqd', attention_weights, values)
-            layer_output = self._merge_heads(layer_output)
+        # Concatenate group outputs
+        attn_output = torch.cat(group_outputs, dim=1)  # [B, H, L, D]
+        
+        # Merge heads and apply output projection
+        attn_output = self._merge_heads(attn_output)  # [B, L, H]
+        output = self.o_proj(attn_output)  # [B, L, H]
+        
+        # Prepare outputs
+        outputs = (output,)
+        
+        if use_cache:
+            # Concatenate cached key/value tensors
+            k_cache = torch.cat([k.unsqueeze(2) for k in past_k], dim=2)
+            v_cache = torch.cat([v.unsqueeze(2) for v in past_v], dim=2)
+            outputs += ((k_cache, v_cache),)
             
-            layer_outputs.append(layer_output)
-            all_attention_weights.append(attention_weights)
+        if output_attentions:
+            # Stack attention weights from all groups
+            attention_weights = torch.stack(group_attentions, dim=1)  # [B, G, H/G, L, L]
+            outputs += (attention_weights,)
             
-        # Stack layer outputs
-        layer_outputs = jnp.stack(layer_outputs)  # [num_prev, batch, seq, hidden]
-        
-        # Compute layer weights
-        layer_weights = self._compute_layer_weights(hidden_states)  # [batch, num_prev]
-        
-        # Expand dimensions for broadcasting
-        layer_weights = jnp.expand_dims(layer_weights, axis=(2, 3))  # [batch, num_prev, 1, 1]
-        
-        # Weighted combination of layer outputs
-        output = jnp.sum(layer_outputs * layer_weights, axis=0)  # [batch, seq, hidden]
-        
-        # Project output
-        output = self.o_proj(output)
-        
-        # Apply dropout during training
-        if not deterministic:
-            output = nn.Dropout(
-                rate=self.dropout_rate,
-                deterministic=deterministic
-            )(output, deterministic=deterministic)
-            
-        aux_outputs = {
-            'layer_weights': layer_weights,
-            'attention_weights': all_attention_weights
-        }
-        
-        return output, aux_outputs
+        return outputs
+    
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (
+            f"hidden_size={self.hidden_size}, "
+            f"num_heads={self.num_attention_heads}, "
+            f"num_groups={self.num_attention_groups}, "
+            f"head_dim={self.head_dim}, "
+            f"rotary={self.use_rotary}"
+        )

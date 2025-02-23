@@ -1,6 +1,6 @@
 """Combined MoE-MLA transformer block implementation."""
 
-from typing import Optional, Dict, List, Tuple, Union, Any
+from typing import Optional, Dict, List, Tuple, Union, Any,Callable
 
 import torch
 import torch.nn as nn

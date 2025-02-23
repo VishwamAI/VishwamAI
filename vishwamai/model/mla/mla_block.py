@@ -1,6 +1,6 @@
 """Multi-Level Attention block implementation."""
 
-from typing import Optional, Dict, List, Tuple, Union
+from typing import Optional, Dict, List, Tuple, Union, Callable
 
 import torch
 import torch.nn as nn

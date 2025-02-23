@@ -1,108 +1,212 @@
 """GSM8K (Grade School Math 8K) dataset implementation."""
-from typing import Dict, List
-import json
+
+from typing import Dict, Any, Optional, Callable
 import torch
+from datasets import Dataset
+from transformers import PreTrainedTokenizer
+
 from ..base import BaseDataset
+from ...augmentation.text_augment import TextAugmenter
+from ....utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 class GSM8KDataset(BaseDataset):
-    def __init__(self, data_path: str, tokenizer_path: str):
+    """Dataset implementation for GSM8K math reasoning problems."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        tokenizer: PreTrainedTokenizer,
+        max_length: int = 512,
+        format_func: Optional[Callable] = None,
+        augment_data: bool = False,
+        **kwargs: Any
+    ):
         """Initialize GSM8K dataset.
+
+        Args:
+            dataset: HuggingFace dataset
+            tokenizer: Tokenizer for text processing
+            max_length: Maximum sequence length
+            format_func: Optional function to format examples
+            augment_data: Whether to use data augmentation
+            **kwargs: Additional arguments
+        """
+        super().__init__()
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.format_func = format_func or self.default_format
+        self.augment_data = augment_data
+        
+        if augment_data:
+            self.augmenter = TextAugmenter(**kwargs.get("augment_config", {}))
+            
+    @staticmethod
+    def default_format(example: Dict[str, Any]) -> Dict[str, str]:
+        """Default formatting for GSM8K examples.
         
         Args:
-            data_path: Path to GSM8K data files
-            tokenizer_path: Path to tokenizer
-        """
-        super().__init__(data_path, tokenizer_path)
-        self.samples = self._load_samples()
-        
-    def _load_samples(self) -> List[Dict]:
-        """Load GSM8K samples from data files.
-        
+            example: Dataset example
+            
         Returns:
-            List of samples with questions and answers
+            Formatted example with input and target text
         """
-        samples = []
-        with open(self.data_path, 'r') as f:
-            for line in f:
-                sample = json.loads(line)
-                samples.append({
-                    'question': sample['question'],
-                    'answer': sample['answer'],
-                    'solution': sample.get('solution', ''),
-                })
-        return samples
+        return {
+            "input_text": (
+                f"Question: {example['question']}\n"
+                "Let's solve this step by step:\n"
+            ),
+            "target_text": example["answer"]
+        }
         
-    def __len__(self) -> int:
-        """Return number of samples."""
-        return len(self.samples)
+    def _augment_example(self, example: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply text augmentation to example.
+        
+        Args:
+            example: Dataset example
+            
+        Returns:
+            Augmented example
+        """
+        if not self.augment_data:
+            return example
+            
+        # Apply number and text augmentation
+        augmented = self.augmenter.augment_math_problem(
+            question=example["question"],
+            answer=example["answer"]
+        )
+        return {
+            "question": augmented["question"],
+            "answer": augmented["answer"]
+        }
+        
+    def _process_example(self, example: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Process a single example.
+        
+        Args:
+            example: Raw dataset example
+            
+        Returns:
+            Processed example with tensors
+        """
+        # Apply augmentation
+        example = self._augment_example(example)
+        
+        # Format example
+        formatted = self.format_func(example)
+        input_text = formatted["input_text"]
+        target_text = formatted["target_text"]
+        
+        # Tokenize input
+        model_inputs = self.tokenizer(
+            input_text,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # Tokenize target
+        with self.tokenizer.as_target_tokenizer():
+            labels = self.tokenizer(
+                target_text,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )["input_ids"]
+            
+        # Remove batch dimension
+        model_inputs = {k: v.squeeze(0) for k, v in model_inputs.items()}
+        model_inputs["labels"] = labels.squeeze(0)
+        
+        return model_inputs
         
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get GSM8K sample by index.
+        """Get processed example by index.
         
         Args:
-            idx: Sample index
+            idx: Example index
             
         Returns:
-            Dict with processed inputs and labels
+            Processed example
         """
-        sample = self.samples[idx]
-        return self.prepare_sample(
-            question=sample['question'],
-            answer=sample['answer'],
-            solution=sample['solution']
-        )
+        example = self.dataset[idx]
+        return self._process_example(example)
         
-    def prepare_sample(self, question: str, answer: str,
-                      solution: str = '') -> Dict[str, torch.Tensor]:
-        """Process GSM8K sample into model inputs.
+    def __len__(self) -> int:
+        """Get dataset length."""
+        return len(self.dataset)
+        
+    def verify_example(self, idx: int) -> bool:
+        """Verify that example is properly formatted.
         
         Args:
-            question: Question text
-            answer: Answer text (typically numerical)
-            solution: Optional step-by-step solution
+            idx: Example index
             
         Returns:
-            Dict with tokenized inputs and label
+            Whether example is valid
         """
-        # Format input text
-        if solution:
-            text = f"Question: {question}\nSolution: {solution}\nAnswer: {answer}"
-        else:
-            text = f"Question: {question}\nAnswer: {answer}"
+        try:
+            example = self[idx]
+            required_keys = {"input_ids", "attention_mask", "labels"}
+            has_required = all(k in example for k in required_keys)
             
-        # Tokenize input
-        inputs = self.tokenizer(
-            text,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
+            # Check shapes
+            correct_shape = all(
+                len(example[k].shape) == 1 and
+                example[k].shape[0] <= self.max_length
+                for k in required_keys
+            )
+            
+            return has_required and correct_shape
+            
+        except Exception as e:
+            logger.warning(f"Example {idx} verification failed: {str(e)}")
+            return False
+            
+    def get_vocab_size(self) -> int:
+        """Get vocabulary size from tokenizer."""
+        return len(self.tokenizer)
         
-        # For training, we use the answer text as the target
-        answer_tokens = self.tokenizer(
-            str(answer),  # Ensure answer is string
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
+    def decode_example(self, example: Dict[str, torch.Tensor]) -> Dict[str, str]:
+        """Decode tokenized example back to text.
         
+        Args:
+            example: Processed example with tensors
+            
+        Returns:
+            Dictionary with decoded input and target text
+        """
+        input_text = self.tokenizer.decode(
+            example["input_ids"],
+            skip_special_tokens=True
+        )
+        target_text = self.tokenizer.decode(
+            example["labels"],
+            skip_special_tokens=True
+        )
         return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'labels': answer_tokens['input_ids'].squeeze()
+            "input_text": input_text,
+            "target_text": target_text
         }
         
-    def collate_fn(self, samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """Collate GSM8K samples into batch.
+    def collate_fn(self, examples: list) -> Dict[str, torch.Tensor]:
+        """Collate examples into batches.
         
         Args:
-            samples: List of processed samples
+            examples: List of processed examples
             
         Returns:
-            Dict with batched tensors
+            Batched examples
         """
-        return {
-            'input_ids': torch.stack([s['input_ids'] for s in samples]),
-            'attention_mask': torch.stack([s['attention_mask'] for s in samples]),
-            'labels': torch.stack([s['labels'] for s in samples])
+        # Stack all tensors
+        batch = {
+            key: torch.stack([ex[key] for ex in examples])
+            for key in examples[0].keys()
         }
+        
+        return batch

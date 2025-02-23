@@ -1,229 +1,249 @@
-"""Text augmentation strategies for data augmentation."""
-from typing import List, Optional
+"""Text augmentation utilities for math problems."""
+
+import re
 import random
-import nltk
-from nltk.corpus import wordnet
-import torch
-from transformers import MarianMTModel, MarianTokenizer
+from typing import Dict, Any, List, Tuple, Optional
+import numpy as np
+
+from ...utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 class TextAugmenter:
-    """Base class for text augmentation strategies."""
-    def __init__(self, p: float = 0.1):
+    """Text augmentation for math problems."""
+    
+    def __init__(
+        self,
+        number_change_prob: float = 0.3,
+        name_change_prob: float = 0.2,
+        variable_change_prob: float = 0.2,
+        context_change_prob: float = 0.1,
+        seed: Optional[int] = None,
+        **kwargs: Any
+    ):
         """Initialize augmenter.
         
         Args:
-            p: Probability of applying augmentation
+            number_change_prob: Probability of changing numbers
+            name_change_prob: Probability of changing names
+            variable_change_prob: Probability of changing variables
+            context_change_prob: Probability of changing context
+            seed: Random seed
+            **kwargs: Additional arguments
         """
-        self.p = p
+        self.number_change_prob = number_change_prob
+        self.name_change_prob = name_change_prob
+        self.variable_change_prob = variable_change_prob
+        self.context_change_prob = context_change_prob
         
-    def augment(self, text: str) -> str:
-        """Apply augmentation to text.
-        
-        Args:
-            text: Input text to augment
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
             
-        Returns:
-            Augmented text
-        """
-        raise NotImplementedError
-
-class BackTranslation(TextAugmenter):
-    """Back translation augmentation using MarianMT models."""
-    def __init__(self, p: float = 0.1, target_lang: str = 'fr'):
-        """Initialize back translation.
+        # Load substitution dictionaries
+        self.names = self._load_names()
+        self.variables = self._load_variables()
+        self.contexts = self._load_contexts()
         
-        Args:
-            p: Probability of applying augmentation
-            target_lang: Target language code for intermediate translation
-        """
-        super().__init__(p)
-        self.target_lang = target_lang
+    def _load_names(self) -> List[str]:
+        """Load list of names for substitution."""
+        return [
+            "John", "Mary", "James", "Sarah", "Michael", "Emma", "David", "Lisa",
+            "Robert", "Emily", "William", "Sophia", "Joseph", "Olivia", "Thomas",
+            "Isabella", "Charles", "Mia", "Daniel", "Charlotte"
+        ]
         
-        # Load translation models
-        self.en_to_tgt = MarianMTModel.from_pretrained(f'Helsinki-NLP/opus-mt-en-{target_lang}')
-        self.tgt_to_en = MarianMTModel.from_pretrained(f'Helsinki-NLP/opus-mt-{target_lang}-en')
-        self.tokenizer = MarianTokenizer.from_pretrained(f'Helsinki-NLP/opus-mt-en-{target_lang}')
+    def _load_variables(self) -> List[str]:
+        """Load list of variable names."""
+        return [
+            "apples", "oranges", "books", "pencils", "cookies", "candies",
+            "dollars", "coins", "marbles", "cards", "toys", "balls", "stickers",
+            "stamps", "tickets", "bananas", "chocolates", "pens", "erasers"
+        ]
         
-    def augment(self, text: str) -> str:
-        """Perform back translation augmentation.
+    def _load_contexts(self) -> List[Dict[str, str]]:
+        """Load context substitution pairs."""
+        return [
+            {
+                "pattern": r"(has|have|own|owns)",
+                "replacements": ["possesses", "holds", "carries", "keeps", "maintains"]
+            },
+            {
+                "pattern": r"(gives|give|gave)",
+                "replacements": ["transfers", "hands", "passes", "delivers", "shares"]
+            },
+            {
+                "pattern": r"(buys|buy|bought)",
+                "replacements": ["purchases", "acquires", "obtains", "gets", "procures"]
+            }
+        ]
+        
+    def _extract_numbers(self, text: str) -> List[Tuple[str, float]]:
+        """Extract numbers from text.
         
         Args:
             text: Input text
             
         Returns:
-            Augmented text via back translation
+            List of (number_str, value) pairs
         """
-        if random.random() > self.p:
-            return text
+        # Match integers, decimals, and fractions
+        number_pattern = r'(\d+(?:\.\d+)?)|(\d+/\d+)'
+        matches = re.finditer(number_pattern, text)
+        
+        numbers = []
+        for match in matches:
+            num_str = match.group(0)
+            if '/' in num_str:
+                num, denom = map(float, num_str.split('/'))
+                value = num / denom
+            else:
+                value = float(num_str)
+            numbers.append((num_str, value))
             
-        # Translate to target language
-        inputs = self.tokenizer(text, return_tensors='pt', padding=True)
-        translated = self.en_to_tgt.generate(**inputs)
-        tgt_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
+        return numbers
         
-        # Translate back to English
-        inputs = self.tokenizer(tgt_text, return_tensors='pt', padding=True) 
-        translated = self.tgt_to_en.generate(**inputs)
-        aug_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
-        
-        return aug_text
-
-class SynonymReplacement(TextAugmenter):
-    """Replace words with synonyms using WordNet."""
-    def __init__(self, p: float = 0.1, num_words: Optional[int] = None):
-        """Initialize synonym replacement.
+    def _modify_number(self, value: float) -> float:
+        """Modify number while preserving mathematical relationships.
         
         Args:
-            p: Probability of applying augmentation per word
-            num_words: Number of words to replace, if None use probability
-        """
-        super().__init__(p)
-        self.num_words = num_words
-        nltk.download('wordnet')
-        nltk.download('averaged_perceptron_tagger')
-        
-    def _get_synonyms(self, word: str) -> List[str]:
-        """Get list of synonyms for a word."""
-        synonyms = []
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                if lemma.name() != word:
-                    synonyms.append(lemma.name())
-        return list(set(synonyms))
-        
-    def augment(self, text: str) -> str:
-        """Replace words with synonyms.
-        
-        Args:
-            text: Input text
+            value: Original number
             
         Returns:
-            Text with words replaced by synonyms
+            Modified number
         """
-        words = text.split()
-        num_words = len(words)
+        # Small random perturbation
+        factor = np.random.uniform(0.8, 1.2)
+        new_value = value * factor
         
-        # Determine words to replace
-        if self.num_words is not None:
-            n_replace = min(self.num_words, num_words)
-            replace_idx = random.sample(range(num_words), n_replace)
+        # Round to reasonable precision
+        if new_value.is_integer():
+            return round(new_value)
         else:
-            replace_idx = [i for i in range(num_words) if random.random() < self.p]
+            return round(new_value, 2)
             
-        for i in replace_idx:
-            synonyms = self._get_synonyms(words[i])
-            if synonyms:
-                words[i] = random.choice(synonyms)
-                
-        return ' '.join(words)
-
-class RandomInsertion(TextAugmenter):
-    """Randomly insert synonyms of words in the text."""
-    def __init__(self, p: float = 0.1, num_words: Optional[int] = None):
-        """Initialize random insertion.
+    def augment_math_problem(
+        self,
+        question: str,
+        answer: str
+    ) -> Dict[str, str]:
+        """Augment math problem with number and text changes.
         
         Args:
-            p: Probability of inserting after each word
-            num_words: Number of words to insert, if None use probability
-        """
-        super().__init__(p)
-        self.num_words = num_words
-        self.synonym_replacer = SynonymReplacement(p=1.0)
-        
-    def augment(self, text: str) -> str:
-        """Insert random synonyms into text.
-        
-        Args:
-            text: Input text
+            question: Original question
+            answer: Original answer
             
         Returns:
-            Text with inserted words
+            Dictionary with augmented question and answer
         """
-        words = text.split()
-        num_words = len(words)
+        # Extract numbers and their relationships
+        numbers = self._extract_numbers(question)
+        answer_numbers = self._extract_numbers(answer)
         
-        # Determine number of insertions
-        if self.num_words is not None:
-            n_insert = min(self.num_words, num_words)
-        else:
-            n_insert = sum(1 for _ in range(num_words) if random.random() < self.p)
-            
-        for _ in range(n_insert):
-            insert_word = self.synonym_replacer._get_synonyms(random.choice(words))
-            if insert_word:
-                insert_idx = random.randint(0, len(words))
-                words.insert(insert_idx, random.choice(insert_word))
+        # Build number mapping
+        number_map = {}
+        for num_str, value in numbers:
+            if random.random() < self.number_change_prob:
+                new_value = self._modify_number(value)
+                number_map[num_str] = str(new_value)
                 
-        return ' '.join(words)
-
-class RandomSwap(TextAugmenter):
-    """Randomly swap words in the text."""
-    def __init__(self, p: float = 0.1, num_swaps: Optional[int] = None):
-        """Initialize random swapping.
+        # Replace numbers
+        aug_question = question
+        aug_answer = answer
+        for old_num, new_num in number_map.items():
+            aug_question = aug_question.replace(old_num, new_num)
+            # Update answer accordingly
+            if old_num in answer:
+                aug_answer = aug_answer.replace(old_num, new_num)
+                
+        # Replace names
+        if random.random() < self.name_change_prob:
+            for name in self.names:
+                if name in aug_question:
+                    new_name = random.choice([n for n in self.names if n != name])
+                    aug_question = aug_question.replace(name, new_name)
+                    aug_answer = aug_answer.replace(name, new_name)
+                    
+        # Replace variables
+        if random.random() < self.variable_change_prob:
+            for var in self.variables:
+                if var in aug_question:
+                    new_var = random.choice([v for v in self.variables if v != var])
+                    aug_question = aug_question.replace(var, new_var)
+                    aug_answer = aug_answer.replace(var, new_var)
+                    
+        # Replace context words
+        if random.random() < self.context_change_prob:
+            for context in self.contexts:
+                pattern = context["pattern"]
+                if re.search(pattern, aug_question):
+                    replacement = random.choice(context["replacements"])
+                    aug_question = re.sub(pattern, replacement, aug_question)
+                    
+        return {
+            "question": aug_question,
+            "answer": aug_answer
+        }
+        
+    def batch_augment(
+        self,
+        questions: List[str],
+        answers: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Augment a batch of math problems.
         
         Args:
-            p: Probability of swapping each word
-            num_swaps: Number of swaps to make, if None use probability
-        """
-        super().__init__(p)
-        self.num_swaps = num_swaps
-        
-    def augment(self, text: str) -> str:
-        """Swap random words in the text.
-        
-        Args:
-            text: Input text
+            questions: List of questions
+            answers: List of answers
             
         Returns:
-            Text with swapped words
+            Tuple of augmented questions and answers
         """
-        words = text.split()
-        num_words = len(words)
+        aug_questions = []
+        aug_answers = []
         
-        if num_words < 2:
-            return text
+        for q, a in zip(questions, answers):
+            augmented = self.augment_math_problem(q, a)
+            aug_questions.append(augmented["question"])
+            aug_answers.append(augmented["answer"])
             
-        # Determine number of swaps
-        if self.num_swaps is not None:
-            n_swaps = min(self.num_swaps, num_words // 2)
-        else:
-            n_swaps = sum(1 for _ in range(num_words) if random.random() < self.p)
-            
-        for _ in range(n_swaps):
-            idx1, idx2 = random.sample(range(num_words), 2)
-            words[idx1], words[idx2] = words[idx2], words[idx1]
-            
-        return ' '.join(words)
-
-class RandomDeletion(TextAugmenter):
-    """Randomly delete words from the text."""
-    def __init__(self, p: float = 0.1):
-        """Initialize random deletion.
+        return aug_questions, aug_answers
+        
+    def verify_augmentation(
+        self,
+        original_question: str,
+        original_answer: str,
+        augmented_question: str,
+        augmented_answer: str
+    ) -> bool:
+        """Verify that augmentation preserves mathematical relationships.
         
         Args:
-            p: Probability of deleting each word
-        """
-        super().__init__(p)
-        
-    def augment(self, text: str) -> str:
-        """Delete random words from text.
-        
-        Args:
-            text: Input text
+            original_question: Original question
+            original_answer: Original answer
+            augmented_question: Augmented question
+            augmented_answer: Augmented answer
             
         Returns:
-            Text with words deleted
+            Whether augmentation is valid
         """
-        words = text.split()
-        if len(words) == 1:
-            return text
+        try:
+            # Extract and compare number relationships
+            orig_numbers = self._extract_numbers(original_question)
+            aug_numbers = self._extract_numbers(augmented_question)
             
-        new_words = []
-        for word in words:
-            if random.random() >= self.p:
-                new_words.append(word)
+            if len(orig_numbers) != len(aug_numbers):
+                return False
                 
-        if not new_words:  # Ensure at least one word remains
-            new_words = [random.choice(words)]
+            # Check answer format consistency
+            orig_steps = original_answer.count('\n')
+            aug_steps = augmented_answer.count('\n')
             
-        return ' '.join(new_words)
+            if orig_steps != aug_steps:
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Augmentation verification failed: {str(e)}")
+            return False

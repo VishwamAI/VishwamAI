@@ -11,7 +11,7 @@ from ..initialization import (
     initialize_expert_biases,
     initialize_expert_layer_norm
 )
-
+import math
 class ExpertNetwork(nn.Module):
     """Expert network for MoE layer."""
     

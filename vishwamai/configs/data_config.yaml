@@ -1,0 +1,99 @@
+# Data Configuration for VishwamAI
+
+# Dataset Configuration
+datasets:
+  mmlu:
+    enabled: true
+    path: "data/datasets/mmlu"
+    train_split: 0.8
+    val_split: 0.1
+    test_split: 0.1
+    subjects: "all"  # or list specific subjects
+    include_explanations: true
+    max_samples_per_subject: null  # null for all samples
+    
+  mmmu:
+    enabled: true
+    path: "data/datasets/mmmu"
+    train_split: 0.8
+    val_split: 0.1
+    test_split: 0.1
+    categories: "all"
+    difficulty_levels: ["easy", "medium", "hard"]
+    include_solutions: true
+    
+  gsm8k:
+    enabled: true
+    path: "data/datasets/gsm8k"
+    train_split: 0.9
+    val_split: 0.05
+    test_split: 0.05
+    include_chain_of_thought: true
+    max_sequence_length: 512
+    
+# Tokenization
+tokenizer:
+  type: "sentencepiece"
+  vocab_size: 32000
+  model_type: "bpe"
+  character_coverage: 0.9995
+  padding_side: "right"
+  truncation_side: "right"
+  add_bos_token: true
+  add_eos_token: true
+  special_tokens:
+    pad_token: "[PAD]"
+    unk_token: "[UNK]"
+    bos_token: "[BOS]"
+    eos_token: "[EOS]"
+    mask_token: "[MASK]"
+
+# Preprocessing
+preprocessing:
+  max_sequence_length: 2048
+  text_cleaning:
+    remove_html: true
+    normalize_unicode: true
+    normalize_whitespace: true
+    fix_common_typos: true
+  augmentation:
+    enabled: true
+    techniques: ["random_insertion", "random_deletion", "random_swap"]
+    probability: 0.1
+    max_augmentations_per_example: 2
+
+# Data Loading
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  shuffle_train: true
+  prefetch_factor: 2
+  persistent_workers: true
+  
+# Caching
+caching:
+  enabled: true
+  cache_dir: "data/cache"
+  max_cache_size_gb: 100
+  cache_type: "memory_mapped"  # Options: memory_mapped, disk, ram
+  preprocessing_cache: true
+  tokenization_cache: true
+
+# Chain-of-Thought
+chain_of_thought:
+  enabled: true
+  prompt_template: "Let's solve this step by step:\n{problem}\n\nSolution:"
+  max_steps: 8
+  include_intermediate_steps: true
+  verification_step: true
+  
+# Monitoring
+monitoring:
+  log_data_statistics: true
+  track_data_distribution: true
+  save_samples: true
+  num_samples_to_save: 100
+  validate_inputs: true
+  log_preprocessing_steps: true

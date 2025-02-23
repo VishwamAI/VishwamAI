@@ -1,0 +1,47 @@
+# Base Model Configuration for VishwamAI
+
+model:
+  name: "vishwamai-base"
+  architecture: "transformer"
+  dtype: "bfloat16"  # TPU v5e optimized format
+
+# Architecture Parameters
+architecture:
+  hidden_size: 2048
+  num_layers: 24
+  num_attention_heads: 32
+  intermediate_size: 8192
+  max_position_embeddings: 2048
+  vocab_size: 32000  # Will be updated after tokenizer training
+  layer_norm_eps: 1e-5
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+
+# Embedding Configuration  
+embeddings:
+  token_embedding_dim: 2048
+  position_embedding_type: "learned"
+  max_position_embeddings: 2048
+  layer_norm_eps: 1e-5
+  hidden_dropout_prob: 0.1
+
+# Transformer Block Configuration
+transformer_block:
+  attention:
+    num_heads: 32
+    head_dim: 64
+    dropout: 0.1
+    use_bias: false
+    use_flash_attention: true
+  
+  feed_forward:
+    expansion_factor: 4
+    activation: "swiglu"
+    dropout: 0.1
+
+# Initialization
+initialization:
+  embedding_init: "normal"
+  embedding_std: 0.02
+  layer_init: "xavier_uniform"
+  layer_scale: 1.0

@@ -1,0 +1,88 @@
+# Training Configuration for VishwamAI
+
+# Training Infrastructure
+infrastructure:
+  accelerator: "tpu_v5e"
+  precision: "bfloat16"
+  num_tpu_cores: 8
+  device: "tpu"
+  strategy: "data_parallel"
+  compile_model: true
+  xla_optimization: true
+
+# Training Parameters
+training:
+  batch_size:
+    per_device: 32
+    gradient_accumulation_steps: 4
+    effective_batch_size: 1024  # per_device * num_devices * gradient_accumulation
+  
+  epochs: 3
+  max_steps: 100000
+  eval_steps: 500
+  save_steps: 1000
+  logging_steps: 100
+  warmup_steps: 2000
+
+# Optimization
+optimizer:
+  name: "adamw"
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1.0e-8
+  clip_grad_norm: 1.0
+  scale_parameter: true
+  relative_step: false
+
+# Learning Rate Schedule
+lr_scheduler:
+  name: "cosine_with_warmup"
+  warmup_ratio: 0.01
+  min_lr_ratio: 0.1
+  num_cycles: 1
+
+# Mixed Precision Training
+mixed_precision:
+  enabled: true
+  dtype: "bfloat16"
+  dynamic_scale: true
+  initial_scale: 2**15
+  
+# Memory Management
+memory:
+  gradient_checkpointing: true
+  selective_checkpoint_ratio: 0.5
+  optimizer_state_sharding: true
+  activation_recomputation: true
+  peak_memory_monitor: true
+
+# Distributed Training
+distributed:
+  world_size: 8
+  backend: "xla"
+  find_unused_parameters: false
+  broadcast_buffers: false
+  bucket_cap_mb: 25
+  gradient_as_bucket_view: true
+
+# Logging and Monitoring
+logging:
+  log_level: "INFO"
+  log_stats_interval: 100
+  profile_steps: [100, 200]
+  tensorboard: true
+  wandb:
+    enabled: true
+    project: "vishwamai"
+    name: "pretrain-run"
+    
+# Checkpointing
+checkpointing:
+  save_strategy: "steps"
+  save_steps: 1000
+  save_total_limit: 5
+  save_safetensors: true
+  save_optimizer: true
+  resume_from_checkpoint: "latest"

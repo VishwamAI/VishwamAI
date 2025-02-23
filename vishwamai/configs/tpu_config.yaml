@@ -1,0 +1,98 @@
+# TPU configuration
+
+# Hardware configuration
+device_type: "tpu"
+num_devices: 8  # Number of TPU cores
+mesh_shape: [2, 4]  # Device mesh arrangement
+mesh_axes: ["data", "model"]  # Mesh axis names
+use_bf16: true  # Use bfloat16 precision
+tpu_version: "v4"  # TPU hardware version
+
+# Sharding configuration
+sharding_strategy:
+  embedding_sharding: ["model", "data"]  # How to shard embeddings
+  attention_sharding:  # How to shard attention components
+    query: ["model", "data"]
+    key: ["model", "data"] 
+    value: ["model", "data"]
+    output: ["data", "model"]
+  mlp_sharding:  # How to shard MLP layers
+    wi: ["model", "data"]
+    wo: ["data", "model"]
+  head_sharding: ["model", "data"]  # How to shard output head
+
+# Model parallelism
+model_parallel_size: 4  # Number of devices for model parallelism
+pipeline_parallel_size: 1  # Number of pipeline stages
+remat: true  # Use gradient checkpointing
+
+# Memory optimization
+memory_optimize:
+  layer_recompute: true  # Recompute activations in backward pass
+  attention_recompute: true  # Recompute attention in backward pass
+  gradient_accumulation: 8  # Number of gradient accumulation steps
+  max_live_activations: 4  # Maximum live activations
+  rematerialization_granularity: "full"  # Rematerialization granularity
+
+# Compilation options
+jit_options:
+  jit_device_inputs: true
+  xla_cpu_fast_math_honor_infs: true
+  xla_cpu_fast_math_honor_nans: true
+  enable_double_vectorization: true
+  enable_float_vectorization: true
+  
+# Profiling and debugging
+profiling:
+  enabled: true
+  trace_level: 2
+  log_compiles: true
+  device_memory_profile: true
+  host_memory_profile: true
+
+# Distributed training
+distributed:
+  cross_replica_sync: true
+  all_reduce_opt: "NCCL"
+  collective_backend: "XLA"
+  replicated_first_dimension: true
+
+# Expert parallelism (for MoE)
+expert_parallel:
+  enabled: true
+  num_experts: 32
+  capacity_factor: 1.5
+  expert_routing: "balanced"
+  load_balancing: true
+  expert_sharding: ["data", "model"]
+  
+# Mixed precision
+mixed_precision:
+  enabled: true
+  dtype: "bfloat16"
+  loss_scaling: "dynamic"
+  min_scale: 1.0
+  max_scale: 32768.0
+  scale_growth_interval: 2000
+
+# Compilation optimization
+compilation:
+  auto_split: true
+  persistent_compilation_cache: true
+  xla_compilation_profile: true
+  debug_options:
+    xla_dump_ir: false
+    xla_dump_hlo: false
+    xla_gpu_crash_on_verification_failures: true
+    xla_dump_device_memory_usage: true
+    
+# TPU-specific optimizations
+tpu_optimizations:
+  brain_floating_point: true
+  conv_precision: "high"
+  layout_mode: "auto"
+  spmd_xla_partitioning: true
+  force_data_parallel: false
+  replicate_on_split: true
+  allow_tf32: true
+  deterministic_algorithms: true

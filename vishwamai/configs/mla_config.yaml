@@ -1,0 +1,69 @@
+# Multi-Layer Attention (MLA) Configuration for VishwamAI
+
+mla:
+  enabled: true
+  num_layers: 24  # Should match model's num_layers
+  attention_window: 4  # Number of previous layers to attend to
+
+# Attention Configuration
+attention:
+  num_heads: 32
+  head_dim: 64
+  dropout: 0.1
+  attention_type: "multi_query"  # Options: multi_query, multi_head
+  use_flash_attention: true
+  causal: true
+  layer_selection:
+    type: "learned"  # Options: learned, fixed, adaptive
+    num_prev_layers: 4
+    
+# Cross-Layer Attention
+cross_layer:
+  enabled: true
+  attention_type: "cross_layer_dot_product"
+  combination_type: "gated"  # Options: gated, additive, concatenative
+  layer_weights: "learned"  # Options: learned, fixed, adaptive
+  gate_temperature: 0.1
+  dropout: 0.1
+
+# Layer Integration
+layer_integration:
+  connection_type: "residual"  # Options: residual, highway, gated
+  layer_norm: true
+  layer_norm_eps: 1e-5
+  pre_norm: true
+  initialization:
+    weight_init: "xavier_uniform"
+    bias_init: "zeros"
+    gate_init: "ones"
+
+# Sparse Attention
+sparse_attention:
+  enabled: true
+  pattern: "strided"  # Options: strided, fixed, learnable
+  sparsity_factor: 0.8
+  block_size: 64
+  num_random_blocks: 3
+
+# Memory Management
+memory:
+  cache_previous_layer_outputs: true
+  max_cache_size: 1024
+  eviction_policy: "lru"  # Options: lru, fifo
+  gradient_checkpointing: true
+
+# Performance Optimization
+optimization:
+  recompute_threshold: 0.5  # Threshold for activation recomputation
+  fuse_attention_ops: true
+  optimize_communication: true
+  use_kernel_fusion: true
+  precision: "bfloat16"
+
+# Monitoring
+monitoring:
+  track_attention_weights: true
+  track_layer_connectivity: true
+  log_cross_layer_patterns: true
+  profile_memory_usage: true
+  attention_visualization: true

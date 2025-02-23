@@ -1,88 +1,130 @@
-# Training Configuration for VishwamAI
+# Training Configuration
 
-# Training Infrastructure
-infrastructure:
-  accelerator: "tpu_v5e"
-  precision: "bfloat16"
-  num_tpu_cores: 8
-  device: "tpu"
-  strategy: "data_parallel"
-  compile_model: true
-  xla_optimization: true
-
-# Training Parameters
-training:
-  batch_size:
-    per_device: 32
-    gradient_accumulation_steps: 4
-    effective_batch_size: 1024  # per_device * num_devices * gradient_accumulation
-  
-  epochs: 3
-  max_steps: 100000
-  eval_steps: 500
-  save_steps: 1000
-  logging_steps: 100
-  warmup_steps: 2000
+# Basic Training Parameters
+max_steps: 1000000
+warmup_steps: 2000
+max_epochs: null  # If null, use max_steps
+eval_steps: 100
+save_steps: 1000
+logging_steps: 10
+gradient_accumulation_steps: 16
 
 # Optimization
-optimizer:
-  name: "adamw"
-  learning_rate: 1.0e-3
-  weight_decay: 0.01
-  beta1: 0.9
-  beta2: 0.999
-  epsilon: 1.0e-8
-  clip_grad_norm: 1.0
-  scale_parameter: true
-  relative_step: false
+optimizer: "adamw"  # Options: adamw, adafactor, lion
+learning_rate: 1.0e-4
+weight_decay: 0.01
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+use_fused_adam: true
 
 # Learning Rate Schedule
-lr_scheduler:
-  name: "cosine_with_warmup"
-  warmup_ratio: 0.01
-  min_lr_ratio: 0.1
-  num_cycles: 1
+lr_scheduler: "cosine"  # Options: cosine, linear, polynomial
+lr_warmup_method: "linear"  # Options: linear, constant
+min_lr_ratio: 0.1
+warmup_ratio: 0.01
+plateau_patience: 3
+plateau_factor: 0.5
+polynomial_power: 1.0
+constant_schedule_after_warmup: false
 
 # Mixed Precision Training
-mixed_precision:
-  enabled: true
-  dtype: "bfloat16"
-  dynamic_scale: true
-  initial_scale: 2**15
-  
+dtype: "bfloat16"
+param_dtype: "bfloat16"
+compute_dtype: "float32"
+use_dynamic_scale: true
+initial_scale: 2**15
+scale_growth_interval: 2000
+
+# TPU Specific
+num_tpu_cores: 8
+tpu_iterations_per_loop: 100
+use_two_step_grad: true
+use_pjit: true
+batch_size_per_device: 8
+total_batch_size: 128
+shard_batch: true
+
 # Memory Management
-memory:
-  gradient_checkpointing: true
-  selective_checkpoint_ratio: 0.5
-  optimizer_state_sharding: true
-  activation_recomputation: true
-  peak_memory_monitor: true
+use_gradient_checkpointing: true
+gradient_checkpointing_ratio: 0.5
+rematerialize_threshold: 1e9
+use_remat_scan: true
+activation_partitioning_dims: 2
+param_partitioning_dims: 1
+
+# Data Loading
+dataloader_num_workers: 8
+prefetch_factor: 2
+dataloader_pin_memory: true
+max_sequence_length: 4096
+pad_to_multiple_of: 8
+use_streaming: true
+dataset_preprocessing_num_proc: 16
 
 # Distributed Training
-distributed:
-  world_size: 8
-  backend: "xla"
-  find_unused_parameters: false
-  broadcast_buffers: false
-  bucket_cap_mb: 25
-  gradient_as_bucket_view: true
+use_mesh: true
+mesh_dim_order: ["data", "model"]
+fsdp_sharding: true
+zero_stage: 3  # Options: 1, 2, 3
+minimum_layer_for_fsdp: 0
+communication_dtype: "bfloat16"
+broadcast_buffers: true
 
-# Logging and Monitoring
-logging:
-  log_level: "INFO"
-  log_stats_interval: 100
-  profile_steps: [100, 200]
-  tensorboard: true
-  wandb:
-    enabled: true
-    project: "vishwamai"
-    name: "pretrain-run"
-    
+# Loss and Metrics
+loss_type: "cross_entropy"  # Options: cross_entropy, mse
+label_smoothing: 0.1
+aux_loss_factor: 0.01
+use_bias_correction: true
+perplexity_eval_steps: 100
+compute_memory_metrics: true
+compute_efficiency_metrics: true
+
+# Training Features
+use_activation_checkpointing: true
+use_memory_efficient_attention: true
+use_flash_attention: true
+use_fused_layernorm: true
+use_fused_softmax: true
+use_kernel_injection: true
+
+# Regularization
+dropout_rate: 0.1
+attention_dropout: 0.1
+activation_dropout: 0.0
+layer_drop_rate: 0.0
+weight_decay_exemptions: ["bias", "LayerNorm"]
+clip_grad_value: null
+stochastic_depth_rate: 0.0
+
 # Checkpointing
-checkpointing:
-  save_strategy: "steps"
-  save_steps: 1000
-  save_total_limit: 5
-  save_safetensors: true
-  save_optimizer: true
-  resume_from_checkpoint: "latest"
+save_total_limit: 5
+save_strategy: "steps"
+save_safetensors: true
+save_optimizer: true
+save_metrics: true
+checkpoint_dir: "checkpoints"
+use_safe_serialization: true
+
+# Monitoring
+wandb_project: "vishwamai"
+wandb_run_name: null
+use_tensorboard: true
+profile_steps: [100, 200, 300]
+memory_profiling: true
+throughput_profiling: true
+save_model_card: true
+
+# Early Stopping
+early_stopping_patience: 5
+early_stopping_threshold: 0.01
+min_delta: 0.001
+patience_counter: 0
+
+# Debug and Testing
+debug_mode: false
+detect_anomaly: false
+profile_memory: false
+dry_run_steps: 0
+benchmark_steps: 100

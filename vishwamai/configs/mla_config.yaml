@@ -1,69 +1,75 @@
-# Multi-Layer Attention (MLA) Configuration for VishwamAI
+# Multi-Layer Attention Configuration
 
-mla:
-  enabled: true
-  num_layers: 24  # Should match model's num_layers
-  attention_window: 4  # Number of previous layers to attend to
+# Core MLA Parameters
+use_mla: true
+num_prev_layers: 4  # Number of previous layers to attend to
+attention_window: 4  # Maximum number of layers back to look
+layer_selection_method: "dynamic"  # Options: dynamic, fixed, learned
 
 # Attention Configuration
-attention:
-  num_heads: 32
-  head_dim: 64
-  dropout: 0.1
-  attention_type: "multi_query"  # Options: multi_query, multi_head
-  use_flash_attention: true
-  causal: true
-  layer_selection:
-    type: "learned"  # Options: learned, fixed, adaptive
-    num_prev_layers: 4
-    
-# Cross-Layer Attention
-cross_layer:
-  enabled: true
-  attention_type: "cross_layer_dot_product"
-  combination_type: "gated"  # Options: gated, additive, concatenative
-  layer_weights: "learned"  # Options: learned, fixed, adaptive
-  gate_temperature: 0.1
-  dropout: 0.1
+num_mla_heads: 32  # Number of attention heads for MLA
+head_dim: 64  # Dimension per attention head
+use_rope: true  # Whether to use rotary embeddings
+max_sequence_length: 4096
+attention_dropout: 0.1
+hidden_dropout: 0.1
+use_flash_attention: true
 
-# Layer Integration
-layer_integration:
-  connection_type: "residual"  # Options: residual, highway, gated
-  layer_norm: true
-  layer_norm_eps: 1e-5
-  pre_norm: true
-  initialization:
-    weight_init: "xavier_uniform"
-    bias_init: "zeros"
-    gate_init: "ones"
+# Layer State Management
+normalize_cached: true  # Whether to normalize cached states
+use_compressed_cache: false  # Whether to use compressed caching
+compression_dim: null  # Dimension for compressed states
+compression_method: "linear"  # Options: linear, svd, random_projection
+eviction_policy: "lru"  # Options: lru, fifo, importance
+max_cache_size: 8  # Maximum number of cached layer states
 
-# Sparse Attention
-sparse_attention:
-  enabled: true
-  pattern: "strided"  # Options: strided, fixed, learnable
-  sparsity_factor: 0.8
-  block_size: 64
-  num_random_blocks: 3
+# Cross-Layer Gating
+use_gate: true  # Whether to use gating mechanism
+gate_type: "learnable"  # Options: learnable, fixed, adaptive
+gate_temperature: 0.1  # Temperature for gate softmax
+gate_init_eps: 0.1  # Initialization epsilon for gates
+min_gate_value: 0.0  # Minimum gate value
+max_gate_value: 1.0  # Maximum gate value
+
+# Layer-wise Processing
+layer_norm_eps: 1.0e-5
+use_adaptive_layer_norm: false  # Whether to use adaptive layer norm
+use_parallel_attention: true  # Whether to process layers in parallel
+use_residual_connection: true  # Whether to use residual connections
+use_pre_layer_norm: true  # Whether to use pre-layer normalization
 
 # Memory Management
-memory:
-  cache_previous_layer_outputs: true
-  max_cache_size: 1024
-  eviction_policy: "lru"  # Options: lru, fifo
-  gradient_checkpointing: true
+memory_efficient_attention: true  # Whether to use memory-efficient attention
+use_gradient_checkpointing: true  # Whether to use gradient checkpointing
+optimize_memory_usage: true  # Whether to optimize memory usage
+max_memory_size: null  # Maximum memory size in bytes (null = auto)
 
-# Performance Optimization
-optimization:
-  recompute_threshold: 0.5  # Threshold for activation recomputation
-  fuse_attention_ops: true
-  optimize_communication: true
-  use_kernel_fusion: true
-  precision: "bfloat16"
+# State Compression
+compression_ratio: 4  # Compression ratio for cached states
+use_quantization: false  # Whether to quantize cached states
+quantization_bits: 8  # Number of bits for quantization
+use_pruning: false  # Whether to prune cached states
+pruning_threshold: 0.01  # Threshold for pruning
+
+# Training
+mla_learning_rate: 1.0e-4  # Learning rate for MLA components
+mla_weight_decay: 0.01  # Weight decay for MLA components
+gradient_clipping: 1.0  # Gradient clipping value
+warmup_steps: 1000  # Number of warmup steps
+enable_loss_scaling: true  # Whether to use loss scaling
+loss_scale: "dynamic"  # Options: dynamic, static
+
+# Regularization
+attention_dropout_rate: 0.1  # Dropout rate for attention
+hidden_dropout_rate: 0.1  # Dropout rate for hidden states
+layer_dropout_rate: 0.0  # Dropout rate for layer selection
+use_stochastic_depth: false  # Whether to use stochastic depth
+path_dropout_rate: 0.0  # Dropout rate for residual paths
 
 # Monitoring
-monitoring:
-  track_attention_weights: true
-  track_layer_connectivity: true
-  log_cross_layer_patterns: true
-  profile_memory_usage: true
-  attention_visualization: true
+monitor_attention_patterns: true  # Whether to monitor attention patterns
+monitor_gate_values: true  # Whether to monitor gate values
+monitor_cache_usage: true  # Whether to monitor cache usage
+profiling_frequency: 100  # Steps between profiling
+save_attention_maps: false  # Whether to save attention maps
+detailed_logging: true  # Whether to enable detailed logging

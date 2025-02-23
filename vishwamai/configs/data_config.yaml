@@ -1,99 +1,133 @@
-# Data Configuration for VishwamAI
+# Data Configuration
 
-# Dataset Configuration
-datasets:
-  mmlu:
-    enabled: true
-    path: "data/datasets/mmlu"
-    train_split: 0.8
-    val_split: 0.1
-    test_split: 0.1
-    subjects: "all"  # or list specific subjects
-    include_explanations: true
-    max_samples_per_subject: null  # null for all samples
-    
-  mmmu:
-    enabled: true
-    path: "data/datasets/mmmu"
-    train_split: 0.8
-    val_split: 0.1
-    test_split: 0.1
-    categories: "all"
-    difficulty_levels: ["easy", "medium", "hard"]
-    include_solutions: true
-    
-  gsm8k:
-    enabled: true
-    path: "data/datasets/gsm8k"
-    train_split: 0.9
-    val_split: 0.05
-    test_split: 0.05
-    include_chain_of_thought: true
-    max_sequence_length: 512
-    
+# Dataset Sources
+train_datasets:
+  - name: "c4"
+    path: "allenai/c4"
+    subset: "en"
+    weight: 0.3
+  - name: "pile"
+    path: "EleutherAI/pile"
+    weight: 0.3
+  - name: "redpajama"
+    path: "togethercomputer/RedPajama-Data-1T"
+    weight: 0.2
+  - name: "starcoderdata"
+    path: "bigcode/starcoderdata"
+    weight: 0.2
+
+eval_datasets:
+  - name: "mmlu"
+    path: "cais/mmlu"
+  - name: "gsm8k"
+    path: "gsm8k"
+    subset: "main"
+  - name: "math"
+    path: "competition_math"
+  - name: "humanevalx"
+    path: "bigcode/humanevalx"
+
 # Tokenization
 tokenizer:
   type: "sentencepiece"
   vocab_size: 32000
   model_type: "bpe"
-  character_coverage: 0.9995
-  padding_side: "right"
-  truncation_side: "right"
-  add_bos_token: true
-  add_eos_token: true
-  special_tokens:
-    pad_token: "[PAD]"
-    unk_token: "[UNK]"
-    bos_token: "[BOS]"
-    eos_token: "[EOS]"
-    mask_token: "[MASK]"
+  character_coverage: 1.0
+  pad_token: "[PAD]"
+  eos_token: "</s>"
+  bos_token: "<s>"
+  unk_token: "[UNK]"
+  mask_token: "[MASK]"
+  additional_special_tokens: ["[SEP]", "[CLS]"]
+  pad_to_multiple_of: 8
 
-# Preprocessing
-preprocessing:
-  max_sequence_length: 2048
-  text_cleaning:
-    remove_html: true
-    normalize_unicode: true
-    normalize_whitespace: true
-    fix_common_typos: true
-  augmentation:
-    enabled: true
-    techniques: ["random_insertion", "random_deletion", "random_swap"]
-    probability: 0.1
-    max_augmentations_per_example: 2
+# Data Processing
+max_sequence_length: 4096
+min_sequence_length: 32
+chunk_size: 2048
+overlap: 128
+truncation_side: "right"
+padding_side: "right"
+add_special_tokens: true
+compute_loss_on_padding: false
+
+# Text Cleaning
+remove_html: true
+normalize_unicode: true
+max_line_length: 1000
+min_line_length: 10
+deduplicate_lines: true
+clean_numbers: false
+clean_whitespace: true
+clean_empty_lines: true
+
+# Data Augmentation
+use_augmentation: true
+augmentation_probability: 0.1
+augmentations:
+  - type: "random_insertion"
+    probability: 0.3
+  - type: "random_deletion"
+    probability: 0.3
+  - type: "random_swap"
+    probability: 0.2
+  - type: "back_translation"
+    probability: 0.2
+    target_langs: ["fr", "de", "es"]
+
+# Sampling and Batching
+batch_size: 128
+sampling_strategy: "weighted_random"  # Options: sequential, random, weighted_random
+sampling_temperature: 0.7
+sampling_alpha: 0.3  # For weighted sampling
+bucket_by_length: true
+length_bucket_size: 32
+shuffle_buffer_size: 10000
 
 # Data Loading
-dataloader:
-  batch_size: 32
-  num_workers: 4
-  pin_memory: true
-  drop_last: true
-  shuffle_train: true
-  prefetch_factor: 2
-  persistent_workers: true
-  
-# Caching
-caching:
-  enabled: true
-  cache_dir: "data/cache"
-  max_cache_size_gb: 100
-  cache_type: "memory_mapped"  # Options: memory_mapped, disk, ram
-  preprocessing_cache: true
-  tokenization_cache: true
+num_proc: 16
+streaming: true
+use_auth_token: false
+keep_in_memory: false
+load_from_cache_file: true
+cache_dir: "cache"
+preprocessing_num_workers: 8
+dataloader_num_workers: 8
+prefetch_factor: 2
+pin_memory: true
 
-# Chain-of-Thought
-chain_of_thought:
-  enabled: true
-  prompt_template: "Let's solve this step by step:\n{problem}\n\nSolution:"
-  max_steps: 8
-  include_intermediate_steps: true
-  verification_step: true
-  
+# Dataset Filtering
+min_words: 10
+max_words: 5000
+min_unique_words: 5
+max_unique_words: 2000
+min_chars: 50
+max_chars: 25000
+allowed_languages: ["en"]
+remove_duplicate_documents: true
+similarity_threshold: 0.9
+
+# Quality Filtering
+perplexity_threshold: 100.0
+min_alphanumeric_ratio: 0.7
+max_special_char_ratio: 0.1
+filter_profanity: true
+filter_low_quality: true
+use_custom_filters: false
+
 # Monitoring
-monitoring:
-  log_data_statistics: true
-  track_data_distribution: true
-  save_samples: true
-  num_samples_to_save: 100
-  validate_inputs: true
-  log_preprocessing_steps: true
+log_dataset_stats: true
+compute_dataset_statistics: true
+save_filtered_examples: false
+max_filtered_examples: 1000
+monitor_data_pipeline: true
+profile_data_loading: true
+
+# Evaluation
+eval_batch_size: 32
+max_eval_samples: null
+eval_sampling_rate: 1.0
+compute_metrics: true
+metric_for_best_model: "accuracy"
+save_predictions: true
+prediction_column_name: "prediction"

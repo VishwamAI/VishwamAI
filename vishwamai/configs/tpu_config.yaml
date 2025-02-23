@@ -1,98 +1,115 @@
-# TPU configuration
+# TPU Configuration
 
-# Hardware configuration
-device_type: "tpu"
-num_devices: 8  # Number of TPU cores
-mesh_shape: [2, 4]  # Device mesh arrangement
-mesh_axes: ["data", "model"]  # Mesh axis names
-use_bf16: true  # Use bfloat16 precision
-tpu_version: "v4"  # TPU hardware version
+# Hardware Configuration
+tpu_type: "v4-8"  # Options: v2-8, v3-8, v4-8
+num_tpu_cores: 8
+num_tpu_chips: 4
+device_type: "tpu"  # Options: tpu, gpu, cpu
+num_hosts: 1
+num_devices_per_host: 8
+topology: "2x2x2"
 
-# Sharding configuration
-sharding_strategy:
-  embedding_sharding: ["model", "data"]  # How to shard embeddings
-  attention_sharding:  # How to shard attention components
-    query: ["model", "data"]
-    key: ["model", "data"] 
-    value: ["model", "data"]
-    output: ["data", "model"]
-  mlp_sharding:  # How to shard MLP layers
-    wi: ["model", "data"]
-    wo: ["data", "model"]
-  head_sharding: ["model", "data"]  # How to shard output head
+# Memory Configuration
+memory_per_core: "32GiB"
+high_bandwidth_memory: true
+dynamic_memory_allocation: true
+memory_growth: false
+optimize_memory_use: true
+max_device_memory: null  # null = use all available memory
 
-# Model parallelism
-model_parallel_size: 4  # Number of devices for model parallelism
-pipeline_parallel_size: 1  # Number of pipeline stages
-remat: true  # Use gradient checkpointing
+# Performance Optimization
+use_bfloat16: true
+use_dynamic_padding: true
+use_auto_sharding: true
+use_rematerialization: true
+use_model_parallelism: true
+use_pipeline_parallelism: false
+use_spatial_partitioning: true
+use_replicated_parameters: false
 
-# Memory optimization
-memory_optimize:
-  layer_recompute: true  # Recompute activations in backward pass
-  attention_recompute: true  # Recompute attention in backward pass
-  gradient_accumulation: 8  # Number of gradient accumulation steps
-  max_live_activations: 4  # Maximum live activations
-  rematerialization_granularity: "full"  # Rematerialization granularity
+# XLA Configuration
+enable_xla: true
+xla_auto_jit: true
+xla_fusion: true
+xla_cpu_fast_math: true
+xla_gpu_cuda_data_dir: null
+xla_gpu_strict_conv_algorithm_picker: true
 
-# Compilation options
-jit_options:
-  jit_device_inputs: true
-  xla_cpu_fast_math_honor_infs: true
-  xla_cpu_fast_math_honor_nans: true
-  enable_double_vectorization: true
-  enable_float_vectorization: true
-  
-# Profiling and debugging
-profiling:
-  enabled: true
-  trace_level: 2
-  log_compiles: true
-  device_memory_profile: true
-  host_memory_profile: true
+# Computation Layout
+computation_shape: [2, 2, 2]
+device_assignment_mode: "linear"  # Options: linear, mesh
+mesh_shape: ["data", "model"]
+layout_rules: ["batch", "vocab"]
+auto_layout: true
 
-# Distributed training
-distributed:
-  cross_replica_sync: true
-  all_reduce_opt: "NCCL"
-  collective_backend: "XLA"
-  replicated_first_dimension: true
+# Data Pipeline
+num_input_pipelines: 8
+prefetch_size: 2
+tpu_input_queue_length: 8
+max_buffer_size: "8GiB"
+enable_async_prefetch: true
+use_parallel_reads: true
 
-# Expert parallelism (for MoE)
-expert_parallel:
-  enabled: true
-  num_experts: 32
-  capacity_factor: 1.5
-  expert_routing: "balanced"
-  load_balancing: true
-  expert_sharding: ["data", "model"]
-  
-# Mixed precision
-mixed_precision:
-  enabled: true
-  dtype: "bfloat16"
-  loss_scaling: "dynamic"
-  min_scale: 1.0
-  max_scale: 32768.0
-  scale_growth_interval: 2000
+# Communication
+all_reduce_algorithm: "ring"  # Options: ring, recursive, binary_tree
+cross_replica_sync: true
+deterministic_ops: false
+collective_backend: "xla"
+replica_group_size: 8
 
-# Compilation optimization
-compilation:
-  auto_split: true
-  persistent_compilation_cache: true
-  xla_compilation_profile: true
-  debug_options:
-    xla_dump_ir: false
-    xla_dump_hlo: false
-    xla_gpu_crash_on_verification_failures: true
-    xla_dump_device_memory_usage: true
-    
-# TPU-specific optimizations
-tpu_optimizations:
-  brain_floating_point: true
-  conv_precision: "high"
-  layout_mode: "auto"
-  spmd_xla_partitioning: true
-  force_data_parallel: false
-  replicate_on_split: true
-  allow_tf32: true
-  deterministic_algorithms: true
+# Optimization
+use_tpu_embeddings: true
+tpu_embedding_mode: "training"  # Options: training, inference
+use_dynamic_batch_size: true
+batch_size_per_core: 8
+steps_per_execution: 50
+pjit_barrier_on_output: true
+
+# Model Sharding
+parameter_sharding:
+  - rule: "model_axis_0"
+    tensor_split_dims: [0]
+  - rule: "data_parallel"
+    tensor_split_dims: [0]
+  - rule: "fully_sharded"
+    tensor_split_dims: [0, 1]
+
+# Training Features
+use_tpu_graphs: true
+compile_ahead_of_time: true
+preserve_spmd_sharding: true
+allow_soft_placement: true
+rewrite_options:
+  layout_optimizer: true
+  constant_folding: true
+  arithmetic_optimization: true
+  dependency_optimization: true
+
+# Profiling and Debugging
+enable_tpu_profiling: true
+profile_execution: true
+tpu_profiler_port: 8466
+enable_tensor_tracer: false
+tensor_tracer_flags: null
+dump_graphs: false
+dump_debug_info: false
+
+# Error Handling
+num_retries: 3
+retry_on_oom: true
+ignore_tpu_health_check: false
+fail_on_tpu_health_check: false
+report_tensor_allocations_upon_oom: true
+
+# Monitoring
+monitor_tpu_status: true
+monitor_memory_usage: true
+monitor_execution_time: true
+log_device_placement: false
+collect_performance_stats: true
+
+# Experimental Features
+use_spmd_partitioning: true
+experimental_external_spmd_autopartitioner: true
+experimental_xla_tensor_sharding: true
+experimental_allow_coordinate_descent: true

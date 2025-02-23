@@ -1,49 +1,71 @@
-# Mixture of Experts Configuration for VishwamAI
+# Mixture of Experts Configuration
 
-moe:
-  enabled: true
-  num_experts: 8
-  num_experts_per_token: 2  # Top-k routing
-  expert_capacity_factor: 1.25  # Overallocation factor for load balancing
-  jitter_noise: 0.1  # Noise for load balancing
-  
-# Expert Configuration
-experts:
-  hidden_size: 8192  # 4x base hidden size for expert FFN
-  activation: "swiglu"
-  dropout: 0.1
-  use_bias: true
-  initialization:
-    weight_init: "kaiming_uniform"
-    bias_init: "zeros"
+# Expert Network
+num_experts: 8
+expert_hidden_size: 8192  # Size of expert feed-forward layer
+expert_capacity_factor: 1.25  # Multiply by tokens-per-expert
+num_experts_per_token: 2  # Top-k experts to route each token to
+expert_dropout: 0.1
+expert_activation: "swiglu"  # Options: gelu, swiglu, silu
+expert_use_bias: false
+
+# Expert Distribution
+expert_distribution: "uniform"  # Options: uniform, power_law, learned
+min_expert_capacity: 4  # Minimum slots per expert
+max_expert_capacity: null  # Maximum slots (null = auto-compute)
+expert_capacity_warmup_steps: 10000
+dynamic_capacity_scaling: true
 
 # Router Configuration
-router:
-  routing_algorithm: "top_k"
-  capacity_factor: 1.25
-  load_balancing:
-    importance: 0.01  # Weight for auxiliary load balancing loss
-    type: "entropy"  # Options: entropy, coefficient_of_variation
-  dropout: 0.1
-  
-# Gating Configuration
-gating:
-  type: "top_k"  # Options: top_k, multiplicative
-  softmax_temperature: 0.1
-  noise_type: "multiplicative"  # Options: multiplicative, additive
-  noise_scale: 1.0
-  z_loss_scale: 0.01  # Scale for router z-loss
+router_dtype: "float32"  # Higher precision for routing
+router_z_loss_scale: 0.01  # Scale for router z-loss
+router_load_balance_scale: 0.01  # Scale for load balancing loss
+router_aux_loss_scale: 0.01  # Scale for auxiliary losses
+router_jitter_noise: 0.1  # Multiplicative noise scale
+router_dropout: 0.0  # Dropout on router logits
+router_ignore_padding_tokens: true
+
+# Gating Mechanism
+gate_type: "top_k"  # Options: top_k, multiplicative, mixture
+gate_temperature: 0.1  # Temperature for routing softmax
+gate_noise_type: "multiplicative"  # Options: multiplicative, additive
+gate_noise_scale: 1.0  # Scale factor for noise
+gate_init_eps: 0.01  # Initialization epsilon for gates
 
 # Load Balancing
-load_balancing:
-  auxiliary_loss: true
-  aux_loss_weight: 0.01
-  aux_loss_type: "load_balance"  # Options: load_balance, importance
-  monitor_expert_usage: true
-  usage_threshold: 0.9  # Alert if expert usage exceeds this
+load_balancing_type: "entropy"  # Options: entropy, cv, importance
+load_balancing_warmup_steps: 1000
+load_balancing_min_rate: 0.0
+load_balancing_max_rate: 1.0
+importance_weight_power: 0.5  # For importance-based balancing
+max_group_size: 4096  # Maximum token group size for balancing
 
-# Communication
-communication:
-  all_to_all_chunk_size: 1024
-  precision: "bfloat16"
-  optimize_communication: true
+# Initialization
+expert_init_type: "kaiming_uniform"  # Options: normal, kaiming_uniform, xavier
+expert_init_scale: 1.0  # Scale factor for expert initialization
+router_init_type: "normal"  # Options: normal, zeros, orthogonal
+router_init_scale: 0.02  # Scale factor for router initialization
+
+# Training
+expert_parallel_training: true  # Whether to parallelize expert training
+router_parallel_training: true  # Whether to parallelize router training
+expert_gradient_checkpointing: true  # Use gradient checkpointing for experts
+router_gradient_clipping: 1.0  # Clip router gradients
+expert_gradient_clipping: 1.0  # Clip expert gradients
+
+# Optimization
+expert_learning_rate: 1.0e-4  # Base learning rate for experts
+router_learning_rate: 1.0e-4  # Base learning rate for routers
+expert_weight_decay: 0.01  # Weight decay for experts
+router_weight_decay: 0.01  # Weight decay for routers
+expert_beta1: 0.9  # Adam beta1 for experts
+expert_beta2: 0.999  # Adam beta2 for experts
+router_beta1: 0.9  # Adam beta1 for routers
+router_beta2: 0.999  # Adam beta2 for routers
+
+# Monitoring
+monitor_expert_utilization: true  # Track expert usage
+monitor_load_balancing: true  # Track load balancing
+monitor_routing_patterns: true  # Track routing decisions
+profiling_steps: 100  # Steps between profiling
+save_router_stats: true  # Save routing statistics

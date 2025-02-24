@@ -5,6 +5,9 @@ import optax
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from .transformer import VisionTransformer10B
+import logging
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Thought:
@@ -18,7 +21,17 @@ class ThoughtGenerator(nn.Module):
     vocab_size: int
     
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Generate thoughts from input tensor.
+
+        Args:
+            x (jnp.ndarray): Input tensor.
+
+        Returns:
+            jnp.ndarray: Generated thoughts.
+        """
+        logger.info("Generating thoughts")
         x = nn.Dense(self.hidden_size)(x)
         x = nn.relu(x)
         x = nn.Dense(self.vocab_size)(x)
@@ -28,7 +41,17 @@ class ThoughtEvaluator(nn.Module):
     hidden_size: int
     
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Evaluate thoughts to assign scores.
+
+        Args:
+            x (jnp.ndarray): Input tensor.
+
+        Returns:
+            jnp.ndarray: Thought scores.
+        """
+        logger.info("Evaluating thoughts")
         x = nn.Dense(self.hidden_size)(x)
         x = nn.relu(x)
         x = nn.Dense(3)(x)  # 3 scores: sure, maybe, impossible
@@ -39,11 +62,25 @@ class TreeOfThoughts(nn.Module):
     max_thoughts: int = 5
     max_depth: int = 3
     
-    def setup(self):
+    def setup(self) -> None:
+        """
+        Setup the Tree of Thoughts components.
+        """
         self.thought_generator = ThoughtGenerator(hidden_size=1024, vocab_size=32000)
         self.thought_evaluator = ThoughtEvaluator(hidden_size=512)
         
-    def generate_thoughts(self, x, k: int = 5) -> List[Thought]:
+    def generate_thoughts(self, x: jnp.ndarray, k: int = 5) -> List[Thought]:
+        """
+        Generate thoughts using the transformer and thought generator.
+
+        Args:
+            x (jnp.ndarray): Input tensor.
+            k (int): Number of thoughts to generate.
+
+        Returns:
+            List[Thought]: List of generated thoughts.
+        """
+        logger.info("Generating thoughts")
         features = self.transformer(x)
         logits = self.thought_generator(features)
         # Sample k thoughts using temperature sampling
@@ -51,12 +88,33 @@ class TreeOfThoughts(nn.Module):
         return [Thought(content=t, score=0.0, children=[]) for t in thoughts]
     
     def evaluate_thought(self, thought: Thought) -> jnp.ndarray:
+        """
+        Evaluate a thought to assign scores.
+
+        Args:
+            thought (Thought): The thought to evaluate.
+
+        Returns:
+            jnp.ndarray: Thought scores.
+        """
+        logger.info("Evaluating thought")
         # Convert thought to embeddings (simplified)
         x = jnp.array([ord(c) for c in thought.content])
         scores = self.thought_evaluator(x)
         return scores
     
-    def bfs_search(self, initial_state, max_width: int = 5) -> Thought:
+    def bfs_search(self, initial_state: jnp.ndarray, max_width: int = 5) -> Thought:
+        """
+        Perform breadth-first search to find the best thought.
+
+        Args:
+            initial_state (jnp.ndarray): Initial state tensor.
+            max_width (int): Maximum width of the search.
+
+        Returns:
+            Thought: The best thought found.
+        """
+        logger.info("Starting BFS search")
         queue = self.generate_thoughts(initial_state, k=max_width)
         best_thought = None
         best_score = float('-inf')
@@ -79,7 +137,18 @@ class TreeOfThoughts(nn.Module):
                 
         return best_thought
     
-    def dfs_search(self, initial_state, max_width: int = 5) -> Thought:
+    def dfs_search(self, initial_state: jnp.ndarray, max_width: int = 5) -> Thought:
+        """
+        Perform depth-first search to find the best thought.
+
+        Args:
+            initial_state (jnp.ndarray): Initial state tensor.
+            max_width (int): Maximum width of the search.
+
+        Returns:
+            Thought: The best thought found.
+        """
+        logger.info("Starting DFS search")
         stack = self.generate_thoughts(initial_state, k=max_width)
         best_thought = None
         best_score = float('-inf')
@@ -102,7 +171,18 @@ class TreeOfThoughts(nn.Module):
                 
         return best_thought
     
-    def __call__(self, x, search_strategy: str = 'bfs'):
+    def __call__(self, x: jnp.ndarray, search_strategy: str = 'bfs') -> Thought:
+        """
+        Perform search to find the best thought.
+
+        Args:
+            x (jnp.ndarray): Input tensor.
+            search_strategy (str): Search strategy ('bfs' or 'dfs').
+
+        Returns:
+            Thought: The best thought found.
+        """
+        logger.info(f"Performing {search_strategy} search")
         if search_strategy == 'bfs':
             return self.bfs_search(x)
         elif search_strategy == 'dfs':
@@ -110,5 +190,15 @@ class TreeOfThoughts(nn.Module):
         else:
             raise ValueError(f"Unknown search strategy: {search_strategy}")
 
-def create_tot_optimizer(learning_rate: float = 1e-4):
+def create_tot_optimizer(learning_rate: float = 1e-4) -> optax.GradientTransformation:
+    """
+    Create an optimizer for the Tree of Thoughts.
+
+    Args:
+        learning_rate (float): Learning rate for the optimizer.
+
+    Returns:
+        optax.GradientTransformation: The optimizer.
+    """
+    logger.info("Creating ToT optimizer")
     return optax.adam(learning_rate)

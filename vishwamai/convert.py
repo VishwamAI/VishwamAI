@@ -8,9 +8,8 @@ import safetensors
 from safetensors.torch import save_file, load_file
 import torch
 import jax.numpy as jnp
-from dataclasses import asdict
-from tqdm import tqdm
 import datetime
+from tqdm import tqdm
 from .model import ModelConfig, VishwamAIModel
 
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +28,7 @@ class SafeModelConverter:
         self.config = config
         self.metadata = {
             "framework_version": "1.0.0",
-            "creation_date": "",
+            "creation_date": datetime.datetime.utcnow().isoformat(),
             "model_type": "VishwamAI"
         }
 
@@ -50,11 +49,14 @@ class SafeModelConverter:
             return False
         if not tensor.is_floating_point():  # Ensure floating point type
             return False
+        # Check for NaN or Inf values
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            return False
         return True
 
     def _secure_conversion(self, tensor: torch.Tensor) -> torch.Tensor:
         """
-        Perform secure tensor conversion.
+        Perform secure tensor conversion with automatic dtype handling.
 
         Args:
             tensor (torch.Tensor): The tensor to convert.
@@ -62,16 +64,34 @@ class SafeModelConverter:
         Returns:
             torch.Tensor: The securely converted tensor.
         """
+        # Convert to float32 for consistency
+        tensor = tensor.to(dtype=torch.float32)
+        
         # Clone and detach for safety
         tensor = tensor.clone().detach()
-        # Check for NaN/Inf values
-        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-            raise ValueError("Tensor contains NaN or Inf values")
+        
+        # Replace NaN/Inf values with zeros/finite numbers
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=float(torch.finfo(tensor.dtype).max), 
+                                neginf=float(torch.finfo(tensor.dtype).min))
+        
         return tensor
+
+    def _convert_to_jax(self, tensor: torch.Tensor) -> jnp.ndarray:
+        """
+        Convert PyTorch tensor to JAX array.
+
+        Args:
+            tensor (torch.Tensor): The PyTorch tensor to convert.
+
+        Returns:
+            jnp.ndarray: The converted JAX array.
+        """
+        # Convert to numpy first, then to JAX
+        return jnp.array(tensor.detach().cpu().numpy())
 
     def _convert_attention_weights(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Securely convert attention weights.
+        Securely convert attention weights with dynamic shape handling.
 
         Args:
             state_dict (Dict[str, torch.Tensor]): The state dictionary containing model weights.
@@ -84,9 +104,9 @@ class SafeModelConverter:
         
         for key in attention_keys:
             tensor = state_dict[key]
-            # Validate shape based on config
             if 'query' in key or 'key' in key or 'value' in key:
-                expected_shape = (self.config.heads, -1, self.config.head_dim)
+                # Use dynamic shape based on input tensor
+                expected_shape = (self.config.heads, tensor.shape[-2], self.config.head_dim)
                 tensor = tensor.view(*expected_shape)
             converted[key] = self._secure_conversion(tensor)
             
@@ -94,7 +114,7 @@ class SafeModelConverter:
 
     def _convert_layer_norm(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Convert layer normalization weights.
+        Convert layer normalization weights with additional validation.
 
         Args:
             state_dict (Dict[str, torch.Tensor]): The state dictionary containing model weights.
@@ -103,21 +123,22 @@ class SafeModelConverter:
             Dict[str, torch.Tensor]: The converted layer normalization weights.
         """
         converted = {}
-        norm_keys = [k for k in state_dict.keys() if 'norm' in k or 'ln' in k]
+        norm_keys = [k for k in state_dict.keys() if any(x in k for x in ['norm', 'ln'])]
         
         for key in norm_keys:
             tensor = state_dict[key]
             if 'weight' in key or 'bias' in key:
-                # Validate shape
                 if tensor.dim() != 1:
-                    raise ValueError(f"Invalid LayerNorm tensor shape for {key}")
+                    raise ValueError(f"Invalid LayerNorm tensor shape for {key}: expected 1D, got {tensor.dim()}D")
+                if tensor.numel() != self.config.hidden_size:
+                    raise ValueError(f"Invalid LayerNorm tensor size for {key}: expected {self.config.hidden_size}, got {tensor.numel()}")
             converted[key] = self._secure_conversion(tensor)
             
         return converted
 
     def validate_checkpoint(self, checkpoint_path: str) -> bool:
         """
-        Validate checkpoint integrity and security.
+        Validate checkpoint integrity and security with enhanced metadata handling.
 
         Args:
             checkpoint_path (str): The path to the checkpoint file.
@@ -127,9 +148,15 @@ class SafeModelConverter:
         """
         try:
             tensors = load_file(checkpoint_path)
-            # Check metadata
-            if not tensors.metadata:
-                logger.warning("No metadata found in checkpoint")
+            # Safely handle metadata
+            metadata = tensors.metadata or {}
+            
+            # Validate metadata fields if present
+            if metadata:
+                required_metadata = ['framework_version', 'model_type']
+                for field in required_metadata:
+                    if field not in metadata:
+                        logger.warning(f"Missing metadata field: {field}")
                 
             # Validate essential tensors
             required_keys = ['model.embed.weight', 'model.head.weight']
@@ -137,7 +164,7 @@ class SafeModelConverter:
                 if key not in tensors:
                     raise ValueError(f"Missing required tensor: {key}")
                     
-            # Validate tensor shapes
+            # Validate tensor shapes and values
             for name, tensor in tensors.items():
                 if not self._validate_tensor(tensor):
                     raise ValueError(f"Invalid tensor: {name}")
@@ -155,7 +182,7 @@ class SafeModelConverter:
         source_format: str
     ) -> None:
         """
-        Convert model weights to SafeTensors format.
+        Convert model weights to SafeTensors format with enhanced metadata.
 
         Args:
             input_path (str): The path to the input checkpoint file.
@@ -177,11 +204,11 @@ class SafeModelConverter:
             converted = self._secure_conversion(tensor)
             converted_weights[key] = converted
 
-        # Add metadata
+        # Update metadata with JSON-safe values
         self.metadata.update({
-            "conversion_date": str(datetime.now()),
+            "conversion_date": datetime.datetime.utcnow().isoformat(),
             "source_format": source_format,
-            "model_config": json.dumps(asdict(self.config))
+            "model_config": json.dumps(self.config.__dict__)  # Use __dict__ instead of asdict
         })
 
         # Save in SafeTensors format
@@ -194,29 +221,40 @@ class SafeModelConverter:
         output_path: str
     ) -> None:
         """
-        Merge sharded checkpoints into single SafeTensors file.
+        Merge sharded checkpoints into single SafeTensors file with validation.
 
         Args:
             shard_paths (List[str]): List of paths to the checkpoint shards.
             output_path (str): The path to save the merged SafeTensors file.
         """
         merged_weights = {}
+        metadata = {}
         
         for shard_path in tqdm(shard_paths, desc="Merging shards"):
-            shard = load_file(shard_path)
-            # Validate shard
+            # Load and validate shard
             if not self.validate_checkpoint(shard_path):
                 raise ValueError(f"Invalid shard: {shard_path}")
+                
+            shard = load_file(shard_path)
+            shard_metadata = shard.metadata or {}
+            
+            # Update metadata from shards
+            metadata.update(shard_metadata)
             merged_weights.update(shard)
 
+        # Add merge-specific metadata
+        metadata.update({
+            "merge_date": datetime.datetime.utcnow().isoformat(),
+            "num_shards": len(shard_paths)
+        })
+
         # Save merged weights
-        save_file(merged_weights, output_path, metadata=self.metadata)
-        logger.info(f"Successfully merged shards to {output_path}")
+        save_file(merged_weights, output_path, metadata=metadata)
+        logger.info(f"Successfully merged {len(shard_paths)} shards to {output_path}")
 
 def main():
     """CLI for safe model conversion"""
     import argparse
-    from datetime import datetime
     
     parser = argparse.ArgumentParser(description="Securely convert models to SafeTensors format")
     parser.add_argument("--input-path", type=str, required=True)
@@ -225,6 +263,7 @@ def main():
     parser.add_argument("--source-format", type=str, default="pytorch")
     parser.add_argument("--shard-paths", nargs="*", help="Paths to checkpoint shards")
     parser.add_argument("--merge-shards", action="store_true")
+    parser.add_argument("--to-jax", action="store_true", help="Convert to JAX format")
     
     args = parser.parse_args()
     

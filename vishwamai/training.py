@@ -4,13 +4,14 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, NamedTuple, Optional
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import flax
 import flax.linen as nn
-from flax.training import train_state, checkpoints
+from flax.training import train_state, checkpoints, dynamic_scale
 from flax.jax_utils import replicate, unreplicate
 import optax
 from tqdm import tqdm
@@ -26,30 +27,79 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+@dataclass
+class TrainingConfig:
+    """Configuration for training hyperparameters."""
+    learning_rate: float
+    batch_size: int
+    grad_accum_steps: int
+    max_grad_norm: float = 1.0
+    warmup_steps: int = 1000
+    weight_decay: float = 0.01
+    use_amp: bool = True
+    dynamic_batch_size: bool = True
+    min_batch_size: int = 4
+    target_batch_size: int = 32
+
+class MetricsState(NamedTuple):
+    """State for tracking training metrics."""
+    loss_scale: float
+    grad_norm: float
+    param_norm: float
+    learning_rate: float
+
+class TrainState(train_state.TrainState):
+    """Custom train state with dynamic scaling for mixed precision."""
+    dynamic_scale: Optional[dynamic_scale.DynamicScale]
+    metrics: Optional[MetricsState] = None
+    grad_accum_count: int = 0
+
 def create_train_state(
     model: VishwamAIModel,
     config: ModelConfig,
-    learning_rate: float,
+    training_config: TrainingConfig,
     rng: jax.random.PRNGKey
-) -> train_state.TrainState:
-    """Initialize training state."""
+) -> TrainState:
+    """Initialize training state with dynamic scaling."""
     params_rng, dropout_rng = jax.random.split(rng)
     
-    # Initialize model parameters with a dummy input
+    # Initialize model parameters
     sample_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
     initial_params = model.init(
         {'params': params_rng, 'dropout': dropout_rng},
         input_ids=sample_input,
         train=True
     )['params']
-
-    # Create optimizer
-    tx = create_optimizer(learning_rate)
     
-    return train_state.TrainState.create(
+    # Create learning rate schedule with warmup
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=training_config.learning_rate,
+        warmup_steps=training_config.warmup_steps,
+        decay_steps=10000,
+        end_value=training_config.learning_rate * 0.1
+    )
+    
+    # Create optimizer with gradient clipping and weight decay
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(training_config.max_grad_norm),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            weight_decay=training_config.weight_decay
+        )
+    )
+    
+    # Create dynamic scale for mixed precision if enabled
+    dynamic_scale = None
+    if training_config.use_amp:
+        dynamic_scale = dynamic_scale.DynamicScale()
+    
+    return TrainState.create(
         apply_fn=model.apply,
         params=initial_params,
-        tx=tx
+        tx=optimizer,
+        dynamic_scale=dynamic_scale,
+        metrics=MetricsState(0.0, 0.0, 0.0, training_config.learning_rate)
     )
 
 def compute_loss(
@@ -57,34 +107,29 @@ def compute_loss(
     labels: jnp.ndarray,
     mask: jnp.ndarray
 ) -> jnp.ndarray:
-    """Compute masked cross-entropy loss."""
+    """Compute masked cross-entropy loss with label smoothing."""
     vocab_size = logits.shape[-1]
-    label_smoothing = 0.1  # Small amount of label smoothing for regularization
+    label_smoothing = 0.1
     
-    # Create smoothed labels
     smooth_positives = 1.0 - label_smoothing
     smooth_negatives = label_smoothing / (vocab_size - 1)
     one_hot_labels = jax.nn.one_hot(labels, vocab_size)
     smooth_labels = one_hot_labels * smooth_positives + \
                    (1 - one_hot_labels) * smooth_negatives
-
-    # Compute cross entropy loss
-    loss = -jnp.sum(smooth_labels * jax.nn.log_softmax(logits), axis=-1)
     
-    # Apply mask and compute mean
-    masked_loss = loss * mask
-    return jnp.sum(masked_loss) / jnp.sum(mask)
+    loss = -jnp.sum(smooth_labels * jax.nn.log_softmax(logits, axis=-1), axis=-1)
+    loss = loss * mask
+    return jnp.sum(loss) / jnp.sum(mask)
 
 def compute_metrics(
     logits: jnp.ndarray,
     labels: jnp.ndarray,
     mask: jnp.ndarray,
-    intermediate_outputs: List = None,
-    error_gates: jnp.ndarray = None,
-    load_balance_loss: jnp.ndarray = None
+    intermediate_outputs: Optional[List] = None,
+    error_gates: Optional[jnp.ndarray] = None,
+    load_balance_loss: Optional[jnp.ndarray] = None
 ) -> Dict[str, jnp.ndarray]:
-    """Compute comprehensive training metrics including MoE and error correction."""
-    # Base metrics
+    """Compute comprehensive training metrics."""
     loss = compute_loss(logits, labels, mask)
     predictions = jnp.argmax(logits, axis=-1)
     correct_predictions = (predictions == labels) * mask
@@ -97,7 +142,6 @@ def compute_metrics(
         'perplexity': perplexity
     }
     
-    # Error correction metrics
     if error_gates is not None:
         error_rate = jnp.mean(error_gates)
         metrics.update({
@@ -105,11 +149,9 @@ def compute_metrics(
             'error_gate_std': jnp.std(error_gates)
         })
     
-    # MoE metrics
     if load_balance_loss is not None:
         metrics['moe_loss'] = load_balance_loss
     
-    # Layer-wise metrics if intermediate outputs available
     if intermediate_outputs:
         for i, layer_output in enumerate(intermediate_outputs):
             layer_loss = compute_loss(layer_output, labels, mask)
@@ -118,15 +160,16 @@ def compute_metrics(
     return metrics
 
 def train_step(
-    state: train_state.TrainState,
+    state: TrainState,
     batch: Dict[str, jnp.ndarray],
     rng: jax.random.PRNGKey,
-    error_correction: ModelIntegrator,
-) -> Tuple[train_state.TrainState, Dict[str, jnp.ndarray], jax.random.PRNGKey]:
-    """Perform a single training step with MoE and error correction."""
-    rng, new_rng = jax.random.split(rng)
+    error_correction: Optional[ModelIntegrator],
+    accum_steps: int,
+) -> Tuple[TrainState, Dict[str, jnp.ndarray], jax.random.PRNGKey]:
+    """Perform a training step with gradient accumulation and mixed precision."""
     
-    def loss_fn(params):
+    # Helper function for forward pass with mixed precision
+    def forward_fn(params):
         outputs = state.apply_fn(
             {'params': params},
             input_ids=batch['input_ids'],
@@ -140,97 +183,150 @@ def train_step(
         error_gates = outputs.get('error_gates', None)
         load_balance_loss = outputs.get('load_balance_loss', None)
         
-        # Base loss computation
         loss = compute_loss(logits, batch['labels'], batch['attention_mask'])
-        
-        # Add MoE load balancing loss if available
         if load_balance_loss is not None:
-            loss = loss + 0.01 * load_balance_loss  # Scale factor for load balancing
+            loss = loss + 0.01 * load_balance_loss
             
-        # Apply error correction if enabled
         if error_correction is not None:
             logits = error_correction.process_logits(logits)
             
         return loss, (logits, intermediate_outputs, error_gates, load_balance_loss)
     
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    # Handle mixed precision training
+    if state.dynamic_scale:
+        # Run forward pass with dynamic scaling
+        dynamic_scale, is_finite, aux = state.dynamic_scale.value_and_grad(
+            forward_fn, has_aux=True)(state.params)
+        
+        # Extract gradients and values
+        grad, (loss, (logits, intermediate_outputs, error_gates, load_balance_loss)) = aux
+        
+        # Update dynamic scale
+        dynamic_scale = dynamic_scale.update(is_finite)
+        
+        # Skip step if gradients contain Inf/NaN
+        grad = jax.tree_map(
+            lambda x: jnp.where(is_finite, x, jnp.zeros_like(x)),
+            grad
+        )
+    else:
+        # Regular forward pass without mixed precision
+        (loss, (logits, intermediate_outputs, error_gates, load_balance_loss)), grad = jax.value_and_grad(
+            forward_fn, has_aux=True)(state.params)
+        is_finite = True
+    
+    # Accumulate gradients
+    grad = jax.tree_map(lambda x: x / accum_steps, grad)
     
     # Average gradients across devices
-    grads = jax.lax.pmean(grads, axis_name='batch')
+    grad = jax.lax.pmean(grad, axis_name='batch')
     
-    # Update state
-    state = state.apply_gradients(grads=grads)
+    # Update state if we have accumulated enough gradients
+    if state.grad_accum_count == accum_steps - 1:
+        # Compute gradient and parameter norms
+        grad_norm = optax.global_norm(grad)
+        param_norm = optax.global_norm(state.params)
+        
+        state = state.apply_gradients(
+            grads=grad,
+            dynamic_scale=state.dynamic_scale if state.dynamic_scale else None,
+            metrics=MetricsState(
+                loss_scale=state.dynamic_scale.scale if state.dynamic_scale else 1.0,
+                grad_norm=grad_norm,
+                param_norm=param_norm,
+                learning_rate=state.tx.learning_rate(state.step)
+            )
+        )
+        grad_accum_count = 0
+    else:
+        state = state.replace(grad_accum_count=state.grad_accum_count + 1)
     
     # Compute metrics
     metrics = compute_metrics(logits, batch['labels'], batch['attention_mask'])
     metrics = jax.lax.pmean(metrics, axis_name='batch')
     
+    rng, new_rng = jax.random.split(rng)
     return state, metrics, new_rng
 
 # Parallel training step
 p_train_step = jax.pmap(
     train_step,
     axis_name='batch',
-    donate_argnums=(0,),  # Donate state buffers
+    donate_argnums=(0,),
 )
+
+def adjust_batch_size(metrics: Dict[str, float], config: TrainingConfig) -> int:
+    """Dynamically adjust batch size based on training metrics."""
+    if not config.dynamic_batch_size:
+        return config.batch_size
+    
+    # Check if we have out of memory or gradient overflow issues
+    has_issues = (metrics.get('grad_norm', 0) > config.max_grad_norm * 2 or
+                 not metrics.get('is_finite', True))
+    
+    if has_issues:
+        # Reduce batch size
+        new_batch_size = max(config.batch_size // 2, config.min_batch_size)
+        logger.info(f"Reducing batch size to {new_batch_size}")
+        return new_batch_size
+    elif config.batch_size < config.target_batch_size:
+        # Try to increase batch size
+        new_batch_size = min(config.batch_size * 2, config.target_batch_size)
+        logger.info(f"Increasing batch size to {new_batch_size}")
+        return new_batch_size
+    
+    return config.batch_size
 
 def create_train_dataset(
     data_path: str,
-    tokenizer: Any,
-    max_seq_len: int,
-    batch_size: int
+    tokenizer: VishwamAITokenizer,
+    config: TrainingConfig
 ):
-    """Create training dataset from text files."""
+    """Create training dataset with dynamic batching."""
     from datasets import load_dataset
     
-    # Load raw text files
     dataset = load_dataset('text', data_files=data_path)['train']
     
-    # Tokenization function
     def tokenize_function(examples):
-        tokenized = tokenizer(
+        return tokenizer(
             examples['text'],
             padding='max_length',
             truncation=True,
-            max_length=max_seq_len,
+            max_length=config.max_seq_len,
             return_tensors='np'
         )
-        return {
-            'input_ids': tokenized['input_ids'],
-            'attention_mask': tokenized['attention_mask'],
-            'labels': tokenized['input_ids']  # For language modeling
-        }
     
-    # Process dataset
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
         remove_columns=['text']
     )
     
-    # Create data loader
     dataloader = tokenized_dataset.with_format('numpy').iter(
-        batch_size=batch_size,
+        batch_size=config.batch_size,
         drop_last=True
     )
     
     return dataloader
 
 def train_epoch(
-    state: train_state.TrainState,
+    state: TrainState,
     train_loader: Any,
     rng: jax.random.PRNGKey,
-    error_correction: ModelIntegrator,
+    config: TrainingConfig,
+    error_correction: Optional[ModelIntegrator],
     epoch: int,
     tot_controller=None
-) -> Tuple[train_state.TrainState, Dict[str, float]]:
-    """Train for one epoch with MoE and ToT support."""
+) -> Tuple[TrainState, Dict[str, float]]:
+    """Train for one epoch with gradient accumulation and dynamic batch sizing."""
     batch_metrics = []
     
-    # Training loop with progress bar
     with tqdm(train_loader, desc=f'Epoch {epoch}') as pbar:
         for batch in pbar:
+            # Adjust batch size if needed
+            if len(batch_metrics) > 0:
+                config.batch_size = adjust_batch_size(batch_metrics[-1], config)
+            
             # Shard batch across devices
             batch = jax.device_put_sharded(
                 jax.tree_util.tree_map(
@@ -240,15 +336,20 @@ def train_epoch(
                 jax.devices()
             )
             
-            # Perform training step
-            state, metrics, rng = p_train_step(state, batch, rng, error_correction)
+            # Perform training step with gradient accumulation
+            state, metrics, rng = p_train_step(
+                state, batch, rng, error_correction, config.grad_accum_steps
+            )
             batch_metrics.append(metrics)
             
-            # Update progress bar
+            # Update progress bar with current metrics and training state
             pbar.set_postfix({
                 'loss': float(metrics['loss'].mean()),
                 'acc': float(metrics['accuracy'].mean()),
-                'ppl': float(metrics['perplexity'].mean())
+                'ppl': float(metrics['perplexity'].mean()),
+                'grad_norm': float(state.metrics.grad_norm if state.metrics else 0),
+                'lr': float(state.metrics.learning_rate if state.metrics else 0),
+                'batch_size': config.batch_size
             })
     
     # Compute epoch metrics
@@ -260,7 +361,7 @@ def train_epoch(
     return state, epoch_metrics
 
 def save_checkpoint(
-    state: train_state.TrainState,
+    state: TrainState,
     save_dir: str,
     step: int
 ):
@@ -274,6 +375,7 @@ def save_checkpoint(
     )
 
 def main():
+    """CLI for training VishwamAI Model."""
     parser = argparse.ArgumentParser(description='Train VishwamAI Model')
     parser.add_argument('--config', type=str, required=True,
                        help='Path to model configuration file')
@@ -301,6 +403,12 @@ def main():
                        help='Weight for MoE load balancing loss')
     parser.add_argument('--gradient_checkpointing', action='store_true',
                        help='Enable gradient checkpointing for memory efficiency')
+    parser.add_argument('--grad_accum_steps', type=int, default=1,
+                       help='Number of gradient accumulation steps')
+    parser.add_argument('--use_amp', action='store_true',
+                       help='Enable automatic mixed precision training')
+    parser.add_argument('--dynamic_batch_size', action='store_true',
+                       help='Enable dynamic batch sizing')
     
     args = parser.parse_args()
     
@@ -310,6 +418,15 @@ def main():
     # Load configuration
     with open(args.config) as f:
         config = ModelConfig(**json.load(f))
+    
+    # Create training config
+    training_config = TrainingConfig(
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
+        use_amp=args.use_amp,
+        dynamic_batch_size=args.dynamic_batch_size
+    )
     
     # Initialize model and tokenizer
     model = VishwamAIModel(config)
@@ -327,7 +444,7 @@ def main():
         tot = TreeOfThoughts(config)
     
     # Create training state
-    state = create_train_state(model, config, args.learning_rate, rng)
+    state = create_train_state(model, config, training_config, rng)
     
     # Replicate state across devices
     state = replicate(state)
@@ -339,13 +456,13 @@ def main():
     train_loader = create_train_dataset(
         args.train_data,
         tokenizer,
-        config.max_seq_len,
-        args.batch_size
+        training_config
     )
 
     # Training loop with improved logging
     logger.info("Starting training with configuration:")
     logger.info(f"Model config: {config}")
+    logger.info(f"Training config: {training_config}")
     logger.info(f"Using error correction: {args.use_error_correction}")
     logger.info(f"Using ToT: {args.use_tot}")
     logger.info(f"MoE loss weight: {args.moe_loss_weight}")
@@ -359,6 +476,7 @@ def main():
             state=state,
             train_loader=train_loader,
             rng=epoch_rng,
+            config=training_config,
             error_correction=error_correction,
             epoch=epoch + 1,
             tot_controller=tot if args.use_tot else None

@@ -1,0 +1,41 @@
+defaults:
+  - model: 10B
+  - training: default
+  - override hydra/job_logging: colorlog
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+monitoring:
+  enabled: true
+  log_every_n_steps: 100
+  save_every_n_steps: 1000
+  wandb:
+    enabled: false
+    project: "vishwamai"
+    name: ${now:%Y-%m-%d_%H-%M-%S}
+  tensorboard:
+    enabled: true
+    log_dir: ${hydra.run.dir}/tensorboard
+
+tuning:
+  enabled: false
+  framework: "optuna"  # or "ray"
+  num_trials: 100
+  metric: "validation_loss"
+  direction: "minimize"
+  pruning:
+    enabled: true
+    n_startup_trials: 5
+    n_warmup_steps: 100
+
+distributed:
+  strategy: "data_parallel"  # or "model_parallel"
+  sync_batch_norm: true
+  gradient_as_bucket_view: true
+  find_unused_parameters: false

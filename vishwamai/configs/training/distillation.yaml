@@ -1,0 +1,36 @@
+defaults:
+  - default
+
+distillation:
+  enabled: true
+  teacher_model:
+    path: null  # Path to teacher model checkpoint
+    temperature: 2.0
+    alpha: 0.5  # Weight for distillation loss vs task loss
+  feature_distillation:
+    enabled: true
+    layers: [0, 6, 11]  # Layers to match (depends on teacher/student architecture)
+    loss_weight: 0.1
+  attention_distillation:
+    enabled: true
+    loss_weight: 0.1
+  hidden_distillation:
+    enabled: true
+    loss_weight: 0.1
+  pruning:
+    enabled: false
+    target_sparsity: 0.5
+    pruning_schedule: cubic
+    begin_step: 1000
+    end_step: 10000
+  quantization:
+    enabled: false
+    precision: "int8"
+    calibration_steps: 100
+
+training:
+  # Override some training settings for distillation
+  optimizer:
+    lr: 5e-4  # Higher learning rate for distillation
+    warmup_steps: 1000
+  max_steps: 20000  # Usually needs fewer steps than full training

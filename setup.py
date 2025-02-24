@@ -45,6 +45,7 @@ install_requires = [
     'flax',
     'optax',
     'safetensors',
+    'omegaconf'
 ]
 
 # Extra requirements for development

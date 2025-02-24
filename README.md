@@ -6,6 +6,7 @@ VishwamAI is an open-source implementation of a mixture-of-experts (MoE) transfo
 
 - Mixture of Experts (MoE) architecture for parameter efficiency
 - Multi-Level Attention (MLA) mechanism for adaptive computation
+- Knowledge distillation support for model compression
 - TPU-optimized training infrastructure
 - Support for HuggingFace ecosystem
 - Efficient distributed training on TPU pods
@@ -15,19 +16,18 @@ VishwamAI is an open-source implementation of a mixture-of-experts (MoE) transfo
 ```
 vishwamai/
 ├── configs/               # Configuration files
-├── data/                 # Data loading and preprocessing
-├── model/               
-│   ├── attention/        # Attention mechanisms
-│   ├── embeddings/       # Token and positional embeddings
-│   ├── moe/             # Mixture of Experts implementation
-│   ├── mla/             # Multi-Level Attention implementation
-│   └── transformer/      # Core transformer components
-├── training/
-│   ├── callbacks/        # Training callbacks
-│   ├── distributed/      # TPU distribution utilities
-│   ├── optimizer/        # Optimizers and schedulers
-│   └── scheduling/       # Learning rate scheduling
-└── utils/               # Utility functions
+│   ├── model/            # Model-specific configurations
+│   └── training/         # Training configurations including distillation
+├── convert.py            # Model conversion utilities
+├── data_utils.py         # Data loading and preprocessing
+├── distillation.py       # Knowledge distillation implementation
+├── error_correction.py   # Error correction mechanisms
+├── generate.py          # Text generation utilities
+├── model.py             # Core model implementation
+├── tokenizer.py         # Tokenization utilities
+├── tot.py               # Tree of Thoughts implementation
+├── training.py          # Training pipeline
+└── transformer.py       # Transformer architecture components
 ```
 
 ## Installation
@@ -36,9 +36,7 @@ vishwamai/
 pip install -e .
 ```
 
-## Quick Start: GSM8K Training
-
-We provide a notebook for training on the GSM8K (Grade School Math 8K) dataset:
+## Quick Start
 
 1. Clone the repository:
 ```bash
@@ -51,17 +49,18 @@ cd VishwamAI
 pip install -r requirements.txt
 ```
 
-3. Open `train_gsm8k.ipynb` in Jupyter:
+3. Start with the distillation training notebook:
 ```bash
-jupyter notebook train_gsm8k.ipynb
+jupyter notebook notebooks/train_vishwamai_distillation.ipynb
 ```
 
-The notebook contains a complete training pipeline including:
+The distillation notebook provides a complete training pipeline including:
+- Knowledge distillation setup and configuration
 - Dataset loading and preprocessing
 - Model initialization with MoE-MLA architecture
 - TPU-optimized training setup
-- Evaluation and model saving
-- Automatic upload to HuggingFace Hub
+- Performance evaluation and model saving
+- Integration with HuggingFace Hub
 
 ## TPU Training
 
@@ -94,12 +93,20 @@ Available model sizes:
 - `large`: 1536 hidden, 36 layers, 24 heads
 - `xl`: 2048 hidden, 48 layers, 32 heads
 
-MoE-MLA specific settings:
+Configuration files (in `vishwamai/configs/`):
 ```yaml
-num_experts: 8
-num_attention_levels: 3
-expert_capacity_factor: 1.25
-use_adaptive_computation: true
+# Model configurations (model/10B.yaml)
+model:
+  num_experts: 8
+  num_attention_levels: 3
+  expert_capacity_factor: 1.25
+  use_adaptive_computation: true
+
+# Training configurations (training/distillation.yaml)
+training:
+  teacher_model: "path/to/teacher"
+  temperature: 2.0
+  alpha: 0.5  # Balance between distillation and task loss
 ```
 
 ## Contributing

@@ -1,6 +1,7 @@
 defaults:
   - model: 10B
   - training: default
+  - training: pretraining_progress
   - override hydra/job_logging: colorlog
   - _self_
 

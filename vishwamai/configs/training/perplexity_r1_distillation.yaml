@@ -6,7 +6,7 @@ teacher_model:
   alpha: 0.5       # Weight between distillation and task-specific loss
 
 student_model:
-  path: "VishwamAI/Perplexity_r1_disttled_experiment"
+  path: "model-00001-to-00015-of-00252.safetensors"  # Completed batch after validation/test
   hidden_size: 2048        # Reduced from teacher's size
   num_layers: 24          # Reduced from teacher's layers
   num_heads: 32           # Number of attention heads
@@ -73,3 +73,15 @@ evaluation:
     - "accuracy"
     - "rouge"
     - "bleu"
+
+pretraining_progress:
+  safetensors:
+    completed_batch: "1-15"
+    total: 252
+    completion_percentage: 13
+  checkpoint:
+    last_completed: "model-00001-to-00015-of-00252.safetensors"
+    next_batch: "model-00016-to-00030-of-00252.safetensors"
+  status:
+    validation: "completed"
+    testing: "completed"

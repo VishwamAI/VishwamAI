@@ -618,6 +618,45 @@ class VishwamAIModel(nn.Module):
         
         return bound_model
 
+    def load_weights(self, model_path: str):
+        """Load pretrained weights from local path or Hugging Face Hub.
+        
+        Args:
+            model_path: Path to model on HF Hub or local directory
+        """
+        from huggingface_hub import snapshot_download
+        import safetensors.flax as stf
+        import os
+
+        # Download model files if needed 
+        if not os.path.exists(model_path):
+            try:
+                model_path = snapshot_download(
+                    repo_id=model_path,
+                    allow_patterns=["*.safetensors"]
+                )
+            except Exception as e:
+                raise ValueError(f"Error downloading model from {model_path}: {str(e)}")
+
+        # Load weights from sharded safetensors files
+        params = {}
+        shard_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
+        
+        if not shard_files:
+            raise ValueError(f"No .safetensors files found in {model_path}")
+        
+        for shard_file in shard_files:
+            shard_path = os.path.join(model_path, shard_file)
+            try:
+                shard_params = stf.load_file(shard_path)
+                params.update(shard_params)
+            except Exception as e:
+                raise ValueError(f"Error loading weights from {shard_path}: {str(e)}")
+
+        # Bind parameters to model
+        self.bind({'params': params})
+        return self
+
     def setup(self):
         self.embeddings = self._create_embeddings()
         self.encoder = self._create_encoder()

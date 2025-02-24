@@ -235,6 +235,12 @@ class VishwamaiShaalaTrainer:
         step: int,
         rng: jax.random.PRNGKey
     ) -> Tuple[train_state.TrainState, Dict[str, float], jax.random.PRNGKey]:
+        import mlflow
+
+        # Set up MLflow tracking if enabled
+        if self.cfg.monitoring.mlflow.enabled:
+            mlflow.set_tracking_uri(self.cfg.monitoring.mlflow.tracking_uri)
+            mlflow.set_experiment(self.cfg.monitoring.mlflow.experiment_name)
         """Execute single gurukul training step.
         
         Like a student practicing yoga asanas under the guru's guidance,
@@ -270,6 +276,20 @@ class VishwamaiShaalaTrainer:
                 batch.get('attention_mask')
             )
             
+            # Log metrics with MLflow
+            if self.cfg.monitoring.mlflow.enabled and step % self.cfg.monitoring.log_every_n_steps == 0:
+                with mlflow.start_run(run_name=self.cfg.monitoring.mlflow.run_name):
+                    for loss_name, loss_value in losses.items():
+                        mlflow.log_metric(loss_name, float(loss_value), step=step)
+                    
+                    # Log model artifacts if configured
+                    if self.cfg.monitoring.mlflow.log_artifacts and step % self.cfg.monitoring.save_every_n_steps == 0:
+                        mlflow.log_dict(self.cfg.to_dict(), "config.yaml")
+                        # Save model checkpoint
+                        checkpoint_path = f"checkpoint_{step}"
+                        state.save(checkpoint_path)
+                        mlflow.log_artifacts(checkpoint_path, "checkpoints")
+
             return losses['total_loss'], losses
         
         # Compute gradients and update model

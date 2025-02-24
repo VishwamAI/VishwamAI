@@ -20,6 +20,12 @@ class SafeModelConverter:
     """Handles secure model conversion using SafeTensors"""
     
     def __init__(self, config: ModelConfig):
+        """
+        Initialize the SafeModelConverter with the given configuration.
+
+        Args:
+            config (ModelConfig): The model configuration.
+        """
         self.config = config
         self.metadata = {
             "framework_version": "1.0.0",
@@ -28,7 +34,16 @@ class SafeModelConverter:
         }
 
     def _validate_tensor(self, tensor: torch.Tensor, expected_shape: Optional[tuple] = None) -> bool:
-        """Validate tensor properties for security"""
+        """
+        Validate tensor properties for security.
+
+        Args:
+            tensor (torch.Tensor): The tensor to validate.
+            expected_shape (Optional[tuple]): The expected shape of the tensor.
+
+        Returns:
+            bool: True if the tensor is valid, False otherwise.
+        """
         if not isinstance(tensor, torch.Tensor):
             return False
         if expected_shape and tensor.shape != expected_shape:
@@ -38,7 +53,15 @@ class SafeModelConverter:
         return True
 
     def _secure_conversion(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Perform secure tensor conversion"""
+        """
+        Perform secure tensor conversion.
+
+        Args:
+            tensor (torch.Tensor): The tensor to convert.
+
+        Returns:
+            torch.Tensor: The securely converted tensor.
+        """
         # Clone and detach for safety
         tensor = tensor.clone().detach()
         # Check for NaN/Inf values
@@ -47,7 +70,15 @@ class SafeModelConverter:
         return tensor
 
     def _convert_attention_weights(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Securely convert attention weights"""
+        """
+        Securely convert attention weights.
+
+        Args:
+            state_dict (Dict[str, torch.Tensor]): The state dictionary containing model weights.
+
+        Returns:
+            Dict[str, torch.Tensor]: The converted attention weights.
+        """
         converted = {}
         attention_keys = [k for k in state_dict.keys() if 'attention' in k]
         
@@ -62,7 +93,15 @@ class SafeModelConverter:
         return converted
 
     def _convert_layer_norm(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Convert layer normalization weights"""
+        """
+        Convert layer normalization weights.
+
+        Args:
+            state_dict (Dict[str, torch.Tensor]): The state dictionary containing model weights.
+
+        Returns:
+            Dict[str, torch.Tensor]: The converted layer normalization weights.
+        """
         converted = {}
         norm_keys = [k for k in state_dict.keys() if 'norm' in k or 'ln' in k]
         
@@ -77,7 +116,15 @@ class SafeModelConverter:
         return converted
 
     def validate_checkpoint(self, checkpoint_path: str) -> bool:
-        """Validate checkpoint integrity and security"""
+        """
+        Validate checkpoint integrity and security.
+
+        Args:
+            checkpoint_path (str): The path to the checkpoint file.
+
+        Returns:
+            bool: True if the checkpoint is valid, False otherwise.
+        """
         try:
             tensors = load_file(checkpoint_path)
             # Check metadata
@@ -107,7 +154,14 @@ class SafeModelConverter:
         output_path: str, 
         source_format: str
     ) -> None:
-        """Convert model weights to SafeTensors format"""
+        """
+        Convert model weights to SafeTensors format.
+
+        Args:
+            input_path (str): The path to the input checkpoint file.
+            output_path (str): The path to save the converted SafeTensors file.
+            source_format (str): The format of the source checkpoint (e.g., "pytorch").
+        """
         logger.info(f"Converting {source_format} checkpoint to SafeTensors")
         
         # Load source weights
@@ -139,7 +193,13 @@ class SafeModelConverter:
         shard_paths: List[str], 
         output_path: str
     ) -> None:
-        """Merge sharded checkpoints into single SafeTensors file"""
+        """
+        Merge sharded checkpoints into single SafeTensors file.
+
+        Args:
+            shard_paths (List[str]): List of paths to the checkpoint shards.
+            output_path (str): The path to save the merged SafeTensors file.
+        """
         merged_weights = {}
         
         for shard_path in tqdm(shard_paths, desc="Merging shards"):

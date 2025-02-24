@@ -1,7 +1,21 @@
 import flax.linen as nn
 import jax.numpy as jnp
+import logging
+from typing import Tuple
 
-def patchify(x, patch_size):
+logger = logging.getLogger(__name__)
+
+def patchify(x: jnp.ndarray, patch_size: int) -> jnp.ndarray:
+    """
+    Convert an image into patches.
+
+    Args:
+        x (jnp.ndarray): Input image tensor of shape (B, H, W, C).
+        patch_size (int): Size of each patch.
+
+    Returns:
+        jnp.ndarray: Patchified image tensor of shape (B, num_patches, patch_size*patch_size*C).
+    """
     B, H, W, C = x.shape
     assert H % patch_size == 0 and W % patch_size == 0
     num_patches_h = H // patch_size
@@ -12,16 +26,37 @@ def patchify(x, patch_size):
 
 class PatchEmbedding(nn.Module):
     embedding_size: int
+
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Apply dense layer to patches.
+
+        Args:
+            x (jnp.ndarray): Input tensor of shape (B, num_patches, patch_size*patch_size*C).
+
+        Returns:
+            jnp.ndarray: Embedded patches of shape (B, num_patches, embedding_size).
+        """
         return nn.Dense(self.embedding_size)(x)
 
 class TransformerBlock(nn.Module):
     num_heads: int
     mlp_dim: int
     dropout_rate: float
+
     @nn.compact
-    def __call__(self, x, train: bool = True):
+    def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+        """
+        Apply a single transformer block.
+
+        Args:
+            x (jnp.ndarray): Input tensor of shape (B, seq_len, hidden_size).
+            train (bool): Whether the model is in training mode.
+
+        Returns:
+            jnp.ndarray: Output tensor of shape (B, seq_len, hidden_size).
+        """
         x_norm = nn.LayerNorm()(x)
         q = nn.Dense(self.hidden_size)(x_norm)
         k = nn.Dense(self.hidden_size)(x_norm)
@@ -42,8 +77,20 @@ class VisionTransformer10B(nn.Module):
     num_layers: int = 24
     mlp_dim: int = 24576
     dropout_rate: float = 0.1
+
     @nn.compact
-    def __call__(self, x, train: bool = True):
+    def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+        """
+        Apply the Vision Transformer model.
+
+        Args:
+            x (jnp.ndarray): Input image tensor of shape (B, H, W, C).
+            train (bool): Whether the model is in training mode.
+
+        Returns:
+            jnp.ndarray: Output logits of shape (B, num_classes).
+        """
+        logger.info("Starting Vision Transformer forward pass")
         B, H, W, C = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0
         num_patches = (H // self.patch_size) * (W // self.patch_size)
@@ -58,4 +105,5 @@ class VisionTransformer10B(nn.Module):
             x = TransformerBlock(self.num_heads, self.mlp_dim, self.dropout_rate)(x, train)
         x = x[:, 0]  # Take [CLS] token
         x = nn.Dense(self.num_classes)(x)
+        logger.info("Completed Vision Transformer forward pass")
         return x

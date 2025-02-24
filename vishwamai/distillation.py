@@ -180,7 +180,12 @@ class VishwamaiShaalaTrainer:
         cfg: DictConfig
     ):
         """Initialize teacher and student models."""
-        self.teacher_model = teacher_model
+        # Initialize models with proper configuration mapping
+        if isinstance(teacher_model, dict):
+            teacher_config = ModelConfig.map_config_params(teacher_model)
+            self.teacher_model = VishwamAIModel(ModelConfig(**teacher_config))
+        else:
+            self.teacher_model = teacher_model
         self.student_model = student_model
         self.loss_fn = VishwamaiGuruKnowledge(cfg)
         self.cfg = cfg

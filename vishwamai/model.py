@@ -57,6 +57,35 @@ class ModelArgs:
 @dataclass
 class ModelConfig:
     """Configuration class for VishwamAI model"""
+    
+    @classmethod
+    def map_config_params(cls, config_dict: Dict) -> Dict:
+        """Map parameters from different naming conventions to ModelConfig format."""
+        mapped_dict = config_dict.copy()
+        
+        # Map attention parameters
+        if 'attention_dropout' in mapped_dict:
+            mapped_dict['attention_dropout_prob'] = mapped_dict.pop('attention_dropout')
+        if 'dropout' in mapped_dict:
+            mapped_dict['hidden_dropout_prob'] = mapped_dict.pop('dropout')
+        
+        # Map architecture parameters
+        if 'hidden_size' not in mapped_dict and 'dim' in mapped_dict:
+            mapped_dict['hidden_size'] = mapped_dict.pop('dim')
+        if 'num_attention_heads' not in mapped_dict and 'num_heads' in mapped_dict:
+            mapped_dict['num_attention_heads'] = mapped_dict.pop('num_heads')
+        if 'num_layers' not in mapped_dict and 'n_layers' in mapped_dict:
+            mapped_dict['num_layers'] = mapped_dict.pop('n_layers')
+        if 'intermediate_size' not in mapped_dict and 'intermediate_dim' in mapped_dict:
+            mapped_dict['intermediate_size'] = mapped_dict.pop('intermediate_dim')
+        
+        # Remove any unsupported parameters
+        mapped_dict.pop('attention_bias', None)
+        
+        # Return only valid ModelConfig parameters
+        return {k: v for k, v in mapped_dict.items() 
+                if k in cls.__dataclass_fields__}
+
     vocab_size: int = 32000
     hidden_size: int = 4096
     num_layers: int = 32
@@ -561,7 +590,7 @@ class VishwamAIModel(nn.Module):
     config: ModelConfig
 
     @classmethod
-    def from_pretrained(cls, model_path: str, *, config: Optional[ModelConfig] = None):
+    def from_pretrained(cls, model_path: str, *, config: Optional[ModelConfig] = None, rename_params: bool = True):
         """Load a pretrained model from Hugging Face Hub or local path.
         
         Args:
@@ -592,7 +621,30 @@ class VishwamAIModel(nn.Module):
                 raise ValueError(f"Config not found at {config_path}")
             with open(config_path) as f:
                 config_dict = json.load(f)
-            config = ModelConfig(**config_dict)
+            # Rename parameters to match ModelConfig if needed
+            if rename_params:
+                # Map attention parameters
+                if 'attention_dropout' in config_dict:
+                    config_dict['attention_dropout_prob'] = config_dict.pop('attention_dropout')
+                if 'dropout' in config_dict:
+                    config_dict['hidden_dropout_prob'] = config_dict.pop('dropout')
+                    
+                # Map architecture parameters
+                if 'hidden_size' not in config_dict and 'dim' in config_dict:
+                    config_dict['hidden_size'] = config_dict.pop('dim')
+                if 'num_attention_heads' not in config_dict and 'num_heads' in config_dict:
+                    config_dict['num_attention_heads'] = config_dict.pop('num_heads')
+                if 'num_layers' not in config_dict and 'n_layers' in config_dict:
+                    config_dict['num_layers'] = config_dict.pop('n_layers')
+                if 'intermediate_size' not in config_dict and 'intermediate_dim' in config_dict:
+                    config_dict['intermediate_size'] = config_dict.pop('intermediate_dim')
+                    
+                # Remove any unsupported parameters
+                config_dict.pop('attention_bias', None)
+                
+            # Create ModelConfig with cleaned parameters
+            config = ModelConfig(**{k: v for k, v in config_dict.items() 
+                                 if k in ModelConfig.__dataclass_fields__})
         
         # Initialize model with config
         model = cls(config)

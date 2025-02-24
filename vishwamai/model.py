@@ -11,7 +11,7 @@ from einops import rearrange, repeat
 from .error_correction import ErrorCorrectionModule, ModelIntegrator
 from .tot import TreeOfThoughts
 from .transformer import VisionTransformer10B
-
+import json
 @dataclass
 class ModelArgs:
     """Model hyperparameters with advanced optimizations"""
@@ -559,6 +559,55 @@ class ExtendedVishwamAIModel(nn.Module):
 class VishwamAIModel(nn.Module):
     """Base VishwamAI model implementing core transformer architecture"""
     config: ModelConfig
+
+    @classmethod
+    def from_pretrained(cls, model_path: str, config: Optional[ModelConfig] = None):
+        """Load a pretrained model from Hugging Face Hub or local path.
+        
+        Args:
+            model_path: Path to model on HF Hub or local directory
+            config: Optional ModelConfig, will load from model_path if not provided
+        
+        Returns:
+            VishwamAIModel: Loaded model instance
+        """
+        from huggingface_hub import snapshot_download
+        import safetensors.flax as stf
+        import os
+
+        # Download model files if needed
+        if not os.path.exists(model_path):
+            try:
+                model_path = snapshot_download(
+                    repo_id=model_path,
+                    allow_patterns=["*.safetensors", "config.json"]
+                )
+            except Exception as e:
+                raise ValueError(f"Error downloading model from {model_path}: {str(e)}")
+
+        # Load config
+        if config is None:
+            config_path = os.path.join(model_path, "config.json") 
+            if not os.path.exists(config_path):
+                raise ValueError(f"Config not found at {config_path}")
+            with open(config_path) as f:
+                config_dict = json.load(f)
+            config = ModelConfig(**config_dict)
+
+        # Initialize model
+        model = cls(config)
+
+        # Load weights from sharded safetensors
+        params = {}
+        for filename in sorted(os.listdir(model_path)):
+            if filename.endswith(".safetensors"):
+                shard_path = os.path.join(model_path, filename)
+                shard_params = stf.load_file(shard_path)
+                params.update(shard_params)
+
+        # Create variables dict and return bound model
+        variables = {'params': params}
+        return model.bind(variables)
 
     def setup(self):
         self.embeddings = self._create_embeddings()

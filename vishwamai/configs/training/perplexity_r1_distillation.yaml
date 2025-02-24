@@ -1,0 +1,75 @@
+# Configuration for Perplexity-R1 distillation
+
+teacher_model:
+  path: "perplexity-ai/r1-1776"
+  temperature: 2.0  # Higher temperature for softer probability distribution
+  alpha: 0.5       # Weight between distillation and task-specific loss
+
+student_model:
+  path: "VishwamAI/Perplexity_r1_disttled_experiment"
+  hidden_size: 2048        # Reduced from teacher's size
+  num_layers: 24          # Reduced from teacher's layers
+  num_heads: 32           # Number of attention heads
+  num_kv_heads: 8        # Number of key/value heads for GQA
+  intermediate_size: 8192 # Size of feed-forward layers
+  max_seq_len: 2048      # Maximum sequence length
+
+data:
+  path: "c4"             # Common Crawl dataset
+  subset: "en"           # English subset
+  preprocessing:
+    max_length: 2048
+    batch_size: 32
+    num_proc: 4
+
+training:
+  batch_size: 32
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_epochs: 3
+  warmup_steps: 1000
+  log_every: 100
+  eval_every: 500
+  save_every: 1
+  seed: 42
+
+distillation:
+  feature_distillation:
+    enabled: true
+    layers: [0, 8, 16, 23]  # Layer indices for feature matching
+    loss_weight: 0.1
+  
+  attention_distillation:
+    enabled: true
+    loss_weight: 0.1
+  
+  hidden_distillation:
+    enabled: true
+    loss_weight: 0.1
+  
+  pruning:
+    enabled: true
+    target_sparsity: 0.3
+    begin_step: 1000
+    end_step: 10000
+    pruning_schedule: "cubic"  # Linear or cubic schedule
+  
+  quantization:
+    enabled: true
+    precision: "int8"  # Quantization precision for final model
+
+optimization:
+  use_flash_attention: true
+  use_gqa: true           # Use Grouped-Query Attention
+  mixed_precision: true    # Use mixed precision training
+  gradient_checkpointing: true
+  
+evaluation:
+  eval_batch_size: 16
+  num_eval_samples: 1000
+  metrics:
+    - "perplexity"
+    - "accuracy"
+    - "rouge"
+    - "bleu"

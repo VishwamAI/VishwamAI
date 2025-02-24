@@ -16,14 +16,19 @@ class ErrorCorrectionModule(nn.Module):
     def __call__(self, x: jnp.ndarray, errors: Optional[jnp.ndarray] = None, training: bool = True) -> jnp.ndarray:
         """
         Apply error correction to the input tensor.
-
+        
+        This method computes multi-head dot product attention to detect errors in the input tensor,
+        generates error features via a dense layer, and applies an error gate computed with a sigmoid
+        activation to modulate the correction. The corrected tensor is obtained by adding the gated
+        error features to the original input through a residual connection.
+        
         Args:
-            x (jnp.ndarray): Input tensor.
-            errors (Optional[jnp.ndarray]): Optional error tensor.
-            training (bool): Whether the model is in training mode.
-
+            x (jnp.ndarray): The input tensor to be corrected.
+            errors (Optional[jnp.ndarray]): An optional tensor for error signals (currently not used).
+            training (bool): Flag indicating whether the module is in training mode.
+        
         Returns:
-            jnp.ndarray: Corrected tensor.
+            tuple[jnp.ndarray, jnp.ndarray]: A tuple containing the corrected tensor and the error gate.
         """
         logger.info("Applying error correction")
         # Error detection
@@ -63,24 +68,25 @@ class ModelIntegrator:
     """Integrates DeepSeek, ToT and Transformer components"""
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the ModelIntegrator with the given configuration.
-
+        Initializes the ModelIntegrator with a model configuration.
+        
+        This constructor assigns the given configuration to the model integrator and sets a default
+        error detection threshold of 0.1 used for validating model outputs.
+        
         Args:
-            config (Dict[str, Any]): Model configuration.
+            config (Dict[str, Any]): A dictionary containing model configuration parameters.
         """
         self.config = config
         self.error_threshold = 0.1
         
     def validate_outputs(self, outputs: jnp.ndarray, expected: Optional[jnp.ndarray] = None) -> bool:
         """
-        Validate model outputs and detect anomalies.
-
-        Args:
-            outputs (jnp.ndarray): Model outputs.
-            expected (Optional[jnp.ndarray]): Expected outputs.
-
-        Returns:
-            bool: True if outputs are valid, False otherwise.
+        Validates model outputs against expected values.
+        
+        If expected outputs are provided, computes the mean absolute error between the
+        predicted and expected outputs and compares it with the instance's error threshold.
+        Returns True if the error rate is below the threshold; otherwise, returns False.
+        If no expected outputs are supplied, validation is bypassed and True is returned.
         """
         logger.info("Validating model outputs")
         if expected is not None:
@@ -90,14 +96,18 @@ class ModelIntegrator:
     
     def error_correction_strategy(self, outputs: jnp.ndarray, errors: float) -> jnp.ndarray:
         """
-        Apply error correction based on detected errors.
-
+        Correct model outputs when error rate exceeds the acceptable threshold.
+        
+        If the detected error rate is above the error threshold, a correction factor is computed
+        (as the ratio of the error rate to the threshold, clipped between 0 and 1) and applied to
+        scale down the outputs. Otherwise, the original outputs are returned unchanged.
+        
         Args:
-            outputs (jnp.ndarray): Model outputs.
-            errors (float): Detected error rate.
-
+            outputs (jnp.ndarray): The original model outputs.
+            errors (float): The current error rate.
+            
         Returns:
-            jnp.ndarray: Corrected outputs.
+            jnp.ndarray: The corrected outputs if the error rate is high; otherwise, the original outputs.
         """
         logger.info("Applying error correction strategy")
         if errors > self.error_threshold:

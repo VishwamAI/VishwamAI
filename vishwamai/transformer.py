@@ -30,13 +30,15 @@ class PatchEmbedding(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
-        Apply dense layer to patches.
-
+        Embeds flattened image patches into a learned embedding space.
+        
+        Transforms each flattened patch into a dense embedding by applying a linear projection.
+        
         Args:
-            x (jnp.ndarray): Input tensor of shape (B, num_patches, patch_size*patch_size*C).
-
+            x (jnp.ndarray): Input tensor of shape (B, num_patches, patch_size*patch_size*C) representing flattened image patches.
+        
         Returns:
-            jnp.ndarray: Embedded patches of shape (B, num_patches, embedding_size).
+            jnp.ndarray: Tensor of shape (B, num_patches, embedding_size) containing the embedded patches.
         """
         return nn.Dense(self.embedding_size)(x)
 
@@ -48,14 +50,17 @@ class TransformerBlock(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
         """
-        Apply a single transformer block.
-
+        Applies a transformer block to a sequence.
+        
+        This block performs self-attention followed by a feedforward network, each with a residual
+        connection and preceded by layer normalization. Dropout is applied during training mode.
+        
         Args:
-            x (jnp.ndarray): Input tensor of shape (B, seq_len, hidden_size).
-            train (bool): Whether the model is in training mode.
-
+            x (jnp.ndarray): Input tensor with shape (B, seq_len, hidden_size).
+            train (bool): Indicates if the block is operating in training mode, affecting dropout.
+        
         Returns:
-            jnp.ndarray: Output tensor of shape (B, seq_len, hidden_size).
+            jnp.ndarray: Output tensor with shape (B, seq_len, hidden_size) after transformation.
         """
         x_norm = nn.LayerNorm()(x)
         q = nn.Dense(self.hidden_size)(x_norm)

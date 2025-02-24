@@ -561,7 +561,7 @@ class VishwamAIModel(nn.Module):
     config: ModelConfig
 
     @classmethod
-    def from_pretrained(cls, model_path: str, config: Optional[ModelConfig] = None):
+    def from_pretrained(cls, model_path: str, *, config: Optional[ModelConfig] = None):
         """Load a pretrained model from Hugging Face Hub or local path.
         
         Args:
@@ -574,40 +574,49 @@ class VishwamAIModel(nn.Module):
         from huggingface_hub import snapshot_download
         import safetensors.flax as stf
         import os
-
+        
         # Download model files if needed
         if not os.path.exists(model_path):
             try:
                 model_path = snapshot_download(
                     repo_id=model_path,
-                    allow_patterns=["*.safetensors", "config.json"]
+                    allow_patterns=["*.safetensors", "config.json", "tokenizer.model"]
                 )
             except Exception as e:
                 raise ValueError(f"Error downloading model from {model_path}: {str(e)}")
-
-        # Load config
+        
+        # Load config if not provided
         if config is None:
-            config_path = os.path.join(model_path, "config.json") 
+            config_path = os.path.join(model_path, "config.json")
             if not os.path.exists(config_path):
                 raise ValueError(f"Config not found at {config_path}")
             with open(config_path) as f:
                 config_dict = json.load(f)
             config = ModelConfig(**config_dict)
-
-        # Initialize model
+        
+        # Initialize model with config
         model = cls(config)
-
-        # Load weights from sharded safetensors
+        
+        # Load weights from sharded safetensors files
         params = {}
-        for filename in sorted(os.listdir(model_path)):
-            if filename.endswith(".safetensors"):
-                shard_path = os.path.join(model_path, filename)
+        shard_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
+        
+        if not shard_files:
+            raise ValueError(f"No .safetensors files found in {model_path}")
+        
+        for shard_file in shard_files:
+            shard_path = os.path.join(model_path, shard_file)
+            try:
                 shard_params = stf.load_file(shard_path)
                 params.update(shard_params)
-
-        # Create variables dict and return bound model
+            except Exception as e:
+                raise ValueError(f"Error loading weights from {shard_path}: {str(e)}")
+        
+        # Create variables dict and bind to model
         variables = {'params': params}
-        return model.bind(variables)
+        bound_model = model.bind(variables)
+        
+        return bound_model
 
     def setup(self):
         self.embeddings = self._create_embeddings()

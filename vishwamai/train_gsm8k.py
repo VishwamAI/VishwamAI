@@ -1,6 +1,5 @@
 import jax
-from jax.experimental import mesh_utils
-from jax.experimental.maps import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 from datasets import load_dataset
 from vishwamai.training import train, create_train_state
@@ -119,24 +118,29 @@ def save_model_safetensors(params: Dict, save_path: str):
 
 def setup_tpu_cluster():
     """Set up JAX TPU cluster configuration."""
-    # Get TPU configuration
+    # Get available devices
     devices = jax.devices()
     logger.info(f"Available devices: {devices}")
     
-    # Create mesh for data parallelism
-    mesh_shape = (8,)  # Assuming 8-core TPU
-    device_mesh = mesh_utils.create_device_mesh(mesh_shape)
-    mesh = Mesh(device_mesh, ('dp',))
+    # Create device mesh for data parallel training
+    device_count = len(devices)
+    device_mesh = np.array(devices).reshape(device_count)
     
-    return mesh
+    # Create mesh with data parallel sharding
+    mesh = Mesh(device_mesh, ('data',))
+    
+    # Create sharding rules
+    data_sharding = NamedSharding(mesh, P('data'))
+    
+    return mesh, data_sharding
 
 def main():
     # Load GSM8K specific config
     config_path = "vishwamai/configs/training/gsm8k.yaml"
     config = OmegaConf.load(config_path)
     
-    # Set up TPU configuration
-    mesh = setup_tpu_cluster()
+    # Set up TPU configuration with modern sharding
+    mesh, sharding = setup_tpu_cluster()
     
     # Initialize model with GSM8K specific configuration
     model_config = ModelConfig(**config.model)
@@ -166,7 +170,8 @@ def main():
             log_every=config.logging_steps,
             eval_every=config.eval_steps,
             checkpoint_dir=checkpoint_dir,
-            save_checkpoint_fn=save_checkpoint_hook
+            save_checkpoint_fn=save_checkpoint_hook,
+            sharding=sharding
         )
     
     # Save final model in safetensors format

@@ -19,6 +19,7 @@ from .tot import TreeOfThoughts, Thought, SearchState
 from .data_utils import create_train_dataloader, create_val_dataloader
 from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
 from .error_correction import ErrorCorrectionModule, compute_error_metrics
+from .error_correction_trainer import ErrorCorrectionTrainer
 from .training import train, train_step, eval_step
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "MultiLevelToTAttention",
     "ErrorCorrectionModule",
     "compute_error_metrics",
+    "ErrorCorrectionTrainer",
     "VishwamaiGuruKnowledge",
     "VishwamaiShaalaTrainer",
     "train",

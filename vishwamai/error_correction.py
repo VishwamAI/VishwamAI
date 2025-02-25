@@ -1,11 +1,14 @@
-import jax
-import jax.numpy as jnp
 from typing import Optional, Dict, Any, NamedTuple
-import flax.linen as nn
-import logging
 from dataclasses import dataclass
 from functools import partial
+import logging
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
 import optax
+# Re-export ErrorCorrectionTrainer from error_correction_trainer to maintain compatibility
+from .error_correction_trainer import ErrorCorrectionTrainer
+
 logger = logging.getLogger(__name__)
 
 class ErrorCorrectionOutput(NamedTuple):

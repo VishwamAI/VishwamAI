@@ -1,148 +1,114 @@
-graph TB
-    %% Input Processing
-    Input["**Input Text**"]:::primary
-    Tokenizer["**Tokenizer**"]:::processing
-    Embedding["**Token Embedding**"]:::processing
-    PosEmbed["**Positional Encoding/RoPE**"]:::processing
-
-    %% Main Components
-    MLA["**Multi-Level Attention**"]:::attention
-    MoE["**Mixture of Experts**"]:::secondary
-    MoD["**Mixture of Depth**"]:::depth
-    ToT["**Tree of Thoughts**"]:::tot
-
-    %% Attention Components
-    GQA["Grouped Query<br>Attention"]:::attention
-    FlashAttn["Flash Attention"]:::attention
-    SlidingWindow["Sliding Window<br>Attention"]:::attention
-
-    %% MLA Components
-    MLA_F["Fine Level"]:::attention
-    MLA_M["Medium Level"]:::attention
-    MLA_C["Coarse Level"]:::attention
-    MLA_Fusion["Level Fusion"]:::attention
-
-    %% MoE Components
-    Router["Expert Router"]:::secondary
-    Expert1["Expert 1"]:::expert
-    Expert2["Expert 2"]:::expert
-    ExpertN["Expert N"]:::expert
-    LoadBal["Load Balancing"]:::secondary
-
-    %% MoD Components
-    DepthRouter["Depth Router"]:::depth
-    Layer1["Layer 1"]:::depth
-    Layer2["Layer 2"]:::depth
-    LayerN["Layer N"]:::depth
-    DepthControl["Depth Controller"]:::depth
-
-    %% ToT Components
-    ThoughtGen["Thought<br>Generator"]:::tot
-    BeamSearch["Beam Search"]:::tot
-    ThoughtInt["Thought<br>Integration"]:::tot
-
-    %% Output Processing
-    LayerNorm["**Layer Normalization**"]:::processing
-    Output["**Output**"]:::primary
-
-    %% Connections for Input Processing
-    Input -->|"1"| Tokenizer
-    Tokenizer -->|"2"| Embedding
-    Embedding -->|"3"| PosEmbed
+flowchart TB
+    %% MAIN COMPONENTS WITH IMPROVED STYLING
+    Input([Input Text]):::mainInput
+    Output([Generated Output]):::mainOutput
     
-    %% Attention Mechanisms
-    PosEmbed -->|"4"| GQA
-    GQA -->|"5"| FlashAttn
-    FlashAttn -->|"6"| SlidingWindow
-    SlidingWindow -->|"7"| MLA
-
-    %% Multi-Level Attention Flow
-    MLA -->|"8a"| MLA_F 
-    MLA -->|"8b"| MLA_M 
-    MLA -->|"8c"| MLA_C
-    MLA_F --> MLA_Fusion
-    MLA_M --> MLA_Fusion
-    MLA_C --> MLA_Fusion
-
-    %% Tree of Thoughts Flow
-    MLA_Fusion -->|"10"| ThoughtGen
-    ThoughtGen -->|"11"| BeamSearch
-    BeamSearch -->|"12"| ThoughtInt
-
-    %% Mixture of Experts Flow
-    ThoughtInt -->|"13"| Router
-    Router -->|"14a"| Expert1 
-    Router -->|"14b"| Expert2 
-    Router -->|"14c"| ExpertN
-    Expert1 --> LoadBal
-    Expert2 --> LoadBal
-    ExpertN --> LoadBal
-
-    %% Mixture of Depth Flow
-    LoadBal -->|"16"| DepthRouter
-    DepthRouter -->|"17a"| Layer1 
-    DepthRouter -->|"17b"| Layer2 
-    DepthRouter -->|"17c"| LayerN
-    Layer1 --> DepthControl
-    Layer2 --> DepthControl
-    LayerN --> DepthControl
-
-    %% Output Flow
-    DepthControl -->|"19"| LayerNorm
-    LayerNorm -->|"20"| Output
-
-    %% Subgraph Wrapping
-    subgraph Attention Mechanisms
-        GQA
-        FlashAttn
-        SlidingWindow
+    %% PROCESSING BLOCKS
+    subgraph InputProcessing ["Input Processing"]
+        direction TB
+        Tokenizer[/"Tokenizer"/]:::processor
+        Embedding["Token Embedding"]:::processor
+        PosEmbed["Positional Encoding (RoPE)"]:::processor
     end
-
-    subgraph Multi-Level Attention
-        MLA
-        MLA_F
-        MLA_M
-        MLA_C
-        MLA_Fusion
+    
+    subgraph AttentionMechanisms ["Attention Mechanisms"]
+        direction TB
+        GQA["Grouped Query Attention"]:::attention
+        FlashAttn["Flash Attention"]:::attention
+        SlidingWindow["Sliding Window Attention"]:::attention
     end
-
-    subgraph Tree of Thoughts
-        ThoughtGen
-        BeamSearch
-        ThoughtInt
+    
+    subgraph MultiLevelAttention ["Multi-Level Attention"]
+        direction LR
+        MLA["Level Selection"]:::attention
+        
+        subgraph AttentionLevels ["Attention Levels"]
+            direction TB
+            MLA_F["Fine Level"]:::attention
+            MLA_M["Medium Level"]:::attention
+            MLA_C["Coarse Level"]:::attention
+        end
+        
+        MLA_Fusion["Level Fusion"]:::attention
     end
-
-    subgraph Mixture of Experts
-        Router
-        Expert1
-        Expert2
-        ExpertN
-        LoadBal
+    
+    subgraph TreeOfThoughts ["Tree of Thoughts"]
+        direction TB
+        ThoughtGen["Thought Generator"]:::thinking
+        BeamSearch["Beam Search"]:::thinking
+        ThoughtInt["Thought Integration"]:::thinking
     end
-
-    subgraph Mixture of Depth
-        DepthRouter
-        Layer1
-        Layer2
-        LayerN
-        DepthControl
+    
+    subgraph MixtureOfExperts ["Mixture of Experts"]
+        direction TB
+        Router{{"Expert Router"}}:::router
+        
+        subgraph Experts ["Expert Modules"]
+            direction LR
+            Expert1["Expert 1"]:::expert
+            Expert2["Expert 2"]:::expert
+            ExpertN["Expert N"]:::expert
+        end
+        
+        LoadBal["Load Balancing"]:::router
     end
-
-    %% Legend (Mermaid does not support styling subgraphs)
+    
+    subgraph MixtureOfDepth ["Mixture of Depth"]
+        direction TB
+        DepthRouter{{"Depth Router"}}:::depth
+        
+        subgraph DynamicLayers ["Dynamic Layers"]
+            direction LR
+            Layer1["Layer 1"]:::depth
+            Layer2["Layer 2"]:::depth
+            LayerN["Layer N"]:::depth
+        end
+        
+        DepthControl["Depth Controller"]:::depth
+    end
+    
+    %% CONNECTING THE COMPONENTS WITH CLEAR FLOW
+    Input --> InputProcessing
+    Tokenizer --> Embedding --> PosEmbed
+    
+    InputProcessing --> AttentionMechanisms
+    GQA --> FlashAttn --> SlidingWindow
+    
+    AttentionMechanisms --> MultiLevelAttention
+    MLA --> AttentionLevels
+    MLA_F & MLA_M & MLA_C --> MLA_Fusion
+    
+    MultiLevelAttention --> TreeOfThoughts
+    ThoughtGen --> BeamSearch --> ThoughtInt
+    
+    TreeOfThoughts --> MixtureOfExperts
+    Router --> Experts
+    Expert1 & Expert2 & ExpertN --> LoadBal
+    
+    MixtureOfExperts --> MixtureOfDepth
+    DepthRouter --> DynamicLayers
+    Layer1 & Layer2 & LayerN --> DepthControl
+    
+    MixtureOfDepth --> LayerNorm["Layer Normalization"]:::processor
+    LayerNorm --> Output
+    
+    %% IMPROVED STYLING WITH CLEAR VISUAL HIERARCHY
+    classDef mainInput fill:#3498db,stroke:#2980b9,color:white,stroke-width:2px,rounded:true,padding:10px
+    classDef mainOutput fill:#2ecc71,stroke:#27ae60,color:white,stroke-width:2px,rounded:true,padding:10px
+    classDef processor fill:#f39c12,stroke:#e67e22,stroke-width:1px
+    classDef attention fill:#9b59b6,stroke:#8e44ad,color:white,stroke-width:1px
+    classDef thinking fill:#f1c40f,stroke:#f39c12,stroke-width:1px
+    classDef router fill:#e74c3c,stroke:#c0392b,color:white,stroke-width:1px,shape:hexagon
+    classDef expert fill:#1abc9c,stroke:#16a085,color:white,stroke-width:1px
+    classDef depth fill:#34495e,stroke:#2c3e50,color:white,stroke-width:1px
+    
+    %% LEGEND
     subgraph Legend
-        A["Processing"]:::processing
-        B["Attention Mechanism"]:::attention
-        C["Expert Node"]:::expert
-        D["Flow Control"]:::secondary
-        E["Depth Control"]:::depth
-        F["Tree of Thoughts"]:::tot
+        L_Input([Input/Output]):::mainInput
+        L_Process[/"Processing"/]:::processor
+        L_Attention["Attention"]:::attention
+        L_Think["Thought Processing"]:::thinking
+        L_Route{{"Router"}}:::router
+        L_Expert["Expert"]:::expert
+        L_Depth["Depth Control"]:::depth
     end
-
-    %% Styling (Subgraphs cannot be styled directly)
-    classDef primary fill:#a8d5e5,stroke:#457b9d,stroke-width:2px
-    classDef secondary fill:#f1faee,stroke:#457b9d,stroke-width:1px
-    classDef expert fill:#e63946,stroke:#457b9d,color:#fff,stroke-width:1px
-    classDef attention fill:#457b9d,stroke:#1d3557,color:#fff,stroke-width:1px
-    classDef processing fill:#ffd6a5,stroke:#457b9d,stroke-width:1px
-    classDef depth fill:#2a9d8f,stroke:#264653,color:#fff,stroke-width:1px
-    classDef tot fill:#f4a261,stroke:#264653,stroke-width:1px

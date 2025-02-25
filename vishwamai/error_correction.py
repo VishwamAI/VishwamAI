@@ -5,7 +5,7 @@ import flax.linen as nn
 import logging
 from dataclasses import dataclass
 from functools import partial
-
+import optax
 logger = logging.getLogger(__name__)
 
 class ErrorCorrectionOutput(NamedTuple):
@@ -22,107 +22,139 @@ class ErrorMetrics:
     correction_strength: float
 
 class ErrorCorrectionModule(nn.Module):
-    """Enhanced error correction module with parallel processing."""
-    hidden_size: int
-    num_heads: int = 4
-    dropout_rate: float = 0.1
-    qkv_features: Optional[int] = None
-    memory_size: int = 1024  # Size of error memory buffer
-    
-    def setup(self):
-        self.error_memory = self.param(
-            'error_memory',
-            nn.initializers.normal(0.02),
-            (self.memory_size, self.hidden_size)
-        )
-        self.memory_scores = self.param(
-            'memory_scores',
-            nn.initializers.zeros,
-            (self.memory_size,)
-        )
-    
-    @partial(jax.vmap, in_axes=(None, 0, None, None))
-    def detect_errors(self, x: jnp.ndarray, memory: jnp.ndarray) -> jnp.ndarray:
-        """Parallel error detection using vectorized operations."""
-        similarity = jnp.einsum('h,mh->m', x, memory)
-        return jax.nn.softmax(similarity / jnp.sqrt(self.hidden_size))
-    
-    def update_memory(self, errors: jnp.ndarray, features: jnp.ndarray) -> None:
-        """Update error memory with new examples using moving average."""
-        error_magnitude = jnp.mean(jnp.abs(errors), axis=-1)
-        update_idx = jnp.argmin(self.memory_scores)
-        
-        def update_slot(state, idx):
-            memory, scores = state
-            memory = memory.at[idx].set(features[idx])
-            scores = scores.at[idx].set(error_magnitude[idx])
-            return (memory, scores)
-        
-        self.error_memory, self.memory_scores = jax.lax.fori_loop(
-            0, len(error_magnitude),
-            update_slot,
-            (self.error_memory, self.memory_scores)
-        )
+    """Module for error detection and correction in model outputs."""
+    hidden_dim: int = 1024
+    num_correction_layers: int = 2
+    correction_threshold: float = 0.7
     
     @nn.compact
-    def __call__(self, 
-                 x: jnp.ndarray, 
-                 errors: Optional[jnp.ndarray] = None, 
-                 training: bool = True) -> ErrorCorrectionOutput:
-        """Enhanced error correction with memory-based attention."""
-        logger.info("Applying parallel error correction")
+    def __call__(self, hidden_states, labels=None, deterministic=True):
+        # Error detection network
+        detection_logits = nn.Dense(features=1, name="error_detector")(hidden_states)
+        detection_probs = jax.nn.sigmoid(detection_logits)
         
-        # Calculate qkv_features if not provided
-        qkv_features = self.qkv_features or self.hidden_size
+        # Error correction network
+        correction_states = hidden_states
+        for i in range(self.num_correction_layers):
+            correction_states = nn.Dense(features=self.hidden_dim)(correction_states)
+            correction_states = nn.gelu(correction_states)
+            correction_states = nn.Dropout(rate=0.1, deterministic=deterministic)(correction_states)
         
-        # Multi-scale error detection
-        error_scores = []
-        for scale in [1, 2, 4]:  # Multiple attention scales
-            # Reshape input for multi-scale processing
-            B, L, H = x.shape
-            scale_x = x.reshape(B, L // scale, scale, H).mean(axis=2)
+        corrected_states = nn.Dense(features=hidden_states.shape[-1])(correction_states)
+        
+        # Apply correction based on detection
+        error_mask = detection_probs > self.correction_threshold
+        final_states = jnp.where(error_mask, corrected_states, hidden_states)
+        
+        result = {
+            "corrected_states": final_states,
+            "error_probs": detection_probs,
+            "correction_mask": error_mask
+        }
+        
+        if labels is not None:
+            # Calculate error detection metrics when labels are provided
+            has_error = labels != jnp.argmax(hidden_states @ hidden_states.T, axis=-1)
+            detection_loss = optax.sigmoid_binary_cross_entropy(
+                detection_logits, has_error.astype(jnp.float32)
+            ).mean()
+            result["detection_loss"] = detection_loss
             
-            # Error detection at current scale
-            error_attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads,
-                qkv_features=qkv_features,
-                dropout_rate=self.dropout_rate,
-                deterministic=not training,
-                use_bias=True
-            )(scale_x, scale_x)
-            
-            error_scores.append(error_attn)
+        return result
+
+def compute_error_metrics(logits, corrected_logits, labels):
+    """Compute metrics to evaluate error correction performance."""
+    original_predictions = jnp.argmax(logits, axis=-1)
+    corrected_predictions = jnp.argmax(corrected_logits, axis=-1)
+    
+    original_accuracy = jnp.mean((original_predictions == labels).astype(jnp.float32))
+    corrected_accuracy = jnp.mean((corrected_predictions == labels).astype(jnp.float32))
+    
+    # Calculate where corrections helped vs. where they made things worse
+    original_correct = original_predictions == labels
+    corrected_correct = corrected_predictions == labels
+    
+    helped = jnp.logical_and(~original_correct, corrected_correct)
+    hurt = jnp.logical_and(original_correct, ~corrected_correct)
+    
+    helped_ratio = jnp.sum(helped) / jnp.sum(~original_correct) if jnp.sum(~original_correct) > 0 else 0.0
+    hurt_ratio = jnp.sum(hurt) / jnp.sum(original_correct) if jnp.sum(original_correct) > 0 else 0.0
+    
+    return {
+        "original_accuracy": original_accuracy,
+        "corrected_accuracy": corrected_accuracy,
+        "helped_ratio": helped_ratio,
+        "hurt_ratio": hurt_ratio,
+        "net_improvement": corrected_accuracy - original_accuracy,
+    }
+
+def create_error_corrected_train_step(base_train_step, error_correction_weight=0.5):
+    """Wraps a training step with error correction capabilities."""
+    def error_corrected_train_step(state, batch, dropout_rng):
+        base_outputs, updated_state = base_train_step(state, batch, dropout_rng)
         
-        # Combine multi-scale error features
-        error_features = jnp.concatenate([
-            jnp.repeat(score, scale, axis=1)[:, :L, :]
-            for score, scale in zip(error_scores, [1, 2, 4])
-        ], axis=-1)
-        
-        # Memory-augmented error correction
-        memory_weights = self.detect_errors(x, self.error_memory)
-        memory_context = jnp.einsum('bsm,mh->bsh', memory_weights, self.error_memory)
-        
-        # Fused correction network
-        correction_features = nn.Dense(self.hidden_size)(
-            jnp.concatenate([error_features, memory_context], axis=-1)
+        # Apply error correction module
+        error_module = ErrorCorrectionModule()
+        error_outputs = error_module(
+            hidden_states=base_outputs["hidden_states"], 
+            labels=batch.get("labels"),
+            deterministic=False
         )
-        correction_features = nn.LayerNorm()(correction_features)
-        correction_features = nn.relu(correction_features)
         
-        # Adaptive gating mechanism
-        error_gate = jax.nn.sigmoid(nn.Dense(self.hidden_size)(x))
-        confidence = jnp.mean(error_gate, axis=-1, keepdims=True)
+        # Combine losses
+        total_loss = base_outputs["loss"]
+        if "detection_loss" in error_outputs:
+            total_loss = total_loss + error_correction_weight * error_outputs["detection_loss"]
         
-        # Apply correction with dynamic scaling
-        scale = jnp.sqrt(1.0 / (self.hidden_size * confidence + 1e-6))
-        corrected = x + scale * error_gate * correction_features
+        # Update metrics
+        metrics = base_outputs.get("metrics", {})
+        metrics.update({
+            "error_detection_loss": error_outputs.get("detection_loss", 0.0),
+            "error_correction_rate": jnp.mean(error_outputs["correction_mask"].astype(jnp.float32))
+        })
         
-        # Update error memory during training
-        if training and errors is not None:
-            self.update_memory(errors, x)
+        return {
+            **base_outputs,
+            "corrected_hidden_states": error_outputs["corrected_states"],
+            "error_probs": error_outputs["error_probs"],
+            "metrics": metrics,
+            "loss": total_loss
+        }, updated_state
+    
+    return error_corrected_train_step
+
+def create_error_corrected_eval_step(base_eval_step):
+    """Wraps an evaluation step with error correction capabilities."""
+    def error_corrected_eval_step(state, batch):
+        base_outputs = base_eval_step(state, batch)
         
-        return ErrorCorrectionOutput(corrected, error_gate)
+        # Apply error correction module in eval mode
+        error_module = ErrorCorrectionModule()
+        error_outputs = error_module(
+            hidden_states=base_outputs["hidden_states"], 
+            labels=batch.get("labels"),
+            deterministic=True
+        )
+        
+        # Calculate error correction metrics
+        if "logits" in base_outputs and "labels" in batch:
+            corrected_logits = error_outputs["corrected_states"] @ state.params["output_projection"]["kernel"].T
+            error_metrics = compute_error_metrics(
+                base_outputs["logits"], 
+                corrected_logits,
+                batch["labels"]
+            )
+            
+            metrics = base_outputs.get("metrics", {})
+            metrics.update(error_metrics)
+            base_outputs["metrics"] = metrics
+        
+        base_outputs["corrected_hidden_states"] = error_outputs["corrected_states"]
+        base_outputs["error_probs"] = error_outputs["error_probs"]
+        
+        return base_outputs
+    
+    return error_corrected_eval_step
 
 class AdaptiveErrorCorrection(nn.Module):
     """

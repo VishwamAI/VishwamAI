@@ -306,3 +306,171 @@ def evaluate_error_correction(
     logger.info(f"ToT triggered: {metrics['tot_triggered']} times")
     
     return metrics
+
+import optax
+from flax.training import train_state
+from typing import List, Optional
+from functools import partial
+
+from .loss_functions import compute_loss, compute_weighted_cross_entropy, compute_contrastive_loss
+
+def create_train_state(model, learning_rate_fn, weight_decay=0.01):
+    """Create initial training state."""
+    optimizer = optax.adamw(
+        learning_rate=learning_rate_fn,
+        b1=0.9,
+        b2=0.999,
+        eps=1e-8,
+        weight_decay=weight_decay
+    )
+    
+    return train_state.TrainState.create(
+        apply_fn=model.__call__,
+        params=model.params,
+        tx=optimizer
+    )
+
+def standard_train_step(state, batch, dropout_rng, loss_fn=compute_loss):
+    """Standard training step function."""
+    dropout_rng = jax.random.fold_in(dropout_rng, state.step)
+    
+    def loss_fn_wrapper(params):
+        outputs = state.apply_fn(
+            params,
+            batch["input_ids"],
+            attention_mask=batch.get("attention_mask"),
+            deterministic=False,
+            rngs={"dropout": dropout_rng}
+        )
+        loss, loss_metrics = loss_fn(outputs, batch)
+        return loss, (outputs, loss_metrics)
+    
+    grad_fn = jax.value_and_grad(loss_fn_wrapper, has_aux=True)
+    (loss, (outputs, loss_metrics)), grads = grad_fn(state.params)
+    
+    # Update model
+    new_state = state.apply_gradients(grads=grads)
+    
+    metrics = {
+        "loss": loss,
+        "learning_rate": get_learning_rate(new_state),
+        "gradient_norm": optax.global_norm(grads),
+        **loss_metrics
+    }
+    
+    outputs["metrics"] = metrics
+    outputs["loss"] = loss
+    
+    return outputs, new_state
+
+def standard_eval_step(state, batch, loss_fn=compute_loss):
+    """Standard evaluation step function."""
+    outputs = state.apply_fn(
+        state.params,
+        batch["input_ids"],
+        attention_mask=batch.get("attention_mask"),
+        deterministic=True
+    )
+    
+    loss, loss_metrics = loss_fn(outputs, batch)
+    
+    metrics = {
+        "loss": loss,
+        **loss_metrics
+    }
+    
+    outputs["metrics"] = metrics
+    outputs["loss"] = loss
+    
+    return outputs
+
+def distillation_train_step(state, batch, dropout_rng, teacher_state, temperature=2.0, alpha=0.5):
+    """Training step with knowledge distillation."""
+    dropout_rng = jax.random.fold_in(dropout_rng, state.step)
+    
+    # Get teacher logits
+    teacher_outputs = teacher_state.apply_fn(
+        teacher_state.params,
+        batch["input_ids"],
+        attention_mask=batch.get("attention_mask"),
+        deterministic=True
+    )
+    teacher_logits = teacher_outputs["logits"]
+    
+    def loss_fn(params):
+        outputs = state.apply_fn(
+            params,
+            batch["input_ids"],
+            attention_mask=batch.get("attention_mask"),
+            deterministic=False,
+            rngs={"dropout": dropout_rng}
+        )
+        student_logits = outputs["logits"]
+        
+        # Hard loss (standard cross-entropy with true labels)
+        hard_loss, loss_metrics = compute_loss(outputs, batch)
+        
+        # Soft loss (distillation from teacher predictions)
+        soft_loss = compute_weighted_cross_entropy(
+            student_logits,
+            jax.nn.softmax(teacher_logits / temperature, axis=-1),
+            temperature=temperature
+        )
+        
+        # Combined loss
+        total_loss = alpha * hard_loss + (1.0 - alpha) * soft_loss
+        
+        loss_metrics["hard_loss"] = hard_loss
+        loss_metrics["soft_loss"] = soft_loss
+        
+        return total_loss, (outputs, loss_metrics)
+    
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, (outputs, loss_metrics)), grads = grad_fn(state.params)
+    
+    # Update model
+    new_state = state.apply_gradients(grads=grads)
+    
+    metrics = {
+        "loss": loss,
+        "learning_rate": get_learning_rate(new_state),
+        "gradient_norm": optax.global_norm(grads),
+        **loss_metrics
+    }
+    
+    outputs["metrics"] = metrics
+    outputs["loss"] = loss
+    outputs["teacher_logits"] = teacher_logits
+    
+    return outputs, new_state
+
+def get_learning_rate(state):
+    """Helper function to extract current learning rate."""
+    if hasattr(state.tx, "learning_rate"):
+        return state.tx.learning_rate
+    else:
+        # Try to extract from optimizer
+        return 0.0  # Fallback if can't extract learning rate
+
+def create_learning_rate_fn(
+    lr_init: float = 1e-4,
+    lr_end: float = 1e-5,
+    warmup_steps: int = 1000,
+    num_train_steps: int = 100000,
+):
+    """Creates learning rate schedule."""
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0, end_value=lr_init, transition_steps=warmup_steps
+    )
+    
+    decay_fn = optax.linear_schedule(
+        init_value=lr_init,
+        end_value=lr_end,
+        transition_steps=num_train_steps - warmup_steps,
+    )
+    
+    schedule_fn = optax.join_schedules(
+        schedules=[warmup_fn, decay_fn], boundaries=[warmup_steps]
+    )
+    
+    return schedule_fn

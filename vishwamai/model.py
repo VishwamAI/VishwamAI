@@ -14,7 +14,11 @@ import gc
 from huggingface_hub import snapshot_download
 import safetensors.flax as stf  # Correct import
 from omegaconf import OmegaConf
-import logger
+import logging  # Replace import logger with standard logging
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
 def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
                     beta1: float = 0.9, beta2: float = 0.999, 
                     warmup_steps: int = 2000, num_train_steps: int = 100000):

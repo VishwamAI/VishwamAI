@@ -534,3 +534,276 @@ def evaluate_error_correction(
     logger.info(f"ToT triggered: {metrics['tot_triggered']} times")
     
     return metrics
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax.training import train_state
+import optax
+from typing import Dict, List, Tuple, Callable, Any, Optional
+from tqdm import tqdm
+import time
+
+from .error_correction import (
+    ErrorCorrectionModule, 
+    create_error_corrected_train_step, 
+    create_error_corrected_eval_step,
+    compute_error_metrics
+)
+from .training_steps import (
+    standard_train_step,
+    standard_eval_step,
+    create_learning_rate_fn
+)
+from .loss_functions import compute_loss
+
+class ErrorCorrectionTrainer:
+    """
+    A trainer class that incorporates error correction during model training.
+    """
+    
+    def __init__(
+        self,
+        model,
+        error_correction_config: Dict = None,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
+        warmup_steps: int = 500,
+        max_steps: int = 10000,
+        error_correction_weight: float = 0.5,
+    ):
+        """
+        Initialize the trainer with model and configuration.
+        
+        Args:
+            model: The base model to train
+            error_correction_config: Configuration for error correction
+            learning_rate: Maximum learning rate
+            weight_decay: Weight decay regularization strength
+            warmup_steps: Number of warmup steps
+            max_steps: Total number of training steps
+            error_correction_weight: Weight for error correction loss
+        """
+        self.model = model
+        self.error_correction_config = error_correction_config or {}
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.error_correction_weight = error_correction_weight
+        
+        # Create learning rate schedule
+        self.lr_schedule = create_learning_rate_fn(
+            lr_init=learning_rate,
+            lr_end=learning_rate / 10,
+            warmup_steps=warmup_steps,
+            num_train_steps=max_steps
+        )
+        
+        # Create error correction module
+        self.error_module = ErrorCorrectionModule(
+            hidden_dim=self.error_correction_config.get("hidden_dim", 1024),
+            num_correction_layers=self.error_correction_config.get("num_layers", 2),
+            correction_threshold=self.error_correction_config.get("threshold", 0.7)
+        )
+        
+        # Create training state
+        self.state = None
+        
+    def create_state(self, params=None):
+        """Create or update the training state."""
+        if params is not None:
+            self.model.params = params
+            
+        # Create optimizer
+        optimizer = optax.adamw(
+            learning_rate=self.lr_schedule,
+            b1=0.9,
+            b2=0.999,
+            eps=1e-8,
+            weight_decay=self.weight_decay
+        )
+        
+        # Create training state
+        self.state = train_state.TrainState.create(
+            apply_fn=self.model.__call__,
+            params=self.model.params,
+            tx=optimizer
+        )
+        
+        return self.state
+    
+    def train(
+        self,
+        train_dataloader,
+        eval_dataloader=None,
+        num_epochs: int = 1,
+        log_every: int = 100,
+        eval_every: int = 1000,
+        save_every: int = 5000,
+        checkpoint_path: str = None,
+    ):
+        """
+        Train the model with error correction.
+        
+        Args:
+            train_dataloader: Training data loader
+            eval_dataloader: Optional evaluation data loader
+            num_epochs: Number of epochs to train
+            log_every: Log metrics every N steps
+            eval_every: Evaluate model every N steps
+            save_every: Save checkpoint every N steps
+            checkpoint_path: Directory to save checkpoints
+        
+        Returns:
+            Dictionary with training metrics
+        """
+        if self.state is None:
+            self.create_state()
+            
+        # Create training and evaluation steps with error correction
+        train_step_fn = create_error_corrected_train_step(
+            standard_train_step,
+            error_correction_weight=self.error_correction_weight
+        )
+        
+        eval_step_fn = create_error_corrected_eval_step(standard_eval_step)
+        
+        # JIT-compile steps
+        train_step_jit = jax.jit(train_step_fn)
+        if eval_dataloader is not None:
+            eval_step_jit = jax.jit(eval_step_fn)
+            
+        # Track metrics
+        train_metrics = []
+        eval_metrics = []
+        step = 0
+        dropout_rng = jax.random.PRNGKey(0)
+        
+        for epoch in range(num_epochs):
+            print(f"Starting epoch {epoch + 1}/{num_epochs}")
+            
+            # Training loop
+            for batch in tqdm(train_dataloader, desc=f"Epoch {epoch + 1}"):
+                step_start_time = time.time()
+                dropout_rng, step_rng = jax.random.split(dropout_rng)
+                
+                # Train step
+                outputs, self.state = train_step_jit(self.state, batch, step_rng)
+                
+                # Log metrics
+                if step % log_every == 0:
+                    metrics = outputs["metrics"]
+                    metrics["step"] = step
+                    metrics["epoch"] = epoch
+                    metrics["step_time"] = time.time() - step_start_time
+                    train_metrics.append(metrics)
+                    
+                    print(f"Step {step}: loss={metrics['loss']:.4f}, "
+                          f"accuracy={metrics.get('accuracy', 0.0):.4f}, "
+                          f"error_rate={metrics.get('error_correction_rate', 0.0):.4f}")
+                
+                # Evaluate
+                if eval_dataloader is not None and step % eval_every == 0:
+                    eval_metric = self.evaluate(eval_dataloader, eval_step_jit)
+                    eval_metric["step"] = step
+                    eval_metric["epoch"] = epoch
+                    eval_metrics.append(eval_metric)
+                    
+                    print(f"Eval at step {step}: loss={eval_metric['loss']:.4f}, "
+                          f"accuracy={eval_metric.get('accuracy', 0.0)::.4f}, "
+                          f"net_improvement={eval_metric.get('net_improvement', 0.0):.4f}")
+                
+                # Save checkpoint
+                if checkpoint_path is not None and step % save_every == 0:
+                    self.save_checkpoint(checkpoint_path, step)
+                
+                step += 1
+                if step >= self.max_steps:
+                    break
+                    
+            if step >= self.max_steps:
+                break
+        
+        # Final evaluation
+        if eval_dataloader is not None:
+            final_metrics = self.evaluate(eval_dataloader, eval_step_jit)
+            final_metrics["step"] = step
+            final_metrics["epoch"] = epoch
+            eval_metrics.append(final_metrics)
+            
+            print(f"Final evaluation: loss={final_metrics['loss']:.4f}, "
+                  f"accuracy={final_metrics.get('accuracy', 0.0):.4f}")
+        
+        # Final checkpoint
+        if checkpoint_path is not None:
+            self.save_checkpoint(checkpoint_path, step)
+        
+        return {
+            "train_metrics": train_metrics,
+            "eval_metrics": eval_metrics,
+            "steps": step,
+            "epochs": epoch + 1
+        }
+    
+    def evaluate(self, dataloader, eval_step_fn=None):
+        """
+        Evaluate the model on a dataset.
+        
+        Args:
+            dataloader: Evaluation dataloader
+            eval_step_fn: Optional pre-compiled evaluation step function
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        if eval_step_fn is None:
+            eval_step_fn = jax.jit(create_error_corrected_eval_step(standard_eval_step))
+            
+        all_metrics = []
+        
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            outputs = eval_step_fn(self.state, batch)
+            all_metrics.append(outputs["metrics"])
+        
+        # Aggregate metrics
+        metrics = {}
+        for key in all_metrics[0].keys():
+            metrics[key] = jnp.mean(jnp.array([m.get(key, 0.0) for m in all_metrics]))
+            
+        return metrics
+    
+    def save_checkpoint(self, path, step):
+        """Save model checkpoint."""
+        import os
+        import pickle
+        
+        os.makedirs(path, exist_ok=True)
+        checkpoint_path = os.path.join(path, f"checkpoint_{step}")
+        
+        # Save optimizer state and model parameters
+        with open(checkpoint_path, "wb") as f:
+            pickle.dump({
+                "params": self.state.params,
+                "step": step,
+                "opt_state": self.state.opt_state
+            }, f)
+            
+        print(f"Saved checkpoint to {checkpoint_path}")
+    
+    def load_checkpoint(self, path):
+        """Load model checkpoint."""
+        import pickle
+        
+        with open(path, "rb") as f:
+            checkpoint = pickle.load(f)
+            
+        # Recreate state with loaded parameters and optimizer state
+        self.create_state(params=checkpoint["params"])
+        self.state = self.state.replace(
+            step=checkpoint["step"],
+            opt_state=checkpoint["opt_state"]
+        )
+        
+        print(f"Loaded checkpoint from {path} at step {checkpoint['step']}")
+        return self.state

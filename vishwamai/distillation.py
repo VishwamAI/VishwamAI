@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 # Define TrainingState class directly to avoid circular import
 class TrainingState(train_state.TrainState):
     """Extended train state with EMA and other training metrics."""
-    ema_params: Dict = None
-    step: int = 0
-    best_metrics: Dict = None
-    tot_state: Dict = None  # New field for Tree of Thoughts state
+    # Fix the order: non-default arguments need to come before default arguments
+    ema_params: Optional[Dict] = None
+    best_metrics: Optional[Dict] = None
+    tot_state: Optional[Dict] = None  # New field for Tree of Thoughts state
 
 def create_optimizer(config):
     """Create optimizer with learning rate schedule."""

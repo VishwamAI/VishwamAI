@@ -2,10 +2,11 @@ dim: 6144
 depth: 44
 heads: 48
 vocab_size: 50304
-max_seq_len: 8192
+max_seq_len: 2048  # Reduced for math problems
 dropout_rate: 0.1
-expert_count: 8
-expert_capacity: 4
+expert_count: 4    # Reduced expert count for more focused training
+expert_capacity: 8  # Increased capacity per expert
+attention_type: "flash"  # More efficient attention
 ffn_dim: 24576
 head_dim: 128
 rope_base: 10000
@@ -13,28 +14,28 @@ attention_bias: false
 parallel_factor: 1
 
 moe_config:
-  num_experts: 8
-  capacity_factor: 1.25
-  expert_dropout: 0.1
-  load_balance_weight: 0.01
-  router_z_loss_weight: 0.001
-  router_aux_loss_weight: 0.001
+  num_experts: 4             # Reduced experts
+  capacity_factor: 2.0       # Increased capacity
+  expert_dropout: 0.05       # Reduced dropout for stability
+  load_balance_weight: 0.02  # Increased balance weight
+  router_z_loss_weight: 0.002
+  router_aux_loss_weight: 0.002
 
 error_correction:
   enabled: true
-  hidden_size: 1024
-  num_heads: 4
-  intermediate_size: 4096
-  error_threshold: 0.1
-  correction_weight: 0.5
+  hidden_size: 2048        # Increased for better error detection
+  num_heads: 8            # More attention heads
+  intermediate_size: 8192  # Larger intermediate size
+  error_threshold: 0.05   # Lower threshold for math problems
+  correction_weight: 0.7  # Higher correction weight
 
 tot_config:
   enabled: true
-  max_thoughts: 5
-  max_depth: 3
-  beam_width: 3
-  temperature: 0.7
-  thought_dropout: 0.1
+  max_thoughts: 8        # More thoughts for complex math
+  max_depth: 5          # Deeper reasoning
+  beam_width: 5         # Wider beam search
+  temperature: 0.5      # Lower temperature for precise outputs
+  thought_dropout: 0.05 # Lower dropout for stability
 
 optimization:
   gradient_checkpointing: true

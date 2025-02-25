@@ -12,10 +12,11 @@ import json
 import os
 import gc
 from huggingface_hub import snapshot_download
-import safetensors.flax as stf
+import safetensors.flax as stf  # Correct import
 from omegaconf import OmegaConf
-import safetensors
-
+from .tokenizer import VishwamAITokenizer
+from .distillation import VishwamaiGuruKnowledge, VishwamaiShaalaTrainer
+from .tot import create_train_dataloader, create_val_dataloader, evaluate
 def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
                     beta1: float = 0.9, beta2: float = 0.999, 
                     warmup_steps: int = 2000, num_train_steps: int = 100000):
@@ -49,7 +50,7 @@ def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01,
     )
     
     optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),  # Gradient clipping
+        optax.clip_by_global_norm(1.0),
         optax.adamw(
             learning_rate=decay_scheduler,
             b1=beta1,
@@ -59,6 +60,7 @@ def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01,
     )
     
     return optimizer
+
 @dataclass
 class ModelArgs:
     dim: int = 4096
@@ -430,6 +432,7 @@ class VishwamAIModel(nn.Module):
 
     def load_weights(self, model_path: str, reduced_size: bool = True):
         """Load pretrained weights with option to reduce model size for memory efficiency."""
+        print(f"Debug: Using safetensors.flax as stf: {stf}")  # Debug to confirm stf is imported
         if not os.path.exists(model_path):
             try:
                 model_path = snapshot_download(
@@ -457,7 +460,7 @@ class VishwamAIModel(nn.Module):
             shard_path = os.path.join(model_path, shard_file)
             try:
                 print(f"Loading {shard_file}...")
-                with safetensors.safe_open(shard_path, framework="numpy") as f:
+                with stf.safe_open(shard_path, framework="numpy") as f:
                     for name in f.keys():
                         try:
                             tensor = f.get_tensor(name).astype(np.float16)
@@ -483,8 +486,8 @@ class VishwamAIModel(nn.Module):
                     )
                 raise ValueError(f"Error loading weights from {shard_path}: {str(e)}")
         
-            gc.collect()
-            jax.clear_backends()
+        gc.collect()
+        jax.clear_backends()
 
         self.bind({'params': params})
         return self
@@ -554,7 +557,6 @@ class VishwamAITokenizer:
     def __init__(self, vocab_size: int, model_prefix: str):
         self.vocab_size = vocab_size
         self.model_prefix = model_prefix
-        # Replace with actual tokenizer implementation
         print(f"Initialized dummy tokenizer with vocab_size={vocab_size}, prefix={model_prefix}")
 
 class VishwamaiShaalaTrainer:
@@ -562,16 +564,13 @@ class VishwamaiShaalaTrainer:
         self.teacher_model = teacher_model
         self.student_model = student_model
         self.cfg = cfg
-        # Replace with actual trainer implementation
         print("Initialized dummy trainer")
 
 # Main execution
 if __name__ == "__main__":
     # Load distillation configuration
-    # Assuming the config file is in the specified path; adjust as needed
     distillation_config_path = os.path.join("vishwamai", "configs", "training", "perplexity_r1_distillation.yaml")
     if not os.path.exists(distillation_config_path):
-        # Create a default config if file not found
         distillation_config = OmegaConf.create({
             'distillation': {
                 'teacher_model': {
@@ -607,7 +606,7 @@ if __name__ == "__main__":
     # Download partial teacher model
     teacher_path = download_partial_model(
         distillation_config['distillation']['teacher_model']['path'],
-        num_shards=5  # Reduced for memory efficiency
+        num_shards=5
     )
 
     # Initialize teacher model

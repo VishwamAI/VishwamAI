@@ -17,8 +17,8 @@ from .transformer import VishwamAIModel
 # Import from loss_functions module
 from .loss_functions import cross_entropy_loss, tot_guided_loss, compute_metrics
 
-# Import from training_steps to avoid circular imports
-from .error_correction import (
+# Import from error_correction_trainer to avoid circular imports
+from .error_correction_trainer import (
     create_error_corrected_train_step,
     create_error_corrected_eval_step,
     evaluate_error_correction,

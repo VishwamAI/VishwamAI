@@ -13,13 +13,22 @@ from .model import VishwamAIModel, ModelConfig
 from .tokenizer import VishwamAITokenizer
 from .transformer import VishwamAIModel, VisionTransformer10B
 
+# Import error correction components - fixing import location
+from .error_correction import (
+    ErrorCorrectionModule,
+    compute_error_metrics
+)
+
+# Import ErrorCorrectionTrainer separately to avoid circular imports
+from .error_correction_trainer import ErrorCorrectionTrainer
+
 # Break circular imports by carefully organizing the import order
 from .distillation import VishwamaiGuruKnowledge, VishwamaiShaalaTrainer
 from .tot import TreeOfThoughts, Thought, SearchState
 from .data_utils import create_train_dataloader, create_val_dataloader
 from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
-from .error_correction import ErrorCorrectionModule, compute_error_metrics
-from .error_correction_trainer import ErrorCorrectionTrainer
+
+# Import training components last to avoid circular imports
 from .training import train, train_step, eval_step
 
 __all__ = [
@@ -35,6 +44,11 @@ __all__ = [
     "VishwamAITokenizer",
     "VisionTransformer10B",
     
+    # Error correction components
+    "ErrorCorrectionModule",
+    "ErrorCorrectionTrainer",
+    "compute_error_metrics",
+    
     # Other modules
     "TreeOfThoughts",
     "Thought",
@@ -44,13 +58,11 @@ __all__ = [
     "ToTIntegrationLayer",
     "MixtureDensityNetwork",
     "MultiLevelToTAttention",
-    "ErrorCorrectionModule",
-    "compute_error_metrics",
-    "ErrorCorrectionTrainer",
     "VishwamaiGuruKnowledge",
     "VishwamaiShaalaTrainer",
     "train",
     "train_step",
     "eval_step"
 ]
+
 __version__ = "0.1.0"

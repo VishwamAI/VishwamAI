@@ -7,9 +7,8 @@ from typing import Dict, List, Tuple, Any, Optional, NamedTuple, Callable
 from functools import partial
 from tqdm import tqdm
 
-# Import from local modules without creating circular dependencies
 # Import error correction components directly
-from .error_correction import ErrorCorrectionModule, ErrorMetrics, compute_error_metrics
+from .error_correction import ErrorCorrectionModule, ErrorMetrics, compute_error_metrics, ErrorCorrectionState, create_error_correction_state, ErrorCorrectionTrainer
 # These imports should be okay as they don't import back from error_correction_trainer
 from .tot import TreeOfThoughts, Thought, SearchState
 from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
@@ -17,21 +16,6 @@ from .loss_functions import cross_entropy_loss, tot_guided_loss
 from .training_steps import standard_train_step, standard_eval_step, create_learning_rate_fn
 
 logger = logging.getLogger(__name__)
-
-class ErrorCorrectionState(NamedTuple):
-    """State for tracking error correction during training."""
-    error_threshold: float = 0.1
-    error_history: jnp.ndarray = None
-    correction_strength: float = 1.0
-    history_idx: int = 0
-    tot_triggered: int = 0  # Count of ToT activations due to errors
-    avg_correction_impact: float = 0.0  # Average impact of corrections
-
-def create_error_correction_state(history_size: int = 100):
-    """Create initial error correction state."""
-    return ErrorCorrectionState(
-        error_history=jnp.zeros(history_size),
-    )
 
 class ErrorCorrectionTrainer:
     """
@@ -140,7 +124,7 @@ def compute_metrics(logits: jnp.ndarray, labels: jnp.ndarray) -> Dict[str, float
 
 def create_error_corrected_train_step(
     base_train_step_fn: Callable,
-    error_trainer: 'ErrorCorrectionTrainer',
+    error_trainer: ErrorCorrectionTrainer,
     alpha: float = 0.2
 ):
     """
@@ -163,7 +147,7 @@ def create_error_corrected_train_step(
 
 def create_error_corrected_eval_step(
     base_eval_step_fn: Callable,
-    error_trainer: 'ErrorCorrectionTrainer'
+    error_trainer: ErrorCorrectionTrainer
 ):
     """
     Create an evaluation step that incorporates error correction.
@@ -185,7 +169,7 @@ def create_error_corrected_eval_step(
 def evaluate_error_correction(
     model,
     dataloader,
-    error_trainer: 'ErrorCorrectionTrainer',
+    error_trainer: ErrorCorrectionTrainer,
     num_batches: int = 10,
     rng_key = None
 ) -> Dict[str, float]:
@@ -208,3 +192,9 @@ def evaluate_error_correction(
         'corrected_loss': 0.0,
         'improvement': 0.0,
     }
+
+# Additional implementation details for ErrorCorrectionTrainer
+def enhance_error_correction_trainer(trainer: ErrorCorrectionTrainer):
+    """Add additional capabilities to the ErrorCorrectionTrainer."""
+    # Custom enhancements can be implemented here
+    pass

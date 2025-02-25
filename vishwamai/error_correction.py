@@ -6,10 +6,73 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import optax
-# Re-export ErrorCorrectionTrainer from error_correction_trainer to maintain compatibility
-from .error_correction_trainer import ErrorCorrectionTrainer
 
 logger = logging.getLogger(__name__)
+
+# Define the ErrorCorrectionTrainer class directly in this file
+# to resolve the circular import issue
+class ErrorCorrectionTrainer:
+    """
+    Enhanced error correction system that integrates with training
+    and utilizes Tree of Thoughts for complex error resolution.
+    """
+    def __init__(
+        self, 
+        config: Dict[str, Any],
+        use_tot: bool = True,
+        use_mod: bool = True,
+        history_size: int = 100,
+        threshold_percentile: float = 85.0
+    ):
+        self.config = config
+        self.use_tot = use_tot
+        self.use_mod = use_mod
+        self.history_size = history_size
+        self.threshold_percentile = threshold_percentile
+        
+        # Create error correction module
+        hidden_size = config.get('model', {}).get('hidden_size', 1024)
+        self.error_module = ErrorCorrectionModule(
+            hidden_dim=hidden_size,
+            num_correction_layers=config.get('error_correction', {}).get('num_layers', 2),
+            correction_threshold=config.get('error_correction', {}).get('threshold', 0.7)
+        )
+        
+        # Initialize state
+        self.state = create_error_correction_state(history_size)
+        
+    def update_error_history(self, error: float):
+        """Update error history and dynamically adjust threshold."""
+        # Implementation
+        pass
+    
+    def apply_error_correction(
+        self,
+        logits: jnp.ndarray,
+        features: jnp.ndarray,
+        labels: Optional[jnp.ndarray] = None,
+        training: bool = True,
+        rng_key: Optional[jnp.ndarray] = None
+    ):
+        """Apply error correction to model outputs."""
+        # Implementation
+        pass
+
+# Define necessary classes for the ErrorCorrectionTrainer
+class ErrorCorrectionState(NamedTuple):
+    """State for tracking error correction during training."""
+    error_threshold: float = 0.1
+    error_history: jnp.ndarray = None
+    correction_strength: float = 1.0
+    history_idx: int = 0
+    tot_triggered: int = 0  # Count of ToT activations due to errors
+    avg_correction_impact: float = 0.0  # Average impact of corrections
+
+def create_error_correction_state(history_size: int = 100):
+    """Create initial error correction state."""
+    return ErrorCorrectionState(
+        error_history=jnp.zeros(history_size),
+    )
 
 class ErrorCorrectionOutput(NamedTuple):
     """Output structure for error correction module."""

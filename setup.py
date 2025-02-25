@@ -19,33 +19,20 @@ def get_version() -> str:
 
 # Read package requirements
 install_requires = [
-    'torch>=2.0.0',
-    'torch-xla>=2.0.0',
-    'transformers>=4.30.0',
-    'sentencepiece>=0.1.99',
+    'jax>=0.4.13',
+    'jaxlib>=0.4.13',
+    'flax>=0.7.0',
+    'optax>=0.1.7',
     'numpy>=1.24.0',
-    'pyyaml>=6.0',
-    'tqdm>=4.65.0',
-    'fastapi>=0.95.0',
-    'uvicorn>=0.22.0',
-    'tensorboard>=2.13.0',
-    'wandb>=0.15.0',
-    'einops>=0.6.1',
-    'flash-attn>=2.0.0',
-    'bitsandbytes>=0.41.0',
     'datasets>=2.13.0',
-    'accelerate>=0.21.0',
-    'fairscale>=0.4.13',
-    'triton>=2.0.0',
-    'huggingface-hub>=0.16.4',
-    'scipy>=1.10.0',
+    'tqdm>=4.65.0',
+    'tensorboard>=2.13.0',
     'matplotlib>=3.7.1',
-    'jax',
-    'jaxlib',
-    'flax',
-    'optax',
-    'safetensors',
-    'omegaconf'
+    'safetensors>=0.3.3',
+    'omegaconf>=2.3.0',
+    'chex>=0.1.7',
+    'typing_extensions>=4.5.0',
+    'sentencepiece>=0.1.99'  # For tokenization
 ]
 
 # Extra requirements for development
@@ -65,9 +52,8 @@ extras_require = {
         'sphinx-autodoc-typehints>=1.23.0',
     ],
     'profiling': [
-        'tensorboard-plugin-profile>=2.13.0',
-        'py-spy>=0.3.14',
-        'memory_profiler>=0.61.0',
+        'clu>=0.0.9',  # JAX-specific profiling tools
+        'jaxprof>=0.1.0',  # JAX profiling
     ],
 }
 

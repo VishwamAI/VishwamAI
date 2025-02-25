@@ -3,12 +3,12 @@ defaults:
 
 distillation:
   enabled: true
+  kd_temperature: 2.0
+  alpha_kd: 0.5
+  alpha_ce: 0.5
   teacher_model:
     path: "model-00001-to-00015-of-00252.safetensors"  # Completed batch after validation/test
     temperature: 2.0
-    kd_temperature: 2.0
-    alpha_kd: 0.5
-    alpha_ce: 0.5
   feature_distillation:
     enabled: true
     layers: [0, 6, 11]  # Layers to match (depends on teacher/student architecture)

@@ -27,12 +27,69 @@ from .error_correction_trainer import (
 
 logger = logging.getLogger(__name__)
 
-class TrainingState(train_state.TrainState):
-    """Extended train state with EMA and other training metrics."""
-    ema_params: Dict = None
-    step: int = 0
-    best_metrics: Dict = None
-    tot_state: Dict = None  # New field for Tree of Thoughts state
+# Define a class without inheritance to avoid conflicts with TrainState
+class VishwamaiTrainingState:
+    """Extended training state with EMA and other training metrics."""
+    apply_fn: Callable
+    params: Dict
+    tx: optax.GradientTransformation
+    opt_state: Any
+    ema_params: Optional[Dict]
+    step: int
+    best_metrics: Dict
+    tot_state: Dict
+    
+    @classmethod
+    def create(cls, apply_fn, params, tx, ema_params=None, best_metrics=None, tot_state=None):
+        """Create a new instance of VishwamaiTrainingState."""
+        return cls(
+            apply_fn=apply_fn,
+            params=params,
+            tx=tx,
+            opt_state=tx.init(params),
+            ema_params=ema_params,
+            step=0,
+            best_metrics=best_metrics if best_metrics is not None else {},
+            tot_state=tot_state if tot_state is not None else {}
+        )
+    
+    def __init__(self, apply_fn, params, tx, opt_state, ema_params=None, step=0, best_metrics=None, tot_state=None):
+        """Initialize the VishwamaiTrainingState."""
+        self.apply_fn = apply_fn
+        self.params = params
+        self.tx = tx
+        self.opt_state = opt_state
+        self.ema_params = ema_params
+        self.step = step
+        self.best_metrics = best_metrics if best_metrics is not None else {}
+        self.tot_state = tot_state if tot_state is not None else {}
+    
+    def apply_gradients(self, *, grads, **kwargs):
+        """Update the parameters using the gradients."""
+        updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
+        new_params = optax.apply_updates(self.params, updates)
+        return self.replace(
+            params=new_params,
+            opt_state=new_opt_state,
+            step=self.step + 1,
+            **kwargs
+        )
+    
+    def replace(self, **kwargs):
+        """Return a new state with the specified fields replaced."""
+        return self.__class__(
+            apply_fn=kwargs.get('apply_fn', self.apply_fn),
+            params=kwargs.get('params', self.params),
+            tx=kwargs.get('tx', self.tx),
+            opt_state=kwargs.get('opt_state', self.opt_state),
+            ema_params=kwargs.get('ema_params', self.ema_params),
+            step=kwargs.get('step', self.step),
+            best_metrics=kwargs.get('best_metrics', self.best_metrics),
+            tot_state=kwargs.get('tot_state', self.tot_state)
+        )
+
+# Use the custom training state as TrainingState
+TrainingState = VishwamaiTrainingState
 
 def create_learning_rate_scheduler(
     factors="constant * linear_warmup * cosine_decay",

@@ -92,15 +92,13 @@ graph TB
     LayerNorm -->|"20"| Output
 
     %% Subgraph Wrapping
-    subgraph AttentionMechanisms["Attention Mechanisms"]
-        direction TB
+    subgraph Attention Mechanisms
         GQA
         FlashAttn
         SlidingWindow
     end
 
-    subgraph MultiLevelAttention["Multi-Level Attention"]
-        direction TB
+    subgraph Multi-Level Attention
         MLA
         MLA_F
         MLA_M
@@ -108,15 +106,13 @@ graph TB
         MLA_Fusion
     end
 
-    subgraph TreeOfThoughts["Tree of Thoughts"]
-        direction TB
+    subgraph Tree of Thoughts
         ThoughtGen
         BeamSearch
         ThoughtInt
     end
 
-    subgraph MixtureOfExperts["Mixture of Experts"]
-        direction TB
+    subgraph Mixture of Experts
         Router
         Expert1
         Expert2
@@ -124,8 +120,7 @@ graph TB
         LoadBal
     end
 
-    subgraph MixtureOfDepth["Mixture of Depth"]
-        direction TB
+    subgraph Mixture of Depth
         DepthRouter
         Layer1
         Layer2
@@ -133,8 +128,8 @@ graph TB
         DepthControl
     end
 
-    %% Legend in separate subgraph
-    subgraph Legend["Legend"]
+    %% Legend (Mermaid does not support styling subgraphs)
+    subgraph Legend
         A["Processing"]:::processing
         B["Attention Mechanism"]:::attention
         C["Expert Node"]:::expert
@@ -143,7 +138,7 @@ graph TB
         F["Tree of Thoughts"]:::tot
     end
 
-    %% Styling
+    %% Styling (Subgraphs cannot be styled directly)
     classDef primary fill:#a8d5e5,stroke:#457b9d,stroke-width:2px
     classDef secondary fill:#f1faee,stroke:#457b9d,stroke-width:1px
     classDef expert fill:#e63946,stroke:#457b9d,color:#fff,stroke-width:1px
@@ -151,4 +146,3 @@ graph TB
     classDef processing fill:#ffd6a5,stroke:#457b9d,stroke-width:1px
     classDef depth fill:#2a9d8f,stroke:#264653,color:#fff,stroke-width:1px
     classDef tot fill:#f4a261,stroke:#264653,stroke-width:1px
-    classDef subgraph fill:#f9f9f9,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5

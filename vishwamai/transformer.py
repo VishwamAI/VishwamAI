@@ -367,3 +367,6 @@ class VishwamAIModel(nn.Module):
     def param_count(self):
         """Return the number of parameters in the model."""
         return sum(x.size for x in jax.tree_leaves(self.params))
+
+# Alias for backward compatibility - this fixes the import error
+VisionTransformer10B = VishwamAIModel

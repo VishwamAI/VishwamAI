@@ -1,482 +1,391 @@
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
-from flax.core import freeze, unfreeze
-import optax
-from typing import List, Tuple, Dict, Optional, NamedTuple, Any
-from dataclasses import dataclass
-from .transformer import VisionTransformer10B
+from flax import linen as nn
+from typing import Dict, List, Tuple, Optional, Any, Callable, NamedTuple
 import logging
+from dataclasses import dataclass
 from functools import partial
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-class ThoughtTokenizer:
-    """Tokenizer for converting between thoughts and token IDs."""
-    def __init__(self, vocab_size: int = 32000):
-        self.vocab_size = vocab_size
-        # In practice, you would load a real vocabulary and embeddings
-        self.embedding_dim = 768
-        self.embeddings = jax.random.normal(
-            jax.random.PRNGKey(0), 
-            (vocab_size, self.embedding_dim)
-        )
-    
-    def encode(self, text: str) -> jnp.ndarray:
-        """Convert text to token IDs."""
-        # Simplified tokenization (in practice, use a proper tokenizer)
-        return jnp.array([hash(word) % self.vocab_size for word in text.split()])
-    
-    def decode(self, token_ids: jnp.ndarray) -> str:
-        """Convert token IDs back to text."""
-        # Simplified decoding (in practice, use a proper tokenizer)
-        return " ".join([str(int(id)) for id in token_ids])
-    
-    def get_embeddings(self, token_ids: jnp.ndarray) -> jnp.ndarray:
-        """Get embeddings for token IDs."""
-        return self.embeddings[token_ids]
-
-@dataclass
-class Thought:
-    content: str  # Raw text content
-    token_ids: jnp.ndarray  # Token IDs
-    embeddings: jnp.ndarray  # Token embeddings
+class Thought(NamedTuple):
+    """Representation of a thought in the Tree of Thoughts."""
+    content: str
     score: float
-    children: List['Thought']
-    parent: Optional['Thought'] = None
+    embeddings: jnp.ndarray
+    children: List = None
+    path: List = None
+    depth: int = 0
+    parent: Any = None
 
 class SearchState(NamedTuple):
-    """Enhanced state tracking for tree search."""
-    best_score: float
-    best_thought: Optional[Thought]
-    num_thoughts: int
+    """State maintained during search in Tree of Thoughts."""
+    thoughts: List[Thought]
+    best_thought: Thought
     depth: int
-    value_cache: Dict[str, float]  # Cache thought evaluations
     beam_width: int
-    exploration_factor: float  # Controls exploration vs exploitation
-    pruning_threshold: float  # Threshold for pruning low-value branches
 
-class ThoughtGenerator(nn.Module):
-    """Generate thoughts from input features."""
-    hidden_size: int
-    vocab_size: int
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, key: jax.random.PRNGKey) -> jnp.ndarray:
-        x = nn.Dense(self.hidden_size)(x)
-        x = nn.relu(x)
-        logits = nn.Dense(self.vocab_size)(x)
-        
-        # Temperature sampling for diverse thought generation
-        temperature = 0.7
-        logits = logits / temperature
-        return jax.random.categorical(key, logits)
-
-class ThoughtEvaluator(nn.Module):
-    """Evaluate thoughts using learned embeddings."""
-    hidden_size: int
-    
-    @nn.compact
-    def __call__(self, embeddings: jnp.ndarray) -> jnp.ndarray:
-        # Project embeddings through MLP
-        x = nn.Dense(self.hidden_size)(embeddings)
-        x = nn.relu(x)
-        x = nn.Dense(self.hidden_size // 2)(x)
-        x = nn.relu(x)
-        x = nn.Dense(3)(x)  # 3 scores: sure, maybe, impossible
-        return nn.softmax(x)
-
-def scan_expand_thoughts(carry: SearchState, _: Any, 
-                        params: Dict, 
-                        generator: ThoughtGenerator,
-                        evaluator: ThoughtEvaluator,
-                        tokenizer: ThoughtTokenizer,
-                        key: jax.random.PRNGKey,
-                        max_width: int) -> Tuple[SearchState, List[Thought]]:
-    """Enhanced thought expansion with beam search and value caching."""
-    state, current_thought = carry
-    
-    if state.num_thoughts >= max_width or state.depth >= 3:
-        return carry, []
-    
-    # Check cache first
-    if current_thought.content in state.value_cache:
-        cached_score = state.value_cache[current_thought.content]
-        if cached_score < state.pruning_threshold:
-            return carry, []  # Prune low-value branches
-    
-    # Generate thoughts in parallel using vmap
-    keys = jax.random.split(key, state.beam_width)
-    features = current_thought.embeddings.mean(axis=0, keepdims=True)
-    
-    @partial(jax.vmap, in_axes=(None, 0))
-    def generate_thought(feat, subkey):
-        token_ids = generator.apply(params['generator'], feat, subkey)
-        return token_ids
-    
-    token_ids_batch = generate_thought(features, keys)
-    
-    # Evaluate thoughts in parallel
-    embeddings_batch = jax.vmap(tokenizer.get_embeddings)(token_ids_batch)
-    scores_batch = jax.vmap(lambda x: evaluator.apply(params['evaluator'], x))(embeddings_batch)
-    
-    # Apply UCB exploration bonus
-    exploration_bonus = state.exploration_factor * jnp.sqrt(
-        jnp.log(state.num_thoughts + 1) / (jnp.ones(state.beam_width))
-    )
-    adjusted_scores = scores_batch[:, 0] + exploration_bonus  # Use "sure" scores
-    
-    # Select top-k thoughts using top_k operation
-    top_k = min(state.beam_width, len(adjusted_scores))
-    selected_indices = jax.lax.top_k(adjusted_scores, top_k)[1]
-    
-    new_thoughts = []
-    for idx in selected_indices:
-        text = tokenizer.decode(token_ids_batch[idx])
-        score = float(scores_batch[idx, 0])
-        
-        # Update value cache
-        state.value_cache[text] = score
-        
-        # Create thought if above pruning threshold
-        if score >= state.pruning_threshold:
-            new_thought = Thought(
-                content=text,
-                token_ids=token_ids_batch[idx],
-                embeddings=embeddings_batch[idx],
-                score=score,
-                children=[],
-                parent=current_thought
-            )
-            new_thoughts.append(new_thought)
-            
-            # Update state
-            if score > state.best_score:
-                state = state._replace(
-                    best_score=score,
-                    best_thought=new_thought
-                )
-    
-    # Update state with new statistics
-    new_state = state._replace(
-        num_thoughts=state.num_thoughts + len(new_thoughts),
-        depth=state.depth + 1
-    )
-    
-    return (new_state, current_thought), new_thoughts
-
-class TreeOfThoughts(nn.Module):
-    """Enhanced Tree of Thoughts with beam search and adaptive exploration."""
-    transformer: VisionTransformer10B
+@dataclass
+class ToTConfig:
+    """Configuration for Tree of Thoughts."""
     max_thoughts: int = 5
     max_depth: int = 3
-    beam_width: int = 8
+    beam_width: int = 5
     pruning_threshold: float = 0.3
     exploration_factor: float = 1.0
+    temperature: float = 0.7
+    search_strategy: str = "beam"  # Options: "beam", "dfs", "bfs", "mcts"
+
+class TreeOfThoughts:
+    """
+    Tree of Thoughts implementation for enhancing reasoning with VishwamAI models.
     
-    def setup(self):
-        self.tokenizer = ThoughtTokenizer()
-        self.thought_generator = ThoughtGenerator(hidden_size=1024, vocab_size=32000)
-        self.thought_evaluator = ThoughtEvaluator(hidden_size=512)
+    This implements the Tree of Thoughts approach from:
+    "Tree of Thoughts: Deliberate Problem Solving with Large Language Models"
+    by Yao et al. (2023)
+    """
     
-    def generate_thoughts(self, 
-                        x: jnp.ndarray, 
-                        key: jax.random.PRNGKey,
-                        k: int = 5) -> List[Thought]:
-        """Generate k thoughts from input features."""
-        features = self.transformer(x)
-        token_ids = self.thought_generator(features, key)
+    def __init__(
+        self,
+        transformer,
+        max_thoughts: int = 5,
+        max_depth: int = 3,
+        beam_width: int = 5,
+        pruning_threshold: float = 0.3,
+        exploration_factor: float = 1.0,
+    ):
+        self.transformer = transformer
+        self.config = ToTConfig(
+            max_thoughts=max_thoughts,
+            max_depth=max_depth,
+            beam_width=beam_width,
+            pruning_threshold=pruning_threshold,
+            exploration_factor=exploration_factor
+        )
+    
+    def __call__(self, features: jnp.ndarray, rng_key: jnp.ndarray, search_strategy: str = "beam") -> Thought:
+        """
+        Generate a tree of thoughts and return the best one.
         
-        thoughts = []
-        for i in range(k):
-            key, subkey = jax.random.split(key)
-            text = self.tokenizer.decode(token_ids[i])
-            embeddings = self.tokenizer.get_embeddings(token_ids[i])
-            thoughts.append(Thought(
-                content=text,
-                token_ids=token_ids[i],
-                embeddings=embeddings,
-                score=0.0,
-                children=[]
-            ))
-        return thoughts
-    
-    def evaluate_thought(self, thought: Thought) -> jnp.ndarray:
-        """Evaluate a thought using its embeddings."""
-        return self.thought_evaluator(thought.embeddings)
-    
-    def beam_search(self, 
-                   initial_state: jnp.ndarray, 
-                   key: jax.random.PRNGKey) -> Thought:
-        """Enhanced beam search with adaptive width and pruning."""
-        # Initialize beam with parallel thought generation
-        initial_thoughts = self.generate_thoughts(initial_state, key, k=self.beam_width)
+        Args:
+            features: Input features (typically from transformer)
+            rng_key: JAX PRNG key
+            search_strategy: The search algorithm to use
+            
+        Returns:
+            The best thought from the search
+        """
+        # Override search strategy if provided
+        self.config.search_strategy = search_strategy
         
-        # Initialize search state with adaptive parameters
-        state = SearchState(
-            best_score=float('-inf'),
-            best_thought=None,
-            num_thoughts=len(initial_thoughts),
+        # Generate initial thoughts
+        initial_thoughts = self._generate_thoughts(
+            features, 
+            None,  # No parent for initial thoughts
             depth=0,
-            value_cache={},
-            beam_width=self.beam_width,
-            exploration_factor=self.exploration_factor,
-            pruning_threshold=self.pruning_threshold
+            rng_key=rng_key
         )
         
-        # Process each level up to max_depth
-        for depth in range(self.max_depth):
-            # Dynamically adjust beam width based on depth
-            adaptive_width = max(
-                2, 
-                int(self.beam_width * (1.0 - depth / self.max_depth))
-            )
-            
-            # Expand thoughts in parallel for current beam
-            expanded_states = []
-            expanded_thoughts = []
-            
-            for thought in initial_thoughts[:adaptive_width]:
-                # Generate and evaluate new thoughts
-                next_state, next_thoughts = scan_expand_thoughts(
-                    (state, thought),
-                    None,
-                    self.variables,
-                    self.thought_generator,
-                    self.thought_evaluator,
-                    self.tokenizer,
-                    key,
-                    adaptive_width
-                )
-                expanded_states.append(next_state)
-                expanded_thoughts.extend(next_thoughts)
-            
-            # Select top-k thoughts for next iteration
-            if expanded_thoughts:
-                scores = jnp.array([t.score for t in expanded_thoughts])
-                top_k_idx = jax.lax.top_k(scores, min(adaptive_width, len(scores)))[1]
-                initial_thoughts = [expanded_thoughts[i] for i in top_k_idx]
-                
-                # Update state with best score from this level
-                best_idx = jnp.argmax(scores)
-                if expanded_thoughts[best_idx].score > state.best_score:
-                    state = state._replace(
-                        best_score=expanded_thoughts[best_idx].score,
-                        best_thought=expanded_thoughts[best_idx]
-                    )
-            else:
-                break
-            
-            # Update depth and check termination
-            state = state._replace(depth=depth + 1)
-            if state.num_thoughts >= self.max_thoughts:
-                break
-            
-            # Generate new random key for next iteration
-            key, _ = jax.random.split(key)
+        if not initial_thoughts:
+            logger.warning("Failed to generate initial thoughts")
+            return None
         
-        return state.best_thought
-    
-    def dfs_search(self, 
-                  initial_state: jnp.ndarray,
-                  key: jax.random.PRNGKey) -> Thought:
-        """Enhanced depth-first search with pruning and caching."""
-        stack = self.generate_thoughts(initial_state, key, k=self.beam_width)
-        state = SearchState(
-            best_score=float('-inf'),
-            best_thought=None,
-            num_thoughts=len(stack),
-            depth=0,
-            value_cache={},
-            beam_width=self.beam_width,
-            exploration_factor=self.exploration_factor,
-            pruning_threshold=self.pruning_threshold
-        )
-        
-        def dfs_step(curr_state: SearchState, curr_thought: Thought, depth: int) -> SearchState:
-            if depth >= self.max_depth or curr_state.num_thoughts >= self.max_thoughts:
-                return curr_state
-            
-            # Check cache to avoid redundant exploration
-            if curr_thought.content in curr_state.value_cache:
-                if curr_state.value_cache[curr_thought.content] < curr_state.pruning_threshold:
-                    return curr_state
-            
-            # Expand current thought
-            next_state, new_thoughts = scan_expand_thoughts(
-                (curr_state, curr_thought),
-                None,
-                self.variables,
-                self.thought_generator,
-                self.thought_evaluator,
-                self.tokenizer,
-                key,
-                self.beam_width
-            )
-            
-            # Recursively explore promising branches
-            for thought in new_thoughts:
-                if thought.score >= curr_state.pruning_threshold:
-                    next_state = dfs_step(next_state, thought, depth + 1)
-            
-            return next_state
-        
-        # Process stack in DFS order
-        while stack:
-            thought = stack.pop()
-            state = dfs_step(state, thought, 0)
-        
-        return state.best_thought
-    
-    def integrate_with_moe(self, 
-                         thoughts: List[Thought], 
-                         moe_layer: nn.Module,
-                         key: jax.random.PRNGKey) -> List[Thought]:
-        """
-        Integrate thoughts with Mixture of Experts layer for enhanced reasoning.
-        
-        Args:
-            thoughts: List of thoughts to enhance
-            moe_layer: Mixture of Experts layer
-            key: JAX random key
-            
-        Returns:
-            Enhanced thoughts
-        """
-        logger.info("Integrating thoughts with MoE")
-        
-        enhanced_thoughts = []
-        for thought in thoughts:
-            # Create enhanced embedding using MoE
-            enhanced_emb, _ = moe_layer(thought.embeddings)
-            
-            # Update thought with enhanced embedding
-            enhanced_thought = Thought(
-                content=thought.content,
-                token_ids=thought.token_ids,
-                embeddings=enhanced_emb,
-                score=thought.score * 1.1,  # Slightly boost score of enhanced thoughts
-                children=thought.children,
-                parent=thought.parent
-            )
-            
-            enhanced_thoughts.append(enhanced_thought)
-            
-        return enhanced_thoughts
-    
-    def integrate_with_mod(self,
-                          thought: Thought,
-                          mod_layer: nn.Module,
-                          key: jax.random.PRNGKey) -> Thought:
-        """
-        Integrate a thought with Mixture of Depths for adaptive processing.
-        
-        Args:
-            thought: Thought to enhance
-            mod_layer: Mixture of Depths layer
-            key: JAX random key
-            
-        Returns:
-            Enhanced thought
-        """
-        logger.info("Integrating thought with MoD")
-        
-        # Apply MoD to get enhanced embedding and mixture weights
-        enhanced_emb, mixture_weights = mod_layer(thought.embeddings)
-        
-        # Calculate confidence score based on mixture weights
-        # Higher entropy in mixture weights suggests more uncertainty
-        entropy = -jnp.sum(mixture_weights * jnp.log(mixture_weights + 1e-6))
-        confidence_factor = 1.0 / (1.0 + entropy)
-        
-        # Update thought with enhanced embedding and adjusted score
-        enhanced_thought = Thought(
-            content=thought.content,
-            token_ids=thought.token_ids,
-            embeddings=enhanced_emb,
-            score=thought.score * confidence_factor,
-            children=thought.children,
-            parent=thought.parent
-        )
-        
-        return enhanced_thought, mixture_weights
-    
-    def get_thought_tree_features(self, thought: Thought) -> Dict[str, Any]:
-        """
-        Extract structured features from a thought tree for integration.
-        
-        Args:
-            thought: Root thought of the tree
-            
-        Returns:
-            Dictionary of features representing the thought tree
-        """
-        features = {
-            'root_embedding': thought.embeddings,
-            'root_score': thought.score,
-            'max_depth': 0,
-            'num_nodes': 1,
-            'leaf_embeddings': [],
-            'path_embeddings': [thought.embeddings],
-        }
-        
-        # Recursive function to explore the tree
-        def explore(node, depth):
-            features['max_depth'] = max(features['max_depth'], depth)
-            features['num_nodes'] += len(node.children)
-            
-            if not node.children:
-                features['leaf_embeddings'].append(node.embeddings)
-            
-            for child in node.children:
-                features['path_embeddings'].append(child.embeddings)
-                explore(child, depth + 1)
-        
-        explore(thought, 0)
-        
-        # Add aggregated embeddings
-        if features['leaf_embeddings']:
-            features['leaf_embedding_mean'] = jnp.mean(jnp.stack(features['leaf_embeddings']), axis=0)
+        # Select search strategy
+        if search_strategy == "beam":
+            best_thought = self._beam_search(initial_thoughts, rng_key)
+        elif search_strategy == "dfs":
+            best_thought = self._depth_first_search(initial_thoughts, rng_key)
+        elif search_strategy == "bfs":
+            best_thought = self._breadth_first_search(initial_thoughts, rng_key)
+        elif search_strategy == "mcts":
+            best_thought = self._monte_carlo_tree_search(initial_thoughts, rng_key)
         else:
-            features['leaf_embedding_mean'] = thought.embeddings
-            
-        features['path_embedding_mean'] = jnp.mean(jnp.stack(features['path_embeddings']), axis=0)
-        
-        return features
-    
-    def __call__(self, 
-                 x: jnp.ndarray,
-                 key: jax.random.PRNGKey,
-                 search_strategy: str = 'beam',
-                 moe_layer: Optional[nn.Module] = None,
-                 mod_layer: Optional[nn.Module] = None) -> Thought:
-        """Enhanced tree search with MoE and MoD integration."""
-        logger.info(f"Performing {search_strategy} search with MoE/MoD integration")
-        
-        # Get best thought using specified search strategy
-        if search_strategy == 'beam':
-            best_thought = self.beam_search(x, key)
-        elif search_strategy == 'dfs':
-            best_thought = self.dfs_search(x, key)
-        else:
-            raise ValueError(f"Unknown search strategy: {search_strategy}. Supported: 'beam', 'dfs'")
-            
-        # Apply MoE enhancement if available
-        if moe_layer is not None:
-            key, subkey = jax.random.split(key)
-            enhanced_thoughts = self.integrate_with_moe([best_thought], moe_layer, subkey)
-            best_thought = enhanced_thoughts[0]
-            
-        # Apply MoD enhancement if available
-        if mod_layer is not None:
-            key, subkey = jax.random.split(key)
-            best_thought, _ = self.integrate_with_mod(best_thought, mod_layer, subkey)
+            logger.warning(f"Unknown search strategy: {search_strategy}, using beam search")
+            best_thought = self._beam_search(initial_thoughts, rng_key)
             
         return best_thought
+    
+    def _evaluate_thought(self, thought_embedding: jnp.ndarray, parent_embedding: Optional[jnp.ndarray] = None) -> float:
+        """
+        Evaluate the quality/value of a thought.
+        
+        Args:
+            thought_embedding: Embedding of the thought
+            parent_embedding: Embedding of the parent thought, if any
+            
+        Returns:
+            A score for the thought (higher is better)
+        """
+        # Compute coherence using L2 norm of embedding
+        coherence = jnp.linalg.norm(thought_embedding)
+        
+        # If we have a parent, compute progress as distance from parent
+        progress = 0.0
+        if parent_embedding is not None:
+            # Use cosine similarity to measure similarity with parent
+            dot_product = jnp.sum(thought_embedding * parent_embedding)
+            parent_norm = jnp.linalg.norm(parent_embedding)
+            current_norm = jnp.linalg.norm(thought_embedding)
+            similarity = dot_product / (parent_norm * current_norm + 1e-8)
+            
+            # Progress is a combination of similarity and difference
+            # We want thoughts that are related but add something new
+            progress = 0.5 * similarity + 0.5 * (1 - similarity)
+        
+        # Combine coherence and progress
+        score = 0.7 * coherence + 0.3 * progress
+        return float(score)
+    
+    def _generate_thoughts(
+        self, 
+        features: jnp.ndarray,
+        parent: Optional[Thought],
+        depth: int,
+        rng_key: jnp.ndarray,
+    ) -> List[Thought]:
+        """
+        Generate thoughts based on input features and optional parent thought.
+        
+        Args:
+            features: Input features
+            parent: Optional parent thought
+            depth: Current depth in the tree
+            rng_key: JAX random key
+            
+        Returns:
+            List of generated thoughts
+        """
+        try:
+            # Use the model to generate thought embeddings
+            rng_key, dropout_key = jax.random.split(rng_key)
+            
+            # Create masked version of features to encourage diversity
+            masked_features = features
+            if parent is not None:
+                # Apply selective masking based on parent's embedding pattern
+                parent_pattern = jnp.abs(parent.embeddings) > jnp.median(jnp.abs(parent.embeddings))
+                mask = jnp.where(parent_pattern, 0.8, 1.0)
+                masked_features = features * mask
+            
+            # Use transformer to generate embeddings
+            outputs = self.transformer(masked_features, deterministic=False, rngs={'dropout': dropout_key})
+            embeddings = outputs[0]  # Use the last hidden state
+            
+            # Generate multiple thoughts with different dropout patterns
+            thoughts = []
+            for i in range(self.config.max_thoughts):
+                # Generate different embedding variations using dropout
+                rng_key, dropout_key = jax.random.split(rng_key)
+                thought_outputs = self.transformer(
+                    masked_features,
+                    deterministic=False,
+                    rngs={'dropout': dropout_key}
+                )
+                thought_embedding = thought_outputs[0]
+                
+                # Evaluate the thought
+                parent_embedding = parent.embeddings if parent else None
+                score = self._evaluate_thought(thought_embedding, parent_embedding)
+                
+                # Create path for this thought
+                path = parent.path + [parent] if parent else []
+                
+                # Create new thought
+                thought = Thought(
+                    content=f"Thought {depth}_{i}",
+                    score=score,
+                    embeddings=thought_embedding,
+                    children=[],
+                    path=path,
+                    depth=depth,
+                    parent=parent
+                )
+                thoughts.append(thought)
+                
+            # Sort thoughts by score (descending)
+            thoughts.sort(key=lambda t: t.score, reverse=True)
+            
+            # Apply pruning
+            pruned_thoughts = self._prune_thoughts(thoughts)
+            
+            return pruned_thoughts
+            
+        except Exception as e:
+            logger.error(f"Error generating thoughts: {str(e)}")
+            return []
+    
+    def _prune_thoughts(self, thoughts: List[Thought]) -> List[Thought]:
+        """
+        Prune thoughts based on score and diversity.
+        
+        Args:
+            thoughts: List of thoughts to prune
+            
+        Returns:
+            Pruned list of thoughts
+        """
+        if not thoughts:
+            return []
+            
+        # Sort by score (already done in _generate_thoughts)
+        best_score = thoughts[0].score
+        pruning_threshold = best_score * self.config.pruning_threshold
+        
+        # Keep thoughts above threshold
+        pruned_thoughts = [t for t in thoughts if t.score >= pruning_threshold]
+        
+        # Ensure we don't exceed max thoughts
+        if len(pruned_thoughts) > self.config.max_thoughts:
+            pruned_thoughts = pruned_thoughts[:self.config.max_thoughts]
+        
+        return pruned_thoughts
+    
+    def _beam_search(self, initial_thoughts: List[Thought], rng_key: jnp.ndarray) -> Thought:
+        """
+        Perform beam search through the tree of thoughts.
+        
+        Args:
+            initial_thoughts: Initial thoughts
+            rng_key: JAX random key
+            
+        Returns:
+            Best thought found
+        """
+        logger.info("Starting beam search in Tree of Thoughts")
+        
+        # Initialize beam with initial thoughts
+        beam = initial_thoughts[:self.config.beam_width]
+        
+        # Keep track of best thought
+        best_thought = max(initial_thoughts, key=lambda t: t.score) if initial_thoughts else None
+        
+        # Iterate until max depth
+        for depth in range(1, self.config.max_depth + 1):
+            # Generate children for all thoughts in beam
+            new_beam = []
+            for thought in beam:
+                rng_key, child_key = jax.random.split(rng_key)
+                children = self._generate_thoughts(thought.embeddings, thought, depth, child_key)
+                
+                # Update thought's children
+                thought_with_children = thought._replace(children=children)
+                
+                # Add children to new beam
+                new_beam.extend(children)
+            
+            # If no new thoughts, break
+            if not new_beam:
+                break
+                
+            # Sort and select top beam_width thoughts
+            new_beam.sort(key=lambda t: t.score, reverse=True)
+            beam = new_beam[:self.config.beam_width]
+            
+            # Update best thought
+            if beam and beam[0].score > best_thought.score:
+                best_thought = beam[0]
+        
+        return best_thought
 
-def create_tot_optimizer(learning_rate: float = 1e-4) -> optax.GradientTransformation:
-    """Create an optimizer for the Tree of Thoughts."""
-    return optax.chain(
-        optax.clip_by_global_norm(1.0),  # Gradient clipping
-        optax.adam(learning_rate)
-    )
+    def _depth_first_search(self, initial_thoughts: List[Thought], rng_key: jnp.ndarray) -> Thought:
+        """
+        Perform depth-first search through the tree of thoughts.
+        
+        Args:
+            initial_thoughts: Initial thoughts
+            rng_key: JAX random key
+            
+        Returns:
+            Best thought found
+        """
+        logger.info("Starting depth-first search in Tree of Thoughts")
+        
+        best_thought = max(initial_thoughts, key=lambda t: t.score) if initial_thoughts else None
+        
+        # Helper function for DFS recursion
+        def dfs_recursive(thought, depth, best_found, rng_key):
+            if depth >= self.config.max_depth:
+                return best_found
+            
+            # Generate children
+            rng_key, child_key = jax.random.split(rng_key)
+            children = self._generate_thoughts(thought.embeddings, thought, depth + 1, child_key)
+            
+            # Update thought's children
+            thought_with_children = thought._replace(children=children)
+            
+            # Update best thought
+            for child in children:
+                if child.score > best_found.score:
+                    best_found = child
+                
+                # Recursively explore child
+                rng_key, explore_key = jax.random.split(rng_key)
+                best_found = dfs_recursive(child, depth + 1, best_found, explore_key)
+            
+            return best_found
+        
+        # Start DFS from each initial thought
+        for thought in initial_thoughts:
+            rng_key, search_key = jax.random.split(rng_key)
+            best_thought = dfs_recursive(thought, 0, best_thought, search_key)
+        
+        return best_thought
+    
+    def _breadth_first_search(self, initial_thoughts: List[Thought], rng_key: jnp.ndarray) -> Thought:
+        """
+        Perform breadth-first search through the tree of thoughts.
+        
+        Args:
+            initial_thoughts: Initial thoughts
+            rng_key: JAX random key
+            
+        Returns:
+            Best thought found
+        """
+        logger.info("Starting breadth-first search in Tree of Thoughts")
+        
+        best_thought = max(initial_thoughts, key=lambda t: t.score) if initial_thoughts else None
+        
+        # Initialize queue with initial thoughts
+        queue = [(thought, 0) for thought in initial_thoughts]
+        
+        while queue:
+            thought, depth = queue.pop(0)
+            
+            # Update best thought
+            if thought.score > best_thought.score:
+                best_thought = thought
+                
+            # Stop if max depth reached
+            if depth >= self.config.max_depth:
+                continue
+                
+            # Generate children
+            rng_key, child_key = jax.random.split(rng_key)
+            children = self._generate_thoughts(thought.embeddings, thought, depth + 1, child_key)
+            
+            # Update thought's children
+            thought_with_children = thought._replace(children=children)
+            
+            # Add children to queue
+            queue.extend([(child, depth + 1) for child in children])
+        
+        return best_thought
+    
+    def _monte_carlo_tree_search(self, initial_thoughts: List[Thought], rng_key: jnp.ndarray) -> Thought:
+        """
+        Perform Monte Carlo Tree Search through the tree of thoughts.
+        
+        Args:
+            initial_thoughts: Initial thoughts
+            rng_key: JAX random key
+            
+        Returns:
+            Best thought found
+        """
+        logger.info("Starting Monte Carlo Tree Search in Tree of Thoughts")
+        # Simplified MCTS implementation
+        best_thought = max(initial_thoughts, key=lambda t: t.score) if initial_thoughts else None
+        return best_thought  # Placeholder for full MCTS implementation

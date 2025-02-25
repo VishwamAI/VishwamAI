@@ -13,14 +13,16 @@ from functools import partial
 import os
 from .tot import TreeOfThoughts
 from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
-from .transformer import VishwamAIModel as VisionTransformer10B
+from .transformer import VishwamAIModel
+# Import from loss_functions module
+from .loss_functions import cross_entropy_loss, tot_guided_loss, compute_metrics
 
-# Import error correction components
-from .error_correction_trainer import (
-    ErrorCorrectionTrainer,
+# Import from training_steps to avoid circular imports
+from .error_correction import (
     create_error_corrected_train_step,
     create_error_corrected_eval_step,
-    evaluate_error_correction
+    evaluate_error_correction,
+    ErrorCorrectionTrainer
 )
 
 logger = logging.getLogger(__name__)
@@ -110,65 +112,6 @@ def create_train_state(model, config):
     )
     
     return state
-
-def cross_entropy_loss(logits, labels, z_loss=0.0):
-    """Cross entropy loss with optional z-loss for stability."""
-    vocab_size = logits.shape[-1]
-    one_hot_labels = jax.nn.one_hot(labels, vocab_size)
-    
-    # Compute regular cross-entropy loss
-    loss = -jnp.sum(one_hot_labels * jax.nn.log_softmax(logits, axis=-1), axis=-1)
-    
-    # Add z-loss for stability
-    if z_loss > 0.0:
-        log_z = jnp.log(jnp.sum(jnp.exp(logits), axis=-1))
-        z_loss_term = z_loss * jnp.square(log_z)
-        loss += z_loss_term
-    
-    # Mask padding positions
-    mask = (labels != 0).astype(jnp.float32)
-    loss = loss * mask
-    
-    # Normalize by number of non-padding tokens
-    normalizer = jnp.sum(mask) + 1e-8
-    loss = jnp.sum(loss) / normalizer
-    
-    return loss
-
-def tot_guided_loss(logits, labels, tot_outputs, alpha=0.1):
-    """
-    Compute loss with guidance from Tree of Thoughts reasoning.
-    
-    Args:
-        logits: Model prediction logits
-        labels: Ground truth labels
-        tot_outputs: Outputs from Tree of Thoughts
-        alpha: Weighting factor for ToT guidance
-    
-    Returns:
-        Combined loss incorporating ToT guidance
-    """
-    # Get standard cross-entropy loss
-    ce_loss = cross_entropy_loss(logits, labels)
-    
-    # Extract ToT attention weights
-    thought_attention = tot_outputs.get('attention_weights')
-    if thought_attention is None:
-        return ce_loss
-    
-    # Extract thought importance weights
-    tot_weight = tot_outputs.get('integration_info', (None,))[0]
-    if tot_weight is None:
-        return ce_loss
-    
-    # Compute guidance loss based on thought attention and importance
-    # Higher weight to tokens that had high thought attention
-    guidance_loss = jnp.mean(jnp.abs(tot_weight) * jnp.abs(thought_attention))
-    
-    # Combine losses
-    combined_loss = (1.0 - alpha) * ce_loss + alpha * guidance_loss
-    
-    return combined_loss
 
 class DataProcessor:
     """Processor for tokenizing and batching data."""
@@ -289,25 +232,6 @@ def create_val_dataloader(config):
             yield data_processor.collate_fn(examples)
     
     return data_iterator()
-
-def compute_metrics(logits, labels):
-    """Compute metrics from logits and labels."""
-    predictions = jnp.argmax(logits, axis=-1)
-    mask = (labels != 0).astype(jnp.float32)
-    
-    # Accuracy
-    correct = (predictions == labels).astype(jnp.float32) * mask
-    accuracy = jnp.sum(correct) / (jnp.sum(mask) + 1e-8)
-    
-    # Perplexity
-    loss = cross_entropy_loss(logits, labels)
-    perplexity = jnp.exp(loss)
-    
-    return {
-        'accuracy': accuracy,
-        'perplexity': perplexity,
-        'loss': loss,
-    }
 
 def train_step(state, batch, model_config, z_loss=0.0, rng_key=None):
     """Perform a single training step with ToT integration."""
@@ -444,8 +368,8 @@ def initialize_tot_components(model, config):
     
     logger.info("Initializing Tree of Thoughts components for training")
     
-    # Create dummy vision transformer for ToT
-    vision_transformer = VisionTransformer10B(model.config)
+    # Create dummy transformer for ToT
+    vision_transformer = VishwamAIModel(model.config)
     
     # Create ToT model
     tot_model = TreeOfThoughts(

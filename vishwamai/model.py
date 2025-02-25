@@ -8,68 +8,55 @@ import flax.linen as nn
 import optax
 import numpy as np
 from einops import rearrange, repeat
-from .error_correction import ErrorCorrectionModule, ModelIntegrator
-from .tot import TreeOfThoughts
-from .transformer import VisionTransformer10B
 import json
+import os
+import gc
+from huggingface_hub import snapshot_download
+import safetensors.flax as stf
+from omegaconf import OmegaConf  # Added for configuration loading
+import safetensors
 @dataclass
 class ModelArgs:
-    """Model hyperparameters with advanced optimizations"""
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
-    n_kv_heads: int = 8  # GQA: Fewer KV heads than Q heads
+    n_kv_heads: int = 8
     vocab_size: int = 32000
     multiple_of: int = 256
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    
-    # Expert configurations
     n_experts: int = 8
     expert_dim: int = 4096
-    expert_pruning_threshold: float = 0.1  # Threshold for pruning inactive experts
-    min_active_experts: int = 4  # Minimum number of experts to maintain
-    dynamic_expert_selection: bool = True  # Enable token complexity-based routing
-    expert_capacity_factor: float = 1.25  # Allow expert overflow for important tokens
-    
-    # Attention configurations
-    window_size: int = 512  # Size of local attention window
-    global_tokens: int = 64  # Number of global attention tokens
+    expert_pruning_threshold: float = 0.1
+    min_active_experts: int = 4
+    dynamic_expert_selection: bool = True
+    expert_capacity_factor: float = 1.25
+    window_size: int = 512
+    global_tokens: int = 64
     attention_dropout: float = 0.1
     dropout_rate: float = 0.1
     expert_dropout: float = 0.1
-    use_alibi: bool = True  # Enable ALiBi position embeddings
-    num_alibi_heads: Optional[int] = None  # Number of heads using ALiBi
-    
-    # Memory optimization
-    use_flash_attention: bool = True  # Enable Flash Attention 2.0
-    kv_cache_dtype: jnp.dtype = jnp.int8  # INT8 quantization for KV cache
-    param_dtype: jnp.dtype = jnp.bfloat16  # bfloat16 for parameters
-    
-    # Vision-language configurations
-    vision_dim: int = 1024  # Vision embedding dimension
-    use_contrastive_loss: bool = True  # Enable CLIP-style contrastive loss
-    temperature: float = 0.07  # Temperature for contrastive loss
-    max_image_length: int = 256  # Maximum number of image tokens
+    use_alibi: bool = True
+    num_alibi_heads: Optional[int] = None
+    use_flash_attention: bool = True
+    kv_cache_dtype: jnp.dtype = jnp.int8
+    param_dtype: jnp.dtype = jnp.bfloat16
+    vision_dim: int = 1024
+    use_contrastive_loss: bool = True
+    temperature: float = 0.07
+    max_image_length: int = 256
 
 @dataclass
 class ModelConfig:
-    """Configuration class for VishwamAI model"""
-    
     @classmethod
     def map_config_params(cls, config_dict: Dict) -> Dict:
-        """Map parameters from different naming conventions to ModelConfig format."""
         mapped_dict = config_dict.copy()
-        
-        # Map attention parameters
         if 'attention_dropout' in mapped_dict:
             mapped_dict['attention_dropout_prob'] = mapped_dict.pop('attention_dropout')
         if 'dropout' in mapped_dict:
             mapped_dict['hidden_dropout_prob'] = mapped_dict.pop('dropout')
-        
-        # Map architecture parameters
         if 'hidden_size' not in mapped_dict and 'dim' in mapped_dict:
             mapped_dict['hidden_size'] = mapped_dict.pop('dim')
         if 'num_attention_heads' not in mapped_dict and 'num_heads' in mapped_dict:
@@ -78,13 +65,8 @@ class ModelConfig:
             mapped_dict['num_layers'] = mapped_dict.pop('n_layers')
         if 'intermediate_size' not in mapped_dict and 'intermediate_dim' in mapped_dict:
             mapped_dict['intermediate_size'] = mapped_dict.pop('intermediate_dim')
-        
-        # Remove any unsupported parameters
         mapped_dict.pop('attention_bias', None)
-        
-        # Return only valid ModelConfig parameters
-        return {k: v for k, v in mapped_dict.items() 
-                if k in cls.__dataclass_fields__}
+        return {k: v for k, v in mapped_dict.items() if k in cls.__dataclass_fields__}
 
     vocab_size: int = 32000
     hidden_size: int = 4096
@@ -102,25 +84,20 @@ class ModelConfig:
     eos_token_id: int = 2
     tie_word_embeddings: bool = True
     gradient_checkpointing: bool = False
-    
-    # Advanced model capabilities
     use_flash_attention: bool = True
-    use_rope: bool = True  # Rotary Position Embeddings
-    use_alibi: bool = False  # ALiBi position encoding
-    use_gqa: bool = True  # Grouped Query Attention
-    num_key_value_heads: int = 8  # For GQA
-    
-    # Performance optimization
+    use_rope: bool = True
+    use_alibi: bool = False
+    use_gqa: bool = True
+    num_key_value_heads: int = 8
     dtype: str = "bfloat16"
-    quantization: Optional[str] = None  # Options: None, "int8", "int4"
-    
+    quantization: Optional[str] = None
+
     def __post_init__(self):
         if self.use_gqa:
             assert self.num_attention_heads % self.num_key_value_heads == 0, \
                 "num_attention_heads must be divisible by num_key_value_heads for GQA"
 
 class ParallelDense(nn.Module):
-    """Advanced parallel dense layer with automatic sharding"""
     features: int
     use_bias: bool = True
     dtype: jnp.dtype = jnp.float32
@@ -129,21 +106,16 @@ class ParallelDense(nn.Module):
     
     @nn.compact
     def __call__(self, inputs):
-        kernel = self.param('kernel',
-                          self.kernel_init,
-                          (inputs.shape[-1], self.features))
+        kernel = self.param('kernel', self.kernel_init, (inputs.shape[-1], self.features))
         kernel = jnp.asarray(kernel, self.dtype)
         y = jnp.dot(inputs, kernel, precision=self.precision)
         if self.use_bias:
-            bias = self.param('bias',
-                            nn.initializers.zeros,
-                            (self.features,))
+            bias = self.param('bias', nn.initializers.zeros, (self.features,))
             bias = jnp.asarray(bias, self.dtype)
             y = y + bias
         return y
 
 class RMSNorm(nn.Module):
-    """RMS Normalization with improved numerical stability"""
     epsilon: float = 1e-6
     dtype: jnp.dtype = jnp.float32
 
@@ -151,27 +123,18 @@ class RMSNorm(nn.Module):
     def __call__(self, x):
         variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
         x = x * jax.lax.rsqrt(variance + self.epsilon)
-        scale = self.param('scale',
-                          nn.initializers.ones,
-                          (x.shape[-1],))
+        scale = self.param('scale', nn.initializers.ones, (x.shape[-1],))
         return x * jnp.asarray(scale, self.dtype)
 
 def rotary_embedding(x: jnp.ndarray, freqs: jnp.ndarray) -> jnp.ndarray:
-    """Enhanced rotary embeddings with better position encoding"""
     sin, cos = freqs
     sin = repeat(sin, '... d -> ... (d 2)')
     cos = repeat(cos, '... d -> ... (d 2)')
-    
     x1, x2 = rearrange(x, '... (d r) -> ... d r', r=2).unbind(-1)
-    rotated = jnp.stack([
-        x1 * cos - x2 * sin,
-        x1 * sin + x2 * cos
-    ], axis=-1)
-    
+    rotated = jnp.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
     return rearrange(rotated, '... d r -> ... (d r)')
 
 def precompute_freqs(dim: int, max_seq_len: int, base: int = 10000) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Precompute frequency tensors for rotary embeddings with extended range"""
     freqs = 1.0 / (base ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
     t = jnp.arange(max_seq_len)
     freqs = jnp.outer(t, freqs)
@@ -179,27 +142,22 @@ def precompute_freqs(dim: int, max_seq_len: int, base: int = 10000) -> Tuple[jnp
     return sin, cos
 
 class ParallelMLP(nn.Module):
-    """Advanced parallel MLP with gated activation and skip connections"""
     config: ModelArgs
     
     @nn.compact
     def __call__(self, x, deterministic: bool = True):
         dim = self.config.dim
-        hidden_dim = self.config.ffn_dim_multiplier
+        hidden_dim = int(self.config.ffn_dim_multiplier * dim if self.config.ffn_dim_multiplier else dim * 4)
         
         x = RMSNorm(dtype=x.dtype)(x)
         gate = ParallelDense(hidden_dim, dtype=x.dtype)(x)
         up = ParallelDense(hidden_dim, dtype=x.dtype)(x)
-        
-        # SwiGLU activation
         gate = nn.silu(gate)
         intermediate = gate * up
-        
         output = ParallelDense(dim, dtype=x.dtype)(intermediate)
         return nn.Dropout(rate=self.config.dropout_rate)(output, deterministic=deterministic)
 
 class MoELayer(nn.Module):
-    """Memory-efficient MoE with Top-2 routing and improved load balancing"""
     config: ModelArgs
     
     @nn.compact
@@ -207,68 +165,45 @@ class MoELayer(nn.Module):
         batch_size, seq_len, dim = x.shape
         num_experts = self.config.n_experts
         
-        # Expert networks - shared parameters for efficiency
         expert_fn = ParallelMLP(self.config)
+        router_weights = self.param('router_weights', nn.initializers.normal(stddev=0.02), (dim, num_experts))
         
-        # Router with efficient top-2 gating
-        router_weights = self.param('router_weights',
-                                  nn.initializers.normal(stddev=0.02),
-                                  (dim, num_experts))
-        
-        # Compute routing probabilities with jax.lax.stop_gradient for router
-        router_logits = jax.lax.stop_gradient(
-            jnp.einsum('bsd,de->bse', x, router_weights)
-        )
+        router_logits = jax.lax.stop_gradient(jnp.einsum('bsd,de->bse', x, router_weights))
         routing_probs = nn.softmax(router_logits, axis=-1)
         
-        # Select top-2 experts for each token
         top2_weights, top2_indices = jax.lax.top_k(routing_probs, k=2)
         top2_weights = top2_weights / jnp.sum(top2_weights, axis=-1, keepdims=True)
         
-        # Dispatch to top-2 experts with scatter-gather operations
         expert_inputs = []
         expert_indices = []
         
         for expert_idx in range(num_experts):
-            # Find tokens routed to this expert
             expert_mask = (top2_indices == expert_idx).any(axis=-1)
             if jnp.any(expert_mask):
-                # Get inputs and their weights for this expert
                 mask_weights = jnp.where(top2_indices == expert_idx, top2_weights, 0).max(axis=-1)
                 expert_inputs.append(x[expert_mask] * mask_weights[expert_mask, None])
                 expert_indices.append(jnp.where(expert_mask)[0])
         
-        # Process expert inputs in parallel
         expert_outputs = []
         if expert_inputs:
-            # Concatenate and process all expert inputs at once
             batched_expert_input = jnp.concatenate(expert_inputs, axis=0)
             batched_expert_output = expert_fn(batched_expert_input, deterministic)
-            
-            # Split outputs back per expert
             offset = 0
             for expert_input in expert_inputs:
                 expert_len = len(expert_input)
-                expert_outputs.append((
-                    expert_indices[offset:offset + expert_len],
-                    batched_expert_output[offset:offset + expert_len]
-                ))
+                expert_outputs.append((expert_indices[offset:offset + expert_len], batched_expert_output[offset:offset + expert_len]))
                 offset += expert_len
         
-        # Combine expert outputs
         final_output = jnp.zeros_like(x)
         for indices, outputs in expert_outputs:
             final_output = final_output.at[indices].add(outputs)
         
-        # Auxiliary loss for load balancing
-        # Using entropy maximization for better expert utilization
         expert_usage = jnp.mean(routing_probs, axis=(0, 1))
         load_balancing_loss = -jnp.sum(expert_usage * jnp.log(expert_usage + 1e-6))
         
         return final_output, load_balancing_loss
 
 def create_alibi_slopes(num_heads: int) -> jnp.ndarray:
-    """Create ALiBi attention biases for each head"""
     closest_power_of_2 = 2 ** jnp.floor(jnp.log2(num_heads))
     base = jnp.array([2 ** (-(2 ** -(jnp.log2(closest_power_of_2) - 3)))], dtype=jnp.float32)
     powers = jnp.arange(1, 1 + num_heads, dtype=jnp.float32)
@@ -276,27 +211,18 @@ def create_alibi_slopes(num_heads: int) -> jnp.ndarray:
     return slopes
 
 class MultiheadAttention(nn.Module):
-    """Advanced attention with GQA, ALiBi, and Flash Attention 2.0"""
     config: ModelArgs
     
     def create_sliding_window_mask(self, seq_len: int) -> jnp.ndarray:
-        """Create sliding window attention mask with global tokens"""
         window_size = self.config.window_size
         global_tokens = self.config.global_tokens
-        
-        # Initialize mask with -inf
         mask = jnp.full((seq_len, seq_len), -1e9)
-        
-        # Set sliding window attention pattern
         for i in range(seq_len):
             window_start = max(0, i - window_size // 2)
             window_end = min(seq_len, i + window_size // 2 + 1)
             mask = mask.at[i, window_start:window_end].set(0.0)
-        
-        # Set global attention for special tokens
-        mask = mask.at[:global_tokens, :].set(0.0)  # Global tokens attend to all
-        mask = mask.at[:, :global_tokens].set(0.0)  # All tokens attend to global tokens
-        
+        mask = mask.at[:global_tokens, :].set(0.0)
+        mask = mask.at[:, :global_tokens].set(0.0)
         return mask
     
     def setup(self):
@@ -305,15 +231,11 @@ class MultiheadAttention(nn.Module):
             self.alibi_slopes = create_alibi_slopes(num_alibi_heads)
     
     def compute_alibi_attention(self, qk: jnp.ndarray) -> jnp.ndarray:
-        """Add ALiBi positional bias to attention scores"""
         seq_len = qk.shape[-1]
-        # Create position differences matrix
         positions = jnp.arange(seq_len)
-        distance = positions[:, None] - positions[None, :]  # [seq_len, seq_len]
-        # Convert to float and make negative (smaller distance = higher attention)
+        distance = positions[:, None] - positions[None, :]
         distance = -jnp.abs(distance).astype(jnp.float32)
-        # Add head dimension and multiply by slopes
-        distance = distance[None, :, :]  # [1, seq_len, seq_len]
+        distance = distance[None, :, :]
         alibi_bias = self.alibi_slopes[:, None, None] * distance
         return qk + alibi_bias
 
@@ -324,43 +246,34 @@ class MultiheadAttention(nn.Module):
         num_kv_heads = self.config.n_kv_heads
         head_dim = dim // num_heads
         
-        # Compute token complexity for dynamic attention
         token_complexity = jnp.sum(jnp.abs(x), axis=-1, keepdims=True)
         complexity_weights = nn.sigmoid(token_complexity)
         
-        # Grouped-Query Attention projections with complexity weighting
         q = nn.remat(ParallelDense)(dim, use_bias=False, dtype=x.dtype)(x * complexity_weights)
         kv = nn.remat(ParallelDense)(2 * dim * (num_kv_heads / num_heads), use_bias=False, dtype=x.dtype)(x)
         k, v = jnp.split(kv, 2, axis=-1)
         
-        # Reshape heads for GQA
         q = rearrange(q, 'b s (h d) -> b h s d', h=num_heads)
         k = rearrange(k, 'b s (h d) -> b h s d', h=num_kv_heads)
         v = rearrange(v, 'b s (h d) -> b h s d', h=num_kv_heads)
         
-        # Repeat KV heads to match query heads for GQA
         repeats = num_heads // num_kv_heads
         k = repeat(k, 'b h s d -> b (h r) s d', r=repeats)
         v = repeat(v, 'b h s d -> b (h r) s d', r=repeats)
         
-        # Create sliding window attention mask
         if mask is None:
             mask = self.create_sliding_window_mask(seq_len)
         else:
             window_mask = self.create_sliding_window_mask(seq_len)
             mask = jnp.minimum(mask, window_mask)
         
-        # Compute attention scores with ALiBi and Flash Attention
         scale = 1.0 / jnp.sqrt(head_dim)
         qk = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
         
-        # Add ALiBi bias if enabled
         if self.config.use_alibi:
             qk = self.compute_alibi_attention(qk)
         
-        # Apply mask and compute attention with Flash Attention or standard attention
         if self.config.use_flash_attention:
-            # Note: This is a placeholder for Flash Attention 2.0
             qk = jnp.where(mask, qk, -1e9)
             attention = nn.softmax(qk, axis=-1)
         else:
@@ -368,37 +281,28 @@ class MultiheadAttention(nn.Module):
             attention = nn.softmax(qk, axis=-1)
         
         if not deterministic:
-            attention = nn.Dropout(rate=self.config.attention_dropout)(
-                attention, deterministic=False
-            )
+            attention = nn.Dropout(rate=self.config.attention_dropout)(attention, deterministic=False)
         
-        # Compute output with quantized KV cache
         if not deterministic:
-            v = jnp.asarray(v, self.config.kv_cache_dtype)  # Quantize KV cache during training
+            v = jnp.asarray(v, self.config.kv_cache_dtype)
             
         output = jnp.einsum('bhij,bhjd->bhid', attention, v)
         output = rearrange(output, 'b h s d -> b s (h d)')
         
-        # Final projection with gradient checkpointing
         output = nn.remat(ParallelDense)(dim, dtype=x.dtype)(output)
-        output = nn.Dropout(rate=self.config.dropout_rate)(
-            output, deterministic=deterministic
-        )
+        output = nn.Dropout(rate=self.config.dropout_rate)(output, deterministic=deterministic)
         
         return output
 
 class TransformerBlock(nn.Module):
-    """Advanced transformer block with parallel processing and error correction"""
     config: ModelArgs
     
     @nn.compact
     def __call__(self, x, mask=None, deterministic: bool = True):
-        # Attention with pre-norm
         attn_norm = RMSNorm(dtype=x.dtype)(x)
         attn_output = MultiheadAttention(self.config)(attn_norm, mask, deterministic)
         x = x + attn_output
         
-        # MoE or MLP with pre-norm
         ff_norm = RMSNorm(dtype=x.dtype)(x)
         if self.config.n_experts > 0:
             ff_output, load_balance_loss = MoELayer(self.config)(ff_norm, deterministic)
@@ -410,201 +314,39 @@ class TransformerBlock(nn.Module):
         return x
 
 class ParallelEmbedding(nn.Module):
-    """Enhanced parallel embedding layer with device sharding"""
     args: ModelArgs
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        embedding = self.param(
-            'embedding',
-            nn.initializers.normal(stddev=0.02),
-            (self.args.vocab_size, self.args.dim),
-            self.param_dtype
-        )
-        
-        # Check input values
+        embedding = self.param('embedding', nn.initializers.normal(stddev=0.02), (self.args.vocab_size, self.args.dim), self.param_dtype)
         if jnp.any((x < 0) | (x >= self.args.vocab_size)):
             raise ValueError("Input ids must be in range [0, vocab_size)")
-            
         embedded = jnp.take(embedding, x, axis=0)
         return jnp.asarray(embedded, self.dtype)
 
-class ExtendedVishwamAIModel(nn.Module):
-    """Enhanced model with improved component integration"""
-    args: ModelArgs
-    
-    def setup(self):
-        # Core components
-        self.embedding = ParallelEmbedding(self.args)
-        self.layers = [
-            TransformerBlock(self.args) for _ in range(self.args.n_layers)
-        ]
-        self.norm = RMSNorm(eps=self.args.norm_eps)
-        
-        # Error correction and multimodal components
-        self.error_correction = ErrorCorrectionModule(
-            hidden_size=self.args.dim,
-            num_heads=self.args.n_heads,
-            dropout_rate=0.1
+def download_partial_model(model_path: str, num_shards: int = 15):
+    """Download only specified number of model shards"""
+    patterns = [f"model-{i+1:05d}-of-00252.safetensors" for i in range(num_shards)]
+    patterns.extend(["config.json", "tokenizer.model"])
+    try:
+        local_path = snapshot_download(
+            repo_id=model_path,
+            allow_patterns=patterns,
+            local_files_only=False,
+            resume_download=True
         )
-        
-        # Vision processing
-        self.vision_transformer = VisionTransformer10B(
-            num_classes=self.args.vocab_size,
-            hidden_size=self.args.dim,
-            num_heads=self.args.n_heads
-        )
-        
-        # Tree of Thoughts reasoning
-        self.tot = TreeOfThoughts(
-            transformer=self.vision_transformer,
-            max_thoughts=5,
-            max_depth=3
-        )
-        
-        # MoE components
-        self.moe = MoELayer(self.args)
-        
-        # Add gradient checkpointing
-        self.use_checkpointing = True
-        
-        # Add model parallel settings
-        self.model_parallel_size = jax.device_count()
-
-    def compute_clip_loss(
-        self,
-        text_embeddings: jnp.ndarray,
-        image_embeddings: jnp.ndarray,
-        temperature: Optional[float] = None
-    ) -> jnp.ndarray:
-        """Compute CLIP-style contrastive loss for vision-language alignment"""
-        # Normalize embeddings
-        text_embeddings = text_embeddings / jnp.linalg.norm(text_embeddings, axis=-1, keepdims=True)
-        image_embeddings = image_embeddings / jnp.linalg.norm(image_embeddings, axis=-1, keepdims=True)
-        
-        # Compute similarity matrix
-        logits = jnp.einsum('bd,nd->bn', text_embeddings, image_embeddings)
-        logits = logits * (1 / (temperature or self.args.temperature))
-        
-        # Contrastive loss using cross entropy
-        labels = jnp.arange(len(text_embeddings))
-        loss_i = optax.softmax_cross_entropy(logits, jax.nn.one_hot(labels, len(text_embeddings)))
-        loss_t = optax.softmax_cross_entropy(logits.T, jax.nn.one_hot(labels, len(text_embeddings)))
-        
-        return (loss_i + loss_t) / 2
-
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        images: Optional[jnp.ndarray] = None,
-        attention_mask: Optional[jnp.ndarray] = None,
-        train: bool = False
-    ) -> Dict[str, jnp.ndarray]:
-        """
-        Forward pass with multimodal support and error correction.
-        
-        Args:
-            input_ids: Text input tokens
-            images: Optional image inputs
-            attention_mask: Optional attention mask
-            train: Whether in training mode
-        
-        Returns:
-            Dictionary containing model outputs and intermediate states
-        """
-        # Initialize containers for intermediate outputs
-        intermediate_outputs = []
-        error_gates = []
-        
-        # Text processing
-        x = self.embedding(input_ids)
-        
-        # Process layers with error correction
-        for layer in self.layers:
-            if self.use_checkpointing and train:
-                x = jax.checkpoint(layer)(x, attention_mask, train)
-            else:
-                x = layer(x, attention_mask, train)
-            x_corrected, error_gate = self.error_correction(x, training=train)
-            x = x_corrected
-            
-            intermediate_outputs.append(x)
-            error_gates.append(error_gate)
-        
-        x = self.norm(x)
-        
-        # Vision processing if images provided
-        if images is not None:
-            vision_features = self.vision_transformer(images, train=train)
-            x = x + vision_features
-        
-        # Text features for contrastive learning
-        text_pooled = jnp.mean(x, axis=1)  # Global average pooling
-        
-        # Apply MoE routing
-        moe_output, load_balance_loss = self.moe(x)
-        x = x + moe_output
-        
-        # Vision-language contrastive loss
-        contrastive_loss = None
-        if images is not None and self.args.use_contrastive_loss and train:
-            vision_features = self.vision_transformer(images, train=train)
-            vision_pooled = jnp.mean(vision_features, axis=1)  # Global average pooling
-            contrastive_loss = self.compute_clip_loss(text_pooled, vision_pooled)
-            x = x + vision_features
-        else:
-            vision_features = None
-        
-        # Apply Tree of Thoughts reasoning
-        tot_loss = None
-        if train:
-            tot_output = self.tot(x, search_strategy='bfs')
-            x = x + tot_output
-            tot_loss = jnp.mean(jnp.abs(tot_output))  # Monitor ToT contribution
-        
-        # Final projection
-        logits = jnp.dot(x, self.embedding.embedding.T)
-        
-        # Compute aggregate metrics
-        attention_stats = {
-            'mean_attention': jnp.mean(jnp.stack([o['attention'] for o in intermediate_outputs])),
-            'max_attention': jnp.max(jnp.stack([o['attention'] for o in intermediate_outputs]))
-        }
-        
-        return {
-            'logits': logits,
-            'intermediate_outputs': intermediate_outputs,
-            'error_gates': error_gates,
-            'load_balance_loss': load_balance_loss,
-            'contrastive_loss': contrastive_loss,
-            'tot_loss': tot_loss,
-            'attention_stats': attention_stats,
-            'text_embeddings': text_pooled,
-            'vision_embeddings': vision_pooled if vision_features is not None else None
-        }
+        print(f"Successfully downloaded {num_shards} model shards to {local_path}")
+        return local_path
+    except Exception as e:
+        raise ValueError(f"Error downloading model shards: {str(e)}")
 
 class VishwamAIModel(nn.Module):
-    """Base VishwamAI model implementing core transformer architecture"""
     config: ModelConfig
 
     @classmethod
-    def from_pretrained(cls, model_path: str, *, config: Optional[ModelConfig] = None, rename_params: bool = True):
-        """Load a pretrained model from Hugging Face Hub or local path.
-        
-        Args:
-            model_path: Path to model on HF Hub or local directory
-            config: Optional ModelConfig, will load from model_path if not provided
-        
-        Returns:
-            VishwamAIModel: Loaded model instance
-        """
-        from huggingface_hub import snapshot_download
-        import safetensors.flax as stf
-        import os
-        
-        # Download model files if needed
+    def from_pretrained(cls, model_path: str, config: Optional[ModelConfig] = None, rename_params: bool = True):
         if not os.path.exists(model_path):
             try:
                 model_path = snapshot_download(
@@ -614,42 +356,17 @@ class VishwamAIModel(nn.Module):
             except Exception as e:
                 raise ValueError(f"Error downloading model from {model_path}: {str(e)}")
         
-        # Load config if not provided
         if config is None:
             config_path = os.path.join(model_path, "config.json")
             if not os.path.exists(config_path):
                 raise ValueError(f"Config not found at {config_path}")
             with open(config_path) as f:
                 config_dict = json.load(f)
-            # Rename parameters to match ModelConfig if needed
             if rename_params:
-                # Map attention parameters
-                if 'attention_dropout' in config_dict:
-                    config_dict['attention_dropout_prob'] = config_dict.pop('attention_dropout')
-                if 'dropout' in config_dict:
-                    config_dict['hidden_dropout_prob'] = config_dict.pop('dropout')
-                    
-                # Map architecture parameters
-                if 'hidden_size' not in config_dict and 'dim' in config_dict:
-                    config_dict['hidden_size'] = config_dict.pop('dim')
-                if 'num_attention_heads' not in config_dict and 'num_heads' in config_dict:
-                    config_dict['num_attention_heads'] = config_dict.pop('num_heads')
-                if 'num_layers' not in config_dict and 'n_layers' in config_dict:
-                    config_dict['num_layers'] = config_dict.pop('n_layers')
-                if 'intermediate_size' not in config_dict and 'intermediate_dim' in config_dict:
-                    config_dict['intermediate_size'] = config_dict.pop('intermediate_dim')
-                    
-                # Remove any unsupported parameters
-                config_dict.pop('attention_bias', None)
-                
-            # Create ModelConfig with cleaned parameters
-            config = ModelConfig(**{k: v for k, v in config_dict.items() 
-                                 if k in ModelConfig.__dataclass_fields__})
+                config_dict = ModelConfig.map_config_params(config_dict)
+            config = ModelConfig(**config_dict)
         
-        # Initialize model with config
         model = cls(config)
-        
-        # Load weights from sharded safetensors files
         params = {}
         shard_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
         
@@ -664,23 +381,11 @@ class VishwamAIModel(nn.Module):
             except Exception as e:
                 raise ValueError(f"Error loading weights from {shard_path}: {str(e)}")
         
-        # Create variables dict and bind to model
         variables = {'params': params}
-        bound_model = model.bind(variables)
-        
-        return bound_model
+        return model.bind(variables)
 
-    def load_weights(self, model_path: str):
-        """Load pretrained weights from local path or Hugging Face Hub.
-        
-        Args:
-            model_path: Path to model on HF Hub or local directory
-        """
-        from huggingface_hub import snapshot_download
-        import safetensors.flax as stf
-        import os
-
-        # Download model files if needed 
+    def load_weights(self, model_path: str, reduced_size: bool = True):
+        """Load pretrained weights with option to reduce model size for memory efficiency."""
         if not os.path.exists(model_path):
             try:
                 model_path = snapshot_download(
@@ -690,7 +395,14 @@ class VishwamAIModel(nn.Module):
             except Exception as e:
                 raise ValueError(f"Error downloading model from {model_path}: {str(e)}")
 
-        # Load weights from sharded safetensors files
+        if reduced_size:
+            print("Loading reduced size model for memory constraints...")
+            self.config.hidden_size = self.config.hidden_size // 2
+            self.config.num_attention_heads = self.config.num_attention_heads // 2
+            self.config.num_key_value_heads = max(1, self.config.num_key_value_heads // 2)
+            self.config.intermediate_size = self.config.intermediate_size // 2
+            self.config.num_layers = self.config.num_layers // 2
+        
         params = {}
         shard_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
         
@@ -700,12 +412,36 @@ class VishwamAIModel(nn.Module):
         for shard_file in shard_files:
             shard_path = os.path.join(model_path, shard_file)
             try:
-                shard_params = stf.load_file(shard_path)
-                params.update(shard_params)
+                print(f"Loading {shard_file}...")
+                with safetensors.safe_open(shard_path, framework="numpy") as f:
+                    for name in f.keys():
+                        try:
+                            tensor = f.get_tensor(name).astype(np.float16)
+                            if reduced_size and len(tensor.shape) >= 2:
+                                new_shape = tuple(s // 2 if i < 2 else s for i, s in enumerate(tensor.shape))
+                                tensor = tensor[tuple(slice(0, s) for s in new_shape)]
+                            with jax.default_device(jax.devices("cpu")[0]):
+                                params[name] = jnp.array(tensor)
+                            del tensor
+                            gc.collect()
+                        except Exception as e:
+                            print(f"Warning: Could not load {name}, skipping... Error: {str(e)}")
+                            continue
             except Exception as e:
+                params.clear()
+                gc.collect()
+                jax.clear_backends()
+                if "RESOURCE_EXHAUSTED" in str(e):
+                    raise ValueError(
+                        "Failed to load model due to memory constraints.\n"
+                        "Options:\n1. Use Colab Pro/Pro+\n2. Try a smaller model\n3. Use CPU offloading\n"
+                        f"Error: {str(e)}"
+                    )
                 raise ValueError(f"Error loading weights from {shard_path}: {str(e)}")
+        
+            gc.collect()
+            jax.clear_backends()
 
-        # Bind parameters to model
         self.bind({'params': params})
         return self
 
@@ -713,112 +449,50 @@ class VishwamAIModel(nn.Module):
         self.embeddings = self._create_embeddings()
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
-        self.final_layer_norm = nn.LayerNorm(
-            epsilon=self.config.layer_norm_eps,
-            dtype=jnp.dtype(self.config.dtype)
-        )
-        
+        self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
+    
     def _create_embeddings(self):
-        return ParallelEmbedding(
-            vocab_size=self.config.vocab_size,
-            hidden_size=self.config.hidden_size,
-            max_position_embeddings=self.config.max_position_embeddings,
-            dropout_rate=self.config.hidden_dropout_prob,
+        return nn.Embed(
+            num_embeddings=self.config.vocab_size,
+            features=self.config.hidden_size,
+            embedding_init=nn.initializers.normal(stddev=0.02),
             dtype=jnp.dtype(self.config.dtype)
         )
     
     def _create_encoder(self):
-        return [
-            TransformerBlock(
-                hidden_size=self.config.hidden_size,
-                num_heads=self.config.num_attention_heads,
-                num_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else None,
-                intermediate_size=self.config.intermediate_size,
-                dropout_rate=self.config.hidden_dropout_prob,
-                attention_dropout=self.config.attention_dropout_prob,
-                dtype=jnp.dtype(self.config.dtype),
-                use_flash_attention=self.config.use_flash_attention,
-                use_rope=self.config.use_rope,
-                use_alibi=self.config.use_alibi
-            )
-            for _ in range(self.config.num_layers)
-        ]
+        return [TransformerBlock(ModelArgs(
+            dim=self.config.hidden_size,
+            n_layers=1,
+            n_heads=self.config.num_attention_heads,
+            n_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads,
+            vocab_size=self.config.vocab_size
+        )) for _ in range(self.config.num_layers)]
     
     def _create_decoder(self):
-        return [
-            TransformerBlock(
-                hidden_size=self.config.hidden_size,
-                num_heads=self.config.num_attention_heads,
-                num_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else None,
-                intermediate_size=self.config.intermediate_size,
-                dropout_rate=self.config.hidden_dropout_prob,
-                attention_dropout=self.config.attention_dropout_prob,
-                dtype=jnp.dtype(self.config.dtype),
-                use_flash_attention=self.config.use_flash_attention,
-                use_rope=self.config.use_rope,
-                use_alibi=self.config.use_alibi,
-                is_decoder=True
-            )
-            for _ in range(self.config.num_layers)
-        ]
+        return [TransformerBlock(ModelArgs(
+            dim=self.config.hidden_size,
+            n_layers=1,
+            n_heads=self.config.num_attention_heads,
+            n_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads,
+            vocab_size=self.config.vocab_size
+        )) for _ in range(self.config.num_layers)]
     
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        position_ids: Optional[jnp.ndarray] = None,
-        deterministic: bool = True,
-    ) -> Dict[str, jnp.ndarray]:
-        """Forward pass of the model"""
+    def __call__(self, input_ids: jnp.ndarray, attention_mask: Optional[jnp.ndarray] = None, position_ids: Optional[jnp.ndarray] = None, deterministic: bool = True) -> Dict[str, jnp.ndarray]:
+        hidden_states = self.embeddings(input_ids)
         
-        # Input embedding
-        hidden_states = self.embeddings(
-            input_ids,
-            position_ids=position_ids,
-            deterministic=deterministic
-        )
-        
-        # Create causal attention mask if needed
         if attention_mask is None:
             attention_mask = self._create_causal_mask(input_ids.shape[1])
         
-        # Process through encoder layers
         encoder_outputs = []
         for encoder_layer in self.encoder:
-            if self.config.gradient_checkpointing and not deterministic:
-                hidden_states = jax.checkpoint(encoder_layer)(
-                    hidden_states,
-                    attention_mask,
-                    deterministic=deterministic
-                )
-            else:
-                hidden_states = encoder_layer(
-                    hidden_states,
-                    attention_mask,
-                    deterministic=deterministic
-                )
+            hidden_states = encoder_layer(hidden_states, attention_mask, deterministic)
             encoder_outputs.append(hidden_states)
         
-        # Process through decoder layers
         decoder_outputs = []
         for decoder_layer in self.decoder:
-            if self.config.gradient_checkpointing and not deterministic:
-                hidden_states = jax.checkpoint(decoder_layer)(
-                    hidden_states,
-                    attention_mask,
-                    encoder_outputs[-1],
-                    deterministic=deterministic
-                )
-            else:
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask,
-                    encoder_outputs[-1],
-                    deterministic=deterministic
-                )
+            hidden_states = decoder_layer(hidden_states, attention_mask, deterministic)
             decoder_outputs.append(hidden_states)
         
-        # Final layer norm
         hidden_states = self.final_layer_norm(hidden_states)
         
         return {
@@ -828,88 +502,91 @@ class VishwamAIModel(nn.Module):
         }
     
     def _create_causal_mask(self, sequence_length: int) -> jnp.ndarray:
-        """Create causal attention mask"""
-        mask = jnp.triu(
-            jnp.ones((sequence_length, sequence_length), dtype=jnp.bool_),
-            k=1
-        )
+        mask = jnp.triu(jnp.ones((sequence_length, sequence_length), dtype=jnp.bool_), k=1)
         return jnp.where(mask, -1e9, 0.0)
 
-class SpeculativeDecoder(nn.Module):
-    """Speculative Decoding for faster inference using a draft model"""
-    large_model: ExtendedVishwamAIModel
-    small_model: Optional[ExtendedVishwamAIModel] = None
-    num_draft_tokens: int = 5
-    
-    def setup(self):
-        if self.small_model is None:
-            # Create smaller version of the model by reducing layers and dim
-            small_config = ModelArgs(
-                dim=self.large_model.args.dim // 2,
-                n_layers=self.large_model.args.n_layers // 2,
-                n_heads=self.large_model.args.n_heads // 2,
-                vocab_size=self.large_model.args.vocab_size
-            )
-            self.small_model = ExtendedVishwamAIModel(small_config)
-    
-    def __call__(self, input_ids: jnp.ndarray, max_length: int = 100) -> jnp.ndarray:
-        """Generate tokens using speculative decoding with draft model"""
-        generated_ids = input_ids
-        
-        for _ in range(0, max_length, self.num_draft_tokens):
-            # Draft phase: Generate candidate tokens with small model
-            draft_outputs = self.small_model(generated_ids)
-            draft_logits = draft_outputs['logits'][:, -1:, :]
-            draft_tokens = jax.random.categorical(
-                jax.random.PRNGKey(0), draft_logits, axis=-1
-            )
-            draft_sequence = jnp.concatenate([generated_ids, draft_tokens], axis=1)
-            
-            # Verify phase: Large model verifies draft tokens
-            large_outputs = self.large_model(draft_sequence)
-            large_logits = large_outputs['logits'][:, -self.num_draft_tokens:, :]
-            
-            # Compare draft and verified probabilities
-            draft_probs = nn.softmax(draft_logits, axis=-1)
-            verified_probs = nn.softmax(large_logits, axis=-1)
-            
-            # Accept tokens where draft model matches large model closely
-            prob_threshold = 0.9
-            matches = jnp.sum(jnp.abs(draft_probs - verified_probs), axis=-1) < (1 - prob_threshold)
-            
-            # If match found, keep draft tokens; otherwise use large model prediction
-            verified_tokens = jnp.where(
-                matches,
-                draft_tokens,
-                jax.random.categorical(jax.random.PRNGKey(0), large_logits, axis=-1)
-            )
-            
-            generated_ids = jnp.concatenate([generated_ids, verified_tokens], axis=1)
-            
-        return generated_ids
+# Placeholder classes for missing dependencies
+class VishwamAITokenizer:
+    def __init__(self, vocab_size: int, model_prefix: str):
+        self.vocab_size = vocab_size
+        self.model_prefix = model_prefix
+        # Replace with actual tokenizer implementation
+        print(f"Initialized dummy tokenizer with vocab_size={vocab_size}, prefix={model_prefix}")
 
-def create_optimizer(
-    learning_rate: float,
-    warmup_steps: int = 2000,
-    decay_steps: int = 50000,
-    end_learning_rate: float = 1e-5
-) -> optax.GradientTransformation:
-    """Create an advanced optimizer with learning rate schedule"""
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=learning_rate,
-        warmup_steps=warmup_steps,
-        decay_steps=decay_steps,
-        end_value=end_learning_rate
+class VishwamaiShaalaTrainer:
+    def __init__(self, teacher_model, student_model, cfg):
+        self.teacher_model = teacher_model
+        self.student_model = student_model
+        self.cfg = cfg
+        # Replace with actual trainer implementation
+        print("Initialized dummy trainer")
+
+# Main execution
+if __name__ == "__main__":
+    # Load distillation configuration
+    # Assuming the config file is in the specified path; adjust as needed
+    distillation_config_path = os.path.join("vishwamai", "configs", "training", "perplexity_r1_distillation.yaml")
+    if not os.path.exists(distillation_config_path):
+        # Create a default config if file not found
+        distillation_config = OmegaConf.create({
+            'distillation': {
+                'teacher_model': {
+                    'path': "perplexity-ai/r1-1776",
+                    'config': {
+                        'hidden_size': 7168,
+                        'intermediate_size': 18432,
+                        'num_attention_heads': 128,
+                        'num_layers': 61,
+                        'num_key_value_heads': 128,
+                        'vocab_size': 129280,
+                        'max_position_embeddings': 163840
+                    }
+                },
+                'student_model': {
+                    'path': "model-00001-to-00015-of-00252.safetensors",
+                    'config': {
+                        'hidden_size': 2048,
+                        'intermediate_size': 8192,
+                        'num_attention_heads': 32,
+                        'num_layers': 24,
+                        'num_key_value_heads': 32,
+                        'vocab_size': 129280,
+                        'max_position_embeddings': 163840
+                    }
+                }
+            }
+        })
+        print(f"Warning: Config file not found at {distillation_config_path}. Using default config.")
+    else:
+        distillation_config = OmegaConf.load(distillation_config_path)
+
+    # Download partial teacher model
+    teacher_path = download_partial_model(
+        distillation_config['distillation']['teacher_model']['path'],
+        num_shards=5  # Reduced for memory efficiency
     )
-    
-    return optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(
-            learning_rate=schedule,
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
-            weight_decay=0.1
-        )
+
+    # Initialize teacher model
+    teacher_config = distillation_config['distillation']['teacher_model']['config']
+    student_config = distillation_config['distillation']['student_model']['config']
+
+    teacher_model = VishwamAIModel(ModelConfig(**teacher_config))
+    teacher_model.load_weights(teacher_path, reduced_size=True)
+
+    # Initialize student model
+    student_model = VishwamAIModel(ModelConfig(**student_config))
+
+    # Initialize tokenizer (placeholder)
+    tokenizer = VishwamAITokenizer(
+        vocab_size=teacher_config["vocab_size"],
+        model_prefix="vishwamai"
     )
+
+    # Initialize trainer (placeholder)
+    trainer = VishwamaiShaalaTrainer(
+        teacher_model=teacher_model,
+        student_model=student_model,
+        cfg=distillation_config
+    )
+
+    print("Setup completed successfully!")

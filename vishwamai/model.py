@@ -13,8 +13,52 @@ import os
 import gc
 from huggingface_hub import snapshot_download
 import safetensors.flax as stf
-from omegaconf import OmegaConf  # Added for configuration loading
+from omegaconf import OmegaConf
 import safetensors
+
+def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
+                    beta1: float = 0.9, beta2: float = 0.999, 
+                    warmup_steps: int = 2000, num_train_steps: int = 100000):
+    """
+    Creates an optimizer for training the model.
+    
+    Args:
+        learning_rate: Peak learning rate
+        weight_decay: Weight decay coefficient
+        beta1: First moment coefficient for Adam
+        beta2: Second moment coefficient for Adam
+        warmup_steps: Number of warmup steps
+        num_train_steps: Total number of training steps
+    
+    Returns:
+        An optax optimizer
+    """
+    decay_scheduler = optax.linear_schedule(
+        init_value=0.0,
+        end_value=learning_rate,
+        transition_steps=warmup_steps
+    )
+    
+    decay_scheduler = optax.join_schedules(
+        schedules=[decay_scheduler, optax.linear_schedule(
+            init_value=learning_rate,
+            end_value=0,
+            transition_steps=num_train_steps - warmup_steps
+        )],
+        boundaries=[warmup_steps]
+    )
+    
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Gradient clipping
+        optax.adamw(
+            learning_rate=decay_scheduler,
+            b1=beta1,
+            b2=beta2,
+            weight_decay=weight_decay
+        )
+    )
+    
+    return optimizer
 @dataclass
 class ModelArgs:
     dim: int = 4096

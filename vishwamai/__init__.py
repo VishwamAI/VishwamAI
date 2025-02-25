@@ -1,10 +1,7 @@
 from .model import (
     VishwamAIModel,
     ModelConfig,
-    create_optimizer,
-    ModelArgs,
-    ExtendedVishwamAIModel,
-    SpeculativeDecoder
+    ModelArgs
 )
 from .tokenizer import VishwamAITokenizer
 from .distillation import VishwamaiGuruKnowledge, VishwamaiShaalaTrainer
@@ -19,10 +16,7 @@ __version__ = '0.1.0'
 __all__ = [
     'VishwamAIModel',
     'ModelConfig',
-    'create_optimizer',
     'ModelArgs',
-    'ExtendedVishwamAIModel',
-    'SpeculativeDecoder',
     'VishwamAITokenizer',
     'VishwamaiGuruKnowledge',
     'VishwamaiShaalaTrainer',

@@ -124,6 +124,21 @@ class ErrorCorrectionModule(nn.Module):
         
         return ErrorCorrectionOutput(corrected, error_gate)
 
+class AdaptiveErrorCorrection(nn.Module):
+    """
+    Enhanced error correction that adapts during training with ToT integration.
+    """
+    hidden_size: int
+    num_heads: int = 4
+    dropout_rate: float = 0.1
+    qkv_features: Optional[int] = None
+    use_tot_features: bool = True
+    
+    @nn.compact
+    def __call__(self, 
+                features: jnp.ndarray):
+        pass
+
 @partial(jax.jit, static_argnums=(2,))
 def compute_error_metrics(predictions: jnp.ndarray, 
                         targets: jnp.ndarray,

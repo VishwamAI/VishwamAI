@@ -14,6 +14,7 @@ import gc
 from huggingface_hub import snapshot_download
 import safetensors.flax as stf  # Correct import
 from omegaconf import OmegaConf
+import logger
 def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
                     beta1: float = 0.9, beta2: float = 0.999, 
                     warmup_steps: int = 2000, num_train_steps: int = 100000):
@@ -495,6 +496,40 @@ class VishwamAIModel(nn.Module):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
+        
+        # Add ToT integration components
+        self.use_tot = getattr(self.config, 'use_tot', False)
+        if self.use_tot:
+            from vishwamai.tot import TreeOfThoughts
+            from vishwamai.transformer import VishwamAIModel as VisionTransformer10B
+            from vishwamai.integration import ToTIntegrationLayer, MultiLevelToTAttention
+            
+            # Create dummy vision transformer for ToT
+            self.vision_transformer = VisionTransformer10B(self.config)
+            
+            # Create ToT model
+            self.tot_model = TreeOfThoughts(
+                transformer=self.vision_transformer,
+                max_thoughts=getattr(self.config, 'tot_max_thoughts', 5),
+                max_depth=getattr(self.config, 'tot_max_depth', 3),
+                beam_width=getattr(self.config, 'tot_beam_width', 8)
+            )
+            
+            # Create integration components
+            self.tot_integration = ToTIntegrationLayer(self.config)
+            self.tot_mla = MultiLevelToTAttention(
+                hidden_size=self.config.hidden_size,
+                num_heads=min(8, self.config.num_attention_heads)
+            )
+            
+        # Add MoD components
+        self.use_mod = getattr(self.config, 'use_mod', False)
+        if self.use_mod:
+            from vishwamai.integration import MixtureDensityNetwork
+            self.mod_layer = MixtureDensityNetwork(
+                hidden_size=self.config.hidden_size,
+                num_mixtures=getattr(self.config, 'mod_num_mixtures', 5)
+            )
     
     def _create_embeddings(self):
         return nn.Embed(
@@ -522,7 +557,20 @@ class VishwamAIModel(nn.Module):
             vocab_size=self.config.vocab_size
         )) for _ in range(self.config.num_layers)]
     
-    def __call__(self, input_ids: jnp.ndarray, attention_mask: Optional[jnp.ndarray] = None, position_ids: Optional[jnp.ndarray] = None, deterministic: bool = True) -> Dict[str, jnp.ndarray]:
+    def __call__(self, input_ids: jnp.ndarray, attention_mask: Optional[jnp.ndarray] = None, 
+                position_ids: Optional[jnp.ndarray] = None, deterministic: bool = True,
+                use_tot: bool = None, tot_rng_key: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+        """
+        Enhanced forward pass with Tree of Thoughts integration.
+        
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            position_ids: Position IDs
+            deterministic: Whether to use deterministic mode
+            use_tot: Whether to use Tree of Thoughts (overrides config)
+            tot_rng_key: Random key for ToT search
+        """
         hidden_states = self.embeddings(input_ids)
         
         if attention_mask is None:
@@ -533,6 +581,11 @@ class VishwamAIModel(nn.Module):
             hidden_states = encoder_layer(hidden_states, attention_mask, deterministic)
             encoder_outputs.append(hidden_states)
         
+        # Apply MoD if enabled
+        mod_weights = None
+        if self.use_mod:
+            hidden_states, mod_weights = self.mod_layer(hidden_states, deterministic)
+        
         decoder_outputs = []
         for decoder_layer in self.decoder:
             hidden_states = decoder_layer(hidden_states, attention_mask, deterministic)
@@ -540,15 +593,68 @@ class VishwamAIModel(nn.Module):
         
         hidden_states = self.final_layer_norm(hidden_states)
         
-        return {
+        # Apply Tree of Thoughts if enabled
+        tot_outputs = None
+        if (use_tot is True) or (use_tot is None and self.use_tot):
+            try:
+                # Generate thoughts
+                if tot_rng_key is None:
+                    tot_rng_key = jax.random.PRNGKey(0)
+                
+                tot_thought = self.tot_model(hidden_states, tot_rng_key)
+                
+                # Collect thought features
+                thought_features = []
+                current_thought = tot_thought
+                while current_thought:
+                    thought_features.append(current_thought.embeddings)
+                    if current_thought.children:
+                        current_thought = max(current_thought.children, key=lambda t: t.score)
+                    else:
+                        break
+                
+                # Apply multi-level attention if we have thoughts
+                if thought_features:
+                    tot_features = jnp.stack(thought_features)
+                    enhanced_features, attn_weights = self.tot_mla(
+                        hidden_states,
+                        tot_features,
+                        thought_features,
+                        deterministic
+                    )
+                    
+                    # Integrate features
+                    integrated_features, integration_info = self.tot_integration(
+                        hidden_states,
+                        enhanced_features,
+                        deterministic
+                    )
+                    
+                    # Use integrated features
+                    hidden_states = integrated_features
+                    
+                    tot_outputs = {
+                        'thought': tot_thought,
+                        'attention_weights': attn_weights,
+                        'integration_info': integration_info
+                    }
+            
+            except Exception as e:
+                logger.warning(f"ToT integration failed: {e}")
+        
+        outputs = {
             'last_hidden_state': hidden_states,
             'encoder_outputs': encoder_outputs,
             'decoder_outputs': decoder_outputs,
         }
-    
-    def _create_causal_mask(self, sequence_length: int) -> jnp.ndarray:
-        mask = jnp.triu(jnp.ones((sequence_length, sequence_length), dtype=jnp.bool_), k=1)
-        return jnp.where(mask, -1e9, 0.0)
+        
+        if tot_outputs is not None:
+            outputs['tot_outputs'] = tot_outputs
+            
+        if mod_weights is not None:
+            outputs['mod_weights'] = mod_weights
+            
+        return outputs
 
 # Placeholder classes for missing dependencies
 class VishwamAITokenizer:

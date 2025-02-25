@@ -328,18 +328,151 @@ class TreeOfThoughts(nn.Module):
         
         return state.best_thought
     
+    def integrate_with_moe(self, 
+                         thoughts: List[Thought], 
+                         moe_layer: nn.Module,
+                         key: jax.random.PRNGKey) -> List[Thought]:
+        """
+        Integrate thoughts with Mixture of Experts layer for enhanced reasoning.
+        
+        Args:
+            thoughts: List of thoughts to enhance
+            moe_layer: Mixture of Experts layer
+            key: JAX random key
+            
+        Returns:
+            Enhanced thoughts
+        """
+        logger.info("Integrating thoughts with MoE")
+        
+        enhanced_thoughts = []
+        for thought in thoughts:
+            # Create enhanced embedding using MoE
+            enhanced_emb, _ = moe_layer(thought.embeddings)
+            
+            # Update thought with enhanced embedding
+            enhanced_thought = Thought(
+                content=thought.content,
+                token_ids=thought.token_ids,
+                embeddings=enhanced_emb,
+                score=thought.score * 1.1,  # Slightly boost score of enhanced thoughts
+                children=thought.children,
+                parent=thought.parent
+            )
+            
+            enhanced_thoughts.append(enhanced_thought)
+            
+        return enhanced_thoughts
+    
+    def integrate_with_mod(self,
+                          thought: Thought,
+                          mod_layer: nn.Module,
+                          key: jax.random.PRNGKey) -> Thought:
+        """
+        Integrate a thought with Mixture of Depths for adaptive processing.
+        
+        Args:
+            thought: Thought to enhance
+            mod_layer: Mixture of Depths layer
+            key: JAX random key
+            
+        Returns:
+            Enhanced thought
+        """
+        logger.info("Integrating thought with MoD")
+        
+        # Apply MoD to get enhanced embedding and mixture weights
+        enhanced_emb, mixture_weights = mod_layer(thought.embeddings)
+        
+        # Calculate confidence score based on mixture weights
+        # Higher entropy in mixture weights suggests more uncertainty
+        entropy = -jnp.sum(mixture_weights * jnp.log(mixture_weights + 1e-6))
+        confidence_factor = 1.0 / (1.0 + entropy)
+        
+        # Update thought with enhanced embedding and adjusted score
+        enhanced_thought = Thought(
+            content=thought.content,
+            token_ids=thought.token_ids,
+            embeddings=enhanced_emb,
+            score=thought.score * confidence_factor,
+            children=thought.children,
+            parent=thought.parent
+        )
+        
+        return enhanced_thought, mixture_weights
+    
+    def get_thought_tree_features(self, thought: Thought) -> Dict[str, Any]:
+        """
+        Extract structured features from a thought tree for integration.
+        
+        Args:
+            thought: Root thought of the tree
+            
+        Returns:
+            Dictionary of features representing the thought tree
+        """
+        features = {
+            'root_embedding': thought.embeddings,
+            'root_score': thought.score,
+            'max_depth': 0,
+            'num_nodes': 1,
+            'leaf_embeddings': [],
+            'path_embeddings': [thought.embeddings],
+        }
+        
+        # Recursive function to explore the tree
+        def explore(node, depth):
+            features['max_depth'] = max(features['max_depth'], depth)
+            features['num_nodes'] += len(node.children)
+            
+            if not node.children:
+                features['leaf_embeddings'].append(node.embeddings)
+            
+            for child in node.children:
+                features['path_embeddings'].append(child.embeddings)
+                explore(child, depth + 1)
+        
+        explore(thought, 0)
+        
+        # Add aggregated embeddings
+        if features['leaf_embeddings']:
+            features['leaf_embedding_mean'] = jnp.mean(jnp.stack(features['leaf_embeddings']), axis=0)
+        else:
+            features['leaf_embedding_mean'] = thought.embeddings
+            
+        features['path_embedding_mean'] = jnp.mean(jnp.stack(features['path_embeddings']), axis=0)
+        
+        return features
+    
     def __call__(self, 
                  x: jnp.ndarray,
                  key: jax.random.PRNGKey,
-                 search_strategy: str = 'beam') -> Thought:
-        """Perform tree search with the specified strategy."""
-        logger.info(f"Performing {search_strategy} search")
+                 search_strategy: str = 'beam',
+                 moe_layer: Optional[nn.Module] = None,
+                 mod_layer: Optional[nn.Module] = None) -> Thought:
+        """Enhanced tree search with MoE and MoD integration."""
+        logger.info(f"Performing {search_strategy} search with MoE/MoD integration")
+        
+        # Get best thought using specified search strategy
         if search_strategy == 'beam':
-            return self.beam_search(x, key)
+            best_thought = self.beam_search(x, key)
         elif search_strategy == 'dfs':
-            return self.dfs_search(x, key)
+            best_thought = self.dfs_search(x, key)
         else:
             raise ValueError(f"Unknown search strategy: {search_strategy}. Supported: 'beam', 'dfs'")
+            
+        # Apply MoE enhancement if available
+        if moe_layer is not None:
+            key, subkey = jax.random.split(key)
+            enhanced_thoughts = self.integrate_with_moe([best_thought], moe_layer, subkey)
+            best_thought = enhanced_thoughts[0]
+            
+        # Apply MoD enhancement if available
+        if mod_layer is not None:
+            key, subkey = jax.random.split(key)
+            best_thought, _ = self.integrate_with_mod(best_thought, mod_layer, subkey)
+            
+        return best_thought
 
 def create_tot_optimizer(learning_rate: float = 1e-4) -> optax.GradientTransformation:
     """Create an optimizer for the Tree of Thoughts."""

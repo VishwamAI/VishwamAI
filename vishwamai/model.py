@@ -14,13 +14,6 @@ import gc
 from huggingface_hub import snapshot_download
 import safetensors.flax as stf  # Correct import
 from omegaconf import OmegaConf
-<<<<<<< HEAD
-=======
-from .tokenizer import VishwamAITokenizer
-from .distillation import VishwamaiGuruKnowledge, VishwamaiShaalaTrainer
-from .tot import create_train_dataloader, create_val_dataloader, evaluate
-
->>>>>>> c816f4e02fc99949a2e9ca02b8e4cfafd08fb8cb
 def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
                     beta1: float = 0.9, beta2: float = 0.999, 
                     warmup_steps: int = 2000, num_train_steps: int = 100000):

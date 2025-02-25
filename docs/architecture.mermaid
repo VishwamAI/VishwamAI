@@ -1,49 +1,49 @@
 graph TB
     %% Input Processing
-    Input["`**Input Text**`"]
-    Tokenizer["`**Tokenizer**`"]
-    Embedding["`**Token Embedding**`"]
-    PosEmbed["`**Positional Encoding/RoPE**`"]
-    
+    Input["**Input Text**"]:::primary
+    Tokenizer["**Tokenizer**"]:::processing
+    Embedding["**Token Embedding**"]:::processing
+    PosEmbed["**Positional Encoding/RoPE**"]:::processing
+
     %% Main Components
-    MLA["`**Multi-Level Attention**`"]
-    MoE["`**Mixture of Experts**`"]
-    MoD["`**Mixture of Depth**`"]
-    ToT["`**Tree of Thoughts**`"]
-    
+    MLA["**Multi-Level Attention**"]:::attention
+    MoE["**Mixture of Experts**"]:::secondary
+    MoD["**Mixture of Depth**"]:::depth
+    ToT["**Tree of Thoughts**"]:::tot
+
     %% Attention Components
-    GQA["`Grouped Query<br>Attention`"]
-    FlashAttn["`Flash Attention`"]
-    SlidingWindow["`Sliding Window<br>Attention`"]
-    
+    GQA["Grouped Query<br>Attention"]:::attention
+    FlashAttn["Flash Attention"]:::attention
+    SlidingWindow["Sliding Window<br>Attention"]:::attention
+
     %% MLA Components
-    MLA_F["`Fine Level`"]
-    MLA_M["`Medium Level`"]
-    MLA_C["`Coarse Level`"]
-    MLA_Fusion["`Level Fusion`"]
-    
+    MLA_F["Fine Level"]:::attention
+    MLA_M["Medium Level"]:::attention
+    MLA_C["Coarse Level"]:::attention
+    MLA_Fusion["Level Fusion"]:::attention
+
     %% MoE Components
-    Router["`Expert Router`"]
-    Expert1["`Expert 1`"]
-    Expert2["`Expert 2`"]
-    ExpertN["`Expert N`"]
-    LoadBal["`Load Balancing`"]
-    
+    Router["Expert Router"]:::secondary
+    Expert1["Expert 1"]:::expert
+    Expert2["Expert 2"]:::expert
+    ExpertN["Expert N"]:::expert
+    LoadBal["Load Balancing"]:::secondary
+
     %% MoD Components
-    DepthRouter["`Depth Router`"]
-    Layer1["`Layer 1`"]
-    Layer2["`Layer 2`"]
-    LayerN["`Layer N`"]
-    DepthControl["`Depth Controller`"]
-    
+    DepthRouter["Depth Router"]:::depth
+    Layer1["Layer 1"]:::depth
+    Layer2["Layer 2"]:::depth
+    LayerN["Layer N"]:::depth
+    DepthControl["Depth Controller"]:::depth
+
     %% ToT Components
-    ThoughtGen["`Thought<br>Generator`"]
-    BeamSearch["`Beam Search`"]
-    ThoughtInt["`Thought<br>Integration`"]
-    
+    ThoughtGen["Thought<br>Generator"]:::tot
+    BeamSearch["Beam Search"]:::tot
+    ThoughtInt["Thought<br>Integration"]:::tot
+
     %% Output Processing
-    LayerNorm["`**Layer Normalization**`"]
-    Output["`**Output**`"]
+    LayerNorm["**Layer Normalization**"]:::processing
+    Output["**Output**"]:::primary
 
     %% Connections for Input Processing
     Input -->|"1"| Tokenizer
@@ -51,54 +51,97 @@ graph TB
     Embedding -->|"3"| PosEmbed
     
     %% Attention Mechanisms
-    subgraph AttentionMechanisms["Attention Mechanisms"]
-        direction TB
-        PosEmbed -->|"4"| GQA
-        GQA -->|"5"| FlashAttn
-        FlashAttn -->|"6"| SlidingWindow
-    end
-    
+    PosEmbed -->|"4"| GQA
+    GQA -->|"5"| FlashAttn
+    FlashAttn -->|"6"| SlidingWindow
+    SlidingWindow -->|"7"| MLA
+
     %% Multi-Level Attention Flow
-    subgraph MultiLevelAttention["Multi-Level Attention"]
-        direction TB
-        SlidingWindow -->|"7"| MLA
-        MLA -->|"8a"| MLA_F 
-        MLA -->|"8b"| MLA_M 
-        MLA -->|"8c"| MLA_C
-        MLA_F & MLA_M & MLA_C -->|"9"| MLA_Fusion
-    end
-    
+    MLA -->|"8a"| MLA_F 
+    MLA -->|"8b"| MLA_M 
+    MLA -->|"8c"| MLA_C
+    MLA_F --> MLA_Fusion
+    MLA_M --> MLA_Fusion
+    MLA_C --> MLA_Fusion
+
     %% Tree of Thoughts Flow
-    subgraph TreeOfThoughts["Tree of Thoughts"]
-        direction TB
-        MLA_Fusion -->|"10"| ThoughtGen
-        ThoughtGen -->|"11"| BeamSearch
-        BeamSearch -->|"12"| ThoughtInt
-    end
-    
+    MLA_Fusion -->|"10"| ThoughtGen
+    ThoughtGen -->|"11"| BeamSearch
+    BeamSearch -->|"12"| ThoughtInt
+
     %% Mixture of Experts Flow
-    subgraph MixtureOfExperts["Mixture of Experts"]
-        direction TB
-        ThoughtInt -->|"13"| Router
-        Router -->|"14a"| Expert1 
-        Router -->|"14b"| Expert2 
-        Router -->|"14c"| ExpertN
-        Expert1 & Expert2 & ExpertN -->|"15"| LoadBal
-    end
-    
+    ThoughtInt -->|"13"| Router
+    Router -->|"14a"| Expert1 
+    Router -->|"14b"| Expert2 
+    Router -->|"14c"| ExpertN
+    Expert1 --> LoadBal
+    Expert2 --> LoadBal
+    ExpertN --> LoadBal
+
     %% Mixture of Depth Flow
-    subgraph MixtureOfDepth["Mixture of Depth"]
-        direction TB
-        LoadBal -->|"16"| DepthRouter
-        DepthRouter -->|"17a"| Layer1 
-        DepthRouter -->|"17b"| Layer2 
-        DepthRouter -->|"17c"| LayerN
-        Layer1 & Layer2 & LayerN -->|"18"| DepthControl
-    end
-    
+    LoadBal -->|"16"| DepthRouter
+    DepthRouter -->|"17a"| Layer1 
+    DepthRouter -->|"17b"| Layer2 
+    DepthRouter -->|"17c"| LayerN
+    Layer1 --> DepthControl
+    Layer2 --> DepthControl
+    LayerN --> DepthControl
+
     %% Output Flow
     DepthControl -->|"19"| LayerNorm
     LayerNorm -->|"20"| Output
+
+    %% Subgraph Wrapping
+    subgraph AttentionMechanisms["Attention Mechanisms"]
+        direction TB
+        GQA
+        FlashAttn
+        SlidingWindow
+    end
+
+    subgraph MultiLevelAttention["Multi-Level Attention"]
+        direction TB
+        MLA
+        MLA_F
+        MLA_M
+        MLA_C
+        MLA_Fusion
+    end
+
+    subgraph TreeOfThoughts["Tree of Thoughts"]
+        direction TB
+        ThoughtGen
+        BeamSearch
+        ThoughtInt
+    end
+
+    subgraph MixtureOfExperts["Mixture of Experts"]
+        direction TB
+        Router
+        Expert1
+        Expert2
+        ExpertN
+        LoadBal
+    end
+
+    subgraph MixtureOfDepth["Mixture of Depth"]
+        direction TB
+        DepthRouter
+        Layer1
+        Layer2
+        LayerN
+        DepthControl
+    end
+
+    %% Legend in separate subgraph
+    subgraph Legend["Legend"]
+        A["Processing"]:::processing
+        B["Attention Mechanism"]:::attention
+        C["Expert Node"]:::expert
+        D["Flow Control"]:::secondary
+        E["Depth Control"]:::depth
+        F["Tree of Thoughts"]:::tot
+    end
 
     %% Styling
     classDef primary fill:#a8d5e5,stroke:#457b9d,stroke-width:2px
@@ -109,22 +152,3 @@ graph TB
     classDef depth fill:#2a9d8f,stroke:#264653,color:#fff,stroke-width:1px
     classDef tot fill:#f4a261,stroke:#264653,stroke-width:1px
     classDef subgraph fill:#f9f9f9,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5
-    
-    class Input,Output primary
-    class Tokenizer,Embedding,PosEmbed,LayerNorm processing
-    class GQA,FlashAttn,SlidingWindow,MLA,MLA_F,MLA_M,MLA_C,MLA_Fusion attention
-    class Router,LoadBal secondary
-    class Expert1,Expert2,ExpertN expert
-    class DepthRouter,Layer1,Layer2,LayerN,DepthControl depth
-    class ThoughtGen,BeamSearch,ThoughtInt tot
-    class AttentionMechanisms,MultiLevelAttention,TreeOfThoughts,MixtureOfExperts,MixtureOfDepth subgraph
-
-    %% Legend in separate subgraph
-    subgraph Legend["Legend"]
-        A["`Processing`"]:::processing
-        B["`Attention Mechanism`"]:::attention
-        C["`Expert Node`"]:::expert
-        D["`Flow Control`"]:::secondary
-        E["`Depth Control`"]:::depth
-        F["`Tree of Thoughts`"]:::tot
-    end

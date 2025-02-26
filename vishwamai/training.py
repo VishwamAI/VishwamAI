@@ -129,7 +129,8 @@ def create_train_state(model, config, rng: jax.random.PRNGKey) -> TrainingState:
     
     if not hasattr(model, 'params') or model.params is None:
         dummy_input = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
-        params = model.init(rng, dummy_input)['params']
+        dummy_attention_mask = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
+        params = model.init(rng, dummy_input, attention_mask=dummy_attention_mask)['params']
     else:
         params = model.params
     

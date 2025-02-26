@@ -398,7 +398,18 @@ class VishwamAIModel(nn.Module):
             vocab_size=self.config.vocab_size,
             use_rope=self.config.use_rope,
             dropout_rate=self.config.hidden_dropout_prob,
-            attention_dropout=self.config.attention_dropout_prob
+            attention_dropout=self.config.attention_dropout_prob,
+            n_experts=4,
+            expert_dim=4096,
+            expert_capacity_factor=1.25,
+            max_seq_len=self.config.max_position_embeddings,
+            window_size=512,
+            global_tokens=64,
+            max_batch_size=32,
+            use_gqa=self.config.use_gqa,
+            use_flash_attention=self.config.use_flash_attention,
+            use_alibi=self.config.use_alibi,
+            n_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads
         )) for _ in range(self.config.num_layers)]
         self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
         self.lm_head = ParallelDense(features=self.config.vocab_size, use_bias=False, dtype=jnp.dtype(self.config.dtype))

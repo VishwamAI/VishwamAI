@@ -187,12 +187,36 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
     with open(temp_file, "w", encoding="utf-8") as f:
         f.write("\n".join(train_texts))
     
-    # Train tokenizer
-    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
-    tokenizer.train([temp_file], "tokenizer_output")
-    config.training.tokenizer = tokenizer
+    # Define additional mathematical special tokens for GSM8K
+    math_special_tokens = [
+        "<answer>", "<step>", "<equation>", "<result>", "<reasoning>"
+    ]
+    
+    # Try to create tokenizer with proper error handling
+    try:
+        logger.info("Training tokenizer with math special tokens")
+        tokenizer = VishwamAITokenizer(
+            vocab_size=config.model.vocab_size,
+            special_tokens=math_special_tokens
+        )
+        tokenizer.train([temp_file], "tokenizer_output")
+        config.training.tokenizer = tokenizer
+    except Exception as e:
+        logger.error(f"Tokenizer training with special tokens failed: {str(e)}")
+        try:
+            logger.info("Trying minimal tokenizer configuration")
+            # Try a completely minimal configuration without any special tokens
+            tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
+            
+            # Explicitly set parameters to avoid conflicts
+            tokenizer.train([temp_file], "tokenizer_output_minimal")
+            config.training.tokenizer = tokenizer
+        except Exception as e2:
+            logger.error(f"Minimal tokenizer training also failed: {str(e2)}")
+            raise RuntimeError(f"Could not train tokenizer: {str(e2)}")
     
     # Clean up temporary file
+    logger.info("Tokenizer training completed successfully")
     os.remove(temp_file)
     
     # Initialize ToT

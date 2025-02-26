@@ -361,7 +361,7 @@ def train(
             use_mod=config.model.get('use_mod', True)
         )
         ec_train_step = create_error_corrected_train_step(train_step, error_trainer)
-        ec_eval_step = create_error_corrected_eval_step(eval_step)
+        ec_eval_step = create_error_corrected_eval_step(eval_step, error_trainer)
     else:
         ec_train_step = train_step
         ec_eval_step = eval_step
@@ -369,6 +369,12 @@ def train(
     
     rng_key = jax.random.PRNGKey(config.training.seed)
     state = create_train_state(model, config, rng_key)
+    
+    # Initialize error trainer if needed
+    if use_error_correction:
+        rng_key, init_key = jax.random.split(rng_key)
+        dummy_input = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
+        error_trainer.init_params(init_key, dummy_input)
     
     for step in range(num_steps):
         batch = next(train_dataloader)
@@ -428,9 +434,15 @@ def save_checkpoint(state: TrainingState, path: str):
         }))
     logger.info(f"Saved checkpoint to {path}.msgpack")
 
-def main(config_path: str) -> TrainingState:
+def main(config_path: str = None) -> TrainingState:
+    if config_path is None:
+        config_path = "vishwamai/configs/training/gsm8k.yaml"
     config = OmegaConf.load(config_path)
     model = VishwamAIModel(ModelConfig(**config.model))
+    
+    # Set error correction defaults if not present
+    if 'use_error_correction' not in config.training:
+        config.training.use_error_correction = True
     
     # Create tokenizer separately from config
     # Initialize tokenizer

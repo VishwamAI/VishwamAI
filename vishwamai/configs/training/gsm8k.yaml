@@ -53,14 +53,15 @@ training:
   use_curriculum: true
   error_history_size: 100
   error_threshold_percentile: 85.0
+  use_ema: false  # Exponential Moving Average for model parameters
 
-dataset:
+data:
   dataset_name: "openai/gsm8k"
-  max_length: 1024
+  max_seq_length: 1024
   batch_size: 8
-  preprocessing:
-    batch_size: 32
-    num_proc: 4
+  preprocessing_num_workers: 4
+  train_split: "train"
+  val_split: "test"
 
 monitoring:
   log_every_n_steps: 10

@@ -15,7 +15,7 @@ import logging
 from functools import partial
 import os
 from .tot import TreeOfThoughts
-from .model import VishwamAIModel, ModelConfig  # Updated import
+from .model import VishwamAIModel, ModelConfig
 from .loss_functions import cross_entropy_loss, tot_guided_loss, compute_metrics, compute_composite_loss
 from .error_correction import ErrorCorrectionTrainer, create_error_corrected_train_step, create_error_corrected_eval_step
 from .tokenizer import VishwamAITokenizer
@@ -199,9 +199,8 @@ class DataProcessor:
         }
         return batch
 
-def create_train_dataloader(config):
+def create_train_dataloader(config, tokenizer):
     dataset = load_dataset("openai/gsm8k", "main", split=config.data.train_split)
-    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
     data_processor = DataProcessor(tokenizer, config)
     processed_dataset = data_processor.prepare_dataset(dataset)
     
@@ -219,9 +218,8 @@ def create_train_dataloader(config):
     
     return data_iterator()
 
-def create_val_dataloader(config):
+def create_val_dataloader(config, tokenizer):
     dataset = load_dataset("openai/gsm8k", "main", split=config.data.val_split)
-    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
     data_processor = DataProcessor(tokenizer, config)
     processed_dataset = data_processor.prepare_dataset(dataset)
     
@@ -341,6 +339,7 @@ def eval_step(
 def train(
     model: VishwamAIModel,
     config: DictConfig,
+    tokenizer: VishwamAITokenizer,
     train_dataloader: Iterator,
     val_dataloader: Optional[Iterator] = None,
     num_steps: int = 10000,
@@ -356,7 +355,7 @@ def train(
         error_trainer = ErrorCorrectionTrainer(
             config=config,
             transformer=model,
-            tokenizer=config.training.get('tokenizer'),
+            tokenizer=tokenizer,
             use_tot=config.training.get('use_tot', True),
             use_mod=config.model.get('use_mod', True)
         )
@@ -431,11 +430,32 @@ def save_checkpoint(state: TrainingState, path: str):
 def main(config_path: str) -> TrainingState:
     config = OmegaConf.load(config_path)
     model = VishwamAIModel(ModelConfig(**config.model))
-    config.training.tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
-    config.training.tokenizer.train([config.data.dataset_path], "tokenizer_output")
     
-    train_dataloader = create_train_dataloader(config)
-    val_dataloader = create_val_dataloader(config)
+    # Create tokenizer separately from config
+    # Initialize tokenizer
+    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
+
+    # Create training data for tokenizer from GSM8K dataset
+    dataset = load_dataset(config.data.dataset_name, "main")
+    train_texts = [
+        f"{example['question']}\n{example['answer']}"
+        for example in dataset["train"]
+    ]
+    
+    # Create temporary file for tokenizer training
+    temp_file = "gsm8k_train_temp.txt"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(train_texts))
+    
+    # Train tokenizer and clean up temp file
+    try:
+        tokenizer.train([temp_file], "tokenizer_output")
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+    
+    train_dataloader = create_train_dataloader(config, tokenizer)
+    val_dataloader = create_val_dataloader(config, tokenizer)
     
     checkpoint_dir = config.training.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -443,6 +463,7 @@ def main(config_path: str) -> TrainingState:
     final_state = train(
         model,
         config,
+        tokenizer,
         train_dataloader,
         val_dataloader,
         num_steps=config.training.max_steps,

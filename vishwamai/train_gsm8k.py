@@ -27,7 +27,7 @@ class GSM8KProcessor:
     def __init__(self, tokenizer: VishwamAITokenizer, config):
         self.tokenizer = tokenizer
         self.config = config
-        self.max_length = config.dataset.max_length
+        self.max_length = config.data.max_seq_length
     
     def validate_dataset_features(self, dataset):
         """Validate dataset has required features."""
@@ -101,8 +101,8 @@ class GSM8KProcessor:
         tokenized_dataset = dataset.map(
             self.tokenize_function,
             batched=True,
-            batch_size=self.config.dataset.preprocessing.batch_size,
-            num_proc=self.config.dataset.preprocessing.num_proc,
+            batch_size=32,  # Default batch size for preprocessing
+            num_proc=self.config.data.preprocessing_num_workers,
             remove_columns=dataset.column_names,
             desc="Tokenizing GSM8K dataset"
         )
@@ -118,10 +118,10 @@ class GSM8KProcessor:
         }
         return batch
 
-def create_gsm8k_dataloader(config, split="train") -> Iterator:
+def create_gsm8k_dataloader(config, tokenizer: VishwamAITokenizer, split="train") -> Iterator:
     """Create GSM8K data loader with ToT-enhanced batches."""
     dataset = load_dataset("openai/gsm8k", "main", split=split)
-    processor = GSM8KProcessor(config.training.tokenizer, config)
+    processor = GSM8KProcessor(tokenizer, config)
     processed_dataset = processor.prepare_dataset(dataset)
     
     def data_iterator():
@@ -133,8 +133,8 @@ def create_gsm8k_dataloader(config, split="train") -> Iterator:
                 indices.sort(key=lambda i: len(processed_dataset[i]['input_ids']))
             random.shuffle(indices)
             
-            for i in range(0, len(indices), config.dataset.batch_size):
-                batch_indices = indices[i:i + config.dataset.batch_size]
+            for i in range(0, len(indices), config.data.batch_size):
+                batch_indices = indices[i:i + config.data.batch_size]
                 examples = [processed_dataset[idx] for idx in batch_indices]
                 yield processor.collate_fn(examples)
             epoch += 1
@@ -176,7 +176,7 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
     model = VishwamAIModel(model_config)
     
     # Initialize tokenizer and prepare dataset for training
-    dataset = load_dataset(config.dataset.dataset_name, "main")
+    dataset = load_dataset(config.data.dataset_name, "main")
     train_texts = [
         f"{example['question']}\n{example['answer']}"
         for example in dataset["train"]
@@ -200,7 +200,6 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
             special_tokens=math_special_tokens
         )
         tokenizer.train([temp_file], "tokenizer_output")
-        config.training.tokenizer = tokenizer
     except Exception as e:
         logger.error(f"Tokenizer training with special tokens failed: {str(e)}")
         try:
@@ -210,7 +209,6 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
             
             # Explicitly set parameters to avoid conflicts
             tokenizer.train([temp_file], "tokenizer_output_minimal")
-            config.training.tokenizer = tokenizer
         except Exception as e2:
             logger.error(f"Minimal tokenizer training also failed: {str(e2)}")
             raise RuntimeError(f"Could not train tokenizer: {str(e2)}")
@@ -242,9 +240,9 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
     # Setup TPU cluster
     mesh, sharding = setup_tpu_cluster()
     
-    # Create data loaders
-    train_dataloader = create_gsm8k_dataloader(config, "train")
-    val_dataloader = create_gsm8k_dataloader(config, "test")
+    # Create data loaders with tokenizer
+    train_dataloader = create_gsm8k_dataloader(config, tokenizer, "train")
+    val_dataloader = create_gsm8k_dataloader(config, tokenizer, "test")
     
     # Create checkpoints directory
     checkpoint_dir = config.checkpointing.dir
@@ -261,12 +259,13 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
         state = create_train_state(model, config, rng)
         
         # Initialize error correction params
-        dummy_input = jnp.ones((1, config.dataset.max_length, config.model.hidden_size))
+        dummy_input = jnp.ones((1, config.data.max_seq_length, config.model.hidden_size))
         error_trainer.init_params(rng, dummy_input)
         
         final_state = train(
             model,
             config,
+            tokenizer,  # Pass tokenizer explicitly
             train_dataloader,
             val_dataloader=val_dataloader,
             num_steps=config.training.max_steps,

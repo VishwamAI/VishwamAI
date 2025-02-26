@@ -51,16 +51,16 @@ def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01,
 # Model Configurations
 @dataclass
 class ModelArgs:
-    dim: int = 768  # Adjusted to match error (12 * 64 = 768)
+    dim: int = 768
     n_layers: int = 32
-    n_heads: int = 12  # Matches error-derived num_heads
+    n_heads: int = 12
     n_kv_heads: int = 8
     vocab_size: int = 32000
     multiple_of: int = 256
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     max_batch_size: int = 32
-    max_seq_len: int = 1024  # Matches error-derived seq_len
+    max_seq_len: int = 1024
     n_experts: int = 8
     expert_dim: int = 4096
     expert_pruning_threshold: float = 0.1
@@ -104,9 +104,9 @@ class ModelConfig:
         return {k: v for k, v in mapped_dict.items() if k in cls.__dataclass_fields__}
 
     vocab_size: int = 32000
-    hidden_size: int = 768  # Adjusted to match error
+    hidden_size: int = 768
     num_layers: int = 32
-    num_attention_heads: int = 12  # Matches error
+    num_attention_heads: int = 12
     intermediate_size: int = 11008
     hidden_dropout_prob: float = 0.1
     attention_dropout_prob: float = 0.1
@@ -163,43 +163,24 @@ class RMSNorm(nn.Module):
         return x * jnp.asarray(scale, self.dtype)
 
 def precompute_freqs(head_dim: int, max_seq_len: int, base: float = 10000.0, dtype: jnp.dtype = jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Precompute frequencies for rotary positional encoding, optimized for TPU v2-8.
-    
-    Args:
-        head_dim: Dimension of each attention head (e.g., 64)
-        max_seq_len: Maximum sequence length (e.g., 1024)
-        base: Base value for frequency computation
-        dtype: Data type for TPU compatibility (bfloat16 recommended)
-    """
-    half_dim = head_dim // 2  # e.g., 32
-    freqs = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=dtype) / half_dim))  # Shape: [32]
-    t = jnp.arange(max_seq_len, dtype=dtype)  # Shape: [1024]
-    freqs = jnp.outer(t, freqs)  # Shape: [1024, 32]
-    sin = jnp.sin(freqs)  # Shape: [1024, 32]
-    cos = jnp.cos(freqs)  # Shape: [1024, 32]
-    # Ensure 4D shape persists for broadcasting
-    sin = jnp.expand_dims(jnp.expand_dims(sin, 0), 0)  # Shape: [1, 1, 1024, 32]
-    cos = jnp.expand_dims(jnp.expand_dims(cos, 0), 0)  # Shape: [1, 1, 1024, 32]
+    half_dim = head_dim // 2
+    freqs = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=dtype) / half_dim))
+    t = jnp.arange(max_seq_len, dtype=dtype)
+    freqs = jnp.outer(t, freqs)
+    sin = jnp.sin(freqs)
+    cos = jnp.cos(freqs)
+    sin = jnp.expand_dims(jnp.expand_dims(sin, 0), 0)
+    cos = jnp.expand_dims(jnp.expand_dims(cos, 0), 0)
     return sin.astype(dtype), cos.astype(dtype)
 
 def rotary_embedding(x: jnp.ndarray, sin: jnp.ndarray, cos: jnp.ndarray, use_local_repeat: bool = False) -> jnp.ndarray:
-    """Apply rotary embeddings, optimized for TPU v2-8.
-    
-    Args:
-        x: Input tensor [batch, heads, seq_len, head_dim]
-        sin: Sine tensor [1, 1, seq_len, head_dim//2]
-        cos: Cosine tensor [1, 1, seq_len, head_dim//2]
-        use_local_repeat: Not used here (GQA-specific)
-    """
     batch, heads, seq_len, head_dim = x.shape
-    half_dim = head_dim // 2  # e.g., 32
-    # Ensure sin and cos match seq_len and half_dim
-    sin = sin[:, :, :seq_len, :half_dim]  # [1, 1, seq_len, 32]
-    cos = cos[:, :, :seq_len, :half_dim]  # [1, 1, seq_len, 32]
-    # Explicitly broadcast to match x1, x2 shape
-    sin = jnp.broadcast_to(sin, (batch, heads, seq_len, half_dim))  # [1, 12, 1024, 32]
-    cos = jnp.broadcast_to(cos, (batch, heads, seq_len, half_dim))  # [1, 12, 1024, 32]
-    x1, x2 = jnp.split(x, 2, axis=-1)  # Each: [batch, heads, seq_len, 32]
+    half_dim = head_dim // 2
+    sin = sin[:, :, :seq_len, :half_dim]
+    cos = cos[:, :, :seq_len, :half_dim]
+    sin = jnp.broadcast_to(sin, (batch, heads, seq_len, half_dim))
+    cos = jnp.broadcast_to(cos, (batch, heads, seq_len, half_dim))
+    x1, x2 = jnp.split(x, 2, axis=-1)
     x_rot = x1 * cos - x2 * sin
     x_pass = x1 * sin + x2 * cos
     return jnp.concatenate([x_rot, x_pass], axis=-1)
@@ -232,35 +213,24 @@ class MoELayer(nn.Module):
         routing_probs = nn.softmax(router_logits, axis=-1)
         top2_weights, top2_indices = jax.lax.top_k(routing_probs, k=2)
         top2_weights = top2_weights / jnp.sum(top2_weights, axis=-1, keepdims=True)
-        expert_inputs = []
-        expert_indices = []
+        final_output = jnp.zeros_like(x)
         for expert_idx in range(num_experts):
             expert_mask = (top2_indices == expert_idx).any(axis=-1)
             if jnp.any(expert_mask):
                 mask_weights = jnp.where(top2_indices == expert_idx, top2_weights, 0).max(axis=-1)
-                expert_inputs.append(x[expert_mask] * mask_weights[expert_mask, None])
-                expert_indices.append(jnp.where(expert_mask)[0])
-        expert_outputs = []
-        if expert_inputs:
-            batched_expert_input = jnp.concatenate(expert_inputs, axis=0)
-            batched_expert_output = expert_fn(batched_expert_input, deterministic)
-            offset = 0
-            for expert_input in expert_inputs:
-                expert_len = len(expert_input)
-                expert_outputs.append((expert_indices[offset:offset + expert_len], batched_expert_output[offset:offset + expert_len]))
-                offset += expert_len
-        final_output = jnp.zeros_like(x)
-        for indices, outputs in expert_outputs:
-            final_output = final_output.at[indices].add(outputs)
+                mask_weights = jnp.expand_dims(mask_weights, -1)
+                masked_input = jnp.where(jnp.expand_dims(expert_mask, -1), x * mask_weights, 0)
+                expert_output = expert_fn(masked_input, deterministic)
+                final_output = final_output + expert_output
         expert_usage = jnp.mean(routing_probs, axis=(0, 1))
         load_balancing_loss = -jnp.sum(expert_usage * jnp.log(expert_usage + 1e-6))
         return final_output, load_balancing_loss
 
 def create_alibi_slopes(num_heads: int) -> jnp.ndarray:
     closest_power_of_2 = 2 ** jnp.floor(jnp.log2(num_heads))
-    base = jnp.array([2 ** (-(2 ** -(jnp.log2(closest_power_of_2) - 3)))], dtype=jnp.float32)
-    powers = jnp.arange(1, 1 + num_heads, dtype=jnp.float32)
-    slopes = jnp.power(base, powers)
+    base = 2 ** (-(2 ** -(jnp.log2(closest_power_of_2) - 3)))
+    powers = jnp.arange(1, num_heads + 1, dtype=jnp.float32)
+    slopes = base ** powers
     return slopes
 
 class MultiheadAttention(nn.Module):
@@ -285,11 +255,10 @@ class MultiheadAttention(nn.Module):
     
     def compute_alibi_attention(self, qk: jnp.ndarray) -> jnp.ndarray:
         seq_len = qk.shape[-1]
-        positions = jnp.arange(seq_len)
-        distance = positions[:, None] - positions[None, :]
-        distance = -jnp.abs(distance).astype(jnp.float32)
-        distance = distance[None, :, :]
-        alibi_bias = self.alibi_slopes[:, None, None] * distance
+        positions = jnp.arange(seq_len, dtype=jnp.float32)
+        distance = positions[None, :] - positions[:, None]  # Reversed order for correct sign
+        distance = -jnp.abs(distance)
+        alibi_bias = self.alibi_slopes[None, None, :] * distance[None, :, :]
         return qk + alibi_bias
 
     @nn.compact
@@ -297,24 +266,20 @@ class MultiheadAttention(nn.Module):
         batch_size, seq_len, dim = x.shape
         num_heads = self.config.n_heads
         num_kv_heads = self.config.n_kv_heads if hasattr(self.config, 'n_kv_heads') else num_heads
-        head_dim = dim // num_heads  # e.g., 768 // 12 = 64
+        head_dim = dim // num_heads
         assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads for GQA"
         
         token_complexity = jnp.sum(jnp.abs(x), axis=-1, keepdims=True)
         complexity_weights = nn.sigmoid(token_complexity)
         
-        # Calculate dimensions for Q, K, V projections
         kv_dim = head_dim * num_kv_heads
         kv_proj_dim = 2 * kv_dim
         
-        # Project inputs
         q = nn.remat(ParallelDense)(dim, use_bias=False, dtype=x.dtype)(x * complexity_weights)
         kv = nn.remat(ParallelDense)(kv_proj_dim, use_bias=False, dtype=x.dtype)(x)
         
-        # Split KV into K and V with correct shapes
         k, v = jnp.split(kv, 2, axis=-1)
         
-        # Reshape with correct head dimensions
         q = rearrange(q, 'b s (h d) -> b h s d', h=num_heads)
         k = rearrange(k, 'b s (h d) -> b h s d', h=num_kv_heads)
         v = rearrange(v, 'b s (h d) -> b h s d', h=num_kv_heads)
@@ -341,12 +306,8 @@ class MultiheadAttention(nn.Module):
         if self.config.use_alibi:
             qk = self.compute_alibi_attention(qk)
         
-        if self.config.use_flash_attention:
-            qk = jnp.where(mask, qk, -1e9)
-            attention = nn.softmax(qk, axis=-1)
-        else:
-            qk = jnp.where(mask, qk, -1e9)
-            attention = nn.softmax(qk, axis=-1)
+        qk = jnp.where(mask[None, None, :, :], qk, -1e9)  # Ensure mask is broadcastable
+        attention = nn.softmax(qk, axis=-1)
         
         if not deterministic:
             attention = nn.Dropout(rate=self.config.attention_dropout)(attention, deterministic=False)
@@ -526,3 +487,13 @@ def split_dataset(text_file: str, tokenizer, batch_size: int, seq_len: int, trai
                 yield jnp.array(batch[:-1]), jnp.array(batch[1:])
     
     return list(process_lines(train_lines)), list(process_lines(test_lines))
+
+# Example usage (not part of original error context, added for completeness)
+if __name__ == "__main__":
+    config = ModelConfig()
+    model = VishwamAIModel(config)
+    rng = jax.random.PRNGKey(0)
+    dummy_input = jnp.ones((1, config.max_position_embeddings), dtype=jnp.int32)
+    dummy_attention_mask = jnp.ones((config.max_position_embeddings, config.max_position_embeddings), dtype=jnp.int32)
+    params = model.init(rng, dummy_input, attention_mask=dummy_attention_mask)['params']
+    print("Model initialized successfully!")

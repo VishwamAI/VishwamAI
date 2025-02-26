@@ -257,7 +257,7 @@ def train_step(
             tot_rng_key=tot_key if use_tot else None
         )
         
-        logits = outputs.get('logits', None)  # Updated to match model output
+        logits = outputs.get('logits')
         if logits is None:
             raise ValueError("Model output doesn't contain 'logits'")
         
@@ -299,6 +299,16 @@ def train_step(
         )
         new_state = new_state.replace(ema_params=new_ema_params)
     
+    # Update ToT state if enabled
+    if use_tot and 'tot_outputs' in metrics:
+        new_state = new_state.replace(
+            tot_state={
+                **new_state.tot_state,
+                'thoughts_per_batch': metrics['tot_outputs'].get('thoughts_per_batch', 0),
+                'best_thought_score': metrics['tot_outputs'].get('score', 0.0)
+            }
+        )
+    
     return new_state, metrics
 
 def eval_step(
@@ -319,7 +329,7 @@ def eval_step(
         tot_rng_key=tot_key if use_tot else None
     )
     
-    logits = outputs.get('logits', None)
+    logits = outputs.get('logits')
     if logits is None:
         raise ValueError("Model output doesn't contain 'logits'")
     
@@ -370,35 +380,37 @@ def train(
     rng_key = jax.random.PRNGKey(config.training.seed)
     state = create_train_state(model, config, rng_key)
     
-    # Initialize error trainer if needed
     if use_error_correction:
         rng_key, init_key = jax.random.split(rng_key)
-        dummy_input = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
-        error_trainer.init_params(init_key, dummy_input)
+        dummy_input = jnp.ones((1, config.data.max_seq_length, config.model.hidden_size))
+        dummy_labels = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
+        error_trainer.init_params(init_key, dummy_input, dummy_labels)
     
     for step in range(num_steps):
         batch = next(train_dataloader)
         rng_key, step_key = jax.random.split(rng_key)
         
         state, metrics = ec_train_step(
-            state, batch, config.model,
+            state=state,
+            batch=batch,
+            model_config=config.model,
             z_loss=config.training.get('z_loss', 0.0),
             rng_key=step_key,
             accum_steps=accum_steps
         )
         
         if step % log_every == 0:
-            logger.info(f"Step {step}/{num_steps}: loss = {metrics['loss']:.4f}, accuracy = {metrics['accuracy']:.4f}")
+            logger.info(f"Step {step}/{num_steps}: loss = {metrics['loss']:.4f}, accuracy = {metrics['metrics']['accuracy']:.4f}")
             if state.tot_state.get('enabled', False):
                 logger.info(f"ToT: thoughts/batch = {state.tot_state['thoughts_per_batch']}, best_score = {state.tot_state['best_thought_score']:.4f}")
-            if use_error_correction and 'corrected_accuracy' in metrics:
-                logger.info(f"Error Correction: improvement = {metrics['improvement']:.4f}")
+            if use_error_correction and 'improvement' in metrics['metrics']:
+                logger.info(f"Error Correction: improvement = {metrics['metrics']['improvement']:.4f}")
         
         if val_dataloader and step % eval_every == 0:
             eval_metrics = {}
             for eval_batch in val_dataloader():
                 batch_metrics = ec_eval_step(state, eval_batch, use_tot=state.tot_state.get('enabled', False), rng_key=rng_key)
-                for k, v in batch_metrics.items():
+                for k, v in batch_metrics['metrics'].items():
                     eval_metrics[k] = eval_metrics.get(k, 0.0) + v / (len(list(val_dataloader())) + 1e-8)
             
             logger.info(f"Eval at step {step}: { {k: f'{v:.4f}' for k, v in eval_metrics.items()} }")
@@ -440,27 +452,17 @@ def main(config_path: str = None) -> TrainingState:
     config = OmegaConf.load(config_path)
     model = VishwamAIModel(ModelConfig(**config.model))
     
-    # Set error correction defaults if not present
     if 'use_error_correction' not in config.training:
         config.training.use_error_correction = True
     
-    # Create tokenizer separately from config
-    # Initialize tokenizer
     tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
-
-    # Create training data for tokenizer from GSM8K dataset
     dataset = load_dataset(config.data.dataset_name, "main")
-    train_texts = [
-        f"{example['question']}\n{example['answer']}"
-        for example in dataset["train"]
-    ]
+    train_texts = [f"{example['question']}\n{example['answer']}" for example in dataset["train"]]
     
-    # Create temporary file for tokenizer training
     temp_file = "gsm8k_train_temp.txt"
     with open(temp_file, "w", encoding="utf-8") as f:
         f.write("\n".join(train_texts))
     
-    # Train tokenizer and clean up temp file
     try:
         tokenizer.train([temp_file], "tokenizer_output")
     finally:
@@ -490,5 +492,7 @@ def main(config_path: str = None) -> TrainingState:
     return final_state
 
 if __name__ == "__main__":
-    config_path = "config.yaml"
-    main(config_path)
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Training failed")

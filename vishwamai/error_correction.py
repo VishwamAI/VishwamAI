@@ -6,8 +6,8 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import optax
-from vishwamai.tot import TreeOfThoughts  # Assuming ToT from previous response
-from vishwamai.tokenizer import VishwamAITokenizer  # Assuming tokenizer from previous context
+from vishwamai.tot import TreeOfThoughts
+from vishwamai.tokenizer import VishwamAITokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class ErrorCorrectionState(NamedTuple):
     history_idx: int = 0
     tot_triggered: int = 0
     avg_correction_impact: float = 0.0
-    mod_weights: Optional[jnp.ndarray] = None  # For MoD integration
+    mod_weights: Optional[jnp.ndarray] = None
 
 class ErrorCorrectionOutput(NamedTuple):
     """Enhanced output structure for error correction module."""
@@ -28,7 +28,7 @@ class ErrorCorrectionOutput(NamedTuple):
     error_probs: jnp.ndarray
     correction_mask: jnp.ndarray
     detection_loss: Optional[float] = None
-    tot_outputs: Optional[Dict] = None  # ToT results if triggered
+    tot_outputs: Optional[Dict] = None
 
 @dataclass
 class ErrorMetrics:
@@ -37,11 +37,10 @@ class ErrorMetrics:
     mae: float
     threshold: float
     correction_strength: float
-    precision: float  # Precision of error detection
-    recall: float    # Recall of error detection
-    improvement: float  # Net improvement after correction
+    precision: float
+    recall: float
+    improvement: float
 
-# Error Correction Module
 class ErrorCorrectionModule(nn.Module):
     """Advanced module for multi-stage error detection and correction."""
     hidden_dim: int
@@ -51,16 +50,13 @@ class ErrorCorrectionModule(nn.Module):
     
     @nn.compact
     def __call__(self, hidden_states: jnp.ndarray, labels: Optional[jnp.ndarray] = None, deterministic: bool = True) -> Dict:
-        # Stage 1: Error Detection
         detection_logits = nn.Dense(features=1, name="error_detector")(hidden_states)
         detection_probs = jax.nn.sigmoid(detection_logits)
         
-        # Stage 2: Error Analysis (Contextual Features)
         analysis_states = nn.Dense(features=self.hidden_dim, name="error_analyzer")(hidden_states)
         analysis_states = nn.gelu(analysis_states)
         analysis_states = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(analysis_states)
         
-        # Stage 3: Correction Network
         correction_states = analysis_states
         for i in range(self.num_correction_layers):
             correction_states = nn.Dense(features=self.hidden_dim, name=f"correction_layer_{i}")(correction_states)
@@ -69,7 +65,6 @@ class ErrorCorrectionModule(nn.Module):
         
         corrected_states = nn.Dense(features=hidden_states.shape[-1], name="output_projector")(correction_states)
         
-        # Adaptive Correction
         error_mask = detection_probs > self.correction_threshold
         final_states = jnp.where(error_mask, corrected_states, hidden_states)
         
@@ -80,14 +75,12 @@ class ErrorCorrectionModule(nn.Module):
         }
         
         if labels is not None:
-            # Detection Loss with Labels
             has_error = labels != jnp.argmax(hidden_states @ hidden_states.T, axis=-1, keepdims=True)
             detection_loss = optax.sigmoid_binary_cross_entropy(detection_logits, has_error.astype(jnp.float32)).mean()
             result["detection_loss"] = detection_loss
             
         return result
 
-# Mixture of Densities Network for Probabilistic Error Modeling
 class MixtureDensityNetwork(nn.Module):
     """MoD network to model error distributions."""
     hidden_size: int
@@ -96,18 +89,20 @@ class MixtureDensityNetwork(nn.Module):
     @nn.compact
     def __call__(self, features: jnp.ndarray, deterministic: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
         # Predict mixture parameters
-        mixture_logits = nn.Dense(features=self.num_mixtures)(features)
+        mixture_logits = nn.Dense(features=self.num_mixtures * features.shape[1])(features)
         mixture_weights = nn.softmax(mixture_logits, axis=-1)
         
-        # Mean and variance for each mixture component
-        means = nn.Dense(features=self.num_mixtures * features.shape[-1])(features)
-        variances = nn.Dense(features=self.num_mixtures * features.shape[-1])(features)
-        variances = jax.nn.softplus(variances) + 1e-6  # Ensure positive variances
+        # Mean and variance for each mixture component, adjusted for sequence length
+        output_size = self.num_mixtures * self.hidden_size * features.shape[1]
+        means = nn.Dense(features=output_size)(features)
+        variances = nn.Dense(features=output_size)(features)
+        variances = jax.nn.softplus(variances) + 1e-6
         
-        means = means.reshape(features.shape[0], features.shape[1], self.num_mixtures, features.shape[-1])
-        variances = variances.reshape(features.shape[0], features.shape[1], self.num_mixtures, features.shape[-1])
+        # Reshape to (batch_size, seq_length, num_mixtures, hidden_size)
+        means = means.reshape(features.shape[0], features.shape[1], self.num_mixtures, self.hidden_size)
+        variances = variances.reshape(features.shape[0], features.shape[1], self.num_mixtures, self.hidden_size)
         
-        # Sample from mixture (during training only)
+        # Sample from mixture (during training) or weighted average (during eval)
         if not deterministic:
             rng = self.make_rng('dropout')
             component = jax.random.categorical(rng, mixture_logits)
@@ -117,16 +112,12 @@ class MixtureDensityNetwork(nn.Module):
             noise = jax.random.normal(rng, features.shape) * jnp.sqrt(sampled_var)
             corrected = sampled_mean + noise
         else:
-            # Weighted average during evaluation
             corrected = jnp.sum(means * mixture_weights[..., None], axis=-2)
         
         return corrected, mixture_weights
 
-# ErrorCorrectionTrainer
 class ErrorCorrectionTrainer:
-    """
-    Advanced error correction system with ToT and MoD integration, optimized for training.
-    """
+    """Advanced error correction system with ToT and MoD integration."""
     def __init__(
         self, 
         config: Dict[str, Any],
@@ -145,7 +136,6 @@ class ErrorCorrectionTrainer:
         self.history_size = history_size
         self.threshold_percentile = threshold_percentile
         
-        # Error Correction Module
         hidden_size = config.get('model', {}).get('hidden_size', 1024)
         self.error_module = ErrorCorrectionModule(
             hidden_dim=hidden_size,
@@ -153,7 +143,6 @@ class ErrorCorrectionTrainer:
             correction_threshold=config.get('error_correction', {}).get('threshold', 0.7)
         )
         
-        # ToT Integration
         if self.use_tot:
             self.tot = TreeOfThoughts(
                 transformer=transformer,
@@ -163,16 +152,13 @@ class ErrorCorrectionTrainer:
                 beam_width=5
             )
         
-        # MoD Integration
         if self.use_mod:
-            self.mod = MixtureDensityNetwork(hidden_size=hidden_size)
+            self.mod = MixtureDensityNetwork(hidden_size=hidden_size, num_mixtures=5)
         
-        # Initialize State
         self.state = create_error_correction_state(history_size)
-        self.error_params = None  # To be initialized during training
+        self.error_params = None
         
     def init_params(self, rng: jnp.ndarray, sample_input: jnp.ndarray, labels: Optional[jnp.ndarray] = None):
-        """Initialize error correction parameters."""
         params = self.error_module.init(rng, sample_input, labels)
         if self.use_mod:
             mod_params = self.mod.init(rng, sample_input)
@@ -180,7 +166,6 @@ class ErrorCorrectionTrainer:
         self.error_params = params
     
     def update_error_history(self, error: float) -> None:
-        """Update error history and dynamically adjust threshold."""
         self.state = self.state._replace(
             error_history=self.state.error_history.at[self.state.history_idx].set(error),
             history_idx=(self.state.history_idx + 1) % self.history_size
@@ -197,11 +182,9 @@ class ErrorCorrectionTrainer:
         training: bool = True,
         rng_key: Optional[jnp.ndarray] = None
     ) -> Dict[str, Any]:
-        """Apply advanced error correction with ToT and MoD."""
         if rng_key is None:
             rng_key = jax.random.PRNGKey(0)
         
-        # Error Detection and Correction
         error_outputs = self.error_module.apply(
             {'params': self.error_params['params'] if self.error_params else {}},
             hidden_states=features,
@@ -214,8 +197,6 @@ class ErrorCorrectionTrainer:
         error_probs = error_outputs['error_probs']
         correction_mask = error_outputs['correction_mask']
         
-        # MoD Correction (if enabled)
-        mod_weights = None
         if self.use_mod:
             corrected_features, mod_weights = self.mod.apply(
                 {'params': self.error_params['mod']},
@@ -225,7 +206,6 @@ class ErrorCorrectionTrainer:
             )
             self.state = self.state._replace(mod_weights=mod_weights)
         
-        # ToT Correction (if enabled and triggered)
         tot_outputs = None
         if self.use_tot and jnp.mean(error_probs) > self.state.error_threshold:
             initial_prompt = self.tokenizer.decode(features.argmax(-1).tolist()) if labels is None else self.tokenizer.decode(labels.tolist())
@@ -235,7 +215,6 @@ class ErrorCorrectionTrainer:
                 tot_outputs = {'thought': tot_thought.content, 'score': tot_thought.score}
                 self.state = self.state._replace(tot_triggered=self.state.tot_triggered + 1)
         
-        # Compute Error Metrics
         if labels is not None:
             corrected_logits = corrected_features @ self.transformer.params['lm_head']['kernel']
             metrics = compute_error_metrics(logits, corrected_logits, labels)
@@ -252,10 +231,8 @@ class ErrorCorrectionTrainer:
             'metrics': metrics if labels is not None else None
         }
 
-# Enhanced Error Metrics Computation
 @jax.jit
 def compute_error_metrics(logits: jnp.ndarray, corrected_logits: jnp.ndarray, labels: jnp.ndarray) -> ErrorMetrics:
-    """Compute advanced error metrics."""
     predictions = jnp.argmax(logits, axis=-1)
     corrected_predictions = jnp.argmax(corrected_logits, axis=-1)
     
@@ -275,35 +252,30 @@ def compute_error_metrics(logits: jnp.ndarray, corrected_logits: jnp.ndarray, la
     return ErrorMetrics(
         mse=float(mse),
         mae=float(mae),
-        threshold=0.1,  # Placeholder, updated dynamically in trainer
-        correction_strength=1.0,  # Placeholder
+        threshold=0.1,
+        correction_strength=1.0,
         precision=float(precision),
         recall=float(recall),
         improvement=float(improvement)
     )
 
-# Training Step with Error Correction
 def create_error_corrected_train_step(base_train_step, error_trainer: 'ErrorCorrectionTrainer', error_weight: float = 0.5):
-    """Advanced training step with error correction."""
     @jax.jit
-    def error_corrected_train_step(state, batch, rng):
-        base_outputs, updated_state = base_train_step(state, batch, rng)
+    def error_corrected_train_step(state, batch, model_config, *args, **kwargs):
+        base_outputs, updated_state = base_train_step(state, batch, model_config, *args, **kwargs)
         
-        # Apply Error Correction
         correction_outputs = error_trainer.apply_error_correction(
             logits=base_outputs['logits'],
-            features=base_outputs['hidden_states'],
+            features=base_outputs.get('hidden_states', base_outputs['logits']),  # Fallback to logits if hidden_states missing
             labels=batch.get('labels'),
             training=True,
-            rng_key=rng
+            rng_key=kwargs.get('rng_key')
         )
         
-        # Combine Losses
         total_loss = base_outputs['loss']
         if correction_outputs['detection_loss'] is not None:
             total_loss += error_weight * correction_outputs['detection_loss']
         
-        # Update Metrics
         metrics = base_outputs.get('metrics', {})
         metrics.update({
             'error_detection_loss': correction_outputs['detection_loss'] or 0.0,
@@ -325,18 +297,17 @@ def create_error_corrected_train_step(base_train_step, error_trainer: 'ErrorCorr
     
     return error_corrected_train_step
 
-# Evaluation Step with Error Correction
 def create_error_corrected_eval_step(base_eval_step, error_trainer: 'ErrorCorrectionTrainer'):
-    """Advanced evaluation step with error correction."""
     @jax.jit
-    def error_corrected_eval_step(state, batch):
-        base_outputs = base_eval_step(state, batch)
+    def error_corrected_eval_step(state, batch, *args, **kwargs):
+        base_outputs = base_eval_step(state, batch, *args, **kwargs)
         
         correction_outputs = error_trainer.apply_error_correction(
             logits=base_outputs['logits'],
-            features=base_outputs['hidden_states'],
+            features=base_outputs.get('hidden_states', base_outputs['logits']),
             labels=batch.get('labels'),
-            training=False
+            training=False,
+            rng_key=kwargs.get('rng_key')
         )
         
         metrics = base_outputs.get('metrics', {})
@@ -354,40 +325,36 @@ def create_error_corrected_eval_step(base_eval_step, error_trainer: 'ErrorCorrec
     
     return error_corrected_eval_step
 
-# Placeholder for Creating Initial State
 def create_error_correction_state(history_size: int = 100) -> ErrorCorrectionState:
-    """Create initial error correction state with advanced features."""
     return ErrorCorrectionState(
         error_history=jnp.zeros(history_size),
         mod_weights=None
     )
 
-# Example Usage
 if __name__ == "__main__":
     from vishwamai.transformer import VishwamAIModel, ModelConfig
     from vishwamai.tokenizer import VishwamAITokenizer
 
     config = {
-        'model': {'hidden_size': 512},
+        'model': {'hidden_size': 1024},
         'error_correction': {'num_layers': 3, 'threshold': 0.7}
     }
-    model = VishwamAIModel(ModelConfig(hidden_size=512, num_layers=6, num_attention_heads=8, vocab_size=32000))
+    model = VishwamAIModel(ModelConfig(hidden_size=1024, num_layers=6, num_attention_heads=8, vocab_size=32000))
     tokenizer = VishwamAITokenizer(vocab_size=32000)
     tokenizer.train(["dataset.txt"], "tokenizer_output")
 
     trainer = ErrorCorrectionTrainer(config, model, tokenizer)
     rng = jax.random.PRNGKey(0)
-    dummy_input = jnp.ones((1, 32, 512))
-    dummy_labels = jnp.ones((1, 32), dtype=jnp.int32)
+    dummy_input = jnp.ones((1, 1024, 1024))  # Match expected feature shape
+    dummy_labels = jnp.ones((1, 1024), dtype=jnp.int32)
     trainer.init_params(rng, dummy_input, dummy_labels)
 
-    # Dummy base train step
-    def base_train_step(state, batch, rng):
-        outputs = state.apply_fn({'params': state.params}, batch['input_ids'], rngs={'dropout': rng})
+    def base_train_step(state, batch, model_config, *args, **kwargs):
+        outputs = state.apply_fn({'params': state.params}, batch['input_ids'], rngs={'dropout': kwargs.get('rng_key')})
         loss = optax.softmax_cross_entropy(outputs['logits'], jax.nn.one_hot(batch['labels'], 32000)).mean()
-        return {'logits': outputs['logits'], 'hidden_states': outputs['hidden_states'], 'loss': loss, 'metrics': {}}, state
+        return {'logits': outputs['logits'], 'hidden_states': outputs.get('hidden_states', outputs['logits']), 'loss': loss, 'metrics': {}}, state
 
     train_step = create_error_corrected_train_step(base_train_step, trainer)
-    batch = {'input_ids': jnp.ones((1, 32), dtype=jnp.int32), 'labels': dummy_labels}
-    outputs, _ = train_step(model, batch, rng)
+    batch = {'input_ids': jnp.ones((1, 1024), dtype=jnp.int32), 'labels': dummy_labels}
+    outputs, _ = train_step(model, batch, ModelConfig(hidden_size=1024), rng_key=rng)
     print(f"Corrected Loss: {outputs['loss']}, ToT Triggered: {outputs['metrics']['tot_triggered']}")

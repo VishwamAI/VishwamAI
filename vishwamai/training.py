@@ -15,15 +15,13 @@ import logging
 from functools import partial
 import os
 from .tot import TreeOfThoughts
-from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
-from .transformer import VishwamAIModel, ModelConfig
+from .model import VishwamAIModel, ModelConfig  # Updated import
 from .loss_functions import cross_entropy_loss, tot_guided_loss, compute_metrics, compute_composite_loss
 from .error_correction import ErrorCorrectionTrainer, create_error_corrected_train_step, create_error_corrected_eval_step
 from .tokenizer import VishwamAITokenizer
 
 logger = logging.getLogger(__name__)
 
-# Custom Training State
 class VishwamaiTrainingState:
     """Enhanced training state with additional features."""
     apply_fn: Callable
@@ -38,7 +36,6 @@ class VishwamaiTrainingState:
     
     @classmethod
     def create(cls, apply_fn, params, tx, ema_params=None, best_metrics=None, tot_state=None, error_state=None):
-        """Create a new instance of VishwamaiTrainingState."""
         return cls(
             apply_fn=apply_fn,
             params=params,
@@ -63,7 +60,6 @@ class VishwamaiTrainingState:
         self.error_state = error_state if error_state is not None else {}
     
     def apply_gradients(self, grads, **kwargs):
-        """Update parameters using gradients with optional gradient accumulation."""
         updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
         new_params = optax.apply_updates(self.params, updates)
         return self.replace(
@@ -74,7 +70,6 @@ class VishwamaiTrainingState:
         )
     
     def replace(self, **kwargs):
-        """Return a new state with specified fields replaced."""
         return self.__class__(
             apply_fn=kwargs.get('apply_fn', self.apply_fn),
             params=kwargs.get('params', self.params),
@@ -95,7 +90,6 @@ def create_learning_rate_scheduler(
     warmup_steps=1000,
     decay_steps=100000,
 ):
-    """Creates a learning rate schedule."""
     factors = [f.strip() for f in factors.split('*')]
     
     def schedule(step):
@@ -112,7 +106,6 @@ def create_learning_rate_scheduler(
     return schedule
 
 def create_optimizer(config):
-    """Create optimizer with advanced features."""
     lr_schedule = create_learning_rate_scheduler(
         base_learning_rate=config.training.learning_rate,
         warmup_steps=config.training.warmup_steps,
@@ -132,7 +125,6 @@ def create_optimizer(config):
     return tx, lr_schedule
 
 def create_train_state(model, config, rng: jax.random.PRNGKey) -> TrainingState:
-    """Create initial training state with ToT and error correction."""
     tx, _ = create_optimizer(config)
     
     if not hasattr(model, 'params') or model.params is None:
@@ -168,35 +160,28 @@ def create_train_state(model, config, rng: jax.random.PRNGKey) -> TrainingState:
     return state
 
 class DataProcessor:
-    """Enhanced processor for tokenizing and batching data."""
-    
-    def __init__(self, tokenizer, config):
+    """Enhanced processor for GSM8K dataset."""
+    def __init__(self, tokenizer: VishwamAITokenizer, config):
         self.tokenizer = tokenizer
         self.config = config
         self.max_length = config.data.max_seq_length
     
     def tokenize_function(self, examples):
-        """Tokenize a batch of text examples with augmentation."""
-        texts = examples[self.config.data.text_column]
-        
+        questions = examples['question']
+        answers = examples['answer']
+        formatted_texts = [f"Question: {q}\nAnswer: {a}" for q, a in zip(questions, answers)]
         tokenized = self.tokenizer(
-            texts,
+            formatted_texts,
             padding="max_length",
             truncation=True,
             max_length=self.max_length,
             return_attention_mask=True,
         )
-        
         tokenized["labels"] = tokenized["input_ids"].copy()
-        
-        # Add error weights for curriculum learning (simple heuristic)
-        if self.config.training.get('use_error_correction', False):
-            tokenized["error_weights"] = np.ones_like(tokenized["input_ids"], dtype=np.float32)
-        
+        tokenized["error_weights"] = np.ones_like(tokenized["input_ids"], dtype=np.float32)
         return tokenized
     
     def prepare_dataset(self, dataset):
-        """Prepare dataset with advanced preprocessing."""
         tokenized_dataset = dataset.map(
             self.tokenize_function,
             batched=True,
@@ -206,67 +191,41 @@ class DataProcessor:
         return tokenized_dataset
     
     def collate_fn(self, examples):
-        """Collate examples into a batch with error weights."""
         batch = {
             "input_ids": np.array([ex["input_ids"] for ex in examples]),
             "attention_mask": np.array([ex["attention_mask"] for ex in examples]),
             "labels": np.array([ex["labels"] for ex in examples]),
+            "error_weights": np.array([ex["error_weights"] for ex in examples])
         }
-        if self.config.training.get('use_error_correction', False):
-            batch["error_weights"] = np.array([ex["error_weights"] for ex in examples])
         return batch
 
 def create_train_dataloader(config):
-    """Create enhanced data loader for training."""
-    dataset_name = config.data.dataset_name
-    dataset = load_dataset(dataset_name, split=config.data.train_split)
-    
-    if config.data.max_train_samples:
-        dataset = dataset.select(range(config.data.max_train_samples))
-    
-    from vishwamai.tokenizer import VishwamAITokenizer
-    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size, model_prefix=config.model.name)
+    dataset = load_dataset("openai/gsm8k", "main", split=config.data.train_split)
+    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
     data_processor = DataProcessor(tokenizer, config)
     processed_dataset = data_processor.prepare_dataset(dataset)
     
     def data_iterator():
-        """Infinite iterator with curriculum-based shuffling."""
         epoch = 0
         while True:
             indices = list(range(len(processed_dataset)))
-            if config.training.get('use_curriculum', False):
-                # Sort by difficulty (e.g., length) early, then randomize later
-                progress = epoch / (config.training.max_steps / config.training.eval_every)
-                if progress < 0.5:
-                    indices.sort(key=lambda i: len(processed_dataset[i]['input_ids']))
-           
             random.shuffle(indices)
-            
             for i in range(0, len(indices), config.training.batch_size):
                 batch_indices = indices[i:i + config.training.batch_size]
                 examples = [processed_dataset[idx] for idx in batch_indices]
                 yield data_processor.collate_fn(examples)
-            
             epoch += 1
             logger.info(f"Finished epoch {epoch}")
     
     return data_iterator()
 
 def create_val_dataloader(config):
-    """Create enhanced validation data loader."""
-    dataset_name = config.data.dataset_name
-    dataset = load_dataset(dataset_name, split=config.data.val_split)
-    
-    if config.data.max_val_samples:
-        dataset = dataset.select(range(config.data.max_val_samples))
-    
-    from vishwamai.tokenizer import VishwamAITokenizer
-    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size, model_prefix=config.model.name)
+    dataset = load_dataset("openai/gsm8k", "main", split=config.data.val_split)
+    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
     data_processor = DataProcessor(tokenizer, config)
     processed_dataset = data_processor.prepare_dataset(dataset)
     
     def data_iterator():
-        """Single-pass iterator for validation."""
         indices = list(range(len(processed_dataset)))
         for i in range(0, len(indices), config.training.eval_batch_size):
             batch_indices = indices[i:i + config.training.eval_batch_size]
@@ -283,9 +242,8 @@ def train_step(
     rng_key: Optional[jax.random.PRNGKey] = None,
     accum_steps: int = 1
 ) -> Tuple[TrainingState, Dict]:
-    """Enhanced training step with ToT, MoD, and gradient accumulation."""
     use_tot = state.tot_state.get('enabled', False)
-    use_mod = model_config.use_mod if hasattr(model_config, 'use_mod') else False
+    use_mod = model_config.use_mod
     
     def loss_fn(params):
         step_key, dropout_key, tot_key = jax.random.split(rng_key, 3) if rng_key else (None, None, None)
@@ -300,30 +258,24 @@ def train_step(
             tot_rng_key=tot_key if use_tot else None
         )
         
-        logits = outputs.get('last_hidden_state')
+        logits = outputs.get('logits', None)  # Updated to match model output
         if logits is None:
-            raise ValueError("Model output doesn't contain 'last_hidden_state'")
-        
-        head_params = params.get('lm_head')
-        if head_params:
-            logits = jax.lax.stop_gradient(logits) @ head_params['kernel']
+            raise ValueError("Model output doesn't contain 'logits'")
         
         shift_logits = logits[:, :-1, :]
         shift_labels = batch['labels'][:, 1:]
         
-        # Composite loss with ToT and MoD
         loss, metrics = compute_composite_loss(
             outputs=outputs,
             batch={'labels': shift_labels},
             weights={
                 'ce': model_config.get('ce_weight', 0.5),
-                'kd': model_config.get('kd_weight', 0.0),  # No teacher here
+                'kd': model_config.get('kd_weight', 0.0),
                 'tot': model_config.get('tot_weight', 0.3) if use_tot else 0.0,
                 'moe': model_config.get('moe_weight', 0.2) if use_mod else 0.0
             }
         )
         
-        # Add z-loss for stability
         if z_loss > 0:
             z_loss_term = z_loss * jnp.mean(jnp.sum(shift_logits ** 2, axis=-1))
             loss += z_loss_term
@@ -331,7 +283,6 @@ def train_step(
         
         return loss, metrics
     
-    # Gradient accumulation
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     accum_grads = jax.tree_map(jnp.zeros_like, state.params)
     for _ in range(accum_steps):
@@ -357,7 +308,6 @@ def eval_step(
     use_tot: bool = False,
     rng_key: Optional[jax.random.PRNGKey] = None
 ) -> Dict:
-    """Enhanced evaluation step with detailed metrics."""
     dropout_key, tot_key = jax.random.split(rng_key, 2) if rng_key else (None, None)
     
     outputs = state.apply_fn(
@@ -370,13 +320,9 @@ def eval_step(
         tot_rng_key=tot_key if use_tot else None
     )
     
-    logits = outputs.get('last_hidden_state')
+    logits = outputs.get('logits', None)
     if logits is None:
-        raise ValueError("Model output doesn't contain 'last_hidden_state'")
-    
-    head_params = state.params.get('lm_head')
-    if head_params:
-        logits = logits @ head_params['kernel']
+        raise ValueError("Model output doesn't contain 'logits'")
     
     shift_logits = logits[:, :-1, :]
     shift_labels = batch['labels'][:, 1:]
@@ -392,18 +338,6 @@ def eval_step(
     
     return metrics
 
-def initialize_tot_components(model: VishwamAIModel, config: DictConfig) -> VishwamAIModel:
-    """Initialize Tree of Thoughts components for the model."""
-    if config.training.get('use_tot', False):
-        tot = TreeOfThoughts(
-            search_strategy=config.training.get('tot_search_strategy', 'beam'),
-            max_thoughts=config.training.get('max_thoughts', 5)
-        )
-        integration_layer = ToTIntegrationLayer()
-        model.tot = tot
-        model.tot_integration = integration_layer
-    return model
-
 def train(
     model: VishwamAIModel,
     config: DictConfig,
@@ -415,10 +349,7 @@ def train(
     checkpoint_dir: Optional[str] = None,
     accum_steps: int = 1
 ) -> TrainingState:
-    """Advanced training loop with ToT, error correction, and MoD."""
-    logger.info("Starting enhanced training with ToT, error correction, and MoD")
-    
-    model = initialize_tot_components(model, config)
+    logger.info("Starting enhanced training with ToT and error correction")
     
     use_error_correction = config.training.get('use_error_correction', True)
     if use_error_correction:
@@ -485,7 +416,6 @@ def train(
     return state
 
 def save_checkpoint(state: TrainingState, path: str):
-    """Save a checkpoint of the training state."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(f"{path}.msgpack", "wb") as f:
         f.write(flax.serialization.msgpack_serialize({
@@ -498,25 +428,10 @@ def save_checkpoint(state: TrainingState, path: str):
         }))
     logger.info(f"Saved checkpoint to {path}.msgpack")
 
-def load_checkpoint(path: str, state: TrainingState) -> TrainingState:
-    """Load a checkpoint into the training state."""
-    with open(f"{path}.msgpack", "rb") as f:
-        loaded = flax.serialization.msgpack_restore(f.read())
-    return state.replace(
-        params=loaded['params'],
-        opt_state=loaded['opt_state'],
-        step=loaded['step'],
-        best_metrics=loaded['best_metrics'],
-        tot_state=loaded['tot_state'],
-        error_state=loaded['error_state']
-    )
-
 def main(config_path: str) -> TrainingState:
-    """Main training function with config from file."""
     config = OmegaConf.load(config_path)
-    
     model = VishwamAIModel(ModelConfig(**config.model))
-    config.training.tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size, model_prefix=config.model.name)
+    config.training.tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
     config.training.tokenizer.train([config.data.dataset_path], "tokenizer_output")
     
     train_dataloader = create_train_dataloader(config)
@@ -541,5 +456,5 @@ def main(config_path: str) -> TrainingState:
     return final_state
 
 if __name__ == "__main__":
-    config_path = "config.yaml"  # Replace with actual path
+    config_path = "config.yaml"
     main(config_path)

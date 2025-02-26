@@ -19,8 +19,6 @@ from .error_correction import (
     compute_error_metrics
 )
 
-# Import ErrorCorrectionTrainer separately to avoid circular imports
-from .error_correction_trainer import ErrorCorrectionTrainer
 
 # Break circular imports by carefully organizing the import order
 from .distillation import VishwamaiGuruKnowledge, VishwamaiShaalaTrainer

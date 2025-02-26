@@ -170,13 +170,30 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
     
     # Load configuration
     config = OmegaConf.load(config_path)
-    model_config = ModelConfig(**config.model)
+    # Filter configuration to only include supported parameters
+    model_params = {k: v for k, v in config.model.items() if k in ModelConfig.__dataclass_fields__}
+    model_config = ModelConfig(**model_params)
     model = VishwamAIModel(model_config)
     
-    # Initialize tokenizer
+    # Initialize tokenizer and prepare dataset for training
+    dataset = load_dataset(config.dataset.dataset_name, "main")
+    train_texts = [
+        f"{example['question']}\n{example['answer']}"
+        for example in dataset["train"]
+    ]
+    
+    # Create temporary file for tokenizer training
+    temp_file = "gsm8k_train_temp.txt"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(train_texts))
+    
+    # Train tokenizer
     tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size)
-    tokenizer.train([config.dataset.dataset_path], "tokenizer_output")
+    tokenizer.train([temp_file], "tokenizer_output")
     config.training.tokenizer = tokenizer
+    
+    # Clean up temporary file
+    os.remove(temp_file)
     
     # Initialize ToT
     tot = TreeOfThoughts(
@@ -194,7 +211,6 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
         transformer=model,
         tokenizer=tokenizer,
         use_tot=config.training.get('use_tot', True),
-        use_mod=config.model.get('use_mod', True),
         history_size=config.training.get('error_history_size', 100),
         threshold_percentile=config.training.get('error_threshold_percentile', 85.0)
     )

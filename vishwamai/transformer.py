@@ -4,41 +4,9 @@ from flax import linen as nn
 from typing import Dict, List, Tuple, Optional, Any, Callable
 import numpy as np
 import logging
-from dataclasses import dataclass
+from .model import ModelConfig
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class ModelConfig:
-    vocab_size: int = 32000
-    hidden_size: int = 512
-    num_layers: int = 6
-    num_attention_heads: int = 8
-    intermediate_size: int = 2048
-    hidden_dropout_prob: float = 0.1
-    attention_dropout_prob: float = 0.1
-    max_position_embeddings: int = 128
-    initializer_range: float = 0.02
-    layer_norm_eps: float = 1e-5
-    use_cache: bool = True
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    tie_word_embeddings: bool = True
-    gradient_checkpointing: bool = False
-    use_flash_attention: bool = True
-    use_rope: bool = True
-    use_alibi: bool = False
-    use_gqa: bool = True
-    num_key_value_heads: int = 4
-    dtype: str = "bfloat16"
-    quantization: Optional[str] = None
-    use_mod: bool = False  # Added to fix error
-
-    def __post_init__(self):
-        if self.use_gqa:
-            assert self.num_attention_heads % self.num_key_value_heads == 0, \
-                "num_attention_heads must be divisible by num_key_value_heads for GQA"
 
 class VishwamAIModel(nn.Module):
     config: ModelConfig

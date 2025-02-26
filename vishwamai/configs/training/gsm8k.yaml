@@ -20,7 +20,6 @@ model:
   use_gqa: true
   num_key_value_heads: 4
   dtype: "bfloat16"
-  use_mod: true
 training:
   seed: 42
   learning_rate: 0.0001
@@ -44,7 +43,6 @@ training:
   checkpoint_dir: "checkpoints"
 dataset:
   dataset_name: "openai/gsm8k"
-  dataset_path: "gsm8k_train.txt"
   max_length: 128
   batch_size: 1000
   preprocessing:

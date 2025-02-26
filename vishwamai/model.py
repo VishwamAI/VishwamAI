@@ -102,6 +102,9 @@ class ModelConfig:
         if 'intermediate_size' not in mapped_dict and 'intermediate_dim' in mapped_dict:
             mapped_dict['intermediate_size'] = mapped_dict.pop('intermediate_dim')
         mapped_dict.pop('attention_bias', None)
+        # Keep use_mod in mapped dict
+        if 'use_mod' in mapped_dict and 'use_mod' in cls.__dataclass_fields__:
+            mapped_dict['use_mod'] = bool(mapped_dict['use_mod'])
         return {k: v for k, v in mapped_dict.items() if k in cls.__dataclass_fields__}
 
     vocab_size: int = 32000

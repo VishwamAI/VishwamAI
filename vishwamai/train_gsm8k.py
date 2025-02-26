@@ -16,10 +16,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Union
 import flax.linen as nn
 from einops import rearrange, repeat
-import gc
 from huggingface_hub import snapshot_download
 import safetensors.flax as stf
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 import json
 logger = logging.getLogger(__name__)
 
@@ -27,6 +26,16 @@ from vishwamai.training import train, create_train_state
 from vishwamai.tokenizer import VishwamAITokenizer
 from vishwamai.error_correction import ErrorCorrectionTrainer
 from vishwamai.tot import TreeOfThoughts, Thought
+from vishwamai.model import (
+    ModelArgs, 
+    ModelConfig, 
+    TransformerBlock, 
+    ParallelDense,
+    RMSNorm, 
+    MoELayer,
+    MultiheadAttention,
+    ParallelMLP
+)
 
 @dataclass
 class ModelArgs:
@@ -61,6 +70,7 @@ class ModelArgs:
     use_contrastive_loss: bool = True
     temperature: float = 0.07
     max_image_length: int = 256
+    use_gqa: bool = True
 
 @dataclass
 class ModelConfig:
@@ -111,234 +121,8 @@ class ModelConfig:
             assert self.num_attention_heads % self.num_key_value_heads == 0, \
                 "num_attention_heads must be divisible by num_key_value_heads for GQA"
 
-class ParallelDense(nn.Module):
-    features: int
-    use_bias: bool = True
-    dtype: jnp.dtype = jnp.float32
-    precision: Optional[tuple] = None
-    kernel_init: callable = nn.initializers.normal(stddev=0.02)
-    
-    @nn.compact
-    def __call__(self, inputs):
-        kernel = self.param('kernel', self.kernel_init, (inputs.shape[-1], self.features))
-        kernel = jnp.asarray(kernel, self.dtype)
-        y = jnp.dot(inputs, kernel, precision=self.precision)
-        if self.use_bias:
-            bias = self.param('bias', nn.initializers.zeros, (self.features,))
-            bias = jnp.asarray(bias, self.dtype)
-            y = y + bias
-        return y
-
-class RMSNorm(nn.Module):
-    epsilon: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        x = x * jax.lax.rsqrt(variance + self.epsilon)
-        scale = self.param('scale', nn.initializers.ones, (x.shape[-1],))
-        return x * jnp.asarray(scale, self.dtype)
-
-def precompute_freqs(head_dim: int, max_seq_len: int, base: float = 10000.0, dtype: jnp.dtype = jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    half_dim = head_dim // 2
-    freqs = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=dtype) / half_dim))
-    t = jnp.arange(max_seq_len, dtype=dtype)
-    freqs = jnp.outer(t, freqs)
-    sin = jnp.sin(freqs)
-    cos = jnp.cos(freqs)
-    sin = jnp.expand_dims(jnp.expand_dims(sin, 0), 0)
-    cos = jnp.expand_dims(jnp.expand_dims(cos, 0), 0)
-    return sin.astype(dtype), cos.astype(dtype)
-
-def rotary_embedding(x: jnp.ndarray, sin: jnp.ndarray, cos: jnp.ndarray, use_local_repeat: bool = False) -> jnp.ndarray:
-    batch, heads, seq_len, head_dim = x.shape
-    half_dim = head_dim // 2
-    sin = sin[:, :, :seq_len, :half_dim]
-    cos = cos[:, :, :seq_len, :half_dim]
-    sin = jnp.broadcast_to(sin, (batch, heads, seq_len, half_dim))
-    cos = jnp.broadcast_to(cos, (batch, heads, seq_len, half_dim))
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    x_rot = x1 * cos - x2 * sin
-    x_pass = x1 * sin + x2 * cos
-    return jnp.concatenate([x_rot, x_pass], axis=-1)
-
-class ParallelMLP(nn.Module):
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, deterministic: bool = True):
-        dim = self.config.dim
-        hidden_dim = int(self.config.ffn_dim_multiplier * dim if self.config.ffn_dim_multiplier else dim * 4)
-        x = RMSNorm(dtype=x.dtype)(x)
-        gate = ParallelDense(hidden_dim, dtype=x.dtype)(x)
-        up = ParallelDense(hidden_dim, dtype=x.dtype)(x)
-        gate = nn.silu(gate)
-        intermediate = gate * up
-        output = ParallelDense(dim, dtype=x.dtype)(intermediate)
-        return nn.Dropout(rate=self.config.dropout_rate)(output, deterministic=deterministic)
-
-class MoELayer(nn.Module):
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, deterministic: bool = True):
-        batch_size, seq_len, dim = x.shape
-        num_experts = self.config.n_experts
-        expert_fn = ParallelMLP(self.config)
-        router_weights = self.param('router_weights', nn.initializers.normal(stddev=0.02), (dim, num_experts))
-        router_logits = jax.lax.stop_gradient(jnp.einsum('bsd,de->bse', x, router_weights))
-        routing_probs = nn.softmax(router_logits, axis=-1)
-        top_k_weights, top_k_indices = jax.lax.top_k(routing_probs, k=1)
-        top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
-        
-        all_indices = []
-        all_outputs = []
-        for expert_idx in range(num_experts):
-            expert_mask = (top_k_indices == expert_idx).any(axis=-1)
-            if jnp.any(expert_mask):
-                mask_weights = jnp.where(top_k_indices == expert_idx, top_k_weights, 0).max(axis=-1)
-                expert_input = x[expert_mask] * mask_weights[expert_mask, None]
-                expert_output = expert_fn(expert_input, deterministic)
-                indices = jnp.where(expert_mask)[0]
-                all_indices.append(indices)
-                all_outputs.append(expert_output)
-        
-        final_output = jnp.zeros_like(x)
-        if all_indices:
-            flat_indices = jnp.concatenate(all_indices, axis=0)
-            flat_outputs = jnp.concatenate(all_outputs, axis=0)
-            
-            # For each index, add its output to the corresponding position in final_output
-            for idx, output in zip(flat_indices, flat_outputs):
-                final_output = final_output.at[idx].add(output)
-        
-        expert_usage = jnp.mean(routing_probs, axis=(0, 1))
-        load_balancing_loss = -jnp.sum(expert_usage * jnp.log(expert_usage + 1e-6))
-        return final_output, load_balancing_loss
-
-def create_alibi_slopes(num_heads: int) -> jnp.ndarray:
-    closest_power_of_2 = 2 ** jnp.floor(jnp.log2(num_heads))
-    base = jnp.array([2 ** (-(2 ** -(jnp.log2(closest_power_of_2) - 3)))], dtype=jnp.float32)
-    powers = jnp.arange(1, 1 + num_heads, dtype=jnp.float32)
-    slopes = jnp.power(base, powers)
-    return slopes
-
-class MultiheadAttention(nn.Module):
-    config: ModelArgs
-    
-    def create_sliding_window_mask(self, seq_len: int) -> jnp.ndarray:
-        window_size = self.config.window_size
-        global_tokens = self.config.global_tokens
-        mask = jnp.full((seq_len, seq_len), -1e9)
-        for i in range(seq_len):
-            window_start = max(0, i - window_size // 2)
-            window_end = min(seq_len, i + window_size // 2 + 1)
-            mask = mask.at[i, window_start:window_end].set(0.0)
-        mask = mask.at[:global_tokens, :].set(0.0)
-        mask = mask.at[:, :global_tokens].set(0.0)
-        return mask
-    
-    def setup(self):
-        if self.config.use_alibi:
-            num_alibi_heads = self.config.num_alibi_heads or self.config.n_heads
-            self.alibi_slopes = create_alibi_slopes(num_alibi_heads)
-    
-    def compute_alibi_attention(self, qk: jnp.ndarray) -> jnp.ndarray:
-        seq_len = qk.shape[-1]
-        positions = jnp.arange(seq_len)
-        distance = positions[:, None] - positions[None, :]
-        distance = -jnp.abs(distance).astype(jnp.float32)
-        distance = distance[None, :, :]
-        alibi_bias = self.alibi_slopes[:, None, None] * distance
-        return qk + alibi_bias
-
-    @nn.compact
-    def __call__(self, x, mask=None, deterministic: bool = True):
-        batch_size, seq_len, dim = x.shape
-        num_heads = self.config.n_heads
-        num_kv_heads = self.config.n_kv_heads if hasattr(self.config, 'n_kv_heads') else num_heads
-        head_dim = dim // num_heads
-        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads for GQA"
-        
-        token_complexity = jnp.sum(jnp.abs(x), axis=-1, keepdims=True)
-        complexity_weights = nn.sigmoid(token_complexity)
-        
-        kv_dim = head_dim * num_kv_heads
-        kv_proj_dim = 2 * kv_dim
-        
-        q = nn.remat(ParallelDense)(dim, use_bias=False, dtype=x.dtype)(x * complexity_weights)
-        kv = nn.remat(ParallelDense)(kv_proj_dim, use_bias=False, dtype=x.dtype)(x)
-        
-        k, v = jnp.split(kv, 2, axis=-1)
-        
-        q = rearrange(q, 'b s (h d) -> b h s d', h=num_heads)
-        k = rearrange(k, 'b s (h d) -> b h s d', h=num_kv_heads)
-        v = rearrange(v, 'b s (h d) -> b h s d', h=num_kv_heads)
-        
-        if self.config.use_rope:
-            compute_dtype = x.dtype
-            sin, cos = precompute_freqs(head_dim, seq_len, dtype=compute_dtype)
-            q = rotary_embedding(q, sin, cos, use_local_repeat=False)
-            k = rotary_embedding(k, sin, cos, use_local_repeat=True)
-        
-        repeats = num_heads // num_kv_heads
-        k = repeat(k, 'b h s d -> b (h r) s d', r=repeats)
-        v = repeat(v, 'b h s d -> b (h r) s d', r=repeats)
-        
-        if mask is None:
-            mask = self.create_sliding_window_mask(seq_len)
-        else:
-            window_mask = self.create_sliding_window_mask(seq_len)
-            mask = jnp.minimum(mask, window_mask)
-        
-        scale = 1.0 / jnp.sqrt(head_dim)
-        qk = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
-        
-        if self.config.use_alibi:
-            qk = self.compute_alibi_attention(qk)
-        
-        if self.config.use_flash_attention:
-            qk = jnp.where(mask, qk, -1e9)
-            attention = nn.softmax(qk, axis=-1)
-        else:
-            qk = jnp.where(mask, qk, -1e9)
-            attention = nn.softmax(qk, axis=-1)
-        
-        if not deterministic:
-            attention = nn.Dropout(rate=self.config.attention_dropout)(attention, deterministic=False)
-        
-        if not deterministic:
-            v = jnp.asarray(v, self.config.kv_cache_dtype)
-            
-        output = jnp.einsum('bhij,bhjd->bhid', attention, v)
-        output = rearrange(output, 'b h s d -> b s (h d)')
-        
-        output = nn.remat(ParallelDense)(dim, dtype=x.dtype)(output)
-        output = nn.Dropout(rate=self.config.dropout_rate)(output, deterministic=deterministic)
-        
-        return output
-
-class TransformerBlock(nn.Module):
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, mask=None, deterministic: bool = True):
-        attn_norm = RMSNorm(dtype=x.dtype)(x)
-        attn_output = MultiheadAttention(self.config)(attn_norm, mask, deterministic)
-        x = x + attn_output
-        
-        ff_norm = RMSNorm(dtype=x.dtype)(x)
-        if self.config.n_experts > 0:
-            ff_output, load_balance_loss = MoELayer(self.config)(ff_norm, deterministic)
-            self.sow('intermediates', 'load_balance_loss', load_balance_loss)
-        else:
-            ff_output = ParallelMLP(self.config)(ff_norm, deterministic)
-        
-        x = x + ff_output
-        return x
-
 class VishwamAIModel(nn.Module):
+    """Main transformer model with ToT integration."""
     config: ModelConfig
 
     def setup(self):
@@ -348,27 +132,31 @@ class VishwamAIModel(nn.Module):
             embedding_init=nn.initializers.normal(stddev=0.02),
             dtype=jnp.dtype(self.config.dtype)
         )
+        n_kv_heads = self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads
         self.encoder = [TransformerBlock(ModelArgs(
             dim=self.config.hidden_size,
             n_layers=1,
             n_heads=self.config.num_attention_heads,
-            n_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads,
+            n_kv_heads=n_kv_heads,
             vocab_size=self.config.vocab_size,
-            use_rope=self.config.use_rope,
-            dropout_rate=self.config.hidden_dropout_prob,
-            attention_dropout=self.config.attention_dropout_prob,
+            multiple_of=256,
+            norm_eps=self.config.layer_norm_eps,
+            max_batch_size=32,
+            max_seq_len=self.config.max_position_embeddings,
             n_experts=4,
             expert_dim=4096,
             expert_capacity_factor=1.25,
-            max_seq_len=self.config.max_position_embeddings,
             window_size=512,
             global_tokens=64,
-            max_batch_size=32,
-            use_gqa=self.config.use_gqa,
+            attention_dropout=self.config.attention_dropout_prob,
+            dropout_rate=self.config.hidden_dropout_prob,
+            expert_dropout=self.config.hidden_dropout_prob,
+            use_rope=self.config.use_rope,
             use_flash_attention=self.config.use_flash_attention,
-            use_alibi=self.config.use_alibi
+            use_alibi=self.config.use_alibi,
+            use_gqa=self.config.use_gqa
         )) for _ in range(self.config.num_layers)]
-        self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
+        self.final_layer_norm = RMSNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
         self.lm_head = ParallelDense(features=self.config.vocab_size, use_bias=False, dtype=jnp.dtype(self.config.dtype))
 
     def _create_causal_mask(self, seq_len: int) -> jnp.ndarray:
@@ -420,6 +208,7 @@ class VishwamAIModel(nn.Module):
         return model, {'params': params}
 
     def load_weights(self, model_path: str, reduced_size: bool = False):
+        """Load model weights with optimized memory management."""
         if not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path, allow_patterns=["*.safetensors"])
         if reduced_size:
@@ -440,13 +229,12 @@ class VishwamAIModel(nn.Module):
                         new_shape = tuple(s // 2 if i < 2 else s for i, s in enumerate(tensor.shape))
                         tensor = tensor[tuple(slice(0, s) for s in new_shape)]
                     with jax.default_device(jax.devices("cpu")[0]):
-                        params[name] = jnp.array(tensor, dtype=dtype)
-                    del tensor
-                    gc.collect()
+                        params[name] = jax.device_put(jnp.array(tensor, dtype=dtype))
         self.bind({'params': params})
         return self
 
 class GSM8KProcessor:
+    """Processor for GSM8K dataset with robust tokenization and evaluation."""
     def __init__(self, tokenizer: VishwamAITokenizer, config):
         self.tokenizer = tokenizer
         self.config = config
@@ -466,8 +254,8 @@ class GSM8KProcessor:
         correct_steps = sum(1 for p, t in zip(pred_steps, target_steps) if p == t)
         total_steps = max(len(pred_steps), len(target_steps))
         
-        pred_answer = prediction.split('####')[-1].strip() if '####' in prediction else pred_steps[-1].split()[-1] if pred_steps else ""
-        target_answer = target.split('####')[-1].strip() if '####' in target else target_steps[-1].split()[-1] if target_steps else ""
+        pred_answer = prediction.split('####')[-1].strip() if '####' in prediction else (pred_steps[-1].split()[-1] if pred_steps else "")
+        target_answer = target.split('####')[-1].strip() if '####' in target else (target_steps[-1].split()[-1] if target_steps else "")
         
         exact_match = pred_answer == target_answer and len(pred_steps) == len(target_steps) and all(p == t for p, t in zip(pred_steps, target_steps))
         
@@ -482,19 +270,27 @@ class GSM8KProcessor:
             questions = examples['question']
             answers = examples['answer']
             
+            if not isinstance(questions, list) or not isinstance(answers, list):
+                raise ValueError("Questions and answers must be lists")
+            
             if len(questions) != len(answers):
                 raise ValueError(f"Mismatched lengths: questions={len(questions)}, answers={len(answers)}")
             
             formatted_texts = []
             for q, a in zip(questions, answers):
+                if not isinstance(q, str) or not isinstance(a, str):
+                    continue
                 formatted_text = f"Question: {q}\nLet's solve this step by step:\n"
                 solution_parts = a.split('####')
-                steps = solution_parts[0].strip().split('\n')
-                final_answer = solution_parts[1].strip() if len(solution_parts) > 1 else steps[-1].strip()
+                steps = solution_parts[0].strip().split('\n') if solution_parts else []
+                final_answer = solution_parts[1].strip() if len(solution_parts) > 1 else (steps[-1].strip() if steps else "")
                 
                 formatted_steps = [f"Step: {step.strip()}" for step in steps if step.strip()]
                 formatted_text += f"{chr(10).join(formatted_steps)}\nTherefore, the final answer is: {final_answer}\n####\n{final_answer}"
                 formatted_texts.append(formatted_text)
+            
+            if not formatted_texts:
+                raise ValueError("No valid question-answer pairs to tokenize")
             
             tokenized = self.tokenizer(
                 formatted_texts,
@@ -505,10 +301,11 @@ class GSM8KProcessor:
             )
             tokenized["labels"] = tokenized["input_ids"].copy()
             tokenized["error_weights"] = np.ones_like(tokenized["input_ids"], dtype=np.float32)
-            answer_pos = formatted_texts[0].find("####")
-            if answer_pos != -1:
-                token_pos = len(self.tokenizer.encode(formatted_texts[0][:answer_pos]))
-                tokenized["error_weights"][:, token_pos:] = 2.0
+            if formatted_texts:
+                answer_pos = formatted_texts[0].find("####")
+                if answer_pos != -1:
+                    token_pos = len(self.tokenizer.encode(formatted_texts[0][:answer_pos]))
+                    tokenized["error_weights"][:, token_pos:] = 2.0
             
             return tokenized
         except Exception as e:
@@ -558,10 +355,13 @@ def create_gsm8k_dataloader(config, tokenizer: VishwamAITokenizer, split="train"
     
     return data_iterator()
 
-def save_model_safetensors(params: Dict, metrics: Dict, save_path: str):
+def save_model_safetensors(params: Dict, metrics: Dict, save_path: str, config: Optional[Dict] = None):
+    """Save model parameters with metrics and optional config."""
     numpy_params = jax.tree_map(np.asarray, params)
     metadata = {f"metric_{k}": str(v) for k, v in metrics.items()}
     metadata["timestamp"] = str(np.datetime64('now'))
+    if config:
+        metadata["config"] = json.dumps(config)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_file(numpy_params, save_path, metadata=metadata)
     logger.info(f"Saved model to {save_path} with metrics: {metrics}")
@@ -570,25 +370,93 @@ def setup_tpu_cluster():
     devices = jax.devices()
     logger.info(f"Available devices: {devices}")
     device_count = len(devices)
-    device_mesh = np.array(devices).reshape((device_count // 2, 2))
+    if device_count < 2:
+        logger.warning("Limited devices detected; parallelism may be reduced")
+    device_mesh = np.array(devices).reshape((device_count // 2, 2)) if device_count >= 2 else np.array(devices).reshape((1, device_count))
     mesh = Mesh(device_mesh, ('data', 'model'))
     sharding = NamedSharding(mesh, P('data', 'model'))
     return mesh, sharding
 
+def validate_config(config: DictConfig):
+    """Validate configuration schema."""
+    schema = OmegaConf.create({
+        'model': {
+            'vocab_size': int,
+            'hidden_size': int,
+            'num_layers': int,
+            'num_attention_heads': int,
+            'intermediate_size': int,
+            'hidden_dropout_prob': float,
+            'attention_dropout_prob': float,
+            'max_position_embeddings': int,
+            'use_gqa': bool,
+            'num_key_value_heads': int,
+            'dtype': str
+        },
+        'training': {
+            'max_steps': int,
+            'seed': int,
+            'eval_every': int,
+            'log_every_n_steps': int,
+            'use_tot': bool,
+            'tot_max_thoughts': int,
+            'tot_max_depth': int,
+            'tot_beam_width': int
+        },
+        'data': {
+            'batch_size': int,
+            'max_seq_length': int,
+            'dataset_name': str
+        },
+        'checkpointing': {
+            'dir': str
+        },
+        'monitoring': {
+            'log_every_n_steps': int
+        },
+        'evaluation': {
+            'eval_steps': int
+        }
+    })
+    try:
+        OmegaConf.merge(schema, config)
+    except Exception as e:
+        logger.error(f"Config validation failed: {str(e)}")
+        raise
+
 def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
+    """Main training function with enhanced error handling and validation."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    config = OmegaConf.load(config_path)
+    try:
+        config = OmegaConf.load(config_path)
+        validate_config(config)
+    except FileNotFoundError:
+        logger.error(f"Config file not found at {config_path}")
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid configuration: {str(e)}")
+        raise
+    
     model_params = {k: v for k, v in config.model.items() if k in ModelConfig.__dataclass_fields__}
-    model_config = ModelConfig(**model_params)
+    try:
+        model_config = ModelConfig(**model_params)
+    except ValueError as e:
+        logger.error(f"Invalid model configuration: {str(e)}")
+        raise
+    
     model = VishwamAIModel(model_config)
     
     dataset = load_dataset(config.data.dataset_name, "main")
     train_texts = [f"{example['question']}\n{example['answer']}" for example in dataset["train"]]
     
     temp_file = "gsm8k_train_temp.txt"
-    with open(temp_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(train_texts))
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(train_texts))
+    except IOError as e:
+        logger.error(f"Failed to write temporary file: {str(e)}")
+        raise
     
     math_special_tokens = ["<answer>", "<step>", "<equation>", "<result>", "<reasoning>"]
     
@@ -691,7 +559,7 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
             val_steps += 1
         
         for k in val_metrics:
-            val_metrics[k] /= val_steps
+            val_metrics[k] /= val_steps if val_steps > 0 else 1
         
         final_metrics = {
             'val_loss': final_state.best_metrics['loss'],
@@ -706,7 +574,8 @@ def main(config_path: str = "vishwamai/configs/training/gsm8k.yaml"):
         save_model_safetensors(
             final_state.params,
             final_metrics,
-            os.path.join(checkpoint_dir, "gsm8k_final.safetensors")
+            os.path.join(checkpoint_dir, "gsm8k_final.safetensors"),
+            config=OmegaConf.to_container(config)
         )
     
     logger.info("Training completed!")

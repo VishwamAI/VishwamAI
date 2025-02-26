@@ -391,25 +391,29 @@ class VishwamAIModel(nn.Module):
             embedding_init=nn.initializers.normal(stddev=0.02),
             dtype=jnp.dtype(self.config.dtype)
         )
+        n_kv_heads = self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads
         self.encoder = [TransformerBlock(ModelArgs(
             dim=self.config.hidden_size,
             n_layers=1,
             n_heads=self.config.num_attention_heads,
-            n_kv_heads=self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads,
+            n_kv_heads=n_kv_heads,
             vocab_size=self.config.vocab_size,
-            use_rope=self.config.use_rope,
-            dropout_rate=self.config.hidden_dropout_prob,
-            attention_dropout=self.config.attention_dropout_prob,
+            multiple_of=256,
+            norm_eps=self.config.layer_norm_eps,
+            max_batch_size=32,
+            max_seq_len=self.config.max_position_embeddings,
             n_experts=4,
             expert_dim=4096,
             expert_capacity_factor=1.25,
-            max_seq_len=self.config.max_position_embeddings,
             window_size=512,
             global_tokens=64,
-            max_batch_size=32,
-            use_gqa=self.config.use_gqa,
+            attention_dropout=self.config.attention_dropout_prob,
+            dropout_rate=self.config.hidden_dropout_prob,
+            expert_dropout=self.config.hidden_dropout_prob,
+            use_rope=self.config.use_rope,
             use_flash_attention=self.config.use_flash_attention,
-            use_alibi=self.config.use_alibi
+            use_alibi=self.config.use_alibi,
+            use_gqa=self.config.use_gqa
         )) for _ in range(self.config.num_layers)]
         self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
         self.lm_head = ParallelDense(features=self.config.vocab_size, use_bias=False, dtype=jnp.dtype(self.config.dtype))

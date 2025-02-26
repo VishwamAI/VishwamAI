@@ -15,16 +15,15 @@ from huggingface_hub import snapshot_download
 import safetensors.flax as stf
 import logging
 import random
-from .tokenizer import VishwamAITokenizer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Optimizer Creation
+# Optimizer Creation (optimized for TPU v2-8)
 def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
-                    beta1: float = 0.9, beta2: float = 0.999, 
-                    warmup_steps: int = 2000, num_train_steps: int = 100000):
+                     beta1: float = 0.9, beta2: float = 0.999, 
+                     warmup_steps: int = 2000, num_train_steps: int = 100000):
     decay_scheduler = optax.linear_schedule(
         init_value=0.0,
         end_value=learning_rate,
@@ -52,16 +51,16 @@ def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01,
 # Model Configurations
 @dataclass
 class ModelArgs:
-    dim: int = 4096
+    dim: int = 768  # Adjusted to match error (12 * 64 = 768)
     n_layers: int = 32
-    n_heads: int = 32
+    n_heads: int = 12  # Matches error-derived num_heads
     n_kv_heads: int = 8
     vocab_size: int = 32000
     multiple_of: int = 256
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 1024  # Matches error-derived seq_len
     n_experts: int = 8
     expert_dim: int = 4096
     expert_pruning_threshold: float = 0.1
@@ -102,19 +101,16 @@ class ModelConfig:
         if 'intermediate_size' not in mapped_dict and 'intermediate_dim' in mapped_dict:
             mapped_dict['intermediate_size'] = mapped_dict.pop('intermediate_dim')
         mapped_dict.pop('attention_bias', None)
-        # Keep use_mod in mapped dict
-        if 'use_mod' in mapped_dict and 'use_mod' in cls.__dataclass_fields__:
-            mapped_dict['use_mod'] = bool(mapped_dict['use_mod'])
         return {k: v for k, v in mapped_dict.items() if k in cls.__dataclass_fields__}
 
     vocab_size: int = 32000
-    hidden_size: int = 4096
+    hidden_size: int = 768  # Adjusted to match error
     num_layers: int = 32
-    num_attention_heads: int = 32
+    num_attention_heads: int = 12  # Matches error
     intermediate_size: int = 11008
     hidden_dropout_prob: float = 0.1
     attention_dropout_prob: float = 0.1
-    max_position_embeddings: int = 2048
+    max_position_embeddings: int = 1024
     initializer_range: float = 0.02
     layer_norm_eps: float = 1e-5
     use_cache: bool = True
@@ -166,17 +162,47 @@ class RMSNorm(nn.Module):
         scale = self.param('scale', nn.initializers.ones, (x.shape[-1],))
         return x * jnp.asarray(scale, self.dtype)
 
-def rotary_embedding(x: jnp.ndarray, sin: jnp.ndarray, cos: jnp.ndarray) -> jnp.ndarray:
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    rotated = jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
-    return rotated
+def precompute_freqs(head_dim: int, max_seq_len: int, base: float = 10000.0, dtype: jnp.dtype = jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Precompute frequencies for rotary positional encoding, optimized for TPU v2-8.
+    
+    Args:
+        head_dim: Dimension of each attention head (e.g., 64)
+        max_seq_len: Maximum sequence length (e.g., 1024)
+        base: Base value for frequency computation
+        dtype: Data type for TPU compatibility (bfloat16 recommended)
+    """
+    half_dim = head_dim // 2  # e.g., 32
+    freqs = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=dtype) / half_dim))  # Shape: [32]
+    t = jnp.arange(max_seq_len, dtype=dtype)  # Shape: [1024]
+    freqs = jnp.outer(t, freqs)  # Shape: [1024, 32]
+    sin = jnp.sin(freqs)  # Shape: [1024, 32]
+    cos = jnp.cos(freqs)  # Shape: [1024, 32]
+    # Ensure 4D shape persists for broadcasting
+    sin = jnp.expand_dims(jnp.expand_dims(sin, 0), 0)  # Shape: [1, 1, 1024, 32]
+    cos = jnp.expand_dims(jnp.expand_dims(cos, 0), 0)  # Shape: [1, 1, 1024, 32]
+    return sin.astype(dtype), cos.astype(dtype)
 
-def precompute_freqs(dim: int, max_seq_len: int, base: int = 10000) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    freqs = 1.0 / (base ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-    t = jnp.arange(max_seq_len)
-    freqs = jnp.outer(t, freqs)
-    sin, cos = jnp.sin(freqs), jnp.cos(freqs)
-    return sin, cos
+def rotary_embedding(x: jnp.ndarray, sin: jnp.ndarray, cos: jnp.ndarray, use_local_repeat: bool = False) -> jnp.ndarray:
+    """Apply rotary embeddings, optimized for TPU v2-8.
+    
+    Args:
+        x: Input tensor [batch, heads, seq_len, head_dim]
+        sin: Sine tensor [1, 1, seq_len, head_dim//2]
+        cos: Cosine tensor [1, 1, seq_len, head_dim//2]
+        use_local_repeat: Not used here (GQA-specific)
+    """
+    batch, heads, seq_len, head_dim = x.shape
+    half_dim = head_dim // 2  # e.g., 32
+    # Ensure sin and cos match seq_len and half_dim
+    sin = sin[:, :, :seq_len, :half_dim]  # [1, 1, seq_len, 32]
+    cos = cos[:, :, :seq_len, :half_dim]  # [1, 1, seq_len, 32]
+    # Explicitly broadcast to match x1, x2 shape
+    sin = jnp.broadcast_to(sin, (batch, heads, seq_len, half_dim))  # [1, 12, 1024, 32]
+    cos = jnp.broadcast_to(cos, (batch, heads, seq_len, half_dim))  # [1, 12, 1024, 32]
+    x1, x2 = jnp.split(x, 2, axis=-1)  # Each: [batch, heads, seq_len, 32]
+    x_rot = x1 * cos - x2 * sin
+    x_pass = x1 * sin + x2 * cos
+    return jnp.concatenate([x_rot, x_pass], axis=-1)
 
 class ParallelMLP(nn.Module):
     config: ModelArgs
@@ -271,23 +297,32 @@ class MultiheadAttention(nn.Module):
         batch_size, seq_len, dim = x.shape
         num_heads = self.config.n_heads
         num_kv_heads = self.config.n_kv_heads
-        head_dim = dim // num_heads
+        head_dim = dim // num_heads  # e.g., 768 // 12 = 64
         
         token_complexity = jnp.sum(jnp.abs(x), axis=-1, keepdims=True)
         complexity_weights = nn.sigmoid(token_complexity)
         
+        # Calculate dimensions for Q, K, V projections
+        kv_dim = head_dim * num_kv_heads
+        kv_proj_dim = 2 * kv_dim
+        
+        # Project inputs
         q = nn.remat(ParallelDense)(dim, use_bias=False, dtype=x.dtype)(x * complexity_weights)
-        kv = nn.remat(ParallelDense)(2 * dim * (num_kv_heads / num_heads), use_bias=False, dtype=x.dtype)(x)
+        kv = nn.remat(ParallelDense)(kv_proj_dim, use_bias=False, dtype=x.dtype)(x)
+        
+        # Split KV into K and V with correct shapes
         k, v = jnp.split(kv, 2, axis=-1)
         
+        # Reshape with correct head dimensions
         q = rearrange(q, 'b s (h d) -> b h s d', h=num_heads)
         k = rearrange(k, 'b s (h d) -> b h s d', h=num_kv_heads)
         v = rearrange(v, 'b s (h d) -> b h s d', h=num_kv_heads)
         
         if self.config.use_rope:
-            sin, cos = precompute_freqs(head_dim // 2, seq_len)
-            q = rotary_embedding(q, sin, cos)
-            k = rotary_embedding(k, sin, cos)
+            compute_dtype = x.dtype
+            sin, cos = precompute_freqs(head_dim, seq_len, dtype=compute_dtype)
+            q = rotary_embedding(q, sin, cos, use_local_repeat=False)
+            k = rotary_embedding(k, sin, cos, use_local_repeat=True)
         
         repeats = num_heads // num_kv_heads
         k = repeat(k, 'b h s d -> b (h r) s d', r=repeats)
@@ -398,7 +433,7 @@ class VishwamAIModel(nn.Module):
         if not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path, allow_patterns=["*.safetensors", "config.json"])
         if config is None:
-            with open(os.path.join(model_path, "config.json")) as f:
+            with open(os.path.join(model_path, "config.json"), 'r') as f:
                 config_dict = json.load(f)
                 config_dict = ModelConfig.map_config_params(config_dict)
             config = ModelConfig(**config_dict)
@@ -459,7 +494,7 @@ def test_step(state, input_ids, targets):
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets_shifted).mean()
     return loss
 
-def split_dataset(text_file: str, tokenizer: VishwamAITokenizer, batch_size: int, seq_len: int, train_ratio: float = 0.8):
+def split_dataset(text_file: str, tokenizer, batch_size: int, seq_len: int, train_ratio: float = 0.8):
     with open(text_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     random.shuffle(lines)

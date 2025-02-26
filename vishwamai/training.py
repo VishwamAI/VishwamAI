@@ -382,8 +382,11 @@ def train(
     
     if use_error_correction:
         rng_key, init_key = jax.random.split(rng_key)
-        dummy_input = jnp.ones((1, config.data.max_seq_length, config.model.hidden_size))
-        dummy_labels = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
+        # Use smaller dimensions for error correction initialization
+        reduced_seq_len = min(config.data.max_seq_length, 128)
+        reduced_hidden_size = min(config.model.hidden_size, 512)
+        dummy_input = jnp.ones((1, reduced_seq_len, reduced_hidden_size))
+        dummy_labels = jnp.ones((1, reduced_seq_len), dtype=jnp.int32)
         error_trainer.init_params(init_key, dummy_input, dummy_labels)
     
     for step in range(num_steps):

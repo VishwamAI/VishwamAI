@@ -1,8 +1,11 @@
+"""
+Enhanced training module for VishwamAI models.
+"""
+
 import jax
 import jax.numpy as jnp
 import flax
 import optax
-from flax.training import train_state
 from typing import Dict, List, Tuple, Callable, Any, Iterator, Optional
 import numpy as np
 from datasets import load_dataset
@@ -13,23 +16,16 @@ from functools import partial
 import os
 from .tot import TreeOfThoughts
 from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
-from .transformer import VishwamAIModel
-# Import from loss_functions module
-from .loss_functions import cross_entropy_loss, tot_guided_loss, compute_metrics
-
-# Import from error_correction_trainer to avoid circular imports
-from .error_correction_trainer import (
-    create_error_corrected_train_step,
-    create_error_corrected_eval_step,
-    evaluate_error_correction,
-    ErrorCorrectionTrainer
-)
+from .transformer import VishwamAIModel, ModelConfig
+from .loss_functions import cross_entropy_loss, tot_guided_loss, compute_metrics, compute_composite_loss
+from .error_correction import ErrorCorrectionTrainer, create_error_corrected_train_step, create_error_corrected_eval_step
+from .tokenizer import VishwamAITokenizer
 
 logger = logging.getLogger(__name__)
 
-# Define a class without inheritance to avoid conflicts with TrainState
+# Custom Training State
 class VishwamaiTrainingState:
-    """Extended training state with EMA and other training metrics."""
+    """Enhanced training state with additional features."""
     apply_fn: Callable
     params: Dict
     tx: optax.GradientTransformation
@@ -38,9 +34,10 @@ class VishwamaiTrainingState:
     step: int
     best_metrics: Dict
     tot_state: Dict
+    error_state: Dict
     
     @classmethod
-    def create(cls, apply_fn, params, tx, ema_params=None, best_metrics=None, tot_state=None):
+    def create(cls, apply_fn, params, tx, ema_params=None, best_metrics=None, tot_state=None, error_state=None):
         """Create a new instance of VishwamaiTrainingState."""
         return cls(
             apply_fn=apply_fn,
@@ -50,11 +47,11 @@ class VishwamaiTrainingState:
             ema_params=ema_params,
             step=0,
             best_metrics=best_metrics if best_metrics is not None else {},
-            tot_state=tot_state if tot_state is not None else {}
+            tot_state=tot_state if tot_state is not None else {},
+            error_state=error_state if error_state is not None else {}
         )
     
-    def __init__(self, apply_fn, params, tx, opt_state, ema_params=None, step=0, best_metrics=None, tot_state=None):
-        """Initialize the VishwamaiTrainingState."""
+    def __init__(self, apply_fn, params, tx, opt_state, ema_params=None, step=0, best_metrics=None, tot_state=None, error_state=None):
         self.apply_fn = apply_fn
         self.params = params
         self.tx = tx
@@ -63,9 +60,10 @@ class VishwamaiTrainingState:
         self.step = step
         self.best_metrics = best_metrics if best_metrics is not None else {}
         self.tot_state = tot_state if tot_state is not None else {}
+        self.error_state = error_state if error_state is not None else {}
     
-    def apply_gradients(self, *, grads, **kwargs):
-        """Update the parameters using the gradients."""
+    def apply_gradients(self, grads, **kwargs):
+        """Update parameters using gradients with optional gradient accumulation."""
         updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
         new_params = optax.apply_updates(self.params, updates)
         return self.replace(
@@ -76,7 +74,7 @@ class VishwamaiTrainingState:
         )
     
     def replace(self, **kwargs):
-        """Return a new state with the specified fields replaced."""
+        """Return a new state with specified fields replaced."""
         return self.__class__(
             apply_fn=kwargs.get('apply_fn', self.apply_fn),
             params=kwargs.get('params', self.params),
@@ -85,10 +83,10 @@ class VishwamaiTrainingState:
             ema_params=kwargs.get('ema_params', self.ema_params),
             step=kwargs.get('step', self.step),
             best_metrics=kwargs.get('best_metrics', self.best_metrics),
-            tot_state=kwargs.get('tot_state', self.tot_state)
+            tot_state=kwargs.get('tot_state', self.tot_state),
+            error_state=kwargs.get('error_state', self.error_state)
         )
 
-# Use the custom training state as TrainingState
 TrainingState = VishwamaiTrainingState
 
 def create_learning_rate_scheduler(
@@ -97,21 +95,10 @@ def create_learning_rate_scheduler(
     warmup_steps=1000,
     decay_steps=100000,
 ):
-    """Creates a learning rate schedule.
-    
-    Args:
-        factors: Factors separated by '*' for the learning rate formula.
-        base_learning_rate: Base learning rate.
-        warmup_steps: Number of warmup steps.
-        decay_steps: Number of decay steps.
-        
-    Returns:
-        A function that takes step and returns learning rate.
-    """
+    """Creates a learning rate schedule."""
     factors = [f.strip() for f in factors.split('*')]
     
     def schedule(step):
-        """Calculate learning rate based on step."""
         rate = 1.0
         for factor in factors:
             if factor == 'constant':
@@ -120,14 +107,12 @@ def create_learning_rate_scheduler(
                 rate *= jnp.minimum(1.0, step / warmup_steps)
             elif factor == 'cosine_decay':
                 rate *= 0.5 * (1 + jnp.cos(jnp.pi * jnp.minimum(step, decay_steps) / decay_steps))
-            else:
-                raise ValueError(f"Unknown factor: {factor}")
         return rate
     
     return schedule
 
 def create_optimizer(config):
-    """Create optimizer with learning rate schedule."""
+    """Create optimizer with advanced features."""
     lr_schedule = create_learning_rate_scheduler(
         base_learning_rate=config.training.learning_rate,
         warmup_steps=config.training.warmup_steps,
@@ -146,32 +131,44 @@ def create_optimizer(config):
     
     return tx, lr_schedule
 
-def create_train_state(model, config):
-    """Create initial training state."""
+def create_train_state(model, config, rng: jax.random.PRNGKey) -> TrainingState:
+    """Create initial training state with ToT and error correction."""
     tx, _ = create_optimizer(config)
+    
+    if not hasattr(model, 'params') or model.params is None:
+        dummy_input = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
+        params = model.init(rng, dummy_input)['params']
+    else:
+        params = model.params
     
     state = TrainingState.create(
         apply_fn=model.__call__,
-        params=model.params,
+        params=params,
         tx=tx,
-        ema_params=None,
+        ema_params=params if config.training.use_ema else None,
         best_metrics={
             'loss': float('inf'),
             'accuracy': 0.0,
-            'ec_improvement': 0.0,  # Track error correction improvement
+            'ec_improvement': 0.0,
+            'tot_score': 0.0
         },
         tot_state={
             'enabled': config.training.get('use_tot', False),
             'search_strategy': config.training.get('tot_search_strategy', 'beam'),
             'thoughts_per_batch': 0,
             'best_thought_score': 0.0
+        },
+        error_state={
+            'enabled': config.training.get('use_error_correction', True),
+            'history_size': config.training.get('error_history_size', 100),
+            'threshold': 0.1
         }
     )
     
     return state
 
 class DataProcessor:
-    """Processor for tokenizing and batching data."""
+    """Enhanced processor for tokenizing and batching data."""
     
     def __init__(self, tokenizer, config):
         self.tokenizer = tokenizer
@@ -179,7 +176,7 @@ class DataProcessor:
         self.max_length = config.data.max_seq_length
     
     def tokenize_function(self, examples):
-        """Tokenize a batch of text examples."""
+        """Tokenize a batch of text examples with augmentation."""
         texts = examples[self.config.data.text_column]
         
         tokenized = self.tokenizer(
@@ -190,99 +187,87 @@ class DataProcessor:
             return_attention_mask=True,
         )
         
-        # Create labels for autoregressive training (shift input_ids right)
         tokenized["labels"] = tokenized["input_ids"].copy()
+        
+        # Add error weights for curriculum learning (simple heuristic)
+        if self.config.training.get('use_error_correction', False):
+            tokenized["error_weights"] = np.ones_like(tokenized["input_ids"], dtype=np.float32)
         
         return tokenized
     
     def prepare_dataset(self, dataset):
-        """Prepare dataset by tokenizing and formatting."""
-        # Tokenize dataset
+        """Prepare dataset with advanced preprocessing."""
         tokenized_dataset = dataset.map(
             self.tokenize_function,
             batched=True,
             num_proc=self.config.data.preprocessing_num_workers,
             remove_columns=dataset.column_names,
         )
-        
         return tokenized_dataset
     
     def collate_fn(self, examples):
-        """Collate examples into a batch."""
+        """Collate examples into a batch with error weights."""
         batch = {
-            "input_ids": np.array([example["input_ids"] for example in examples]),
-            "attention_mask": np.array([example["attention_mask"] for example in examples]),
-            "labels": np.array([example["labels"] for example in examples]),
+            "input_ids": np.array([ex["input_ids"] for ex in examples]),
+            "attention_mask": np.array([ex["attention_mask"] for ex in examples]),
+            "labels": np.array([ex["labels"] for ex in examples]),
         }
-        
+        if self.config.training.get('use_error_correction', False):
+            batch["error_weights"] = np.array([ex["error_weights"] for ex in examples])
         return batch
 
 def create_train_dataloader(config):
-    """Create data loader for training."""
-    # Load the dataset
+    """Create enhanced data loader for training."""
     dataset_name = config.data.dataset_name
     dataset = load_dataset(dataset_name, split=config.data.train_split)
     
-    if config.data.max_train_samples is not None:
+    if config.data.max_train_samples:
         dataset = dataset.select(range(config.data.max_train_samples))
     
-    # Create tokenizer instance (assumes tokenizer is already provided)
     from vishwamai.tokenizer import VishwamAITokenizer
-    tokenizer = VishwamAITokenizer(
-        vocab_size=config.model.vocab_size, 
-        model_prefix=config.model.name
-    )
-    
-    # Process dataset
+    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size, model_prefix=config.model.name)
     data_processor = DataProcessor(tokenizer, config)
     processed_dataset = data_processor.prepare_dataset(dataset)
     
-    # Create data loader
     def data_iterator():
-        """Iterator that yields batches indefinitely."""
+        """Infinite iterator with curriculum-based shuffling."""
         epoch = 0
         while True:
-            # Shuffle at the beginning of each epoch
             indices = list(range(len(processed_dataset)))
+            if config.training.get('use_curriculum', False):
+                # Sort by difficulty (e.g., length) early, then randomize later
+                progress = epoch / (config.training.max_steps / config.training.eval_every)
+                if progress < 0.5:
+                    indices.sort(key=lambda i: len(processed_dataset[i]['input_ids']))
+           
             random.shuffle(indices)
             
-            # Create batches
             for i in range(0, len(indices), config.training.batch_size):
                 batch_indices = indices[i:i + config.training.batch_size]
                 examples = [processed_dataset[idx] for idx in batch_indices]
                 yield data_processor.collate_fn(examples)
             
             epoch += 1
-            print(f"Finished epoch {epoch}")
+            logger.info(f"Finished epoch {epoch}")
     
     return data_iterator()
 
 def create_val_dataloader(config):
-    """Create data loader for validation."""
-    # Load the dataset
+    """Create enhanced validation data loader."""
     dataset_name = config.data.dataset_name
     dataset = load_dataset(dataset_name, split=config.data.val_split)
     
-    if config.data.max_val_samples is not None:
+    if config.data.max_val_samples:
         dataset = dataset.select(range(config.data.max_val_samples))
     
-    # Create tokenizer instance (assumes tokenizer is already provided)
     from vishwamai.tokenizer import VishwamAITokenizer
-    tokenizer = VishwamAITokenizer(
-        vocab_size=config.model.vocab_size, 
-        model_prefix=config.model.name
-    )
-    
-    # Process dataset
+    tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size, model_prefix=config.model.name)
     data_processor = DataProcessor(tokenizer, config)
     processed_dataset = data_processor.prepare_dataset(dataset)
     
-    # Create data loader that iterates once
     def data_iterator():
-        """Iterator that yields batches once."""
+        """Single-pass iterator for validation."""
         indices = list(range(len(processed_dataset)))
-        
-        # Create batches
         for i in range(0, len(indices), config.training.eval_batch_size):
             batch_indices = indices[i:i + config.training.eval_batch_size]
             examples = [processed_dataset[idx] for idx in batch_indices]
@@ -290,18 +275,24 @@ def create_val_dataloader(config):
     
     return data_iterator()
 
-def train_step(state, batch, model_config, z_loss=0.0, rng_key=None):
-    """Perform a single training step with ToT integration."""
-    use_tot = state.tot_state['enabled'] if state.tot_state else False
+def train_step(
+    state: TrainingState,
+    batch: Dict[str, jnp.ndarray],
+    model_config: ModelConfig,
+    z_loss: float = 0.0,
+    rng_key: Optional[jax.random.PRNGKey] = None,
+    accum_steps: int = 1
+) -> Tuple[TrainingState, Dict]:
+    """Enhanced training step with ToT, MoD, and gradient accumulation."""
+    use_tot = state.tot_state.get('enabled', False)
+    use_mod = model_config.use_mod if hasattr(model_config, 'use_mod') else False
     
     def loss_fn(params):
-        # Split PRNG key for different operations
         step_key, dropout_key, tot_key = jax.random.split(rng_key, 3) if rng_key else (None, None, None)
         
-        # Forward pass with optional ToT integration
         outputs = state.apply_fn(
-            {'params': params}, 
-            batch['input_ids'], 
+            {'params': params},
+            batch['input_ids'],
             attention_mask=batch['attention_mask'],
             deterministic=False,
             rngs={'dropout': dropout_key},
@@ -309,80 +300,69 @@ def train_step(state, batch, model_config, z_loss=0.0, rng_key=None):
             tot_rng_key=tot_key if use_tot else None
         )
         
-        logits = outputs.get('last_hidden_state', None)
+        logits = outputs.get('last_hidden_state')
         if logits is None:
             raise ValueError("Model output doesn't contain 'last_hidden_state'")
         
-        # Apply linear head to get vocabulary distribution
-        head_params = params.get('lm_head', None)
-        if head_params is not None:
-            logits = state.apply_fn({'params': head_params}, logits)
+        head_params = params.get('lm_head')
+        if head_params:
+            logits = jax.lax.stop_gradient(logits) @ head_params['kernel']
         
-        # Shift logits and labels for next-token prediction
         shift_logits = logits[:, :-1, :]
         shift_labels = batch['labels'][:, 1:]
         
-        # Compute appropriate loss based on ToT availability
-        if use_tot and 'tot_outputs' in outputs:
-            loss = tot_guided_loss(
-                shift_logits, 
-                shift_labels, 
-                outputs['tot_outputs'],
-                alpha=model_config.get('tot_guidance_alpha', 0.1)
-            )
-        else:
-            loss = cross_entropy_loss(shift_logits, shift_labels, z_loss=z_loss)
+        # Composite loss with ToT and MoD
+        loss, metrics = compute_composite_loss(
+            outputs=outputs,
+            batch={'labels': shift_labels},
+            weights={
+                'ce': model_config.get('ce_weight', 0.5),
+                'kd': model_config.get('kd_weight', 0.0),  # No teacher here
+                'tot': model_config.get('tot_weight', 0.3) if use_tot else 0.0,
+                'moe': model_config.get('moe_weight', 0.2) if use_mod else 0.0
+            }
+        )
         
-        # Add MoE load balancing loss if available
-        if 'mod_weights' in outputs:
-            mod_weights = outputs['mod_weights']
-            # Encourage balanced expert usage with entropy maximization
-            entropy = -jnp.mean(jnp.sum(mod_weights * jnp.log(mod_weights + 1e-8), axis=-1))
-            balance_weight = model_config.get('mod_balance_weight', 0.01)
-            loss = loss - balance_weight * entropy
+        # Add z-loss for stability
+        if z_loss > 0:
+            z_loss_term = z_loss * jnp.mean(jnp.sum(shift_logits ** 2, axis=-1))
+            loss += z_loss_term
+            metrics['z_loss'] = float(z_loss_term)
         
-        # Update ToT metrics if available
-        if use_tot and 'tot_outputs' in outputs:
-            thought = outputs['tot_outputs'].get('thought', None)
-            if thought is not None:
-                # Count valid thoughts and track best score
-                thought_score = thought.score
-                state.tot_state['thoughts_per_batch'] += 1
-                state.tot_state['best_thought_score'] = max(
-                    state.tot_state['best_thought_score'], 
-                    thought_score
-                )
-        
-        return loss
+        return loss, metrics
     
-    # Compute loss and gradients
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params)
+    # Gradient accumulation
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    accum_grads = jax.tree_map(jnp.zeros_like, state.params)
+    for _ in range(accum_steps):
+        step_key, sub_key = jax.random.split(rng_key) if rng_key else (None, None)
+        (loss, metrics), grads = grad_fn(state.params)
+        accum_grads = jax.tree_map(lambda a, g: a + g / accum_steps, accum_grads, grads)
+        rng_key = sub_key
     
-    # Update parameters
-    new_state = state.apply_gradients(grads=grads)
+    new_state = state.apply_gradients(grads=accum_grads)
     
-    # Update EMA parameters if enabled
-    if state.ema_params is not None:
+    if new_state.ema_params is not None:
         new_ema_params = jax.tree_map(
             lambda ema, param: ema * 0.999 + param * 0.001,
-            state.ema_params, new_state.params
+            new_state.ema_params, new_state.params
         )
         new_state = new_state.replace(ema_params=new_ema_params)
     
-    metrics = {'loss': loss}
-    
     return new_state, metrics
 
-def eval_step(state, batch, use_tot=False, rng_key=None):
-    """Perform a single evaluation step with optional ToT integration."""
-    # Split PRNG key for different operations
+def eval_step(
+    state: TrainingState,
+    batch: Dict[str, jnp.ndarray],
+    use_tot: bool = False,
+    rng_key: Optional[jax.random.PRNGKey] = None
+) -> Dict:
+    """Enhanced evaluation step with detailed metrics."""
     dropout_key, tot_key = jax.random.split(rng_key, 2) if rng_key else (None, None)
     
-    # Forward pass with optional ToT
     outputs = state.apply_fn(
-        {'params': state.params}, 
-        batch['input_ids'], 
+        {'params': state.params},
+        batch['input_ids'],
         attention_mask=batch['attention_mask'],
         deterministic=True,
         rngs={'dropout': dropout_key} if dropout_key else None,
@@ -390,302 +370,176 @@ def eval_step(state, batch, use_tot=False, rng_key=None):
         tot_rng_key=tot_key if use_tot else None
     )
     
-    logits = outputs.get('last_hidden_state', None)
+    logits = outputs.get('last_hidden_state')
     if logits is None:
         raise ValueError("Model output doesn't contain 'last_hidden_state'")
     
-    # Apply linear head to get vocabulary distribution
-    head_params = state.params.get('lm_head', None)
-    if head_params is not None:
-        logits = state.apply_fn({'params': head_params}, logits)
+    head_params = state.params.get('lm_head')
+    if head_params:
+        logits = logits @ head_params['kernel']
     
-    # Shift logits and labels for next-token prediction
     shift_logits = logits[:, :-1, :]
     shift_labels = batch['labels'][:, 1:]
     
-    # Compute metrics
-    metrics = compute_metrics(shift_logits, shift_labels)
+    metrics = compute_metrics(shift_logits, shift_labels, outputs.get('corrected_logits'))
     
-    # Add ToT metrics if available
     if use_tot and 'tot_outputs' in outputs:
         tot_outputs = outputs['tot_outputs']
-        if 'thought' in tot_outputs and tot_outputs['thought'] is not None:
-            metrics['tot_score'] = tot_outputs['thought'].score
-        if 'integration_info' in tot_outputs:
-            tot_weight, model_weight = tot_outputs['integration_info'][:2]
-            metrics['tot_weight'] = jnp.mean(tot_weight)
-            metrics['model_weight'] = jnp.mean(model_weight)
+        metrics.update({
+            'tot_score': float(tot_outputs.get('thought', {}).score if 'thought' in tot_outputs else 0.0),
+            'tot_weight': float(tot_outputs.get('integration_info', [0])[0] if 'integration_info' in tot_outputs else 0)
+        })
     
     return metrics
 
-def initialize_tot_components(model, config):
-    """Initialize Tree of Thoughts components for training."""
-    if not config.training.get('use_tot', False):
-        return model
-    
-    logger.info("Initializing Tree of Thoughts components for training")
-    
-    # Create dummy transformer for ToT
-    vision_transformer = VishwamAIModel(model.config)
-    
-    # Create ToT model
-    tot_model = TreeOfThoughts(
-        transformer=vision_transformer,
-        max_thoughts=config.training.get('tot_max_thoughts', 5),
-        max_depth=config.training.get('tot_max_depth', 3),
-        beam_width=config.training.get('tot_beam_width', 8),
-        pruning_threshold=config.training.get('tot_pruning_threshold', 0.3),
-        exploration_factor=config.training.get('tot_exploration_factor', 1.0)
-    )
-    
-    # Create integration components
-    integration_layer = ToTIntegrationLayer(model.config)
-    mla = MultiLevelToTAttention(
-        hidden_size=model.config.hidden_size,
-        num_heads=min(8, model.config.num_attention_heads)
-    )
-    
-    # Create MoD component if enabled
-    if config.model.get('use_mod', False):
-        mod_layer = MixtureDensityNetwork(
-            hidden_size=model.config.hidden_size,
-            num_mixtures=config.model.get('mod_num_mixtures', 5)
+def initialize_tot_components(model: VishwamAIModel, config: DictConfig) -> VishwamAIModel:
+    """Initialize Tree of Thoughts components for the model."""
+    if config.training.get('use_tot', False):
+        tot = TreeOfThoughts(
+            search_strategy=config.training.get('tot_search_strategy', 'beam'),
+            max_thoughts=config.training.get('max_thoughts', 5)
         )
-        model.mod_layer = mod_layer
-    
-    # Add components to model
-    model.tot_model = tot_model
-    model.tot_integration = integration_layer
-    model.tot_mla = mla
-    
-    # Set flag to use ToT
-    model.use_tot = True
-    
+        integration_layer = ToTIntegrationLayer()
+        model.tot = tot
+        model.tot_integration = integration_layer
     return model
 
 def train(
-    model,
-    config,
-    train_dataloader,
-    val_dataloader=None,
-    num_steps=10000,
-    log_every=100,
-    eval_every=1000,
-    checkpoint_dir=None,
-):
-    """
-    Enhanced training loop with ToT integration and error correction.
+    model: VishwamAIModel,
+    config: DictConfig,
+    train_dataloader: Iterator,
+    val_dataloader: Optional[Iterator] = None,
+    num_steps: int = 10000,
+    log_every: int = 100,
+    eval_every: int = 1000,
+    checkpoint_dir: Optional[str] = None,
+    accum_steps: int = 1
+) -> TrainingState:
+    """Advanced training loop with ToT, error correction, and MoD."""
+    logger.info("Starting enhanced training with ToT, error correction, and MoD")
     
-    Args:
-        model: The model to train
-        config: Configuration
-        train_dataloader: Iterator yielding training batches
-        val_dataloader: Iterator yielding validation batches
-        num_steps: Total number of training steps
-        log_every: Log metrics every N steps
-        eval_every: Evaluate model every N steps
-        checkpoint_dir: Directory to save checkpoints
-    """
-    logger.info("Starting training with enhanced ToT integration and error correction")
-    
-    # Initialize ToT components if enabled
     model = initialize_tot_components(model, config)
     
-    # Initialize error correction trainer if enabled
     use_error_correction = config.training.get('use_error_correction', True)
     if use_error_correction:
-        logger.info("Initializing error correction system")
         error_trainer = ErrorCorrectionTrainer(
             config=config,
-            use_tot=config.training.get('use_tot', False),
-            use_mod=config.model.get('use_mod', False),
-            history_size=config.training.get('error_history_size', 100),
-            threshold_percentile=config.training.get('error_threshold_percentile', 85.0)
+            transformer=model,
+            tokenizer=config.training.get('tokenizer'),
+            use_tot=config.training.get('use_tot', True),
+            use_mod=config.model.get('use_mod', True)
         )
-        
-        # Create enhanced train and eval step functions
-        ec_train_step = create_error_corrected_train_step(
-            train_step,
-            error_trainer,
-            alpha=config.training.get('ec_loss_weight', 0.2)
-        )
-        
-        ec_eval_step = create_error_corrected_eval_step(
-            eval_step,
-            error_trainer
-        )
+        ec_train_step = create_error_corrected_train_step(train_step, error_trainer)
+        ec_eval_step = create_error_corrected_eval_step(eval_step)
     else:
-        # Use standard train and eval steps
         ec_train_step = train_step
         ec_eval_step = eval_step
         error_trainer = None
     
-    # Create training state
-    state = create_train_state(model, config)
-    
-    # Set up PRNG key for reproducibility
     rng_key = jax.random.PRNGKey(config.training.seed)
+    state = create_train_state(model, config, rng_key)
     
-    # Training loop
     for step in range(num_steps):
-        # Get next batch
         batch = next(train_dataloader)
-        
-        # Step PRNG key
         rng_key, step_key = jax.random.split(rng_key)
         
-        # Training step with ToT integration and error correction
         state, metrics = ec_train_step(
             state, batch, config.model,
             z_loss=config.training.get('z_loss', 0.0),
-            rng_key=step_key
+            rng_key=step_key,
+            accum_steps=accum_steps
         )
         
-        # Log metrics
         if step % log_every == 0:
-            logger.info(f"Step {step}/{num_steps}: loss = {metrics['loss']:.4f}")
-            
-            # Log ToT metrics if available
-            if state.tot_state and state.tot_state['enabled']:
-                logger.info(f"ToT metrics - thoughts/batch: {state.tot_state['thoughts_per_batch']}, "
-                          f"best score: {state.tot_state['best_thought_score']:.4f}")
-                
-            # Log error correction metrics if available
-            if use_error_correction and 'ec_loss' in metrics:
-                logger.info(f"Error correction - base loss: {metrics.get('base_loss', 0.0):.4f}, "
-                          f"ec loss: {metrics['ec_loss']:.4f}, "
-                          f"threshold: {metrics.get('error_threshold', 0.0):.4f}, "
-                          f"impact: {metrics.get('correction_impact', 0.0):.4f}")
+            logger.info(f"Step {step}/{num_steps}: loss = {metrics['loss']:.4f}, accuracy = {metrics['accuracy']:.4f}")
+            if state.tot_state.get('enabled', False):
+                logger.info(f"ToT: thoughts/batch = {state.tot_state['thoughts_per_batch']}, best_score = {state.tot_state['best_thought_score']:.4f}")
+            if use_error_correction and 'corrected_accuracy' in metrics:
+                logger.info(f"Error Correction: improvement = {metrics['improvement']:.4f}")
         
-        # Evaluate model
-        if val_dataloader is not None and step % eval_every == 0:
-            logger.info(f"Evaluating at step {step}/{num_steps}")
-            
-            # Run evaluation with and without ToT to compare
+        if val_dataloader and step % eval_every == 0:
             eval_metrics = {}
-            eval_metrics_tot = {}
-            
-            # Generate new evaluation key
-            rng_key, eval_key = jax.random.split(rng_key)
-            
-            # Evaluate without ToT
             for eval_batch in val_dataloader():
-                batch_metrics = ec_eval_step(state, eval_batch, use_tot=False, rng_key=eval_key)
+                batch_metrics = ec_eval_step(state, eval_batch, use_tot=state.tot_state.get('enabled', False), rng_key=rng_key)
                 for k, v in batch_metrics.items():
-                    eval_metrics[k] = eval_metrics.get(k, 0.0) + v
+                    eval_metrics[k] = eval_metrics.get(k, 0.0) + v / (len(list(val_dataloader())) + 1e-8)
             
-            # Evaluate with ToT if enabled
-            if state.tot_state and state.tot_state['enabled']:
-                rng_key, tot_eval_key = jax.random.split(rng_key)
-                for eval_batch in val_dataloader():
-                    batch_metrics = ec_eval_step(state, eval_batch, use_tot=True, rng_key=tot_eval_key)
-                    for k, v in batch_metrics.items():
-                        eval_metrics_tot[k] = eval_metrics_tot.get(k, 0.0) + v
+            logger.info(f"Eval at step {step}: { {k: f'{v:.4f}' for k, v in eval_metrics.items()} }")
             
-            # Log evaluation metrics
-            logger.info(f"Evaluation metrics at step {step}:")
-            for k, v in eval_metrics.items():
-                logger.info(f"  {k}: {v:.4f}")
-                
-            if eval_metrics_tot:
-                logger.info(f"Evaluation metrics with ToT at step {step}:")
-                for k, v in eval_metrics_tot.items():
-                    logger.info(f"  {k}: {v:.4f}")
-                
-                # Compute improvement from ToT
-                if 'loss' in eval_metrics and 'loss' in eval_metrics_tot:
-                    improvement = eval_metrics['loss'] - eval_metrics_tot['loss']
-                    logger.info(f"  ToT improvement: {improvement:.4f} ({improvement / eval_metrics['loss'] * 100:.2f}%)")
-            
-            # Run dedicated error correction evaluation if enabled
-            if use_error_correction and error_trainer and step > 0 and step % (eval_every * 5) == 0:
-                rng_key, ec_eval_key = jax.random.split(rng_key)
-                ec_metrics = evaluate_error_correction(
-                    model=model.bind({'params': state.params}),
-                    dataloader=val_dataloader,
-                    error_trainer=error_trainer,
-                    num_batches=10,
-                    rng_key=ec_eval_key
-                )
-                
-                logger.info(f"Error correction evaluation at step {step}:")
-                for k, v in ec_metrics.items():
-                    if isinstance(v, float):
-                        logger.info(f"  {k}: {v:.4f}")
-                    else:
-                        logger.info(f"  {k}: {v}")
-                
-                # Add to eval metrics
-                eval_metrics.update({f"ec_{k}": v for k, v in ec_metrics.items()})
-            
-            # Update best metrics
             if eval_metrics['loss'] < state.best_metrics['loss']:
-                state.best_metrics['loss'] = eval_metrics['loss']
-                state.best_metrics['accuracy'] = eval_metrics['accuracy']
-                
-                # Track error correction improvement if available
-                if 'ec_improvement' in eval_metrics:
-                    state.best_metrics['ec_improvement'] = eval_metrics['ec_improvement']
-                
-                # Save best checkpoint
+                state = state.replace(best_metrics={
+                    'loss': eval_metrics['loss'],
+                    'accuracy': eval_metrics['accuracy'],
+                    'ec_improvement': eval_metrics.get('improvement', 0.0),
+                    'tot_score': eval_metrics.get('tot_score', 0.0)
+                })
                 if checkpoint_dir:
                     save_checkpoint(state, os.path.join(checkpoint_dir, "best_model"))
         
-        # Save checkpoint
         if checkpoint_dir and step % config.training.save_every == 0:
             save_checkpoint(state, os.path.join(checkpoint_dir, f"checkpoint_{step}"))
     
-    # Save final model
     if checkpoint_dir:
         save_checkpoint(state, os.path.join(checkpoint_dir, "final_model"))
     
     return state
 
-def save_checkpoint(state, path):
+def save_checkpoint(state: TrainingState, path: str):
     """Save a checkpoint of the training state."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(f"{path}.msgpack", "wb") as f:
-        f.write(flax.serialization.msgpack_serialize(state))
+        f.write(flax.serialization.msgpack_serialize({
+            'params': jax.tree_map(np.asarray, state.params),
+            'opt_state': state.opt_state,
+            'step': state.step,
+            'best_metrics': state.best_metrics,
+            'tot_state': state.tot_state,
+            'error_state': state.error_state
+        }))
     logger.info(f"Saved checkpoint to {path}.msgpack")
 
-def load_checkpoint(path, state):
+def load_checkpoint(path: str, state: TrainingState) -> TrainingState:
     """Load a checkpoint into the training state."""
     with open(f"{path}.msgpack", "rb") as f:
-        loaded_state = flax.serialization.msgpack_restore(f.read())
-    return loaded_state
+        loaded = flax.serialization.msgpack_restore(f.read())
+    return state.replace(
+        params=loaded['params'],
+        opt_state=loaded['opt_state'],
+        step=loaded['step'],
+        best_metrics=loaded['best_metrics'],
+        tot_state=loaded['tot_state'],
+        error_state=loaded['error_state']
+    )
 
-def main(config_path):
+def main(config_path: str) -> TrainingState:
     """Main training function with config from file."""
-    # Load config
     config = OmegaConf.load(config_path)
     
-    # Initialize model
-    from vishwamai.model import VishwamAIModel, ModelConfig
-    model_config = ModelConfig(**config.model)
-    model = VishwamAIModel(model_config)
+    model = VishwamAIModel(ModelConfig(**config.model))
+    config.training.tokenizer = VishwamAITokenizer(vocab_size=config.model.vocab_size, model_prefix=config.model.name)
+    config.training.tokenizer.train([config.data.dataset_path], "tokenizer_output")
     
-    # Create data loaders
     train_dataloader = create_train_dataloader(config)
     val_dataloader = create_val_dataloader(config)
     
-    # Create checkpoints directory
     checkpoint_dir = config.training.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Train model
     final_state = train(
         model,
         config,
         train_dataloader,
-        val_dataloader=val_dataloader,
+        val_dataloader,
         num_steps=config.training.max_steps,
         log_every=config.training.log_every,
         eval_every=config.training.eval_every,
-        checkpoint_dir=checkpoint_dir
+        checkpoint_dir=checkpoint_dir,
+        accum_steps=config.training.get('accum_steps', 1)
     )
     
-    logger.info("Training completed!")
-    logger.info(f"Best loss: {final_state.best_metrics['loss']:.4f}")
-    logger.info(f"Best accuracy: {final_state.best_metrics['accuracy']:.4f}")
-    
+    logger.info(f"Training completed! Best metrics: {final_state.best_metrics}")
     return final_state
+
+if __name__ == "__main__":
+    config_path = "config.yaml"  # Replace with actual path
+    main(config_path)

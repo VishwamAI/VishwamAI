@@ -7,7 +7,7 @@ import logging
 
 from .tot import TreeOfThoughts
 from .model import MoELayer, ModelConfig, ParallelDense
-from .transformer import FlaxTransformerLayer
+from .transformer import VishwamAIModel
 
 logger = logging.getLogger(__name__)
 

@@ -10,8 +10,22 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import optax
-from vishwamai.tot import TreeOfThoughts
-from vishwamai.tokenizer import VishwamAITokenizer
+
+# Placeholder imports (replace with your actual implementations)
+try:
+    from vishwamai.tot import TreeOfThoughts
+    from vishwamai.tokenizer import VishwamAITokenizer
+except ImportError:
+    # Dummy placeholders if imports fail (for testing)
+    class TreeOfThoughts:
+        def __init__(self, transformer, tokenizer, max_thoughts, max_depth, beam_width):
+            self.transformer = transformer
+            self.tokenizer = tokenizer
+        def __call__(self, features, rng_key, prompt):
+            class Thought: embeddings = features; content = prompt; score = 0.5
+            return Thought()
+    class VishwamAITokenizer:
+        def decode(self, tokens): return "dummy_text"
 
 logger = logging.getLogger(__name__)
 
@@ -197,17 +211,37 @@ class ErrorCorrectionTrainer:
             )
         
         if self.use_mod:
-            self.mod = MixtureDensityNetwork(hidden_size=hidden_size, num_mixtures=3)  # Reduced from 5
+            self.mod = MixtureDensityNetwork(hidden_size=hidden_size, num_mixtures=3)
         
         self.state = create_error_correction_state(history_size)
         self.error_params = None
         
     def init_params(self, rng: jnp.ndarray, sample_input: jnp.ndarray, labels: Optional[jnp.ndarray] = None):
-        params = self.error_module.init(rng, sample_input, labels)
+        """Initialize parameters with correct input shape."""
+        # Split RNG key for different components
+        rng_error, rng_mod = jax.random.split(rng)
+        
+        # Initialize error correction module
+        error_params = self.error_module.init(
+            rngs={'params': rng_error, 'dropout': rng_error},  # Proper Flax RNG structure
+            hidden_states=sample_input,                        # Matches ErrorCorrectionModule.__call__
+            labels=labels,
+            deterministic=False
+        )
+        
+        params = {'error_module': error_params}
+        
+        # Initialize MoD if enabled
         if self.use_mod:
-            mod_params = self.mod.init(rng, sample_input)
-            params = {**params, 'mod': mod_params}
+            mod_params = self.mod.init(
+                rngs={'params': rng_mod, 'dropout': rng_mod},
+                features=sample_input,
+                deterministic=False
+            )
+            params['mod'] = mod_params
+            
         self.error_params = params
+        return params  # Return for debugging or downstream use
     
     def update_error_history(self, error: float) -> None:
         self.state = self.state._replace(
@@ -228,13 +262,15 @@ class ErrorCorrectionTrainer:
     ) -> Dict[str, Any]:
         if rng_key is None:
             rng_key = jax.random.PRNGKey(0)
+            
+        rngs = {'dropout': rng_key} if training else None
         
         error_outputs = self.error_module.apply(
-            {'params': self.error_params['params'] if self.error_params else {}},
+            self.error_params['error_module'] if self.error_params else {},
             hidden_states=features,
             labels=labels,
             deterministic=not training,
-            rngs={'dropout': rng_key} if training else None
+            rngs=rngs
         )
         
         corrected_features = error_outputs['corrected_states']
@@ -243,10 +279,10 @@ class ErrorCorrectionTrainer:
         
         if self.use_mod:
             corrected_features, mod_weights = self.mod.apply(
-                {'params': self.error_params['mod']},
+                self.error_params['mod'] if self.error_params else {},
                 features=corrected_features,
                 deterministic=not training,
-                rngs={'dropout': rng_key} if training else None
+                rngs=rngs
             )
             self.state = self.state._replace(mod_weights=mod_weights)
         
@@ -348,6 +384,83 @@ def create_error_corrected_eval_step(base_eval_step: Callable, error_trainer: 'E
         }
     
     return error_corrected_eval_step
+
+# Placeholder transformer model (replace with your actual model)
+class SimpleTransformer(nn.Module):
+    hidden_size: int = 1024
+    vocab_size: int = 50000
+
+    def setup(self):
+        self.embed = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_size)
+        self.lm_head = nn.Dense(features=self.vocab_size)
+
+    def __call__(self, inputs, deterministic=True):
+        hidden_states = self.embed(inputs)
+        logits = self.lm_head(hidden_states)
+        return {'hidden_states': hidden_states, 'logits': logits}
+
+# Example training function (replace with your actual train logic)
+def train(state, error_trainer, config):
+    """Placeholder training function."""
+    logger.info("Training started (placeholder)...")
+    return state
+
+# Main function with example usage
+def main(config_path=None):
+    """Main training function with error correction."""
+    # Example configuration (adjust based on your config file)
+    config = {
+        'model': {'hidden_size': 1024},
+        'error_correction': {'num_layers': 3, 'threshold': 0.7}
+    }
+    
+    # Initialize RNG and components
+    rng = jax.random.PRNGKey(0)
+    transformer = SimpleTransformer()  # Replace with your actual transformer
+    tokenizer = VishwamAITokenizer()   # Replace with your actual tokenizer
+    
+    # Initialize transformer
+    dummy_input = jnp.ones((1, 128), dtype=jnp.int32)  # Adjust shape to your model's input
+    state = transformer.init(rng, dummy_input)
+    
+    # Initialize error correction trainer
+    error_trainer = ErrorCorrectionTrainer(
+        config=config,
+        transformer=transformer,
+        tokenizer=tokenizer,
+        use_tot=True,
+        use_mod=True,
+        history_size=100,
+        threshold_percentile=85.0
+    )
+    
+    # Get embedded dummy input
+    embedded_dummy_input = transformer.apply(
+        {'params': state['params']},
+        dummy_input,
+        deterministic=True
+    )['hidden_states']
+    
+    # Initialize error correction parameters
+    try:
+        params = error_trainer.init_params(rng, embedded_dummy_input)
+        logger.info("Initialization successful!")
+        logger.info(f"Error correction params initialized: {jax.tree_map(lambda x: x.shape, params)}")
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}")
+        raise
+    
+    # Example training loop (replace with your actual training)
+    final_state = train(state, error_trainer, config)
+    
+    return final_state
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Training failed")
 
 __all__ = [
     'ErrorCorrectionState',

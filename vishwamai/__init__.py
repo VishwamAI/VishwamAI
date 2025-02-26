@@ -1,66 +1,54 @@
-"""VishwamAI package."""
+"""
+VishwamAI initialization module.
+"""
 
-# First import loss functions to prevent circular imports
-from .loss_functions import (
-    cross_entropy_loss,
-    kl_divergence_loss,
-    tot_guided_loss,
-    compute_metrics
-)
+import os
+import sys
+from pathlib import Path
 
-# Core components
+# Add the project root directory to the Python path
+sys.path.append(str(Path(__file__).parent.parent))
+
+# Version info
+__version__ = "0.1.0"
+
+# Import core components
 from .model import VishwamAIModel, ModelConfig
 from .tokenizer import VishwamAITokenizer
-from .transformer import VishwamAIModel, VisionTransformer10B
+from .training import train, create_train_state
 
-# Import error correction components - fixing import location
+# Import error correction components
 from .error_correction import (
+    ErrorCorrectionState,
+    ErrorCorrectionOutput,
+    ErrorMetrics,
     ErrorCorrectionModule,
-    compute_error_metrics
+    MixtureDensityNetwork,
+    ErrorCorrectionTrainer,
+    compute_error_metrics,
+    create_error_correction_state,
+    create_error_corrected_train_step,
+    create_error_corrected_eval_step
 )
 
-
-# Break circular imports by carefully organizing the import order
-from .distillation import VishwamaiGuruKnowledge, VishwamaiShaalaTrainer
-from .tot import TreeOfThoughts, Thought, SearchState
-from .data_utils import create_train_dataloader, create_val_dataloader
-from .integration import ToTIntegrationLayer, MixtureDensityNetwork, MultiLevelToTAttention
-
-# Import training components last to avoid circular imports
-from .training import train, train_step, eval_step
+# Import other components
+from .tot import TreeOfThoughts
 
 __all__ = [
-    # Loss functions
-    "cross_entropy_loss",
-    "kl_divergence_loss",
-    "tot_guided_loss",
-    "compute_metrics",
-    
-    # Core components
     "VishwamAIModel",
     "ModelConfig",
     "VishwamAITokenizer",
-    "VisionTransformer10B",
-    
-    # Error correction components
+    "train",
+    "create_train_state",
+    "ErrorCorrectionState",
+    "ErrorCorrectionOutput",
+    "ErrorMetrics",
     "ErrorCorrectionModule",
+    "MixtureDensityNetwork",
     "ErrorCorrectionTrainer",
     "compute_error_metrics",
-    
-    # Other modules
+    "create_error_correction_state",
+    "create_error_corrected_train_step",
+    "create_error_corrected_eval_step",
     "TreeOfThoughts",
-    "Thought",
-    "SearchState",
-    "create_train_dataloader",
-    "create_val_dataloader",
-    "ToTIntegrationLayer",
-    "MixtureDensityNetwork",
-    "MultiLevelToTAttention",
-    "VishwamaiGuruKnowledge",
-    "VishwamaiShaalaTrainer",
-    "train",
-    "train_step",
-    "eval_step"
 ]
-
-__version__ = "0.1.0"

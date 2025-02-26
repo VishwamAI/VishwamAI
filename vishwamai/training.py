@@ -124,13 +124,33 @@ def create_optimizer(config):
     
     return tx, lr_schedule
 
-def create_train_state(model, config, rng: jax.random.PRNGKey) -> TrainingState:
+def create_train_state(model, config, rng: jax.random.PRNGKey, mesh: Optional[Any] = None) -> TrainingState:
+    """Create training state with optional device mesh support."""
     tx, _ = create_optimizer(config)
+
+    # Default device setup for TPU/GPU
+    if mesh is None:
+        # Try to get default TPU/GPU device
+        try:
+            devices = jax.local_devices()
+            if devices:
+                mesh = devices[0]
+        except:
+            pass
     
     if not hasattr(model, 'params') or model.params is None:
         dummy_input = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
         dummy_attention_mask = jnp.ones((1, config.data.max_seq_length), dtype=jnp.int32)
-        params = model.init(rng, dummy_input, attention_mask=dummy_attention_mask)['params']
+        # Handle both mesh and single device cases
+        device = None
+        if mesh is not None:
+            if hasattr(mesh, 'devices_flat'):
+                device = mesh.devices_flat[0]  # Mesh object case
+            else:
+                device = mesh  # Single device case
+        
+        with jax.default_device(device):
+            params = model.init(rng, dummy_input, attention_mask=dummy_attention_mask)['params']
     else:
         params = model.params
     
@@ -357,7 +377,8 @@ def train(
     log_every: int = 100,
     eval_every: int = 1000,
     checkpoint_dir: Optional[str] = None,
-    accum_steps: int = 1
+    accum_steps: int = 1,
+    mesh: Optional[Any] = None
 ) -> TrainingState:
     logger.info("Starting enhanced training with ToT and error correction")
     
@@ -378,7 +399,7 @@ def train(
         error_trainer = None
     
     rng_key = jax.random.PRNGKey(config.training.seed)
-    state = create_train_state(model, config, rng_key)
+    state = create_train_state(model, config, rng_key, mesh)
     
     if use_error_correction:
         rng_key, init_key = jax.random.split(rng_key)
@@ -449,7 +470,7 @@ def save_checkpoint(state: TrainingState, path: str):
         }))
     logger.info(f"Saved checkpoint to {path}.msgpack")
 
-def main(config_path: str = None) -> TrainingState:
+def main(config_path: str = None, mesh: Optional[Any] = None) -> TrainingState:
     if config_path is None:
         config_path = "vishwamai/configs/training/gsm8k.yaml"
     config = OmegaConf.load(config_path)
@@ -488,7 +509,8 @@ def main(config_path: str = None) -> TrainingState:
         log_every=config.training.log_every,
         eval_every=config.training.eval_every,
         checkpoint_dir=checkpoint_dir,
-        accum_steps=config.training.get('accum_steps', 1)
+        accum_steps=config.training.get('accum_steps', 1),
+        mesh=mesh
     )
     
     logger.info(f"Training completed! Best metrics: {final_state.best_metrics}")
@@ -496,6 +518,20 @@ def main(config_path: str = None) -> TrainingState:
 
 if __name__ == "__main__":
     try:
-        main()
+        # Initialize TPU/GPU device mesh if available
+        devices = None
+        try:
+            from jax.experimental import mesh_utils
+            devices = mesh_utils.create_device_mesh((8,))  # Default TPU setup
+        except:
+            try:
+                devices = jax.local_devices()  # Fallback to available devices
+                if devices:
+                    devices = devices[0]
+            except:
+                pass
+        
+        # Run main with device configuration
+        main(mesh=devices)
     except Exception as e:
         logger.exception("Training failed")

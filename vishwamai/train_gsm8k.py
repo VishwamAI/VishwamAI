@@ -257,8 +257,9 @@ class MultiheadAttention(nn.Module):
     def __call__(self, x, mask=None, deterministic: bool = True):
         batch_size, seq_len, dim = x.shape
         num_heads = self.config.n_heads
-        num_kv_heads = self.config.n_kv_heads
+        num_kv_heads = self.config.n_kv_heads if hasattr(self.config, 'n_kv_heads') else num_heads
         head_dim = dim // num_heads
+        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads for GQA"
         
         token_complexity = jnp.sum(jnp.abs(x), axis=-1, keepdims=True)
         complexity_weights = nn.sigmoid(token_complexity)
@@ -357,7 +358,15 @@ class VishwamAIModel(nn.Module):
             dropout_rate=self.config.hidden_dropout_prob,
             attention_dropout=self.config.attention_dropout_prob,
             n_experts=4,
-            max_seq_len=512
+            expert_dim=4096,
+            expert_capacity_factor=1.25,
+            max_seq_len=self.config.max_position_embeddings,
+            window_size=512,
+            global_tokens=64,
+            max_batch_size=32,
+            use_gqa=self.config.use_gqa,
+            use_flash_attention=self.config.use_flash_attention,
+            use_alibi=self.config.use_alibi
         )) for _ in range(self.config.num_layers)]
         self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
         self.lm_head = ParallelDense(features=self.config.vocab_size, use_bias=False, dtype=jnp.dtype(self.config.dtype))

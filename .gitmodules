@@ -19,3 +19,12 @@
 [submodule "vishwamai/FlashMLA"]
 	path = vishwamai/FlashMLA
 	url = https://github.com/deepseek-ai/FlashMLA.git
+[submodule "vishwamai/deepseekv3"]
+	path = vishwamai/deepseekv3
+	url = https://github.com/deepseek-ai/DeepSeek-V3
+[submodule "vishwamai/grok-1"]
+	path = vishwamai/grok-1
+	url = https://github.com/xai-org/grok-1
+[submodule "vishwamai/gemma"]
+	path = vishwamai/gemma
+	url = https://github.com/google-deepmind/gemma

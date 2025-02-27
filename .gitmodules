@@ -1,3 +1,21 @@
 [submodule "FlashMLA/csrc"]
 	path = vishwamai/FlashMLA/csrc
 	url = https://github.com/deepseek-ai/FlashMLA.git
+[submodule "vishwamai/DualPipe"]
+	path = vishwamai/DualPipe
+	url = https://github.com/deepseek-ai/DualPipe.git
+[submodule "vishwamai/DeepEP"]
+	path = vishwamai/DeepEP
+	url = https://github.com/deepseek-ai/DeepEP.git
+[submodule "vishwamai/EPLB"]
+	path = vishwamai/EPLB
+	url = https://github.com/deepseek-ai/EPLB.git
+[submodule "vishwamai/cutlass"]
+	path = vishwamai/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "vishwamai/DeepGEMM"]
+	path = vishwamai/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+[submodule "vishwamai/FlashMLA"]
+	path = vishwamai/FlashMLA
+	url = https://github.com/deepseek-ai/FlashMLA.git

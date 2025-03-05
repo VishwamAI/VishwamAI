@@ -1,116 +1,36 @@
 # VishwamAI
 
-VishwamAI is a state-of-the-art transformer-based language model implementation featuring advanced architectures like Mixture of Experts (MoE), Tree of Thoughts (ToT), and sophisticated attention mechanisms.
+Efficient pre-training and fine-tuning framework with curriculum learning support for resource-constrained environments.
 
-## Core Features
+## Features
 
-- **Advanced Architecture**:
-  - Mixture of Experts (MoE) with dynamic expert selection
-  - Tree of Thoughts (ToT) reasoning capabilities
-  - Mixture of Depth (MoD) networks
-  - Grouped Query Attention (GQA)
-  - Rotary Position Embeddings (RoPE)
-  - Flash Attention support
+- Curriculum learning for efficient training progression
+- Mixed precision support for both GPU and TPU
+- Memory-efficient training with gradient checkpointing
+- Flexible architecture supporting both TPU and GPU deployments
+- Comprehensive monitoring and metrics tracking
 
-- **Efficient Training**:
-  - Knowledge distillation framework
-  - Multi-level attention mechanisms
-  - Expert capacity management
-  - Load balancing optimization
-  - Gradient checkpointing
+## Training Optimizations
 
-- **Advanced Components**:
-  - Error detection and correction
-  - Sliding window attention
-  - Token-wise complexity weighting
-  - Dynamic expert routing
+### Curriculum Learning
+- Dynamic sequence length progression
+- Automated difficulty adjustment
+- Memory-efficient training strategy
+- Configurable update intervals
 
-## Architecture Details
-
-### Mixture of Experts (MoE)
-- Dynamic expert selection with routing
-- Load balancing optimization
-- Expert capacity management
-- Parallel MLP implementation
-- Adaptive computation paths
-
-### Tree of Thoughts (ToT)
-- Multi-level thought integration
-- Beam search for reasoning paths
-- Thought feature collection
-- Integration with main transformer
-- Attention-based thought selection
-
-### Mixture of Depth (MoD)
-- Dynamic depth adaptation
-- Layer-wise complexity routing
-- Adaptive computation time
-- Efficient forward pass
-- Per-token depth control
-
-### Attention Mechanisms
-- Flash Attention support
-- Grouped Query Attention (GQA)
-- RoPE (Rotary Position Embeddings)
-- ALiBi (Attention with Linear Biases)
-- Sliding window attention with global tokens
-
-## Project Structure
-
-```
-vishwamai/
-├── configs/               # Configuration files
-│   ├── model/            # Model architectures
-│   └── training/         # Training settings
-├── core/
-│   ├── model.py          # Main model implementation
-│   ├── transformer.py    # Transformer architecture
-│   └── attention.py      # Attention mechanisms
-├── training/
-│   ├── distillation.py   # Knowledge distillation
-│   └── error_correction.py # Error correction
-├── reasoning/
-│   └── tot.py           # Tree of Thoughts implementation
-└── utils/
-    ├── convert.py        # Model conversion
-    └── tokenizer.py      # Tokenization utilities
-```
-
-## Configuration
-
-### Model Configuration
-```python
-config = ModelConfig(
-    hidden_size=4096,          # Model dimension
-    num_attention_heads=32,    # Number of attention heads
-    num_key_value_heads=8,     # Number of KV heads for GQA
-    n_experts=8,              # Number of experts
-    expert_dim=4096,          # Expert dimension
-    use_flash_attention=True,  # Enable Flash Attention
-    use_rope=True,            # Enable RoPE
-    use_alibi=False,          # Disable ALiBi
-)
-```
-
-### Expert Configuration
-```python
-moe_config = {
-    "n_experts": 8,
-    "expert_dim": 4096,
-    "expert_pruning_threshold": 0.1,
-    "min_active_experts": 4,
-    "dynamic_expert_selection": True,
-    "expert_capacity_factor": 1.25
-}
-```
+### Hardware-Specific Optimizations
+- **GPU (GTX 1650)**:
+  - Optimized batch sizes for 4GB VRAM
+  - FP16 precision training
+  - Gradient accumulation
+  - Memory-efficient model configuration
+- **TPU**:
+  - BFloat16 precision support
+  - XLA optimization
+  - Efficient data pipeline
+  - Dynamic batch sizing
 
 ## Installation
-
-```bash
-pip install -e .
-```
-
-## Quick Start
 
 1. Clone the repository:
 ```bash
@@ -118,18 +38,118 @@ git clone https://github.com/VishwamAI/VishwamAI.git
 cd VishwamAI
 ```
 
-2. Install dependencies:
+2. Create and activate a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Start with the distillation training notebook:
+4. Install hardware-specific dependencies:
+
+For NVIDIA GPU:
 ```bash
-jupyter notebook notebooks/train_vishwamai_distillation.ipynb
+pip install --upgrade "jax[cuda]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install nvidia-ml-py3
 ```
 
-## Documentation
+For TPU:
+```bash
+pip install --upgrade "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
 
+## Hardware-Specific Setup
+
+### NVIDIA GPU Setup (GTX 1650)
+
+1. Use the optimized GTX 1650 configuration:
+```bash
+python -m vishwamai.pretrain_efficient --config vishwamai/configs/training/gtx1650.yaml
+```
+
+For detailed GPU setup instructions, see [README_GPU.md](README_GPU.md)
+
+### TPU Setup
+
+1. Use the TPU-optimized configuration:
+```bash
+python -m vishwamai.pretrain_efficient --config vishwamai/configs/training/efficient_pretrain.yaml
+```
+
+## Interactive Development
+
+1. Launch Jupyter notebook:
+```bash
+jupyter notebook notebooks/efficient_pretraining.ipynb
+```
+
+## Project Structure
+
+```
+vishwamai/
+├── configs/              # Configuration files
+│   ├── training/        # Training configurations
+│   └── model/          # Model architectures
+├── vishwamai/           # Core implementation
+│   ├── model.py        # Model architecture
+│   ├── training.py     # Training pipeline
+│   └── tokenizer.py    # Tokenization utilities
+├── notebooks/           # Interactive examples
+└── docs/               # Documentation
+```
+
+## Configuration
+
+The system supports different hardware configurations through YAML files:
+
+- `configs/training/gtx1650.yaml`: Optimized for NVIDIA GTX 1650 (4GB VRAM)
+- `configs/training/efficient_pretrain.yaml`: General TPU configuration
+
+Key configuration sections:
+```yaml
+training:
+  curriculum:      # Curriculum learning settings
+  mixed_precision: # Precision optimization
+  batch_size:      # Hardware-specific batch sizes
+  
+model:
+  hidden_size:     # Model architecture parameters
+  num_layers:      # Adjusted for hardware constraints
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+This project is licensed under the MIT License - see [LICENSE](LICENSE) file.
+
+## Citation
+
+If you use VishwamAI in your research, please cite:
+
+```bibtex
+@software{vishwamai2025,
+  title = {VishwamAI: Efficient Pre-training Framework},
+  author = {Kasinadh Sarma},
+  year = {2025},
+  url = {https://github.com/VishwamAI/VishwamAI}
+}
+```
+
+## Support
+
+For support and questions:
+- Open an issue on GitHub
+- Check existing documentation in `/docs`
+- Refer to hardware-specific guides:
+  - [README_GPU.md](README_GPU.md) for GPU setup
+  - [HUGGINGFACE_SETUP.md](HUGGINGFACE_SETUP.md) for HuggingFace integration
 - [Quick Start Guide](QUICKSTART.md)
 - [Technical Documentation](docs/technical.md)
 - [Advanced Training Guide](docs/advanced_training.md)

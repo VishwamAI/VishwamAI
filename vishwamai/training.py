@@ -106,20 +106,38 @@ def create_learning_rate_scheduler(
     return schedule
 
 def create_optimizer(config):
+    """Create optimizer with mixed precision and TPU optimization support."""
     lr_schedule = create_learning_rate_scheduler(
         base_learning_rate=config.training.learning_rate,
         warmup_steps=config.training.warmup_steps,
         decay_steps=config.training.max_steps,
     )
     
+    def loss_scale_fn(step):
+        """Dynamic loss scaling for mixed precision training."""
+        return jnp.where(
+            step < config.training.warmup_steps,
+            1.0,  # Use normal scaling during warmup
+            128.0  # Use higher scaling after warmup
+        )
+    
     tx = optax.chain(
         optax.clip_by_global_norm(config.training.max_grad_norm),
-        optax.adamw(
-            learning_rate=lr_schedule,
+        # Enable mixed precision training
+        optax.scale_by_schedule(loss_scale_fn),
+        # Use Adam optimizer with parameters tuned for TPU
+        optax.scale_by_adam(
             b1=config.training.adam_beta1,
             b2=config.training.adam_beta2,
-            weight_decay=config.training.weight_decay
-        )
+            eps=1e-6,  # Increased epsilon for TPU stability
+            eps_root=1e-6
+        ),
+        # Apply weight decay after Adam
+        optax.add_decayed_weights(config.training.weight_decay),
+        # Scale learning rate
+        optax.scale_by_schedule(lr_schedule),
+        # Final scaling
+        optax.scale(-1.0)
     )
     
     return tx, lr_schedule
@@ -181,25 +199,70 @@ def create_train_state(model, config, rng: jax.random.PRNGKey, mesh: Optional[An
     return state
 
 class DataProcessor:
-    """Enhanced processor for GSM8K dataset."""
+    """Enhanced processor with curriculum learning support."""
     def __init__(self, tokenizer: VishwamAITokenizer, config):
         self.tokenizer = tokenizer
         self.config = config
         self.max_length = config.data.max_seq_length
+        self.curriculum_scheduler = self._create_curriculum_scheduler()
+        
+    def _create_curriculum_scheduler(self):
+        """Create curriculum learning scheduler."""
+        if not hasattr(self.config.training, 'curriculum'):
+            return None
+        
+        curr_config = self.config.training.curriculum
+        curr_type = curr_config.get('type', 'length')
+        
+        if curr_type == 'length':
+            return {
+                'current_max_length': curr_config.get('initial_length', 64),
+                'max_length': self.max_length,
+                'length_increment': curr_config.get('length_increment', 32),
+                'update_every': curr_config.get('update_every', 1000),
+                'steps': 0
+            }
+        return None
+    
+    def update_curriculum(self):
+        """Update curriculum difficulty."""
+        if not self.curriculum_scheduler:
+            return
+        
+        self.curriculum_scheduler['steps'] += 1
+        if self.curriculum_scheduler['steps'] % self.curriculum_scheduler['update_every'] == 0:
+            current_length = self.curriculum_scheduler['current_max_length']
+            max_length = self.curriculum_scheduler['max_length']
+            increment = self.curriculum_scheduler['length_increment']
+            
+            new_length = min(current_length + increment, max_length)
+            self.curriculum_scheduler['current_max_length'] = new_length
+            logger.info(f"Curriculum updated: sequence length = {new_length}")
     
     def tokenize_function(self, examples):
         questions = examples['question']
         answers = examples['answer']
         formatted_texts = [f"Question: {q}\nAnswer: {a}" for q, a in zip(questions, answers)]
+        
+        # Get current max length from curriculum if enabled
+        max_length = (self.curriculum_scheduler['current_max_length'] 
+                     if self.curriculum_scheduler 
+                     else self.max_length)
+        
         tokenized = self.tokenizer(
             formatted_texts,
             padding="max_length",
             truncation=True,
-            max_length=self.max_length,
+            max_length=max_length,
             return_attention_mask=True,
+            return_tensors="np",
         )
+        
+        # Enable mixed precision training by using float16
         tokenized["labels"] = tokenized["input_ids"].copy()
-        tokenized["error_weights"] = np.ones_like(tokenized["input_ids"], dtype=np.float32)
+        tokenized["attention_mask"] = tokenized["attention_mask"].astype(np.float16)
+        tokenized["error_weights"] = np.ones_like(tokenized["input_ids"], dtype=np.float16)
+        
         return tokenized
     
     def prepare_dataset(self, dataset):
@@ -253,6 +316,7 @@ def create_val_dataloader(config, tokenizer):
     
     return data_iterator()
 
+@partial(jax.jit, static_argnums=(3, 4))
 def train_step(
     state: TrainingState,
     batch: Dict[str, jnp.ndarray],
@@ -261,27 +325,35 @@ def train_step(
     rng_key: Optional[jax.random.PRNGKey] = None,
     accum_steps: int = 1
 ) -> Tuple[TrainingState, Dict]:
+    """JAX-jitted training step with mixed precision support."""
     use_tot = state.tot_state.get('enabled', False)
     use_mod = model_config.use_mod
     
     def loss_fn(params):
         step_key, dropout_key, tot_key = jax.random.split(rng_key, 3) if rng_key else (None, None, None)
         
+        # Ensure inputs are in optimal format for TPU
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask'].astype(jnp.float16)  # Mixed precision
+        
         outputs = state.apply_fn(
             {'params': params},
-            batch['input_ids'],
-            attention_mask=batch['attention_mask'],
+            input_ids,
+            attention_mask=attention_mask,
             deterministic=False,
             rngs={'dropout': dropout_key},
             use_tot=use_tot,
-            tot_rng_key=tot_key if use_tot else None
+            tot_rng_key=tot_key if use_tot else None,
+            # Enable mixed precision in model forward pass
+            precision=jax.lax.Precision.DEFAULT
         )
         
         logits = outputs.get('logits')
         if logits is None:
             raise ValueError("Model output doesn't contain 'logits'")
         
-        shift_logits = logits[:, :-1, :]
+        # Cast logits to float32 for loss computation stability
+        shift_logits = logits[:, :-1, :].astype(jnp.float32)
         shift_labels = batch['labels'][:, 1:]
         
         loss, metrics = compute_composite_loss(

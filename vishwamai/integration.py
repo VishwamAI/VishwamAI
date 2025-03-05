@@ -5,7 +5,6 @@ from typing import List, Dict, Tuple, Optional, Callable, Any
 from functools import partial
 import logging
 
-from .tot import TreeOfThoughts
 from .model import MoELayer, ModelConfig, ParallelDense
 from .transformer import VishwamAIModel
 
@@ -195,10 +194,8 @@ class ToTModelIntegrator:
     """
     def __init__(self, 
                 model, 
-                tot_model: TreeOfThoughts,
                 config):
         self.model = model
-        self.tot_model = tot_model
         self.config = config
         self.integration_layer = ToTIntegrationLayer(config)
         self.mla = MultiLevelToTAttention(

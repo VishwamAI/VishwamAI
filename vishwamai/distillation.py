@@ -1,5 +1,5 @@
 """
-Knowledge distillation module for VishwamAI.
+Efficient knowledge distillation module for VishwamAI.
 """
 import jax
 import jax.numpy as jnp
@@ -9,11 +9,9 @@ from flax.training import train_state
 from typing import Dict, List, Tuple, Any, Optional
 import logging
 
-# Import main classes and loss functions
 from .model import VishwamAIModel, ModelConfig
 from .loss_functions import cross_entropy_loss, kl_divergence_loss
-from .error_correction import ErrorCorrectionTrainer  # Assuming from previous response
-from .tot import TreeOfThoughts  # Assuming from previous response
+from .error_correction import ErrorCorrectionTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -136,24 +134,15 @@ class VishwamaiShaalaTrainer:
         self.cfg = cfg
         self.guru = VishwamaiGuruKnowledge(cfg)
         
-        # Error Correction Integration
+        # Initialize error correction and tot
         self.error_trainer = ErrorCorrectionTrainer(
             config=cfg,
             transformer=student_model,
-            tokenizer=cfg.training.get('tokenizer'),  # Assumes tokenizer is provided in config
+            tokenizer=cfg.training.get('tokenizer'),
             use_tot=cfg.training.get('use_tot', True),
-            use_mod=cfg.training.get('use_mod', True)
+            use_mod=False
         )
-        
-        # ToT Integration (if enabled)
-        if cfg.training.get('use_tot', False):
-            self.tot = TreeOfThoughts(
-                transformer=teacher_model,
-                tokenizer=cfg.training.get('tokenizer'),
-                max_thoughts=5,
-                max_depth=3,
-                beam_width=5
-            )
+
     
     def create_train_state(self, rng: jax.random.PRNGKey) -> TrainingState:
         """Create initial training state for student model with advanced features."""

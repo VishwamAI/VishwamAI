@@ -4,8 +4,8 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, List
 import numpy as np
-import safetensors
-from safetensors.torch import save_file, load_file
+import safetensors.flax as stf
+from safetensors.flax import load_file, save_file
 import torch
 import jax.numpy as jnp
 import datetime
@@ -136,6 +136,26 @@ class SafeModelConverter:
             
         return converted
 
+    def _validate_jax_tensor(self, tensor: jnp.ndarray, expected_shape: Optional[tuple] = None) -> bool:
+        """
+        Validate JAX array properties for security.
+
+        Args:
+            tensor (jnp.ndarray): The JAX array to validate.
+            expected_shape (Optional[tuple]): The expected shape of the array.
+
+        Returns:
+            bool: True if the array is valid, False otherwise.
+        """
+        if not isinstance(tensor, jnp.ndarray):
+            return False
+        if expected_shape and tensor.shape != expected_shape:
+            return False
+        # Check for NaN or Inf values
+        if jnp.isnan(tensor).any() or jnp.isinf(tensor).any():
+            return False
+        return True
+
     def validate_checkpoint(self, checkpoint_path: str) -> bool:
         """
         Validate checkpoint integrity and security with enhanced metadata handling.
@@ -166,7 +186,7 @@ class SafeModelConverter:
                     
             # Validate tensor shapes and values
             for name, tensor in tensors.items():
-                if not self._validate_tensor(tensor):
+                if not self._validate_jax_tensor(tensor):
                     raise ValueError(f"Invalid tensor: {name}")
                     
             return True
@@ -198,22 +218,24 @@ class SafeModelConverter:
             raise ValueError(f"Unsupported source format: {source_format}")
 
         # Convert weights with progress bar
-        converted_weights = {}
+        jax_weights = {}
         for key, tensor in tqdm(state_dict.items(), desc="Converting tensors"):
-            # Secure conversion
-            converted = self._secure_conversion(tensor)
-            converted_weights[key] = converted
+            # Secure conversion and transform to JAX
+            tensor = self._secure_conversion(tensor)
+            jax_array = self._convert_to_jax(tensor)
+            jax_weights[key] = jax_array
 
         # Update metadata with JSON-safe values
         self.metadata.update({
             "conversion_date": datetime.datetime.utcnow().isoformat(),
             "source_format": source_format,
-            "model_config": json.dumps(self.config.__dict__)  # Use __dict__ instead of asdict
+            "target_format": "jax",
+            "model_config": json.dumps(self.config.__dict__)
         })
 
-        # Save in SafeTensors format
-        save_file(converted_weights, output_path, metadata=self.metadata)
-        logger.info(f"Successfully saved SafeTensors checkpoint to {output_path}")
+        # Save in SafeTensors format using JAX API
+        save_file(jax_weights, output_path, metadata=self.metadata)
+        logger.info(f"Successfully saved JAX SafeTensors checkpoint to {output_path}")
 
     def merge_sharded_checkpoints(
         self, 
@@ -240,15 +262,19 @@ class SafeModelConverter:
             
             # Update metadata from shards
             metadata.update(shard_metadata)
-            merged_weights.update(shard)
+            
+            # JAX arrays are directly added to merged weights
+            for key, value in shard.items():
+                merged_weights[key] = value
 
         # Add merge-specific metadata
         metadata.update({
             "merge_date": datetime.datetime.utcnow().isoformat(),
-            "num_shards": len(shard_paths)
+            "num_shards": len(shard_paths),
+            "target_format": "jax"
         })
 
-        # Save merged weights
+        # Save merged weights using JAX API
         save_file(merged_weights, output_path, metadata=metadata)
         logger.info(f"Successfully merged {len(shard_paths)} shards to {output_path}")
 

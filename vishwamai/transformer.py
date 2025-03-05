@@ -20,12 +20,9 @@ class VishwamAIModel(nn.Module):
         )
         self.lm_head = nn.Dense(features=self.config.vocab_size, use_bias=False)
 
-    def __call__(self, input_ids, attention_mask=None, deterministic=True, use_tot=False, tot_rng_key=None):
+    def __call__(self, input_ids, attention_mask=None, deterministic=True):
         hidden_states = self.embeddings(input_ids)
         outputs = {'hidden_states': hidden_states, 'logits': self.lm_head(hidden_states)}
-        if use_tot and hasattr(self, 'tot_model') and tot_rng_key is not None:
-            thought = self.tot_model(hidden_states, tot_rng_key)
-            outputs['tot_outputs'] = {'thought': thought}
         return outputs
 
     def init(self, rng, input_ids):
@@ -109,7 +106,7 @@ class VisionTransformer10B(VishwamAIModel):
             name='lm_head'
         )
 
-    def __call__(self, input_ids, attention_mask=None, deterministic=True, use_tot=False, tot_rng_key=None):
+    def __call__(self, input_ids, attention_mask=None, deterministic=True):
         b, s = input_ids.shape
         
         # Get embeddings
@@ -130,11 +127,6 @@ class VisionTransformer10B(VishwamAIModel):
         logits = self.lm_head(hidden_states)
         
         outputs = {'hidden_states': hidden_states, 'logits': logits}
-        
-        # Add ToT outputs if requested
-        if use_tot and hasattr(self, 'tot_model') and tot_rng_key is not None:
-            thought = self.tot_model(hidden_states, tot_rng_key)
-            outputs['tot_outputs'] = {'thought': thought}
             
         return outputs
 

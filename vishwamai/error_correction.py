@@ -1,5 +1,5 @@
 """
-Enhanced error correction module for VishwamAI models with memory optimizations.
+Error correction module for VishwamAI models.
 """
 
 from typing import Optional, Dict, Any, NamedTuple, Tuple, Callable
@@ -11,21 +11,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import optax
 
-# Placeholder imports (replace with your actual implementations)
-try:
-    from vishwamai.tot import TreeOfThoughts
-    from vishwamai.tokenizer import VishwamAITokenizer
-except ImportError:
-    # Dummy placeholders if imports fail (for testing)
-    class TreeOfThoughts:
-        def __init__(self, transformer, tokenizer, max_thoughts, max_depth, beam_width):
-            self.transformer = transformer
-            self.tokenizer = tokenizer
-        def __call__(self, features, rng_key, prompt):
-            class Thought: embeddings = features; content = prompt; score = 0.5
-            return Thought()
-    class VishwamAITokenizer:
-        def decode(self, tokens): return "dummy_text"
+from vishwamai.tokenizer import VishwamAITokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -200,15 +186,6 @@ class ErrorCorrectionTrainer:
             num_correction_layers=config.get('error_correction', {}).get('num_layers', 3),
             correction_threshold=config.get('error_correction', {}).get('threshold', 0.7)
         )
-        
-        if self.use_tot:
-            self.tot = TreeOfThoughts(
-                transformer=transformer,
-                tokenizer=tokenizer,
-                max_thoughts=5,
-                max_depth=3,
-                beam_width=5
-            )
         
         if self.use_mod:
             self.mod = MixtureDensityNetwork(hidden_size=hidden_size, num_mixtures=3)

@@ -323,23 +323,172 @@ class MultiheadAttention(nn.Module):
         
         return output
 
+class FlashMLALayer(nn.Module):
+    """Flash Memory-Level Attention Layer"""
+    config: ModelArgs
+
+    @nn.compact
+    def __call__(self, x, block_size=128):
+        B, S, D = x.shape
+        num_blocks = (S + block_size - 1) // block_size
+        
+        # Reshape input into blocks
+        padded_length = num_blocks * block_size
+        padding = padded_length - S
+        if padding > 0:
+            x = jnp.pad(x, [(0, 0), (0, padding), (0, 0)])
+        
+        # Reshape into blocks
+        blocked_x = x.reshape(B, num_blocks, block_size, D)
+        
+        # Local block attention
+        q = ParallelDense(D)(blocked_x)
+        k = ParallelDense(D)(blocked_x)
+        v = ParallelDense(D)(blocked_x)
+        
+        # Scaled dot-product attention within blocks
+        scale = 1.0 / jnp.sqrt(D)
+        scores = jnp.einsum('bnsd,bnhd->bnsh', q, k) * scale
+        attn = nn.softmax(scores, axis=-1)
+        output = jnp.einsum('bnsh,bnhd->bnsd', attn, v)
+        
+        # Restore original sequence shape
+        output = output.reshape(B, padded_length, D)
+        if padding > 0:
+            output = output[:, :S, :]
+            
+        return output
+
+class DualPipeProcessor(nn.Module):
+    """Dual Pipeline Processing Layer"""
+    config: ModelArgs
+    
+    @nn.compact
+    def __call__(self, x, num_microbatches=4):
+        batch_size = x.shape[0]
+        microbatch_size = batch_size // num_microbatches
+        
+        outputs = []
+        for i in range(num_microbatches):
+            start_idx = i * microbatch_size
+            end_idx = (i + 1) * microbatch_size
+            microbatch = x[start_idx:end_idx]
+            
+            # Pipeline stage 1: Feature extraction
+            features = ParallelDense(self.config.dim)(microbatch)
+            features = nn.gelu(features)
+            
+            # Pipeline stage 2: Transformation
+            transformed = ParallelDense(self.config.dim)(features)
+            outputs.append(transformed)
+            
+        return jnp.concatenate(outputs, axis=0)
+
+class DeepEPModule(nn.Module):
+    """Deep Expert Parallelism Module"""
+    config: ModelArgs
+    
+    @nn.compact
+    def __call__(self, x, deterministic=True):
+        num_experts = self.config.n_experts
+        capacity_factor = self.config.expert_capacity_factor
+        
+        # Expert selection
+        router = ParallelDense(num_experts)(x)
+        routes = nn.softmax(router, axis=-1)
+        
+        # Top-k routing
+        k = 2
+        top_k_routes, top_k_indices = jax.lax.top_k(routes, k=k)
+        top_k_routes = top_k_routes / jnp.sum(top_k_routes, axis=-1, keepdims=True)
+        
+        outputs = []
+        for i in range(num_experts):
+            expert = ParallelMLP(self.config)
+            mask = (top_k_indices == i).any(axis=-1)
+            expert_input = jnp.where(mask[:, :, None], x, 0)
+            expert_output = expert(expert_input, deterministic)
+            outputs.append(expert_output)
+            
+        return sum(outputs)
+
+class EPLBLayer(nn.Module):
+    """Expert Pattern Load Balancing Layer"""
+    config: ModelArgs
+    
+    @nn.compact
+    def __call__(self, x, deterministic=True):
+        # Token mixing for load balancing
+        token_patterns = ParallelDense(self.config.dim)(x)
+        pattern_scores = nn.softmax(token_patterns, axis=-1)
+        
+        # Apply jitter for better load distribution
+        if not deterministic:
+            pattern_scores = pattern_scores + jax.random.normal(
+                self.make_rng('dropout'), 
+                pattern_scores.shape
+            ) * 0.1
+            
+        return x * pattern_scores
+
+class DeepGEMMProcessor(nn.Module):
+    """Deep GEMM Processing Module"""
+    config: ModelArgs
+    
+    @nn.compact
+    def __call__(self, x):
+        # Quantization
+        scale = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+        x_quant = jnp.round(x / scale * 127).astype(jnp.int8)
+        
+        # Block-wise processing
+        block_size = 32
+        B, S, D = x.shape
+        num_blocks = (D + block_size - 1) // block_size
+        
+        outputs = []
+        for i in range(num_blocks):
+            start_idx = i * block_size
+            end_idx = min((i + 1) * block_size, D)
+            block = x_quant[:, :, start_idx:end_idx]
+            
+            # Dequantize and process
+            block_float = (block.astype(jnp.float32) / 127) * scale
+            processed = ParallelDense(block_size)(block_float)
+            outputs.append(processed)
+            
+        return jnp.concatenate(outputs, axis=-1)
+
 class TransformerBlock(nn.Module):
     config: ModelArgs
     
     @nn.compact
     def __call__(self, x, mask=None, deterministic: bool = True):
-        attn_norm = RMSNorm(dtype=x.dtype)(x)
-        attn_output = MultiheadAttention(self.config)(attn_norm, mask, deterministic)
-        x = x + attn_output
+        # Flash MLA processing
+        flash_norm = RMSNorm(dtype=x.dtype)(x)
+        flash_output = FlashMLALayer(self.config)(flash_norm)
+        x = x + flash_output
         
-        ff_norm = RMSNorm(dtype=x.dtype)(x)
-        if self.config.n_experts > 0:
-            ff_output, load_balance_loss = MoELayer(self.config)(ff_norm, deterministic)
-            self.sow('intermediates', 'load_balance_loss', load_balance_loss)
-        else:
-            ff_output = ParallelMLP(self.config)(ff_norm, deterministic)
+        # Dual Pipeline processing
+        dual_norm = RMSNorm(dtype=x.dtype)(x)
+        dual_output = DualPipeProcessor(self.config)(dual_norm)
+        x = x + dual_output
         
-        x = x + ff_output
+        # Deep EP processing
+        deep_ep_norm = RMSNorm(dtype=x.dtype)(x)
+        deep_ep_output = DeepEPModule(self.config)(deep_ep_norm, deterministic)
+        x = x + deep_ep_output
+        
+        # EPLB processing
+        eplb_norm = RMSNorm(dtype=x.dtype)(x)
+        eplb_output = EPLBLayer(self.config)(eplb_norm, deterministic)
+        x = x + eplb_output
+        
+        # DeepGEMM processing
+        gemm_norm = RMSNorm(dtype=x.dtype)(x)
+        gemm_output = DeepGEMMProcessor(self.config)(gemm_norm)
+        x = x + gemm_output
+        
         return x
 
 class VishwamAIModel(nn.Module):
@@ -390,18 +539,15 @@ class VishwamAIModel(nn.Module):
         if attention_mask is None:
             attention_mask = self._create_causal_mask(input_ids.shape[1])
         
-        encoder_outputs = []
         for encoder_layer in self.encoder:
             hidden_states = encoder_layer(hidden_states, attention_mask, deterministic)
-            encoder_outputs.append(hidden_states)
         
         hidden_states = self.final_layer_norm(hidden_states)
         logits = self.lm_head(hidden_states)
         
         return {
             'logits': logits,
-            'hidden_states': hidden_states,
-            'encoder_outputs': encoder_outputs
+            'hidden_states': hidden_states
         }
 
     @classmethod

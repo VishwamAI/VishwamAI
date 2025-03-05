@@ -168,24 +168,21 @@ def generate(
     prompts: List[str],
     config: Optional[GenerationConfig] = None,
     callback: Optional[callable] = None,
-    rng: Optional[jax.random.PRNGKey] = None,
-    use_tot: bool = False,
-    tot_search_strategy: str = "beam"
+    rng: Optional[jax.random.PRNGKey] = None
 ) -> Dict[str, Any]:
-    """Enhanced generation with Tree of Thoughts integration."""
+    """Enhanced text generation with optimized sampling and error correction."""
     if config is None:
         config = GenerationConfig()
     
     if rng is None:
         rng = jax.random.PRNGKey(0)
     
-    # Split RNG keys for model and ToT
-    rng, model_rng, tot_rng = jax.random.split(rng, 3)
+    # Split RNG key for model
+    rng, model_rng = jax.random.split(rng, 2)
     
     # Batch processing
     all_generated = []
     all_metrics = []
-    all_tot_outputs = [] if use_tot else None
     
     for i in range(0, len(prompts), config.batch_size):
         batch_prompts = prompts[i:i + config.batch_size]
@@ -219,23 +216,16 @@ def generate(
         
         # Generate tokens with progress tracking
         generated_tokens = []
-        tot_outputs_batch = [] if use_tot else None
         
         for pos in tqdm(range(max_prompt_len, max_prompt_len + config.max_new_tokens)):
-            # Split PRNG keys
-            model_rng, tot_step_rng, sampling_rng = jax.random.split(model_rng, 3)
+            # Split PRNG key for sampling
+            model_rng, sampling_rng = jax.random.split(model_rng, 2)
             
-            # Get model outputs with ToT integration if enabled
+            # Get model outputs
             outputs = model(
                 tokens[:, :pos], 
-                rngs={'dropout': model_rng},
-                use_tot=use_tot,
-                tot_rng_key=tot_step_rng if use_tot else None
+                rngs={'dropout': model_rng}
             )
-            
-            # Store ToT outputs if enabled
-            if use_tot and 'tot_outputs' in outputs:
-                tot_outputs_batch.append(outputs['tot_outputs'])
                 
             next_token_logits = outputs['logits'][:, -1, :]
             
@@ -286,26 +276,15 @@ def generate(
             output_ids = tokens[j, max_prompt_len:pos].tolist()
             generated_text = tokenizer.decode(output_ids)
             all_generated.append(generated_text)
-            
-        # Add ToT outputs if enabled
-        if use_tot and tot_outputs_batch:
-            all_tot_outputs.extend(tot_outputs_batch)
     
-    # Prepare result dictionary
-    result = {
-        'generated_texts': all_generated,
-    }
-    
+    # Return results with metrics if available
+    result = {'generated_texts': all_generated}
     if all_metrics:
         result['error_metrics'] = all_metrics
-        
-    if all_tot_outputs:
-        result['tot_outputs'] = all_tot_outputs
-        
     return result
 
 def main():
-    """Enhanced main function with ToT support."""
+    """Main function for text generation."""
     import argparse
     
     parser = argparse.ArgumentParser()
@@ -319,8 +298,6 @@ def main():
     parser.add_argument("--dynamic-temperature", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use-tot", action="store_true", help="Enable Tree of Thoughts")
-    parser.add_argument("--tot-strategy", choices=["beam", "dfs"], default="beam", help="ToT search strategy")
     args = parser.parse_args()
 
     try:
@@ -357,19 +334,18 @@ def main():
                     break
                 prompts.append(prompt)
         
-        # Generate text with ToT if enabled
+        # Progress callback
         def progress_callback(current, total):
             logger.info(f"Generation progress: {current}/{total}")
         
+        # Generate text
         results = generate(
             model,
             tokenizer,
             prompts,
             gen_config,
             progress_callback,
-            rng=rng,
-            use_tot=args.use_tot,
-            tot_search_strategy=args.tot_strategy
+            rng=rng
         )
         
         # Save or display results

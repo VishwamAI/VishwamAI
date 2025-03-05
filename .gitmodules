@@ -28,3 +28,6 @@
 [submodule "vishwamai/gemma"]
 	path = vishwamai/gemma
 	url = https://github.com/google-deepmind/gemma
+[submodule "vishwamai/3FS"]
+	path = vishwamai/3FS
+	url = https://github.com/deepseek-ai/3FS

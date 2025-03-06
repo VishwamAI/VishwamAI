@@ -199,8 +199,9 @@ class VishwamaiShaalaTrainer:
         
         # TPU-optimized initialization
         if not hasattr(self.student_model, 'params') or self.student_model.params is None:
-            dummy_input = jnp.ones((1, 16), dtype=jnp.int32)
-            init_rng = jax.random.split(rng, jax.device_count())
+            device_count = jax.device_count()
+            dummy_input = jnp.ones((device_count, 16), dtype=jnp.int32)
+            init_rng = jax.random.split(rng, device_count)
             params = jax.pmap(self.student_model.init)(init_rng, dummy_input)['params']
             self.student_model = self.student_model.bind({'params': params})
         

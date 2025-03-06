@@ -2,12 +2,13 @@
 Error correction module optimized for TPU with advanced batching and sharding.
 """
 
+import numpy as np
+import jax
 from typing import Optional, Dict, Any, NamedTuple, Tuple, Callable
 from dataclasses import dataclass
 from functools import partial
 import logging
 import os
-import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import optax
@@ -301,16 +302,16 @@ class ErrorCorrectionTrainer:
             devices = jax.devices("tpu")
             if devices:
                 device_count = len(devices)
-                device_mesh = np.array(range(device_count)).reshape(-1)
+                device_mesh = jnp.array(range(device_count)).reshape(-1)
                 mesh = jax.sharding.Mesh(device_mesh, ('batch',))
             else:
                 # Fallback to CPU
                 devices = jax.devices("cpu")
-                mesh = jax.sharding.Mesh(np.array([0]), ('batch',))
+                mesh = jax.sharding.Mesh(jnp.array([0]), ('batch',))
         except:
             # Fallback if TPU initialization fails
             logger.warning("TPU initialization failed, falling back to CPU")
-            mesh = jax.sharding.Mesh(np.array([0]), ('batch',))
+            mesh = jax.sharding.Mesh(jnp.array([0]), ('batch',))
         
         self.state = create_error_correction_state(history_size, mesh)
         self.error_params = None

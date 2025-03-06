@@ -13,7 +13,6 @@ import json
 from functools import partial
 import time
 from tqdm import tqdm
-import wandb
 import numpy as np
 
 import jax

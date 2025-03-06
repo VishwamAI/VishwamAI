@@ -1,128 +1,208 @@
-# VishwamAI Knowledge Distillation from Qwen-32B
+# VishwamAI QwQ-32B Distillation Guide
 
-This document describes the optimized knowledge distillation process from Qwen-32B to VishwamAI-7B using JAX/Flax.
+This guide explains how to efficiently distill knowledge from QwQ-32B to VishwamAI using memory-optimized implementation.
 
-## Features
+## System Requirements
 
-- Efficient partial model loading for Qwen-32B
-- TPU-optimized training with bfloat16 precision
-- Intermediate layer feature matching
-- Attention pattern matching with GQA support
-- Dynamic temperature scaling
-- EPLB (Enhanced Progressive Layer Balancing)
-- Aim experiment tracking
-- Automatic layer mapping and alignment
+- TPU v3-8 or higher
+- 128GB RAM minimum
+- 200GB disk space
+- Python 3.9+
 
 ## Setup
 
-1. Install dependencies:
+1. **Install Dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Configure distillation settings in `configs/distillation_config.yaml`:
-```yaml
-distillation:
-  teacher_model:
-    path: "Qwen/Qwen-32B"
-    # Teacher model configuration...
-  student_model:
-    config:
-      # Student model configuration...
-training:
-  # Training parameters...
-distillation_params:
-  # Distillation hyperparameters...
+2. **Environment Setup**
+```bash
+# Set TPU environment variables
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
+export JAX_PLATFORM_NAME="tpu"
+export PYTHONPATH=$PYTHONPATH:/path/to/vishwamai
 ```
 
-## Usage
-
-1. Start training using the provided notebook:
+3. **QwQ Model Setup**
 ```bash
-jupyter notebook train_vishwamai_distillation.ipynb
+# Set model path
+export QWQ_PATH=/path/to/qwq/model
+
+# Verify setup
+python test_qwq_loading.py
 ```
 
-2. Monitor training with Aim:
+## Memory-Optimized Implementation
+
+The implementation uses several strategies to handle QwQ-32B efficiently:
+
+1. **Chunked Loading**
+- Processes model weights in chunks (default 32)
+- Auto-adjusts chunk size based on available memory
+- Caches frequently used chunks
+
+2. **Gradient Accumulation**
+- Per-device batch size of 1
+- Accumulates gradients over 16 steps
+- Effective batch size = 16 * num_devices
+
+3. **Memory Management**
+- Automatic cache clearing
+- Memory monitoring
+- TPU-optimized tensor operations
+
+## Running Distillation
+
+1. **Quick Test**
 ```bash
-aim up
+# Test memory efficiency
+python test_memory_loading.py
+
+# Verify full setup
+python test_distillation_setup.py
+```
+
+2. **Start Training**
+```bash
+# Run full distillation
+./run_distillation.sh
+```
+
+3. **Monitor Progress**
+```bash
+# Start monitoring dashboard
+aim up --host 0.0.0.0 --port 43800
 ```
 
 ## Implementation Details
 
-### Layer Mapping
+### Memory Usage Pattern
 
-We use an optimized layer mapping strategy that aligns Qwen's architecture with the student model:
-- Early layers: Dense mapping for low-level features
-- Middle layers: Progressive mapping
-- Final layers: Attention pattern matching
+For 14 QwQ shards:
+```
+Per Shard (~2.3GB):
+- Load: 2.3GB
+- Process: ~8GB peak
+- Training: ~32GB steady state
+```
 
-### Loss Components
+### Checkpointing
 
-1. Knowledge Distillation Loss:
-   - Soft target matching with dynamic temperature
-   - Feature matching across mapped layers
-   - Attention pattern alignment
+Automatic checkpoints:
+```
+- Every 1000 steps
+- End of each epoch
+- On interruption
+- Keeps last 3 by default
+```
 
-2. Cross-Entropy Loss:
-   - Hard target supervision
-   - Label smoothing for regularization
+### TPU Optimization
 
-3. Feature Matching Loss:
-   - Intermediate layer alignment
-   - Hidden state projection when dimensions differ
+1. **Data Loading**
+```python
+loader = QwenDataLoader(
+    safetensor_dir=QWQ_PATH,
+    batch_size=1,
+    gradient_accumulation_steps=16,
+    chunk_size=32  # Auto-adjusts if needed
+)
+```
 
-4. Attention Matching Loss:
-   - GQA-aware attention pattern matching
-   - Head-wise correspondence
+2. **Training Settings**
+```yaml
+memory_optimization:
+  chunk_size: 32
+  clear_cache_steps: 10
+  prefetch_blocks: 2
+  max_memory_gb: 80
 
-## Memory Optimization
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 16
+```
 
-- Partial model loading (5 shards at a time)
-- Gradient checkpointing
-- TPU sharding strategies
-- bfloat16 precision by default
-
-## TPU Training
-
-The implementation is optimized for TPU training with:
-- Automatic device sharding
-- XLA compilation
-- Efficient tensor operations
-- Multi-host training support
-
-## Monitoring & Checkpointing
-
-Training progress is tracked using Aim:
-- Loss components
-- Feature matching metrics
-- Attention alignment scores
-- Resource utilization
-- Model checkpoints
-- Layer mapping artifacts
-
-## Results
-
-Expected distillation metrics:
-- KL divergence reduction over time
-- Feature alignment improvement
-- Attention pattern convergence
-- Perplexity comparison with teacher
-
-## Recommendations
-
-1. Start with a small number of shards (5) to verify setup
-2. Monitor feature matching losses carefully
-3. Adjust temperature dynamically based on training progress
-4. Use gradient accumulation for larger effective batch sizes
+3. **TPU Configuration**
+```yaml
+tpu_config:
+  use_bfloat16: true
+  use_dynamic_scale: true
+  use_scanned_attention: true
+  memory_fraction: 0.95
+```
 
 ## Troubleshooting
 
-Common issues and solutions:
-- OOM errors: Reduce number of shards or batch size
-- Gradient instability: Adjust learning rate or gradient clipping
-- Feature mismatch: Verify layer mapping configuration
-- TPU compilation errors: Check tensor shapes and types
+### Memory Issues
 
-## License
+1. **Out of Memory**
+```python
+# Reduce chunk size
+loader = QwenDataLoader(..., chunk_size=16)
 
-See LICENSE file for details.
+# Increase gradient accumulation
+config.training.gradient_accumulation_steps = 32
+```
+
+2. **Slow Training**
+```python
+# Check memory usage
+python -c "from vishwamai.tensor_utils import get_memory_usage; print(f'Memory: {get_memory_usage():.2f}GB')"
+
+# Monitor TPU utilization
+python -c "import jax; print(jax.devices())"
+```
+
+3. **Loading Errors**
+```bash
+# Verify shards
+python test_qwq_loading.py --verify-shards
+
+# Check permissions
+ls -l $QWQ_PATH/*.safetensors
+```
+
+### Recovery
+
+If training is interrupted:
+
+1. **Find Last Checkpoint**
+```python
+from vishwamai.qwen_distiller import QwQDistillationTrainer
+
+trainer = QwQDistillationTrainer(...)
+state = trainer.load_checkpoint("checkpoints/step_X")
+```
+
+2. **Resume Training**
+```bash
+# Set resume point
+export RESUME_STEP=X
+./run_distillation.sh --resume
+```
+
+## Monitoring
+
+1. **Memory Usage**
+```python
+from vishwamai.tensor_utils import get_memory_usage
+
+print(f"Current memory: {get_memory_usage():.2f}GB")
+```
+
+2. **Training Metrics**
+- Visit `http://localhost:43800`
+- Monitor:
+  - Memory usage per shard
+  - Loss components
+  - TPU utilization
+  - Gradient norms
+
+## Contact
+
+For issues:
+- Open GitHub issue with:
+  - Error message
+  - Memory usage stats
+  - TPU configuration
+  - Test results from `test_qwq_loading.py`

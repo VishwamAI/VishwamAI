@@ -38,23 +38,31 @@ class TrainingState(train_state.TrainState):
 
 def create_optimizer(config):
     """Create optimizer with learning rate schedule."""
-    lr_schedule = create_learning_rate_scheduler(
-        base_learning_rate=config.training.learning_rate,
-        warmup_steps=config.training.warmup_steps,
-        decay_steps=config.training.max_steps,
-    )
+    # Create learning rate schedule function that takes step as argument
+    def learning_rate_fn(step):
+        warmup_steps = config.training.warmup_steps
+        decay_steps = config.training.max_steps
+        base_learning_rate = config.training.learning_rate
+        
+        # Linear warmup
+        warmup_factor = jnp.minimum(1.0, step / warmup_steps)
+        
+        # Cosine decay
+        decay_factor = 0.5 * (1 + jnp.cos(jnp.pi * jnp.minimum(step, decay_steps) / decay_steps))
+        
+        return base_learning_rate * warmup_factor * decay_factor
     
     tx = optax.chain(
         optax.clip_by_global_norm(config.training.max_grad_norm),
         optax.adamw(
-            learning_rate=lr_schedule,
+            learning_rate=learning_rate_fn,
             b1=config.training.adam_beta1,
             b2=config.training.adam_beta2,
             weight_decay=config.training.weight_decay
         )
     )
     
-    return tx, lr_schedule
+    return tx
 
 @partial(jax.jit, static_argnums=(1, 2, 3))
 def create_learning_rate_scheduler(
@@ -187,7 +195,7 @@ class VishwamaiShaalaTrainer:
     def create_train_state(self, rng: jax.random.PRNGKey) -> TrainingState:
         """Create initial training state with TPU optimizations."""
         # Create optimizer
-        tx, lr_schedule = create_optimizer(self.cfg)
+        tx = create_optimizer(self.cfg)
         
         # TPU-optimized initialization
         if not hasattr(self.student_model, 'params') or self.student_model.params is None:

@@ -295,9 +295,23 @@ class ErrorCorrectionTrainer:
                 use_bfloat16=use_bfloat16
             )
         
-        # Initialize state with TPU device mesh
-        devices = jnp.array(jax.devices()).reshape(-1)
-        mesh = jax.sharding.Mesh(devices, ('batch',))
+        # Fixed TPU initialization
+        try:
+            # Get TPU devices safely
+            devices = jax.devices("tpu")
+            if devices:
+                device_count = len(devices)
+                device_mesh = np.array(range(device_count)).reshape(-1)
+                mesh = jax.sharding.Mesh(device_mesh, ('batch',))
+            else:
+                # Fallback to CPU
+                devices = jax.devices("cpu")
+                mesh = jax.sharding.Mesh(np.array([0]), ('batch',))
+        except:
+            # Fallback if TPU initialization fails
+            logger.warning("TPU initialization failed, falling back to CPU")
+            mesh = jax.sharding.Mesh(np.array([0]), ('batch',))
+        
         self.state = create_error_correction_state(history_size, mesh)
         self.error_params = None
 

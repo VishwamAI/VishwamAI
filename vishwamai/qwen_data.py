@@ -63,14 +63,27 @@ class QwenDataLoader:
         
         # Determine chunk size if not provided
         if chunk_size is None:
-            # Get a sample tensor shape from first shard
-            first_shard = os.path.join(safetensor_dir, self.shard_files[0])
-            with safetensors.safe_open(first_shard, framework="flax") as f:
-                sample_key = next(iter(f.keys()))
-                shape = f.get_tensor_info(sample_key)['shape']
-                self.chunk_size = suggest_chunk_size(shape, self.dtype, target_chunk_gb)
+            try:
+                # Get a sample tensor shape from first shard
+                first_shard = os.path.join(safetensor_dir, self.shard_files[0])
+                with safetensors.safe_open(first_shard, framework="flax") as f:
+                    # Load a small piece to determine shape
+                    sample_key = next(iter(f.keys()))
+                    sample_tensor = f.get_tensor(sample_key)
+                    shape = sample_tensor.shape
+                    del sample_tensor  # Free memory
+                    jax.clear_caches()  # Clear JAX memory
+                    gc.collect()  # Run garbage collection
+                    
+                    self.chunk_size = suggest_chunk_size(shape, self.dtype, target_chunk_gb)
+                    print(f"Auto-determined chunk size: {self.chunk_size}")
+            except Exception as e:
+                print(f"Error determining chunk size: {str(e)}")
+                print("Falling back to default chunk size of 32")
+                self.chunk_size = 32  # Default fallback
         else:
             self.chunk_size = chunk_size
+            print(f"Using provided chunk size: {self.chunk_size}")
         
         print(f"Initialized loader with:"
               f"\n - {self.num_devices} devices"

@@ -112,25 +112,38 @@ def load_tensor_chunks(
     """
     import safetensors
     
-    with safetensors.safe_open(safetensor_file, framework="flax") as f:
-        info = f.get_tensor_info(key)
-        shape = info['shape']
-        
-        chunks = []
-        for start_idx in range(0, shape[0], chunk_size):
-            end_idx = min(start_idx + chunk_size, shape[0])
-            chunk = f.get_slice(key, start_idx, end_idx)
+    try:
+        with safetensors.safe_open(safetensor_file, framework="flax") as f:
+            # Load full tensor first
+            tensor = f.get_tensor(key)
             
-            if dtype is not None:
-                chunk = chunk.astype(dtype)
-            
-            chunks.append(chunk)
-            
+            # Split into chunks manually
+            chunks = []
+            for start_idx in range(0, tensor.shape[0], chunk_size):
+                end_idx = min(start_idx + chunk_size, tensor.shape[0])
+                chunk = tensor[start_idx:end_idx]
+                
+                if dtype is not None:
+                    chunk = chunk.astype(dtype)
+                
+                chunks.append(chunk)
+                
+                if clear_cache:
+                    jax.clear_caches()
+                    gc.collect()
+                    
+            # Free memory
+            del tensor
             if clear_cache:
                 jax.clear_caches()
                 gc.collect()
-    
-    return merge_chunks(chunks, clear_cache=clear_cache)
+            
+            return merge_chunks(chunks, clear_cache=clear_cache)
+            
+    except Exception as e:
+        print(f"Error loading tensor {key} from {safetensor_file}: {str(e)}")
+        print(f"Memory usage at error: {get_memory_usage():.2f}GB")
+        raise
 
 def get_memory_usage() -> float:
     """Get current process memory usage in GB."""

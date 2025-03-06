@@ -12,8 +12,6 @@ training:
     max_batch_size: 64
   use_tpu: true
   tpu_cores: 8
-  use_tot: true
-  tot_search_strategy: "beam"
   use_dualpipe: true
 
 distillation:

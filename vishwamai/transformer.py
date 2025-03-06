@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any, Callable
 import numpy as np
 import logging
 from functools import partial
-from .model import ModelConfig
+from .model import ModelConfig, VishwamAIModel
 
 logger = logging.getLogger(__name__)
 
@@ -14,38 +14,6 @@ def create_causal_attention_mask(seq_length: int) -> jnp.ndarray:
     # Use bfloat16 for TPU efficiency
     mask = jnp.triu(jnp.ones((seq_length, seq_length)), k=1).astype(jnp.bfloat16)
     return -1e9 * mask[None, None, :, :]
-
-class VishwamAIModel(nn.Module):
-    config: ModelConfig
-
-    def setup(self):
-        # Use bfloat16 as default for TPU
-        dtype = getattr(self.config, 'dtype', jnp.bfloat16)
-        self.embeddings = nn.Embed(
-            num_embeddings=self.config.vocab_size,
-            features=self.config.hidden_size,
-            embedding_init=nn.initializers.normal(stddev=0.02),
-            dtype=dtype
-        )
-        self.lm_head = nn.Dense(
-            features=self.config.vocab_size, 
-            use_bias=False,
-            dtype=dtype
-        )
-
-    @nn.compact
-    def __call__(self, input_ids, attention_mask=None, deterministic=True):
-        hidden_states = self.embeddings(input_ids)
-        outputs = {
-            'hidden_states': hidden_states, 
-            'logits': self.lm_head(hidden_states)
-        }
-        return outputs
-
-    def init(self, rng, input_ids):
-        # Initialize with device sharding
-        init_shape = (jax.local_device_count(),) + input_ids.shape[1:]
-        return self.init_weights(rng, init_shape)
 
 class VishwamaiTransformer32B(VishwamAIModel):
     """32B parameter QwQ Transformer model with TPU optimizations."""

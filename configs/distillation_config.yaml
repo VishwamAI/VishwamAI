@@ -1,76 +1,75 @@
-training:
-  learning_rate: 1e-4
-  warmup_steps: 2000
-  max_steps: 100000
-  max_grad_norm: 1.0
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  weight_decay: 0.01
-  dynamic_batch_size:
-    initial_batch_size: 32
-    min_batch_size: 8
-    max_batch_size: 64
-  use_tpu: true
-  tpu_cores: 8
-  use_dualpipe: true
-
 distillation:
   teacher_model:
     path: "Qwen/QwQ-32B"
-    n_shards: 14  # QwQ-32B has 14 shards
     config:
-      hidden_size: 7168
+      hidden_size: 7168      # QwQ architecture
       intermediate_size: 28672
       num_attention_heads: 56
       num_layers: 60
+      num_key_value_heads: 8  # Optimized for QwQ-32B
+      vocab_size: 151936
+      max_position_embeddings: 2048
+      hidden_dropout_prob: 0.1
+      attention_dropout_prob: 0.1
+      initializer_range: 0.02
+      layer_norm_eps: 1e-5
+      use_cache: true
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: 2
+      tie_word_embeddings: true
+      use_flash_attention: true
+      use_rope: true
+      use_alibi: false
+      use_gqa: true
+      dtype: "bfloat16"
+
+  student_model:
+    config:
+      hidden_size: 2048
+      intermediate_size: 8192
+      num_attention_heads: 32
+      num_layers: 24
       num_key_value_heads: 8
       vocab_size: 151936
       max_position_embeddings: 2048
-      layer_norm_eps: 1e-6
-  student_model:
-    hidden_size: 2048
-    intermediate_size: 8192
-    num_attention_heads: 32
-    num_layers: 24
-    num_key_value_heads: 8
-    vocab_size: 151936
-    max_position_embeddings: 2048
-  kd_temperature: 2.0
-  alpha_kd: 0.7
-  alpha_ce: 0.3
-  error_threshold: 0.1
-  eplb_window_size: 100
-  eplb_threshold: 0.8
+      hidden_dropout_prob: 0.1
+      attention_dropout_prob: 0.1
+      initializer_range: 0.02
+      layer_norm_eps: 1e-5
+      use_cache: true
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: 2
+      tie_word_embeddings: true
+      use_flash_attention: true
+      use_rope: true
+      use_alibi: false
+      use_gqa: true
+      dtype: "bfloat16"
 
-model:
-  hidden_size: 2048
-  use_bfloat16: true
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 16
+  learning_rate: 5e-5
+  warmup_steps: 1000
+  max_steps: 50000
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
   use_flash_attention: true
-  use_rope: true
-  use_alibi: false
-  use_gqa: true
-  dtype: "bfloat16"
-  gradient_checkpointing: true
-
-data:
-  train_datasets:
-    - "tatsu-lab/alpaca"
-    - "databricks/dolly-v2-3b"
-    - "bigscience/bloomz"
-  val_split: 0.1
-  max_samples: 1000000  # Adjust as needed
-  preprocessing:
-    max_chars: 2048
-    use_cache: true
-  num_workers: 4
-  use_huggingface: true
-  hf_cache_dir: "~/.cache/huggingface"
-  private_dataset: false
-  output_dataset_name: "VishwamAI/training-data"
-
-error_correction:
-  enabled: true
-  num_layers: 3
-  threshold: 0.7
-  use_mod: true
   use_dualpipe: true
+  use_eplb: true
+
+distillation_params:
+  temperature: 2.0
+  alpha_ce: 0.2
+  alpha_kd: 0.8
+  feature_loss_weight: 0.1
+  attention_loss_weight: 0.1
+  quantization:
+    enabled: true
+    bits: 8
+    scheme: "symmetric"

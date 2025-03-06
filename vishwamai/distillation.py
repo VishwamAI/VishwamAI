@@ -199,11 +199,17 @@ class VishwamaiShaalaTrainer:
         
         # TPU-optimized initialization
         if not hasattr(self.student_model, 'params') or self.student_model.params is None:
+            # Initialize on a single device first
+            dummy_input = jnp.ones((1, 16), dtype=jnp.int32)
+            init_variables = self.student_model.init(rng, dummy_input)
+            params = init_variables['params']
+            
+            # Replicate across devices
             device_count = jax.device_count()
-            dummy_input = jnp.ones((device_count, 16), dtype=jnp.int32)
-            init_rng = jax.random.split(rng, device_count)
-            params = jax.pmap(self.student_model.init)(init_rng, dummy_input)['params']
-            self.student_model = self.student_model.bind({'params': params})
+            params = jax.tree_map(
+                lambda x: jnp.array([x] * device_count),
+                params
+            )
         
         # Initialize error correction parameters with TPU placement
         init_features = jnp.ones((1, 16, self.cfg.model.hidden_size), dtype=jnp.bfloat16)

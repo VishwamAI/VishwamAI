@@ -1,13 +1,16 @@
+"""Text generation optimized for TPU with advanced batching and sampling."""
 import os
 import json
 import logging
 from typing import List, Optional, Dict, Any, NamedTuple
 from dataclasses import dataclass
 from tqdm import tqdm
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer
+from google.cloud import storage
 
 from .model import VishwamAIModel, ModelConfig
 from .tokenizer import VishwamAITokenizer
@@ -18,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GenerationConfig:
-    """Configuration for text generation."""
+    """Configuration for TPU-optimized text generation."""
     max_new_tokens: int = 100
     temperature: float = 0.7
     top_k: int = 50
@@ -34,117 +37,123 @@ class GenerationConfig:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     length_penalty: float = 1.0
+    use_dualpipe: bool = True  # Enable dualpipe-style generation
+    device_batch_size: Optional[int] = None  # Batch size per TPU device
 
 class GenerationState(NamedTuple):
-    """State maintained during generation."""
+    """State maintained during generation, optimized for TPU."""
     tokens: jnp.ndarray
     scores: jnp.ndarray
     temperature: float
     token_counts: Dict[int, int]
+    device_mesh: Optional[Any] = None  # TPU device mesh for sharding
 
+@partial(jax.jit, static_argnums=(1,))
 def adjust_temperature(
     state: GenerationState,
     config: GenerationConfig
 ) -> float:
-    """Dynamically adjust temperature based on generation state."""
+    """TPU-optimized temperature adjustment."""
     if not config.dynamic_temperature:
         return config.temperature
     
-    # Compute token diversity
-    unique_tokens = len(set(state.token_counts.keys()))
-    total_tokens = sum(state.token_counts.values())
-    diversity = unique_tokens / max(total_tokens, 1)
+    # Compute token diversity with TPU optimization
+    unique_tokens = jnp.unique(state.tokens).shape[0]
+    total_tokens = state.tokens.size
+    diversity = unique_tokens / jnp.maximum(total_tokens, 1)
     
-    # Adjust temperature based on diversity
-    if diversity < 0.3:  # Low diversity
-        temperature = min(state.temperature * 1.1, config.max_temperature)
-    elif diversity > 0.7:  # High diversity
-        temperature = max(state.temperature * 0.9, config.min_temperature)
-    else:
-        temperature = state.temperature
-    
-    return temperature
+    # Vectorized temperature adjustment
+    return jnp.clip(
+        jnp.where(
+            diversity < 0.3,
+            state.temperature * 1.1,
+            jnp.where(
+                diversity > 0.7,
+                state.temperature * 0.9,
+                state.temperature
+            )
+        ),
+        config.min_temperature,
+        config.max_temperature
+    )
 
+@partial(jax.jit, static_argnums=(2,))
 def compute_repetition_penalty(
     logits: jnp.ndarray,
     prev_tokens: jnp.ndarray,
     config: GenerationConfig
 ) -> jnp.ndarray:
-    """Apply enhanced repetition, presence, and frequency penalties."""
+    """TPU-optimized token penalty computation."""
     # Get unique previous tokens and their counts
     unique_tokens, counts = jnp.unique(prev_tokens, return_counts=True)
     
     # Initialize penalty matrix
     penalty = jnp.ones_like(logits)
     
-    # Apply repetition penalty
+    # Vectorized penalty application
     if config.repetition_penalty != 1.0:
-        rep_mask = jnp.zeros_like(logits, dtype=bool)
-        rep_mask = rep_mask.at[unique_tokens].set(True)
-        penalty = jnp.where(rep_mask, config.repetition_penalty, penalty)
+        penalty = penalty.at[unique_tokens].multiply(config.repetition_penalty)
     
-    # Apply frequency penalty
     if config.frequency_penalty != 0.0:
         freq_penalty = jnp.zeros_like(logits)
-        freq_penalty = freq_penalty.at[unique_tokens].set(counts * config.frequency_penalty)
+        freq_penalty = freq_penalty.at[unique_tokens].add(counts * config.frequency_penalty)
         logits = logits - freq_penalty
     
-    # Apply presence penalty
     if config.presence_penalty != 0.0:
-        presence_mask = jnp.zeros_like(logits, dtype=bool)
-        presence_mask = presence_mask.at[unique_tokens].set(True)
-        logits = jnp.where(presence_mask, logits - config.presence_penalty, logits)
+        presence_penalty = jnp.zeros_like(logits)
+        presence_penalty = presence_penalty.at[unique_tokens].add(config.presence_penalty)
+        logits = logits - presence_penalty
     
     return jnp.where(logits < 0, logits * penalty, logits / penalty)
 
+@partial(jax.jit, static_argnums=(1, 2, 3))
 def top_k_top_p_filtering(
     logits: jnp.ndarray,
     top_k: int = 0,
     top_p: float = 1.0,
     min_tokens_to_keep: int = 1
 ) -> jnp.ndarray:
-    """Enhanced logits filtering with minimum token guarantee."""
+    """TPU-optimized logits filtering."""
     if top_k > 0:
-        # Keep at least min_tokens_to_keep
-        top_k = max(top_k, min_tokens_to_keep)
-        # Get top k values and create mask
+        top_k = jnp.maximum(top_k, min_tokens_to_keep)
         top_k_values = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))[0]
-        threshold = top_k_values[..., -1, None]
-        logits = jnp.where(logits < threshold, float('-inf'), logits)
+        threshold = jnp.expand_dims(top_k_values[..., -1], axis=-1)
+        logits = jnp.where(logits < threshold, jnp.full_like(logits, float('-inf')), logits)
     
     if top_p < 1.0:
-        sorted_logits = jnp.sort(logits, axis=-1)[:, ::-1]
+        sorted_logits = jnp.sort(logits, axis=-1)[..., ::-1]
         cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
         
-        # Ensure we keep at least min_tokens_to_keep tokens
-        sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
-        sorted_indices = sorted_indices[:, :max(min_tokens_to_keep, (cumulative_probs <= top_p).sum())]
+        # Ensure minimum tokens with TPU optimization
+        sorted_indices = jnp.argsort(logits, axis=-1)[..., ::-1]
+        min_tokens = jnp.maximum(min_tokens_to_keep, (cumulative_probs <= top_p).sum())
+        sorted_indices = sorted_indices[..., :min_tokens]
         
         mask = jnp.zeros_like(logits, dtype=bool)
-        mask = mask.at[jnp.arange(logits.shape[0])[:, None], sorted_indices].set(True)
-        logits = jnp.where(~mask, float('-inf'), logits)
+        batch_indices = jnp.arange(logits.shape[0])[:, None]
+        mask = mask.at[batch_indices, sorted_indices].set(True)
+        logits = jnp.where(~mask, jnp.full_like(logits, float('-inf')), logits)
     
     return logits
 
+@partial(jax.jit, static_argnums=(2,))
 def sample_tokens(
     logits: jnp.ndarray,
     state: GenerationState,
     config: GenerationConfig,
     rng: jax.random.PRNGKey
-) -> jnp.ndarray:
-    """Enhanced token sampling with improved diversity and control."""
-    # Apply penalties
+) -> tuple[jnp.ndarray, jax.random.PRNGKey]:
+    """TPU-optimized token sampling."""
     if state.tokens is not None:
         logits = compute_repetition_penalty(logits, state.tokens, config)
     
-    # Adjust temperature dynamically
     temperature = adjust_temperature(state, config)
+    temperature = jnp.maximum(temperature, 1e-5)
     
-    # Apply temperature scaling
-    if temperature > 0:
-        logits = logits / jnp.maximum(temperature, 1e-5)
+    # Apply temperature scaling with TPU optimization
+    logits = logits / temperature
     
-    # Apply filtering
+    # Filter logits
     filtered_logits = top_k_top_p_filtering(
         logits,
         config.top_k,
@@ -153,7 +162,6 @@ def sample_tokens(
     )
     
     if config.do_sample:
-        # Split PRNG key for sampling
         rng, sampling_rng = jax.random.split(rng)
         probs = jax.nn.softmax(filtered_logits, axis=-1)
         next_tokens = jax.random.categorical(sampling_rng, probs)
@@ -161,6 +169,40 @@ def sample_tokens(
         next_tokens = jnp.argmax(filtered_logits, axis=-1)
     
     return next_tokens, rng
+
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(3,))
+def parallel_generate_step(
+    model_state: Any,
+    tokens: jnp.ndarray,
+    rng: jax.random.PRNGKey,
+    generation_config: GenerationConfig
+) -> tuple[jnp.ndarray, jax.random.PRNGKey]:
+    """TPU-parallel generation step."""
+    outputs = model_state.apply_fn(
+        {'params': model_state.params},
+        tokens,
+        deterministic=True
+    )
+    
+    logits = outputs['logits'][:, -1, :]
+    
+    # Error correction if available
+    if hasattr(model_state, 'error_corrector'):
+        corrected_logits, _ = model_state.error_corrector(
+            logits.reshape(-1, 1, logits.shape[-1])
+        )
+    else:
+        corrected_logits = logits
+    
+    # Sample tokens in parallel
+    next_tokens, new_rng = sample_tokens(
+        corrected_logits,
+        GenerationState(tokens=tokens, scores=None, temperature=generation_config.temperature, token_counts={}),
+        generation_config,
+        rng
+    )
+    
+    return next_tokens, new_rng
 
 def generate(
     model: VishwamAIModel,
@@ -170,32 +212,38 @@ def generate(
     callback: Optional[callable] = None,
     rng: Optional[jax.random.PRNGKey] = None
 ) -> Dict[str, Any]:
-    """Enhanced text generation with optimized sampling and error correction."""
+    """Enhanced text generation with TPU optimizations."""
     if config is None:
         config = GenerationConfig()
     
     if rng is None:
         rng = jax.random.PRNGKey(0)
     
-    # Split RNG key for model
-    rng, model_rng = jax.random.split(rng, 2)
+    # Set device batch size for TPU
+    num_devices = jax.device_count()
+    if config.device_batch_size is None:
+        config.device_batch_size = max(1, config.batch_size // num_devices)
     
-    # Batch processing
+    # Initialize TPU mesh
+    devices = jnp.array(jax.devices()).reshape(-1)
+    mesh = jax.sharding.Mesh(devices, ('batch',))
+    
     all_generated = []
     all_metrics = []
     
+    # Process prompts in TPU-optimized batches
     for i in range(0, len(prompts), config.batch_size):
         batch_prompts = prompts[i:i + config.batch_size]
+        batch_size = len(batch_prompts)
         
-        # Tokenize inputs
+        # Tokenize with padding
         input_ids = tokenizer.encode(batch_prompts)
         if not isinstance(input_ids, list):
             input_ids = [input_ids]
         
-        # Initialize generation tensors
         max_prompt_len = max(len(ids) for ids in input_ids)
-        batch_size = len(batch_prompts)
         
+        # Create padded input tensor
         tokens = jnp.full(
             (batch_size, max_prompt_len + config.max_new_tokens),
             tokenizer.pad_id,
@@ -206,85 +254,113 @@ def generate(
         for j, ids in enumerate(input_ids):
             tokens = tokens.at[j, :len(ids)].set(jnp.array(ids))
         
+        # Reshape for TPU devices
+        if num_devices > 1:
+            pad_size = (num_devices - (batch_size % num_devices)) % num_devices
+            if pad_size > 0:
+                tokens = jnp.pad(tokens, ((0, pad_size), (0, 0)))
+            
+            tokens = tokens.reshape(num_devices, -1, tokens.shape[-1])
+        
         # Initialize generation state
         state = GenerationState(
             tokens=None,
             scores=jnp.zeros((batch_size,)),
             temperature=config.temperature,
-            token_counts={}
+            token_counts={},
+            device_mesh=mesh
         )
         
-        # Generate tokens with progress tracking
-        generated_tokens = []
-        
-        for pos in tqdm(range(max_prompt_len, max_prompt_len + config.max_new_tokens)):
-            # Split PRNG key for sampling
-            model_rng, sampling_rng = jax.random.split(model_rng, 2)
+        # Generate tokens with dualpipe if enabled
+        if config.use_dualpipe:
+            forward_size = batch_size // 2
+            forward_tokens = tokens[:forward_size]
+            backward_tokens = tokens[forward_size:batch_size]
             
-            # Get model outputs
-            outputs = model(
-                tokens[:, :pos], 
-                rngs={'dropout': model_rng}
-            )
+            # Process both streams
+            for pos in tqdm(range(max_prompt_len, max_prompt_len + config.max_new_tokens)):
+                rng, forward_rng, backward_rng = jax.random.split(rng, 3)
                 
-            next_token_logits = outputs['logits'][:, -1, :]
-            
-            # Apply error correction if available
-            if hasattr(model, 'error_corrector'):
-                corrected_logits, error_gates = model.error_corrector(
-                    next_token_logits.reshape(-1, 1, next_token_logits.shape[-1])
+                # Forward pass
+                forward_next, forward_rng = parallel_generate_step(
+                    model, forward_tokens[:, :pos], forward_rng, config
                 )
-            else:
-                corrected_logits = next_token_logits
-            
-            # Update state with current tokens
-            state = state._replace(tokens=tokens[:, :pos])
-            
-            # Sample next tokens
-            next_tokens, sampling_rng = sample_tokens(
-                corrected_logits,
-                state,
-                config,
-                sampling_rng
-            )
-            
-            # Update tokens and state
-            tokens = tokens.at[:, pos].set(next_tokens)
-            generated_tokens.append(next_tokens)
-            
-            # Update token counts for diversity tracking
-            for token in next_tokens:
-                state.token_counts[int(token)] = state.token_counts.get(int(token), 0) + 1
-            
-            # Compute metrics
-            if hasattr(model, 'error_corrector'):
-                metrics = compute_error_metrics(corrected_logits, next_token_logits)
-                all_metrics.append(metrics)
-            
-            # Early stopping check with minimum length consideration
-            min_length_reached = pos - max_prompt_len >= config.max_new_tokens // 2
-            if config.early_stopping and min_length_reached:
-                if all((next_tokens == tokenizer.eos_id).all() for next_tokens in generated_tokens[-5:]):
+                
+                # Backward pass
+                backward_next, backward_rng = parallel_generate_step(
+                    model, backward_tokens[:, :pos], backward_rng, config
+                )
+                
+                # Update tokens
+                forward_tokens = forward_tokens.at[:, pos].set(forward_next)
+                backward_tokens = backward_tokens.at[:, pos].set(backward_next)
+                
+                # Update state and check stopping condition
+                if _check_early_stopping(
+                    tokenizer, forward_next, backward_next, pos - max_prompt_len, config
+                ):
                     break
+                
+                if callback:
+                    callback(pos - max_prompt_len, config.max_new_tokens)
             
-            # Progress callback
-            if callback:
-                callback(pos - max_prompt_len, config.max_new_tokens)
+            # Combine results
+            generated_tokens = jnp.concatenate([forward_tokens, backward_tokens], axis=0)
         
-        # Decode generated tokens
-        for j in range(batch_size):
-            output_ids = tokens[j, max_prompt_len:pos].tolist()
+        else:
+            # Standard generation
+            generated_tokens = tokens
+            for pos in tqdm(range(max_prompt_len, max_prompt_len + config.max_new_tokens)):
+                rng, step_rng = jax.random.split(rng)
+                
+                next_tokens, step_rng = parallel_generate_step(
+                    model, generated_tokens[:, :pos], step_rng, config
+                )
+                
+                generated_tokens = generated_tokens.at[:, pos].set(next_tokens)
+                
+                if callback:
+                    callback(pos - max_prompt_len, config.max_new_tokens)
+        
+        # Process results
+        for j in range(min(batch_size, len(batch_prompts))):
+            output_ids = generated_tokens[j, max_prompt_len:].tolist()
+            # Remove padding and end tokens
+            output_ids = [
+                token for token in output_ids 
+                if token not in {tokenizer.pad_id, tokenizer.eos_id}
+            ]
             generated_text = tokenizer.decode(output_ids)
             all_generated.append(generated_text)
     
-    # Return results with metrics if available
     result = {'generated_texts': all_generated}
     if all_metrics:
         result['error_metrics'] = all_metrics
     return result
 
+def _check_early_stopping(
+    tokenizer: VishwamAITokenizer,
+    forward_tokens: jnp.ndarray,
+    backward_tokens: jnp.ndarray,
+    current_length: int,
+    config: GenerationConfig
+) -> bool:
+    """Check early stopping conditions for dualpipe generation."""
+    if not config.early_stopping:
+        return False
+    
+    min_length_reached = current_length >= config.max_new_tokens // 2
+    if not min_length_reached:
+        return False
+    
+    # Check if both streams have generated EOS tokens
+    forward_done = (forward_tokens == tokenizer.eos_id).any()
+    backward_done = (backward_tokens == tokenizer.eos_id).any()
+    
+    return forward_done and backward_done
+
 def main():
-    """Main function for text generation."""
+    """Main function for TPU-optimized text generation."""
     import argparse
     
     parser = argparse.ArgumentParser()
@@ -294,23 +370,41 @@ def main():
     parser.add_argument("--input-file", type=str)
     parser.add_argument("--output-file", type=str)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--device-batch-size", type=int)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--dynamic-temperature", action="store_true")
+    parser.add_argument("--use-dualpipe", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     try:
+        # Handle GCS paths
+        if args.model_path.startswith('gs://'):
+            client = storage.Client()
+            bucket_name, blob_path = args.model_path.replace('gs://', '').split('/', 1)
+            bucket = client.bucket(bucket_name)
+            local_path = '/tmp/model'
+            os.makedirs(local_path, exist_ok=True)
+            
+            for blob in bucket.list_blobs(prefix=blob_path):
+                if blob.name.endswith(('.safetensors', 'config.json')):
+                    local_file = os.path.join(local_path, os.path.basename(blob.name))
+                    blob.download_to_filename(local_file)
+            args.model_path = local_path
+        
         # Load configurations
         with open(args.config) as f:
             config = ModelConfig(**json.load(f))
         
-        # Create generation config with all parameters
+        # Create TPU-optimized generation config
         gen_config = GenerationConfig(
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             batch_size=args.batch_size,
-            dynamic_temperature=args.dynamic_temperature
+            device_batch_size=args.device_batch_size,
+            dynamic_temperature=args.dynamic_temperature,
+            use_dualpipe=args.use_dualpipe
         )
         
         # Initialize model and tokenizer
@@ -318,8 +412,10 @@ def main():
         model.load_weights(args.model_path)
         tokenizer = VishwamAITokenizer.from_pretrained(args.tokenizer_path)
         
-        # Set random seed
+        # Set TPU-optimized random seed
         rng = jax.random.PRNGKey(args.seed)
+        if jax.device_count() > 1:
+            rng = jax.random.split(rng, jax.device_count())
         
         # Process inputs
         if args.input_file:
@@ -334,11 +430,10 @@ def main():
                     break
                 prompts.append(prompt)
         
-        # Progress callback
         def progress_callback(current, total):
             logger.info(f"Generation progress: {current}/{total}")
         
-        # Generate text
+        # Generate text with TPU optimization
         results = generate(
             model,
             tokenizer,
@@ -350,8 +445,23 @@ def main():
         
         # Save or display results
         if args.output_file:
-            with open(args.output_file, 'w') as f:
-                json.dump(results, f, indent=2)
+            if args.output_file.startswith('gs://'):
+                client = storage.Client()
+                bucket_name, blob_path = args.output_file.replace('gs://', '').split('/', 1)
+                bucket = client.bucket(bucket_name)
+                blob = bucket.blob(blob_path)
+                
+                # Save to temporary file first
+                temp_path = '/tmp/generation_results.json'
+                with open(temp_path, 'w') as f:
+                    json.dump(results, f, indent=2)
+                
+                # Upload to GCS
+                blob.upload_from_filename(temp_path)
+                os.remove(temp_path)
+            else:
+                with open(args.output_file, 'w') as f:
+                    json.dump(results, f, indent=2)
         else:
             for i, (prompt, generated) in enumerate(zip(prompts, results['generated_texts'])):
                 print(f"\nPrompt {i+1}: {prompt}")

@@ -1,5 +1,5 @@
 """
-Efficient knowledge distillation module for VishwamAI.
+Efficient knowledge distillation module for VishwamAI with TPU optimizations.
 """
 import jax
 import jax.numpy as jnp
@@ -8,6 +8,7 @@ import optax
 from flax.training import train_state
 from typing import Dict, List, Tuple, Any, Optional
 import logging
+from functools import partial
 
 from .model import VishwamAIModel, ModelConfig
 from .loss_functions import cross_entropy_loss, kl_divergence_loss
@@ -15,7 +16,20 @@ from .error_correction import ErrorCorrectionTrainer
 
 logger = logging.getLogger(__name__)
 
-# Define TrainingState with enhanced fields
+def _shard_batch(batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    """Shard batch across TPU devices."""
+    return jax.tree_map(
+        lambda x: x.reshape((jax.device_count(), -1) + x.shape[1:]), 
+        batch
+    )
+
+def _unshard_batch(batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    """Un-shard batch from TPU devices."""
+    return jax.tree_map(
+        lambda x: x.reshape((-1,) + x.shape[2:]), 
+        batch
+    )
+
 class TrainingState(train_state.TrainState):
     """Extended train state with EMA, metrics, and ToT state."""
     ema_params: Optional[Dict] = None
@@ -42,32 +56,28 @@ def create_optimizer(config):
     
     return tx, lr_schedule
 
+@partial(jax.jit, static_argnums=(1, 2, 3))
 def create_learning_rate_scheduler(
-    factors="constant * linear_warmup * cosine_decay",
+    step,
     base_learning_rate=0.0001,
     warmup_steps=1000,
     decay_steps=100000,
 ):
-    """Creates a learning rate schedule."""
-    factors = [f.strip() for f in factors.split('*')]
+    """Creates a learning rate schedule with TPU optimization."""
+    rate = base_learning_rate
     
-    def schedule(step):
-        rate = 1.0
-        for factor in factors:
-            if factor == 'constant':
-                rate *= base_learning_rate
-            elif factor == 'linear_warmup':
-                rate *= jnp.minimum(1.0, step / warmup_steps)
-            elif factor == 'cosine_decay':
-                rate *= 0.5 * (1 + jnp.cos(jnp.pi * jnp.minimum(step, decay_steps) / decay_steps))
-            else:
-                raise ValueError(f"Unknown factor: {factor}")
-        return rate
+    # Linear warmup
+    warmup_factor = jnp.minimum(1.0, step / warmup_steps)
+    rate *= warmup_factor
     
-    return schedule
+    # Cosine decay
+    decay_factor = 0.5 * (1 + jnp.cos(jnp.pi * jnp.minimum(step, decay_steps) / decay_steps))
+    rate *= decay_factor
+    
+    return rate
 
 class VishwamaiGuruKnowledge:
-    """Enhanced teacher model knowledge handler for distillation."""
+    """Enhanced teacher model knowledge handler with TPU and EPLB support."""
     
     def __init__(self, config):
         self.config = config
@@ -75,7 +85,20 @@ class VishwamaiGuruKnowledge:
         self.base_alpha_kd = config.distillation.alpha_kd
         self.base_alpha_ce = config.distillation.alpha_ce
         self.error_threshold = config.distillation.get('error_threshold', 0.1)
-    
+        # EPLB-inspired balancing
+        self.eplb_window_size = config.distillation.get('eplb_window_size', 100)
+        self.eplb_threshold = config.distillation.get('eplb_threshold', 0.8)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def compute_expert_weights(self, logits: jnp.ndarray) -> jnp.ndarray:
+        """Compute EPLB-inspired expert weights."""
+        # Compute softmax-based expert weights
+        raw_weights = jax.nn.softmax(jnp.mean(logits, axis=1))
+        # Balance experts using EPLB-like normalization
+        balanced_weights = raw_weights / (jnp.sum(raw_weights) + 1e-6)
+        return balanced_weights
+
+    @partial(jax.jit, static_argnums=(0,))
     def distill(
         self,
         teacher_logits: jnp.ndarray,
@@ -87,31 +110,47 @@ class VishwamaiGuruKnowledge:
         use_error_correction: bool = False,
         corrected_teacher_logits: Optional[jnp.ndarray] = None,
     ) -> Tuple[float, Dict[str, float]]:
-        """Apply advanced knowledge distillation with adaptive scaling."""
-        # Adaptive Temperature
+        """Apply advanced knowledge distillation with EPLB and TPU optimizations."""
+        # Convert to bfloat16 for TPU efficiency
+        teacher_logits = teacher_logits.astype(jnp.bfloat16)
+        student_logits = student_logits.astype(jnp.bfloat16)
+        
+        # Compute expert weights using EPLB-inspired balancing
+        expert_weights = self.compute_expert_weights(student_logits)
+        
+        # Adaptive Temperature with TPU optimization
         if temperature is None:
-            # Increase temperature if error rate is high (more exploration)
             temperature = self.base_temperature
             if error_rate is not None:
                 temperature *= (1 + jnp.tanh(error_rate / self.error_threshold))
 
         # Dynamic Alpha Weighting
         progress = step / self.config.training.max_steps
-        alpha_kd = self.base_alpha_kd * (1 - progress) + 0.1 * progress  # Decrease KD weight over time
-        alpha_ce = self.base_alpha_ce * progress + 0.1 * (1 - progress)  # Increase CE weight over time
+        alpha_kd = self.base_alpha_kd * (1 - progress) + 0.1 * progress
+        alpha_ce = self.base_alpha_ce * progress + 0.1 * (1 - progress)
         
         # Use corrected teacher logits if provided
-        effective_teacher_logits = corrected_teacher_logits if use_error_correction and corrected_teacher_logits is not None else teacher_logits
+        effective_teacher_logits = (
+            corrected_teacher_logits if use_error_correction and corrected_teacher_logits is not None 
+            else teacher_logits
+        )
         
-        # KL Divergence Loss
-        kd_loss = kl_divergence_loss(student_logits, effective_teacher_logits, temperature)
+        # Apply expert balancing to logits
+        balanced_student_logits = student_logits * expert_weights[:, None, None]
+        
+        # KL Divergence Loss with TPU optimization
+        kd_loss = kl_divergence_loss(balanced_student_logits, effective_teacher_logits, temperature)
         
         # Cross-Entropy Loss
-        mask = (labels != 0).astype(jnp.float32)
-        ce_loss = cross_entropy_loss(student_logits, labels)
+        mask = (labels != 0).astype(jnp.bfloat16)  # TPU-optimized dtype
+        ce_loss = cross_entropy_loss(balanced_student_logits, labels)
         
         # Combined Loss
         combined_loss = alpha_kd * kd_loss + alpha_ce * ce_loss
+        
+        # EPLB metrics
+        expert_usage = jnp.mean(expert_weights > self.eplb_threshold)
+        expert_balance = 1.0 - jnp.std(expert_weights)
         
         # Metrics
         metrics = {
@@ -119,13 +158,15 @@ class VishwamaiGuruKnowledge:
             "ce_loss": float(ce_loss),
             "temperature": float(temperature),
             "alpha_kd": float(alpha_kd),
-            "alpha_ce": float(alpha_ce)
+            "alpha_ce": float(alpha_ce),
+            "expert_usage": float(expert_usage),
+            "expert_balance": float(expert_balance)
         }
         
         return combined_loss, metrics
 
 class VishwamaiShaalaTrainer:
-    """Advanced trainer for knowledge distillation with error correction and ToT."""
+    """Advanced trainer with TPU and EPLB optimizations."""
     
     def __init__(self, teacher_model, student_model, cfg):
         """Initialize distillation trainer."""
@@ -143,22 +184,23 @@ class VishwamaiShaalaTrainer:
             use_mod=False
         )
 
-    
     def create_train_state(self, rng: jax.random.PRNGKey) -> TrainingState:
-        """Create initial training state for student model with advanced features."""
+        """Create initial training state with TPU optimizations."""
         # Create optimizer
         tx, lr_schedule = create_optimizer(self.cfg)
         
-        # Initialize student model parameters if not present
+        # TPU-optimized initialization
         if not hasattr(self.student_model, 'params') or self.student_model.params is None:
             dummy_input = jnp.ones((1, 16), dtype=jnp.int32)
-            params = self.student_model.init(rng, dummy_input)['params']
+            init_rng = jax.random.split(rng, jax.device_count())
+            params = jax.pmap(self.student_model.init)(init_rng, dummy_input)['params']
             self.student_model = self.student_model.bind({'params': params})
         
-        # Initialize error correction parameters
-        self.error_trainer.init_params(rng, jnp.ones((1, 16, self.cfg.model.hidden_size)))
+        # Initialize error correction parameters with TPU placement
+        init_features = jnp.ones((1, 16, self.cfg.model.hidden_size), dtype=jnp.bfloat16)
+        self.error_trainer.init_params(rng, init_features)
         
-        # Create TrainingState
+        # Create TrainingState replicated across devices
         state = TrainingState.create(
             apply_fn=self.student_model.__call__,
             params=self.student_model.params,
@@ -179,26 +221,32 @@ class VishwamaiShaalaTrainer:
             }
         )
         
-        return state
+        return jax.device_put_replicated(state, jax.local_devices())
 
-    def train_step(self, state: TrainingState, batch: Dict[str, jnp.ndarray], rng: jax.random.PRNGKey) -> Tuple[Dict, TrainingState]:
-        """Advanced training step with distillation and error correction."""
+    @partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(0,))
+    def _pmapped_train_step(self, state: TrainingState, batch: Dict[str, jnp.ndarray], rng: jax.random.PRNGKey):
+        """TPU-optimized training step implementation."""
         rng, dropout_rng, tot_rng = jax.random.split(rng, 3)
         
         def loss_fn(params):
-            # Student forward pass
-            student_outputs = state.apply_fn({'params': params}, batch['input_ids'], rngs={'dropout': dropout_rng})
-            student_logits = student_outputs['logits']
+            # Student forward pass with bfloat16
+            student_outputs = state.apply_fn(
+                {'params': params}, 
+                batch['input_ids'].astype(jnp.int32),
+                rngs={'dropout': dropout_rng}
+            )
+            student_logits = student_outputs['logits'].astype(jnp.bfloat16)
             
             # Teacher forward pass (frozen)
-            with jax.lax.stop_gradient():
-                teacher_outputs = self.teacher_model(batch['input_ids'], deterministic=True)
-                teacher_logits = teacher_outputs['logits']
+            teacher_outputs = jax.lax.stop_gradient(
+                self.teacher_model(batch['input_ids'], deterministic=True)
+            )
+            teacher_logits = teacher_outputs['logits'].astype(jnp.bfloat16)
             
-            # Error Correction
+            # Error Correction with TPU optimization
             correction_outputs = self.error_trainer.apply_error_correction(
                 logits=student_logits,
-                features=student_outputs['hidden_states'],
+                features=student_outputs['hidden_states'].astype(jnp.bfloat16),
                 labels=batch.get('labels'),
                 training=True,
                 rng_key=dropout_rng
@@ -208,15 +256,15 @@ class VishwamaiShaalaTrainer:
             # ToT Enhancement (if enabled)
             tot_outputs = None
             if state.tot_state['enabled'] and jnp.mean(correction_outputs['error_probs']) > self.error_trainer.state.error_threshold:
-                initial_prompt = self.cfg.training.get('tokenizer').decode(batch['input_ids'][0].tolist())
-                tot_thought = self.tot(teacher_outputs['hidden_states'], tot_rng, prompt=initial_prompt)
-                if tot_thought:
-                    tot_outputs = {'thought': tot_thought.content, 'score': tot_thought.score}
-                    # Blend ToT embeddings with corrected logits
-                    tot_embedding = tot_thought.embeddings[None, :]
-                    corrected_student_logits = 0.7 * corrected_student_logits + 0.3 * self.student_model.params['lm_head']['kernel'] @ tot_embedding.T
+                tot_outputs = self._handle_tot(teacher_outputs, tot_rng, batch)
+                if tot_outputs is not None:
+                    corrected_student_logits = self._blend_tot_outputs(
+                        corrected_student_logits, 
+                        tot_outputs, 
+                        params
+                    )
             
-            # Distillation Loss
+            # Distillation Loss with EPLB
             distill_loss, distill_metrics = self.guru.distill(
                 teacher_logits=teacher_logits,
                 student_logits=corrected_student_logits,
@@ -237,51 +285,57 @@ class VishwamaiShaalaTrainer:
                 }
             }
         
-        # Compute gradients and update state
+        # Compute gradients with TPU optimization
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        
+        # All-reduce gradients across devices
+        grads = jax.lax.pmean(grads, axis_name='batch')
         state = state.apply_gradients(grads=grads)
         
-        # Update metrics in state
-        metrics = aux['metrics']
-        if loss < state.best_metrics['loss']:
-            state = state._replace(best_metrics={
-                'loss': float(loss),
-                'accuracy': metrics.get('accuracy', state.best_metrics['accuracy']),
-                'kd_loss': metrics['kd_loss'],
-                'ce_loss': metrics['ce_loss']
-            })
-        
-        # Update ToT state
-        if state.tot_state['enabled'] and aux['metrics']['tot_triggered'] > state.tot_state['thoughts_per_batch']:
-            state = state._replace(tot_state={
-                **state.tot_state,
-                'thoughts_per_batch': int(aux['metrics']['tot_triggered']),
-                'best_thought_score': aux.get('tot_outputs', {}).get('score', state.tot_state['best_thought_score'])
-            })
+        # Update metrics and ToT state
+        state = self._update_training_state(state, loss, aux)
         
         return {'loss': loss, **aux}, state
 
-    def eval_step(self, state: TrainingState, batch: Dict[str, jnp.ndarray]) -> Dict:
-        """Evaluation step with distillation and error correction."""
-        # Student forward pass
-        student_outputs = state.apply_fn({'params': state.params}, batch['input_ids'], deterministic=True)
-        student_logits = student_outputs['logits']
+    def train_step(self, state: TrainingState, batch: Dict[str, jnp.ndarray], rng: jax.random.PRNGKey) -> Tuple[Dict, TrainingState]:
+        """TPU-distributed training step."""
+        # Shard batch across devices
+        sharded_batch = _shard_batch(batch)
+        sharded_rng = jax.random.split(rng, jax.device_count())
         
-        # Teacher forward pass
-        with jax.lax.stop_gradient():
-            teacher_outputs = self.teacher_model(batch['input_ids'], deterministic=True)
-            teacher_logits = teacher_outputs['logits']
+        # Run training step on all devices
+        outputs, new_state = self._pmapped_train_step(state, sharded_batch, sharded_rng)
+        
+        # Combine results from all devices
+        outputs = jax.device_get(outputs)
+        return outputs, new_state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def eval_step(self, state: TrainingState, batch: Dict[str, jnp.ndarray]) -> Dict:
+        """TPU-optimized evaluation step."""
+        # Forward passes with bfloat16
+        student_outputs = state.apply_fn(
+            {'params': state.params}, 
+            batch['input_ids'], 
+            deterministic=True
+        )
+        student_logits = student_outputs['logits'].astype(jnp.bfloat16)
+        
+        teacher_outputs = jax.lax.stop_gradient(
+            self.teacher_model(batch['input_ids'], deterministic=True)
+        )
+        teacher_logits = teacher_outputs['logits'].astype(jnp.bfloat16)
         
         # Error Correction
         correction_outputs = self.error_trainer.apply_error_correction(
             logits=student_logits,
-            features=student_outputs['hidden_states'],
+            features=student_outputs['hidden_states'].astype(jnp.bfloat16),
             labels=batch.get('labels'),
             training=False
         )
         corrected_student_logits = correction_outputs['corrected_logits']
         
-        # Distillation Loss
+        # Distillation Loss with EPLB
         distill_loss, distill_metrics = self.guru.distill(
             teacher_logits=teacher_logits,
             student_logits=corrected_student_logits,
@@ -292,11 +346,10 @@ class VishwamaiShaalaTrainer:
             corrected_teacher_logits=teacher_outputs.get('corrected_logits', teacher_logits)
         )
         
-        # Metrics
+        # Metrics with expert balancing info
         metrics = {
             **distill_metrics,
-            'error_correction_rate': jnp.mean(correction_outputs['correction_mask'].astype(float)),
-            'tot_triggered': float(self.error_trainer.state.tot_triggered)
+            'error_correction_rate': jnp.mean(correction_outputs['correction_mask'].astype(float))
         }
         
         return {
@@ -311,7 +364,7 @@ if __name__ == "__main__":
     from omegaconf import OmegaConf
     from vishwamai.tokenizer import VishwamAITokenizer
     
-    # Dummy config
+    # Dummy config with TPU settings
     cfg = OmegaConf.create({
         'training': {
             'learning_rate': 1e-4,
@@ -322,24 +375,34 @@ if __name__ == "__main__":
             'adam_beta2': 0.999,
             'weight_decay': 0.01,
             'use_tot': True,
-            'tot_search_strategy': 'beam'
+            'tot_search_strategy': 'beam',
+            'use_tpu': True,
+            'tpu_cores': 8
         },
         'distillation': {
             'kd_temperature': 2.0,
             'alpha_kd': 0.7,
             'alpha_ce': 0.3,
-            'error_threshold': 0.1
+            'error_threshold': 0.1,
+            'eplb_window_size': 100,
+            'eplb_threshold': 0.8
         },
         'model': {
-            'hidden_size': 512
+            'hidden_size': 512,
+            'use_bfloat16': True
         }
     })
     
     # Initialize models
     teacher_config = ModelConfig(hidden_size=512, num_layers=6, num_attention_heads=8, vocab_size=32000)
     student_config = ModelConfig(hidden_size=256, num_layers=4, num_attention_heads=4, vocab_size=32000)
-    teacher_model = VishwamAIModel(teacher_config)
-    student_model = VishwamAIModel(student_config)
+    
+    # Place models on TPU
+    devices = jax.devices("tpu")
+    with jax.default_device(devices[0]):
+        teacher_model = VishwamAIModel(teacher_config)
+        student_model = VishwamAIModel(student_config)
+    
     tokenizer = VishwamAITokenizer(vocab_size=32000)
     tokenizer.train(["dataset.txt"], "tokenizer_output")
     cfg.training.tokenizer = tokenizer
@@ -351,8 +414,8 @@ if __name__ == "__main__":
     
     # Dummy batch
     batch = {
-        'input_ids': jnp.ones((2, 16), dtype=jnp.int32),
-        'labels': jnp.ones((2, 16), dtype=jnp.int32)
+        'input_ids': jnp.ones((16, 16), dtype=jnp.int32),  # Larger batch for TPU
+        'labels': jnp.ones((16, 16), dtype=jnp.int32)
     }
     
     # Test training step

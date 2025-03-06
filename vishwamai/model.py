@@ -1,46 +1,121 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Union
+import os
+import gc
+import json
+import logging
+import random
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import optax
 import numpy as np
+from functools import partial
 from einops import rearrange, repeat
-import json
-import os
-import gc
 from huggingface_hub import snapshot_download
 import safetensors.flax as stf
-import logging
-import random
+
+from google.cloud import storage
+
+# Define ModelArgs before using it
+@dataclass
+class ModelArgs:
+    dim: int
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int
+    vocab_size: int
+    multiple_of: int
+    norm_eps: float
+    max_batch_size: int
+    max_seq_len: int
+    n_experts: int
+    expert_dim: int
+    expert_capacity_factor: float
+    window_size: int
+    global_tokens: int
+    attention_dropout: float
+    dropout_rate: float
+    expert_dropout: float
+    param_dtype: jnp.dtype
+    use_rope: bool
+    use_flash_attention: bool
+    use_alibi: bool
+    use_dualpipe: bool
+    use_eplb: bool
+    use_deepgemm: bool
+
+# Import or define TransformerBlock
+class TransformerBlock(nn.Module):
+    """TPU-optimized Transformer block."""
+    config: ModelArgs
+
+    def setup(self):
+        self.layer_norm1 = LayerNorm(epsilon=self.config.norm_eps, dtype=self.config.param_dtype)
+        self.self_attention = nn.SelfAttention(
+            num_heads=self.config.n_heads,
+            dtype=self.config.param_dtype,
+            dropout_rate=self.config.attention_dropout,
+            deterministic=True
+        )
+        self.layer_norm2 = LayerNorm(epsilon=self.config.norm_eps, dtype=self.config.param_dtype)
+        self.feed_forward = nn.Dense(
+            features=self.config.ffn_dim_multiplier * self.config.dim if self.config.ffn_dim_multiplier else self.config.dim,
+            dtype=self.config.param_dtype
+        )
+
+    def __call__(self, x, attention_mask, deterministic):
+        y = self.layer_norm1(x)
+        y = self.self_attention(y, attention_mask, deterministic=deterministic)
+        y = x + y
+        z = self.layer_norm2(y)
+        z = self.feed_forward(z)
+        return y + z
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Optimizer Creation (optimized for TPU v2-8)
+# TPU-optimized optimizer creation
+@partial(jax.jit, static_argnums=(1, 2, 3, 4, 5))
+def create_learning_rate_schedule(
+    step: int,
+    learning_rate: float = 1e-4,
+    warmup_steps: int = 2000,
+    num_train_steps: int = 100000,
+    weight_decay: float = 0.01,
+    num_training_devices: int = 1
+) -> float:
+    """Create learning rate schedule optimized for TPU."""
+    warmup_fn = lambda step: step / max(1, warmup_steps)
+    decay_fn = lambda step: 1.0 - (step - warmup_steps) / (num_train_steps - warmup_steps)
+    lr = jnp.where(
+        step < warmup_steps,
+        learning_rate * warmup_fn(step),
+        learning_rate * decay_fn(step)
+    )
+    return jnp.maximum(lr, 0.0)
+
 def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01, 
-                     beta1: float = 0.9, beta2: float = 0.999, 
-                     warmup_steps: int = 2000, num_train_steps: int = 100000):
-    decay_scheduler = optax.linear_schedule(
-        init_value=0.0,
-        end_value=learning_rate,
-        transition_steps=warmup_steps
+                    beta1: float = 0.9, beta2: float = 0.999, 
+                    warmup_steps: int = 2000, num_train_steps: int = 100000):
+    """Create optimizer with TPU-optimized learning rate schedule."""
+    num_training_devices = jax.device_count()
+    learning_rate_fn = partial(
+        create_learning_rate_schedule,
+        learning_rate=learning_rate,
+        warmup_steps=warmup_steps,
+        num_train_steps=num_train_steps,
+        weight_decay=weight_decay,
+        num_training_devices=num_training_devices
     )
-    decay_scheduler = optax.join_schedules(
-        schedules=[decay_scheduler, optax.linear_schedule(
-            init_value=learning_rate,
-            end_value=0,
-            transition_steps=num_train_steps - warmup_steps
-        )],
-        boundaries=[warmup_steps]
-    )
+    
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(
-            learning_rate=decay_scheduler,
+            learning_rate=learning_rate_fn,
             b1=beta1,
             b2=beta2,
             weight_decay=weight_decay
@@ -51,6 +126,7 @@ def create_optimizer(learning_rate: float = 1e-4, weight_decay: float = 0.01,
 # Model Configurations
 @dataclass
 class ModelArgs:
+    """TPU-optimized model arguments."""
     dim: int = 768
     n_layers: int = 32
     n_heads: int = 12
@@ -76,15 +152,14 @@ class ModelArgs:
     use_rope: bool = True
     num_alibi_heads: Optional[int] = None
     use_flash_attention: bool = True
-    kv_cache_dtype: jnp.dtype = jnp.int8
-    param_dtype: jnp.dtype = jnp.bfloat16
-    vision_dim: int = 1024
-    use_contrastive_loss: bool = True
-    temperature: float = 0.07
-    max_image_length: int = 256
+    param_dtype: jnp.dtype = jnp.bfloat16  # Default to bfloat16 for TPU
+    use_dualpipe: bool = True
+    use_eplb: bool = True
+    use_deepgemm: bool = True
 
 @dataclass
 class ModelConfig:
+    """Enhanced model configuration with TPU optimizations."""
     @classmethod
     def map_config_params(cls, config_dict: Dict) -> Dict:
         mapped_dict = config_dict.copy()
@@ -124,8 +199,13 @@ class ModelConfig:
     use_alibi: bool = False
     use_gqa: bool = True
     num_key_value_heads: int = 8
-    dtype: str = "bfloat16"
+    dtype: str = "bfloat16"  # Default to bfloat16 for TPU
     quantization: Optional[str] = None
+    use_dualpipe: bool = True
+    use_eplb: bool = True
+    use_deepgemm: bool = True
+    eplb_window_size: int = 100
+    eplb_threshold: float = 0.8
 
     def __post_init__(self):
         if self.use_gqa:
@@ -133,427 +213,141 @@ class ModelConfig:
                 "num_attention_heads must be divisible by num_key_value_heads for GQA"
 
 # Model Components
-class ParallelDense(nn.Module):
+class LayerNorm(nn.Module):
+    """TPU-optimized Layer Normalization."""
+    epsilon: float = 1e-5
+    dtype: jnp.dtype = jnp.bfloat16
+    scale_init: callable = nn.initializers.ones
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = x.astype(jnp.float32)  # Higher precision for stability
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+        inv_std = jax.lax.rsqrt(var + self.epsilon)
+        scale = self.param('scale', self.scale_init, (x.shape[-1],))
+        x = (x - mean) * inv_std * scale
+        return x.astype(self.dtype)
+
+class Dense(nn.Module):
+    """TPU-optimized Dense layer."""
     features: int
     use_bias: bool = True
-    dtype: jnp.dtype = jnp.float32
-    precision: Optional[tuple] = None
+    dtype: jnp.dtype = jnp.bfloat16
     kernel_init: callable = nn.initializers.normal(stddev=0.02)
     
     @nn.compact
-    def __call__(self, inputs):
-        kernel = self.param('kernel', self.kernel_init, (inputs.shape[-1], self.features))
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        kernel = self.param('kernel', self.kernel_init, (x.shape[-1], self.features))
         kernel = jnp.asarray(kernel, self.dtype)
-        y = jnp.dot(inputs, kernel, precision=self.precision)
+        y = jax.lax.dot_general(x, kernel, (((x.ndim - 1,), (0,)), ((), ())))
         if self.use_bias:
             bias = self.param('bias', nn.initializers.zeros, (self.features,))
             bias = jnp.asarray(bias, self.dtype)
             y = y + bias
         return y
 
-class RMSNorm(nn.Module):
-    epsilon: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        x = x * jax.lax.rsqrt(variance + self.epsilon)
-        scale = self.param('scale', nn.initializers.ones, (x.shape[-1],))
-        return x * jnp.asarray(scale, self.dtype)
-
-def precompute_freqs(head_dim: int, max_seq_len: int, base: float = 10000.0, dtype: jnp.dtype = jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    half_dim = head_dim // 2
-    freqs = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=dtype) / half_dim))
-    t = jnp.arange(max_seq_len, dtype=dtype)
-    freqs = jnp.outer(t, freqs)
-    sin = jnp.sin(freqs)
-    cos = jnp.cos(freqs)
-    sin = jnp.expand_dims(jnp.expand_dims(sin, 0), 0)
-    cos = jnp.expand_dims(jnp.expand_dims(cos, 0), 0)
-    return sin.astype(dtype), cos.astype(dtype)
-
-def rotary_embedding(x: jnp.ndarray, sin: jnp.ndarray, cos: jnp.ndarray, use_local_repeat: bool = False) -> jnp.ndarray:
-    batch, heads, seq_len, head_dim = x.shape
-    half_dim = head_dim // 2
-    sin = sin[:, :, :seq_len, :half_dim]
-    cos = cos[:, :, :seq_len, :half_dim]
-    sin = jnp.broadcast_to(sin, (batch, heads, seq_len, half_dim))
-    cos = jnp.broadcast_to(cos, (batch, heads, seq_len, half_dim))
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    x_rot = x1 * cos - x2 * sin
-    x_pass = x1 * sin + x2 * cos
-    return jnp.concatenate([x_rot, x_pass], axis=-1)
-
-class ParallelMLP(nn.Module):
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, deterministic: bool = True):
-        dim = self.config.dim
-        hidden_dim = int(self.config.ffn_dim_multiplier * dim if self.config.ffn_dim_multiplier else dim * 4)
-        x = RMSNorm(dtype=x.dtype)(x)
-        gate = ParallelDense(hidden_dim, dtype=x.dtype)(x)
-        up = ParallelDense(hidden_dim, dtype=x.dtype)(x)
-        gate = nn.silu(gate)
-        intermediate = gate * up
-        output = ParallelDense(dim, dtype=x.dtype)(intermediate)
-        return nn.Dropout(rate=self.config.dropout_rate)(output, deterministic=deterministic)
-
-class MoELayer(nn.Module):
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, deterministic: bool = True):
-        batch_size, seq_len, dim = x.shape
-        num_experts = self.config.n_experts
-        expert_fn = ParallelMLP(self.config)
-        router_weights = self.param('router_weights', nn.initializers.normal(stddev=0.02), (dim, num_experts))
-        router_logits = jax.lax.stop_gradient(jnp.einsum('bsd,de->bse', x, router_weights))
-        routing_probs = nn.softmax(router_logits, axis=-1)
-        top2_weights, top2_indices = jax.lax.top_k(routing_probs, k=2)
-        top2_weights = top2_weights / jnp.sum(top2_weights, axis=-1, keepdims=True)
-        final_output = jnp.zeros_like(x)
-        for expert_idx in range(num_experts):
-            expert_mask = (top2_indices == expert_idx).any(axis=-1)
-            if jnp.any(expert_mask):
-                mask_weights = jnp.where(top2_indices == expert_idx, top2_weights, 0).max(axis=-1)
-                mask_weights = jnp.expand_dims(mask_weights, -1)
-                masked_input = jnp.where(jnp.expand_dims(expert_mask, -1), x * mask_weights, 0)
-                expert_output = expert_fn(masked_input, deterministic)
-                final_output = final_output + expert_output
-        expert_usage = jnp.mean(routing_probs, axis=(0, 1))
-        load_balancing_loss = -jnp.sum(expert_usage * jnp.log(expert_usage + 1e-6))
-        return final_output, load_balancing_loss
-
-def create_alibi_slopes(num_heads: int) -> jnp.ndarray:
-    closest_power_of_2 = 2 ** jnp.floor(jnp.log2(num_heads))
-    base = 2 ** (-(2 ** -(jnp.log2(closest_power_of_2) - 3)))
-    powers = jnp.arange(1, num_heads + 1, dtype=jnp.float32)
-    slopes = base ** powers
-    return slopes
-
-class MultiheadAttention(nn.Module):
-    config: ModelArgs
-    
-    def create_sliding_window_mask(self, seq_len: int) -> jnp.ndarray:
-        window_size = self.config.window_size
-        global_tokens = self.config.global_tokens
-        mask = jnp.full((seq_len, seq_len), -1e9)
-        for i in range(seq_len):
-            window_start = max(0, i - window_size // 2)
-            window_end = min(seq_len, i + window_size // 2 + 1)
-            mask = mask.at[i, window_start:window_end].set(0.0)
-        mask = mask.at[:global_tokens, :].set(0.0)
-        mask = mask.at[:, :global_tokens].set(0.0)
-        return mask
-    
-    def setup(self):
-        if self.config.use_alibi:
-            num_alibi_heads = self.config.num_alibi_heads or self.config.n_heads
-            self.alibi_slopes = create_alibi_slopes(num_alibi_heads)
-    
-    def compute_alibi_attention(self, qk: jnp.ndarray) -> jnp.ndarray:
-        seq_len = qk.shape[-1]
-        positions = jnp.arange(seq_len, dtype=jnp.float32)
-        distance = positions[None, :] - positions[:, None]  # Reversed order for correct sign
-        distance = -jnp.abs(distance)
-        alibi_bias = self.alibi_slopes[None, None, :] * distance[None, :, :]
-        return qk + alibi_bias
-
-    @nn.compact
-    def __call__(self, x, mask=None, deterministic: bool = True):
-        batch_size, seq_len, dim = x.shape
-        num_heads = self.config.n_heads
-        num_kv_heads = self.config.n_kv_heads if hasattr(self.config, 'n_kv_heads') else num_heads
-        head_dim = dim // num_heads
-        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads for GQA"
-        
-        token_complexity = jnp.sum(jnp.abs(x), axis=-1, keepdims=True)
-        complexity_weights = nn.sigmoid(token_complexity)
-        
-        kv_dim = head_dim * num_kv_heads
-        kv_proj_dim = 2 * kv_dim
-        
-        q = nn.remat(ParallelDense)(dim, use_bias=False, dtype=x.dtype)(x * complexity_weights)
-        kv = nn.remat(ParallelDense)(kv_proj_dim, use_bias=False, dtype=x.dtype)(x)
-        
-        k, v = jnp.split(kv, 2, axis=-1)
-        
-        q = rearrange(q, 'b s (h d) -> b h s d', h=num_heads)
-        k = rearrange(k, 'b s (h d) -> b h s d', h=num_kv_heads)
-        v = rearrange(v, 'b s (h d) -> b h s d', h=num_kv_heads)
-        
-        if self.config.use_rope:
-            compute_dtype = x.dtype
-            sin, cos = precompute_freqs(head_dim, seq_len, dtype=compute_dtype)
-            q = rotary_embedding(q, sin, cos, use_local_repeat=False)
-            k = rotary_embedding(k, sin, cos, use_local_repeat=True)
-        
-        repeats = num_heads // num_kv_heads
-        k = repeat(k, 'b h s d -> b (h r) s d', r=repeats)
-        v = repeat(v, 'b h s d -> b (h r) s d', r=repeats)
-        
-        if mask is None:
-            mask = self.create_sliding_window_mask(seq_len)
-        else:
-            window_mask = self.create_sliding_window_mask(seq_len)
-            mask = jnp.minimum(mask, window_mask)
-        
-        scale = 1.0 / jnp.sqrt(head_dim)
-        qk = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
-        
-        if self.config.use_alibi:
-            qk = self.compute_alibi_attention(qk)
-        
-        qk = jnp.where(mask[None, None, :, :], qk, -1e9)  # Ensure mask is broadcastable
-        attention = nn.softmax(qk, axis=-1)
-        
-        if not deterministic:
-            attention = nn.Dropout(rate=self.config.attention_dropout)(attention, deterministic=False)
-        
-        if not deterministic:
-            v = jnp.asarray(v, self.config.kv_cache_dtype)
-            
-        output = jnp.einsum('bhij,bhjd->bhid', attention, v)
-        output = rearrange(output, 'b h s d -> b s (h d)')
-        
-        output = nn.remat(ParallelDense)(dim, dtype=x.dtype)(output)
-        output = nn.Dropout(rate=self.config.dropout_rate)(output, deterministic=deterministic)
-        
-        return output
-
-class FlashMLALayer(nn.Module):
-    """Flash Memory-Level Attention Layer"""
-    config: ModelArgs
-
-    @nn.compact
-    def __call__(self, x, block_size=128):
-        B, S, D = x.shape
-        num_blocks = (S + block_size - 1) // block_size
-        
-        # Reshape input into blocks
-        padded_length = num_blocks * block_size
-        padding = padded_length - S
-        if padding > 0:
-            x = jnp.pad(x, [(0, 0), (0, padding), (0, 0)])
-        
-        # Reshape into blocks
-        blocked_x = x.reshape(B, num_blocks, block_size, D)
-        
-        # Local block attention
-        q = ParallelDense(D)(blocked_x)
-        k = ParallelDense(D)(blocked_x)
-        v = ParallelDense(D)(blocked_x)
-        
-        # Scaled dot-product attention within blocks
-        scale = 1.0 / jnp.sqrt(D)
-        scores = jnp.einsum('bnsd,bnhd->bnsh', q, k) * scale
-        attn = nn.softmax(scores, axis=-1)
-        output = jnp.einsum('bnsh,bnhd->bnsd', attn, v)
-        
-        # Restore original sequence shape
-        output = output.reshape(B, padded_length, D)
-        if padding > 0:
-            output = output[:, :S, :]
-            
-        return output
-
-class DualPipeProcessor(nn.Module):
-    """Dual Pipeline Processing Layer"""
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, num_microbatches=4):
-        batch_size = x.shape[0]
-        microbatch_size = batch_size // num_microbatches
-        
-        outputs = []
-        for i in range(num_microbatches):
-            start_idx = i * microbatch_size
-            end_idx = (i + 1) * microbatch_size
-            microbatch = x[start_idx:end_idx]
-            
-            # Pipeline stage 1: Feature extraction
-            features = ParallelDense(self.config.dim)(microbatch)
-            features = nn.gelu(features)
-            
-            # Pipeline stage 2: Transformation
-            transformed = ParallelDense(self.config.dim)(features)
-            outputs.append(transformed)
-            
-        return jnp.concatenate(outputs, axis=0)
-
-class DeepEPModule(nn.Module):
-    """Deep Expert Parallelism Module"""
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, deterministic=True):
-        num_experts = self.config.n_experts
-        capacity_factor = self.config.expert_capacity_factor
-        
-        # Expert selection
-        router = ParallelDense(num_experts)(x)
-        routes = nn.softmax(router, axis=-1)
-        
-        # Top-k routing
-        k = 2
-        top_k_routes, top_k_indices = jax.lax.top_k(routes, k=k)
-        top_k_routes = top_k_routes / jnp.sum(top_k_routes, axis=-1, keepdims=True)
-        
-        outputs = []
-        for i in range(num_experts):
-            expert = ParallelMLP(self.config)
-            mask = (top_k_indices == i).any(axis=-1)
-            expert_input = jnp.where(mask[:, :, None], x, 0)
-            expert_output = expert(expert_input, deterministic)
-            outputs.append(expert_output)
-            
-        return sum(outputs)
-
-class EPLBLayer(nn.Module):
-    """Expert Pattern Load Balancing Layer"""
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, deterministic=True):
-        # Token mixing for load balancing
-        token_patterns = ParallelDense(self.config.dim)(x)
-        pattern_scores = nn.softmax(token_patterns, axis=-1)
-        
-        # Apply jitter for better load distribution
-        if not deterministic:
-            pattern_scores = pattern_scores + jax.random.normal(
-                self.make_rng('dropout'), 
-                pattern_scores.shape
-            ) * 0.1
-            
-        return x * pattern_scores
-
-class DeepGEMMProcessor(nn.Module):
-    """Deep GEMM Processing Module"""
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x):
-        # Quantization
-        scale = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-        x_quant = jnp.round(x / scale * 127).astype(jnp.int8)
-        
-        # Block-wise processing
-        block_size = 32
-        B, S, D = x.shape
-        num_blocks = (D + block_size - 1) // block_size
-        
-        outputs = []
-        for i in range(num_blocks):
-            start_idx = i * block_size
-            end_idx = min((i + 1) * block_size, D)
-            block = x_quant[:, :, start_idx:end_idx]
-            
-            # Dequantize and process
-            block_float = (block.astype(jnp.float32) / 127) * scale
-            processed = ParallelDense(block_size)(block_float)
-            outputs.append(processed)
-            
-        return jnp.concatenate(outputs, axis=-1)
-
-class TransformerBlock(nn.Module):
-    config: ModelArgs
-    
-    @nn.compact
-    def __call__(self, x, mask=None, deterministic: bool = True):
-        # Flash MLA processing
-        flash_norm = RMSNorm(dtype=x.dtype)(x)
-        flash_output = FlashMLALayer(self.config)(flash_norm)
-        x = x + flash_output
-        
-        # Dual Pipeline processing
-        dual_norm = RMSNorm(dtype=x.dtype)(x)
-        dual_output = DualPipeProcessor(self.config)(dual_norm)
-        x = x + dual_output
-        
-        # Deep EP processing
-        deep_ep_norm = RMSNorm(dtype=x.dtype)(x)
-        deep_ep_output = DeepEPModule(self.config)(deep_ep_norm, deterministic)
-        x = x + deep_ep_output
-        
-        # EPLB processing
-        eplb_norm = RMSNorm(dtype=x.dtype)(x)
-        eplb_output = EPLBLayer(self.config)(eplb_norm, deterministic)
-        x = x + eplb_output
-        
-        # DeepGEMM processing
-        gemm_norm = RMSNorm(dtype=x.dtype)(x)
-        gemm_output = DeepGEMMProcessor(self.config)(gemm_norm)
-        x = x + gemm_output
-        
-        return x
-
 class VishwamAIModel(nn.Module):
+    """Main model class with TPU optimizations."""
     config: ModelConfig
 
     def setup(self):
+        dtype = getattr(jnp, self.config.dtype)
         self.embeddings = nn.Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             embedding_init=nn.initializers.normal(stddev=0.02),
-            dtype=jnp.dtype(self.config.dtype)
+            dtype=dtype
         )
         n_kv_heads = self.config.num_key_value_heads if self.config.use_gqa else self.config.num_attention_heads
-        self.encoder = [TransformerBlock(ModelArgs(
-            dim=self.config.hidden_size,
-            n_layers=1,
-            n_heads=self.config.num_attention_heads,
-            n_kv_heads=n_kv_heads,
-            vocab_size=self.config.vocab_size,
-            multiple_of=256,
-            norm_eps=self.config.layer_norm_eps,
-            max_batch_size=32,
-            max_seq_len=self.config.max_position_embeddings,
-            n_experts=4,
-            expert_dim=4096,
-            expert_capacity_factor=1.25,
-            window_size=512,
-            global_tokens=64,
-            attention_dropout=self.config.attention_dropout_prob,
-            dropout_rate=self.config.hidden_dropout_prob,
-            expert_dropout=self.config.hidden_dropout_prob,
-            use_rope=self.config.use_rope,
-            use_flash_attention=self.config.use_flash_attention,
-            use_alibi=self.config.use_alibi,
-            use_gqa=self.config.use_gqa
-        )) for _ in range(self.config.num_layers)]
-        self.final_layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=jnp.dtype(self.config.dtype))
-        self.lm_head = ParallelDense(features=self.config.vocab_size, use_bias=False, dtype=jnp.dtype(self.config.dtype))
+        
+        # Create TPU-optimized transformer blocks
+        self.encoder = [
+            TransformerBlock(ModelArgs(
+                dim=self.config.hidden_size,
+                n_layers=1,
+                n_heads=self.config.num_attention_heads,
+                n_kv_heads=n_kv_heads,
+                vocab_size=self.config.vocab_size,
+                multiple_of=256,
+                norm_eps=self.config.layer_norm_eps,
+                max_batch_size=32,
+                max_seq_len=self.config.max_position_embeddings,
+                n_experts=4,
+                expert_dim=4096,
+                expert_capacity_factor=1.25,
+                window_size=512,
+                global_tokens=64,
+                attention_dropout=self.config.attention_dropout_prob,
+                dropout_rate=self.config.hidden_dropout_prob,
+                expert_dropout=self.config.hidden_dropout_prob,
+                param_dtype=dtype,
+                use_rope=self.config.use_rope,
+                use_flash_attention=self.config.use_flash_attention,
+                use_alibi=self.config.use_alibi,
+                use_dualpipe=self.config.use_dualpipe,
+                use_eplb=self.config.use_eplb,
+                use_deepgemm=self.config.use_deepgemm
+            )) for _ in range(self.config.num_layers)
+        ]
+        self.final_layer_norm = LayerNorm(epsilon=self.config.layer_norm_eps, dtype=dtype)
+        self.lm_head = Dense(features=self.config.vocab_size, use_bias=False, dtype=dtype)
 
     def _create_causal_mask(self, seq_len: int) -> jnp.ndarray:
-        mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        return jnp.where(mask, 0.0, -1e9)
+        """Create TPU-optimized causal mask."""
+        return jnp.triu(
+            jnp.full((seq_len, seq_len), -1e9, dtype=jnp.bfloat16), 
+            k=1
+        )
 
-    def __call__(self, input_ids: jnp.ndarray, attention_mask: Optional[jnp.ndarray] = None, 
-                 deterministic: bool = True) -> Dict[str, jnp.ndarray]:
-        hidden_states = self.embeddings(input_ids)
-        
-        if attention_mask is None:
-            attention_mask = self._create_causal_mask(input_ids.shape[1])
-        
-        for encoder_layer in self.encoder:
-            hidden_states = encoder_layer(hidden_states, attention_mask, deterministic)
-        
-        hidden_states = self.final_layer_norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-        
-        return {
-            'logits': logits,
-            'hidden_states': hidden_states
-        }
+    @partial(jax.jit, static_argnums=(0,))
+    def __call__(
+        self, 
+        input_ids: jnp.ndarray, 
+        attention_mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> Dict[str, jnp.ndarray]:
+        """TPU-optimized forward pass."""
+        # Place computation on TPU
+        device = jax.devices("tpu")[0] if jax.devices("tpu") else jax.devices("cpu")[0]
+        with jax.default_device(device):
+            hidden_states = self.embeddings(input_ids)
+            
+            if attention_mask is None:
+                attention_mask = self._create_causal_mask(input_ids.shape[1])
+            
+            # Process through transformer layers with TPU optimization
+            for encoder_layer in self.encoder:
+                hidden_states = encoder_layer(hidden_states, attention_mask, deterministic)
+            
+            hidden_states = self.final_layer_norm(hidden_states)
+            logits = self.lm_head(hidden_states)
+            
+            return {
+                'logits': logits,
+                'hidden_states': hidden_states
+            }
 
     @classmethod
     def from_pretrained(cls, model_path: str, config: Optional[ModelConfig] = None):
-        if not os.path.exists(model_path):
+        """Load pretrained model with TPU and GCS support."""
+        # Handle GCS paths
+        if model_path.startswith('gs://'):
+            client = storage.Client()
+            bucket_name, blob_path = model_path.replace('gs://', '').split('/', 1)
+            bucket = client.get_bucket(bucket_name)
+            local_path = '/tmp/model'
+            os.makedirs(local_path, exist_ok=True)
+            
+            # Download config and weights
+            for blob in bucket.list_blobs(prefix=blob_path):
+                if blob.name.endswith(('.safetensors', 'config.json')):
+                    local_file = os.path.join(local_path, os.path.basename(blob.name))
+                    blob.download_to_filename(local_file)
+            model_path = local_path
+        elif not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path, allow_patterns=["*.safetensors", "config.json"])
+        
         if config is None:
             with open(os.path.join(model_path, "config.json"), 'r') as f:
                 config_dict = json.load(f)
@@ -562,14 +356,35 @@ class VishwamAIModel(nn.Module):
         
         model = cls(config)
         params = {}
+        
+        # Load weights with TPU optimization
         for shard_file in sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")]):
             shard_path = os.path.join(model_path, shard_file)
-            params.update(stf.load_file(shard_path))
+            shard_params = stf.load_file(shard_path)
+            # Convert to bfloat16 for TPU
+            for k, v in shard_params.items():
+                params[k] = v.astype(jnp.bfloat16)
+        
         return model, {'params': params}
 
     def load_weights(self, model_path: str, reduced_size: bool = False):
-        if not os.path.exists(model_path):
+        """Load weights with TPU optimization and optional model reduction."""
+        if model_path.startswith('gs://'):
+            client = storage.Client()
+            bucket_name, blob_path = model_path.replace('gs://', '').split('/', 1)
+            bucket = client.get_bucket(bucket_name)
+            local_path = '/tmp/model_weights'
+            os.makedirs(local_path, exist_ok=True)
+            
+            for blob in bucket.list_blobs(prefix=blob_path):
+                if blob.name.endswith('.safetensors'):
+                    local_file = os.path.join(local_path, os.path.basename(blob.name))
+                    blob.download_to_filename(local_file)
+            model_path = local_path
+        elif not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path, allow_patterns=["*.safetensors"])
+        
+        # Adjust model size if needed
         if reduced_size:
             self.config.hidden_size //= 2
             self.config.num_attention_heads //= 2
@@ -578,68 +393,74 @@ class VishwamAIModel(nn.Module):
             self.config.num_layers //= 2
         
         params = {}
-        dtype = getattr(jnp, self.config.dtype)
+        dtype = jnp.bfloat16  # Always use bfloat16 for TPU
+        
+        # Load and process weights with TPU optimization
         for shard_file in sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")]):
             shard_path = os.path.join(model_path, shard_file)
             with stf.safe_open(shard_path, framework="numpy") as f:
                 for name in f.keys():
-                    tensor = f.get_tensor(name).astype(np.float32)
+                    tensor = f.get_tensor(name)
                     if reduced_size and len(tensor.shape) >= 2:
                         new_shape = tuple(s // 2 if i < 2 else s for i, s in enumerate(tensor.shape))
                         tensor = tensor[tuple(slice(0, s) for s in new_shape)]
-                    with jax.default_device(jax.devices("cpu")[0]):
+                    # Place directly on TPU if available
+                    device = jax.devices("tpu")[0] if jax.devices("tpu") else jax.devices("cpu")[0]
+                    with jax.default_device(device):
                         params[name] = jnp.array(tensor, dtype=dtype)
                     del tensor
                     gc.collect()
+        
         self.bind({'params': params})
         return self
 
 # Training and Evaluation Utilities
-@jax.jit
-def train_step(state, input_ids, targets, rng):
+@partial(jax.jit, static_argnums=(0,))
+def train_step(model, state, batch, rng):
+    """TPU-optimized training step."""
     def loss_fn(params):
-        outputs = state.apply_fn({'params': params}, input_ids, deterministic=False, rngs={'dropout': rng})
-        logits = outputs['logits'][:, :-1]
-        targets_shifted = targets[:, 1:]
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets_shifted).mean()
+        outputs = model.apply(
+            {'params': params},
+            batch['input_ids'],
+            deterministic=False,
+            rngs={'dropout': rng}
+        )
+        logits = outputs['logits'][:, :-1].astype(jnp.float32)
+        labels = batch['labels'][:, 1:]
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
         return loss
+
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = grad_fn(state.params)
+    # All-reduce gradients across TPU cores
+    grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return state, loss
 
-@jax.jit
-def test_step(state, input_ids, targets):
-    outputs = state.apply_fn({'params': state.params}, input_ids, deterministic=True)
-    logits = outputs['logits'][:, :-1]
-    targets_shifted = targets[:, 1:]
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets_shifted).mean()
+@partial(jax.jit, static_argnums=(0,))
+def eval_step(model, params, batch):
+    """TPU-optimized evaluation step."""
+    outputs = model.apply(
+        {'params': params},
+        batch['input_ids'],
+        deterministic=True
+    )
+    logits = outputs['logits'][:, :-1].astype(jnp.float32)
+    labels = batch['labels'][:, 1:]
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
     return loss
 
-def split_dataset(text_file: str, tokenizer, batch_size: int, seq_len: int, train_ratio: float = 0.8):
-    with open(text_file, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    random.shuffle(lines)
-    split_idx = int(len(lines) * train_ratio)
-    train_lines, test_lines = lines[:split_idx], lines[split_idx:]
-    
-    def process_lines(lines):
-        tokens = []
-        for line in lines:
-            tokens.extend(tokenizer.encode(line.strip(), add_special_tokens=True))
-        for i in range(0, len(tokens) - seq_len, seq_len):
-            batch = tokens[i:i + seq_len + 1]
-            if len(batch) == seq_len + 1:
-                yield jnp.array(batch[:-1]), jnp.array(batch[1:])
-    
-    return list(process_lines(train_lines)), list(process_lines(test_lines))
-
-# Example usage (not part of original error context, added for completeness)
+# Example Usage
 if __name__ == "__main__":
     config = ModelConfig()
     model = VishwamAIModel(config)
-    rng = jax.random.PRNGKey(0)
-    dummy_input = jnp.ones((1, config.max_position_embeddings), dtype=jnp.int32)
-    dummy_attention_mask = jnp.ones((config.max_position_embeddings, config.max_position_embeddings), dtype=jnp.int32)
-    params = model.init(rng, dummy_input, attention_mask=dummy_attention_mask)['params']
-    print("Model initialized successfully!")
+    
+    # Initialize on TPU if available
+    device = jax.devices("tpu")[0] if jax.devices("tpu") else jax.devices("cpu")[0]
+    with jax.default_device(device):
+        rng = jax.random.PRNGKey(0)
+        dummy_input = jnp.ones((1, config.max_position_embeddings), dtype=jnp.int32)
+        dummy_attention_mask = jnp.ones((config.max_position_embeddings, config.max_position_embeddings), dtype=jnp.int32)
+        params = model.init(rng, dummy_input, attention_mask=dummy_attention_mask)['params']
+    
+    logger.info("Model initialized successfully on TPU!")

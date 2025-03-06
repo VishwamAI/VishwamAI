@@ -33,6 +33,7 @@ from .error_correction import (
 
 # Import other components
 from .tot import TreeOfThoughts
+from .distillation import VishwamaiShaalaTrainer, VishwamaiGuruKnowledge
 
 __all__ = [
     "VishwamAIModel",
@@ -51,4 +52,6 @@ __all__ = [
     "create_error_corrected_train_step",
     "create_error_corrected_eval_step",
     "TreeOfThoughts",
+    "VishwamaiShaalaTrainer",
+    "VishwamaiGuruKnowledge"
 ]

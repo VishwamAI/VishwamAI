@@ -17,7 +17,7 @@ from .tensor_utils import (
     apply_chunked
 )
 
-class QwQDistillationTrainer(VishwamaiShaalaTrainer):
+class QwenDistillationTrainer(VishwamaiShaalaTrainer):
     """Specialized trainer for QwQ-32B distillation with memory optimization."""
 
     def __init__(self, teacher_model, student_model, cfg):
@@ -38,6 +38,10 @@ class QwQDistillationTrainer(VishwamaiShaalaTrainer):
               f"\n - Devices: {self.num_devices}"
               f"\n - Chunk size: {self.chunk_size}"
               f"\n - Initial memory: {get_memory_usage():.2f}GB")
+    
+    def create_train_state(self, rng: jnp.ndarray) -> train_state.TrainState:
+        """Create initial training state."""
+        return self._initialize_training_state(rng)
     
     def _initialize_training_state(self, rng: jnp.ndarray) -> train_state.TrainState:
         """Initialize training state with gradient accumulation."""
@@ -176,29 +180,3 @@ class QwQDistillationTrainer(VishwamaiShaalaTrainer):
                 os.remove(ckpt)
             except OSError:
                 pass
-
-if __name__ == "__main__":
-    # Test usage
-    from omegaconf import OmegaConf
-    
-    cfg = OmegaConf.create({
-        'memory_optimization': {
-            'chunk_size': 32,
-            'clear_cache_steps': 10
-        },
-        'training': {
-            'gradient_accumulation_steps': 16,
-            'learning_rate': 1e-4,
-            'max_grad_norm': 1.0
-        },
-        'distillation_params': {
-            'temperature': 2.0,
-            'alpha_ce': 0.2,
-            'alpha_kd': 0.8,
-            'feature_loss_weight': 0.1,
-            'attention_loss_weight': 0.1
-        }
-    })
-    
-    trainer = QwQDistillationTrainer(None, None, cfg)
-    print("Trainer initialized successfully")

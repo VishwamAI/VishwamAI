@@ -1,8 +1,9 @@
 import jax
 import jax.numpy as jnp
 import optax
-from flax.training import train_state
-from typing import Dict, Any, Optional, Tuple
+from flax.training import train_state, checkpoints
+import os
+from typing import Dict, Any, Optional, Tuple, Iterator
 import logging
 from functools import partial
 from omegaconf import DictConfig
@@ -114,6 +115,96 @@ def train_step(
     state = state.apply_gradients(grads=grads)
     return state, metrics
 
+@partial(jax.pmap, axis_name='batch')
+def eval_step(
+    state: TrainState,
+    batch: Dict[str, jnp.ndarray]
+) -> Dict[str, jnp.ndarray]:
+    """TPU-parallel evaluation step."""
+    outputs = state.apply_fn(
+        {'params': state.params},
+        batch['input_ids'],
+        attention_mask=batch.get('attention_mask'),
+        deterministic=True
+    )
+    
+    logits = outputs['logits'][:, :-1]
+    labels = batch['labels'][:, 1:]
+    
+    # Loss and metrics
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    loss = loss.mean()
+    
+    # Calculate accuracy
+    predictions = jnp.argmax(logits, axis=-1)
+    correct = (predictions == labels).astype(jnp.float32)
+    accuracy = jnp.mean(correct)
+    
+    # Calculate perplexity
+    perplexity = jnp.exp(jnp.minimum(loss, 100.0))
+    
+    metrics = {
+        'loss': loss,
+        'accuracy': accuracy,
+        'perplexity': perplexity
+    }
+    
+    return jax.lax.pmean(metrics, axis_name='batch')
+
+def evaluate(
+    state: TrainState, 
+    val_loader: Iterator[Dict[str, jnp.ndarray]], 
+    config: DictConfig,
+    num_batches: int = 10
+) -> Dict[str, float]:
+    """Evaluate the model on validation data with TPU parallelization."""
+    metrics_list = []
+    
+    for _ in range(num_batches):
+        try:
+            batch = next(val_loader)
+            batch_metrics = eval_step(state, batch)
+            
+            # Get metrics from first device
+            device_metrics = jax.tree_map(lambda x: x[0], batch_metrics)
+            metrics_list.append(device_metrics)
+        except StopIteration:
+            break
+    
+    # Average metrics across batches
+    avg_metrics = {}
+    if metrics_list:
+        for k in metrics_list[0].keys():
+            avg_metrics[k] = float(sum(m[k] for m in metrics_list)) / len(metrics_list)
+    
+    return avg_metrics
+
+def save_checkpoint(
+    state: TrainState,
+    config: DictConfig,
+    step: int
+) -> None:
+    """Save training checkpoint with TPU compatibility."""
+    # Create checkpoint directory if it doesn't exist
+    checkpoint_dir = os.path.join(
+        config.training.output_dir, 
+        config.training.checkpoint_dir
+    )
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Save only unreplicated params to avoid duplication
+    unreplicated_state = jax.device_get(jax.tree_map(lambda x: x[0], state))
+    
+    checkpoints.save_checkpoint(
+        ckpt_dir=checkpoint_dir,
+        target=unreplicated_state,
+        step=step,
+        overwrite=True,
+        keep=config.training.keep_checkpoints
+    )
+    
+    logger.info(f"Checkpoint saved at step {step}")
+
 def train(
     config: DictConfig,
     model: VishwamAIModel,
@@ -176,4 +267,4 @@ def train(
     return state
 
 # Import this module in __init__.py
-__all__ = ['train', 'create_train_state', 'TrainState']
+__all__ = ['train', 'create_train_state', 'TrainState', 'evaluate', 'save_checkpoint']

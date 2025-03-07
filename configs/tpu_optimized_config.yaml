@@ -1,0 +1,90 @@
+# TPU-Optimized Training Configuration for VishwamAI
+# Optimized for 8 TPU devices with memory constraints
+
+wandb_project: "vishwamai-tpu"
+wandb_run_name: "tot_optimized_run"
+
+model:
+  vocab_size: 32000
+  hidden_size: 768  # Reduced from 1024 for memory efficiency
+  num_layers: 24    # Balanced for performance vs memory
+  num_attention_heads: 12
+  intermediate_size: 4096  # Reduced from original for memory efficiency
+  hidden_dropout_prob: 0.1
+  attention_dropout_prob: 0.1
+  max_position_embeddings: 2048
+  initializer_range: 0.02
+  layer_norm_eps: 1.0e-5
+  use_cache: true
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+  tie_word_embeddings: true
+  gradient_checkpointing: true  # Enable checkpointing for memory savings
+  use_flash_attention: true     # Use flash attention for speed
+  use_rope: true                # Use RoPE embeddings
+  use_alibi: false              # Disable ALiBi for memory savings
+  use_gqa: true                 # Enable grouped query attention
+  num_key_value_heads: 4        # Reduced KV heads for memory efficiency
+  dtype: "bfloat16"             # Use bfloat16 for TPU compatibility
+  use_dualpipe: true            # Enable dualpipe architecture
+  use_eplb: true                # Enable Expert-Parallel Load Balancing
+  use_deepgemm: true            # Enable optimized GEMM operations
+
+tokenizer:
+  path: "/path/to/tokenizer"  # Update this path for your environment
+  vocab_size: 32000
+
+training:
+  learning_rate: 1.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 500
+  max_steps: 20000
+  steps_per_epoch: 1000
+  epochs: 20
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  grad_clip: 1.0
+  initial_batch_size: 8
+  max_batch_size: 32
+  gradient_accumulation_steps: 4  # Effective batch size = 8 * 4 = 32
+  dynamic_batch_size: true
+  batch_size_increase_step: 2000
+  batch_size_increase_factor: 1.2
+  log_every: 10
+  eval_every: 500
+  save_every: 1000
+  do_eval: true
+  checkpoint_dir: "./checkpoints/tpu_optimized"
+  use_gradient_checkpointing: true
+  use_bfloat16: true
+  seed: 42
+  use_tot: true
+  use_error_correction: true
+  error_correction_weight: 0.4
+
+data:
+  path: "/path/to/training/data"  # Update with your dataset
+  val_path: "/path/to/validation/data"  # Update with validation set
+  val_split: 0.1
+  num_workers: 4
+  preprocessing:
+    max_chars: 4096
+    num_proc: 4
+    use_cache: true
+
+tot:
+  max_thoughts: 5
+  max_depth: 3
+  beam_width: 5
+  search_strategy: "beam"  # Options: beam, dfs, bfs, mcts
+  use_tpu: true
+  memory_efficient: true
+  thoughts_per_step: 3    # Reduced for memory efficiency
+
+error_correction:
+  num_layers: 2           # Reduced for memory efficiency
+  threshold: 0.7
+  use_mixture_density: true
+  memory_efficient: true

@@ -1,8 +1,7 @@
 # /home/kasinadhsarma/VishwamAI/vishwamai/models/tot_model.py
 """
-Tree of Thoughts (ToT) model for VishwamAI, extending the CoT model with tree search.
-Supports DFS and BFS for thought exploration, thought generation, and evaluation.
-Designed for complex reasoning tasks requiring deep calculations.
+Device-agnostic Tree of Thoughts (ToT) model for VishwamAI.
+Supports both GPU (PyTorch) and TPU (JAX) execution with unified interface.
 """
 
 import torch
@@ -11,10 +10,26 @@ from torch.nn import functional as F
 from collections import deque
 import heapq
 
-# Update import to use the new VishwamAI Transformer
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random, grad, jit, vmap
+    import flax.linen as flax_nn
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
 from vishwamai.models.transformer import VishwamAITransformer
-from vishwamai.models.attention import OptimizedMoEAttention
+from vishwamai.models.attention import OptimizedMoEAttention, DeviceAgnosticModule
 from vishwamai.models.cot_model import CoTModel, extract_answer
+
+def get_device_type():
+    """Determine the available device type."""
+    if torch.cuda.is_available():
+        return "gpu"
+    elif HAS_JAX and len(jax.devices("tpu")) > 0:
+        return "tpu"
+    return "cpu"
 
 class ThoughtNode:
     """
@@ -39,13 +54,13 @@ class ThoughtNode:
             current = current.parent
         return list(reversed(path))
 
-class ToTModel(CoTModel):
+class ToTModel(CoTModel, DeviceAgnosticModule):
     """
     Tree of Thoughts model extending CoTModel with tree search capabilities.
     """
     def __init__(self, embed_dim=512, num_layers=12, num_heads=8, ff_dim=2048, 
                  vocab_size=50000, max_seq_len=512, num_experts=7, 
-                 max_steps=3, candidates_per_step=5, max_depth=10):
+                 max_steps=3, candidates_per_step=5, max_depth=10, force_device=None):
         """
         Initialize the ToT model.
         
@@ -61,17 +76,24 @@ class ToTModel(CoTModel):
             candidates_per_step (int): Number of candidate thoughts per step (e.g., 5).
             max_depth (int): Maximum depth of the thought tree.
         """
-        super(ToTModel, self).__init__(embed_dim, num_layers, num_heads, ff_dim, 
-                                      vocab_size, max_seq_len, num_experts)
+        CoTModel.__init__(self, embed_dim, num_layers, num_heads, ff_dim, 
+                         vocab_size, max_seq_len, num_experts, force_device)
+        DeviceAgnosticModule.__init__(self)
+        
+        if force_device:
+            self.device_type = force_device
         self.max_steps = max_steps
         self.candidates_per_step = candidates_per_step
         self.max_depth = max_depth
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Evaluation head to score thoughts (sure/maybe/impossible)
-        self.eval_head = nn.Linear(embed_dim, 3)  # Outputs logits for 3 classes
+        # Device-specific evaluation head
+        if self.device_type == "tpu" and HAS_JAX:
+            self.eval_head = flax_nn.Dense(3)  # JAX implementation
+        else:
+            self.eval_head = nn.Linear(embed_dim, 3)  # PyTorch implementation
 
-    def evaluate_thought(self, thought_ids):
+    def evaluate_thought(self, thought_ids, use_cache=True):
         """
         Evaluate a thought by predicting its likelihood of leading to a solution.
         
@@ -81,16 +103,33 @@ class ToTModel(CoTModel):
         Returns:
             float: Score (probability of "sure").
         """
-        with torch.no_grad():
-            logits = self.transformer(thought_ids)
-            # Use the last token's embedding for evaluation
-            last_hidden = self.transformer.get_hidden_state(thought_ids, mask=None)[:, -1, :]  # (batch_size, embed_dim)
-            eval_logits = self.eval_head(last_hidden)  # (batch_size, 3)
-            probs = F.softmax(eval_logits, dim=-1)
-            sure_prob = probs[:, 0].item()  # Probability of "sure"
+        # Convert input to appropriate device format
+        thought_ids = self.to_device(thought_ids)
+
+        if self.device_type == "tpu" and HAS_JAX:
+            # JAX/TPU implementation
+            @jit
+            def evaluate_fn(params, inputs):
+                logits = self.transformer.apply({'params': params}, inputs)
+                last_hidden = logits[:, -1, :]
+                eval_logits = self.eval_head.apply({'params': params}, last_hidden)
+                probs = jax.nn.softmax(eval_logits, axis=-1)
+                return probs[:, 0]  # Return "sure" probability
+            
+            with jax.disable_jit() if not use_cache else jax.enable_jit():
+                sure_prob = evaluate_fn(self.params, thought_ids)[0].item()
+        else:
+            # PyTorch/GPU implementation
+            with torch.no_grad():
+                logits = self.transformer(thought_ids)
+                last_hidden = self.transformer.get_hidden_state(thought_ids, mask=None)[:, -1, :]
+                eval_logits = self.eval_head(last_hidden)
+                probs = F.softmax(eval_logits, dim=-1)
+                sure_prob = probs[:, 0].item()
+        
         return sure_prob
 
-    def generate_candidates(self, input_text, current_thought, tokenizer, num_candidates):
+    def generate_candidates(self, input_text, current_thought, tokenizer, num_candidates, use_cache=True):
         """
         Generate candidate thoughts for the next step.
         
@@ -105,21 +144,53 @@ class ToTModel(CoTModel):
         """
         # Construct prompt for thought generation
         prompt = f"{input_text}\nCurrent thought: {current_thought}\nPropose next steps:"
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         
-        candidates = []
-        for _ in range(num_candidates):
-            # Generate a candidate thought (without <think> tags for now)
-            output_ids = self._sample(input_ids, max_length=50, temperature=0.8, top_p=0.9)
-            candidate_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            # Clean up the candidate text (remove prompt prefix if present)
-            candidate_text = candidate_text.replace(prompt, "").strip()
-            if candidate_text:
-                candidates.append(candidate_text)
+        # Handle different device types
+        if self.device_type == "tpu" and HAS_JAX:
+            input_ids = self.to_device(tokenizer.encode(prompt, return_tensors="jax"))
+            
+            @jit
+            def generate_fn(params, inputs, rng_key):
+                def sample_next_token(logits, rng_key):
+                    temperature = 0.8
+                    logits = logits / temperature
+                    return random.categorical(rng_key, logits)
+                
+                # JAX generation loop
+                output_ids = inputs
+                rng_key = random.PRNGKey(0)
+                
+                for _ in range(50):  # max_length
+                    logits = self.transformer.apply({'params': params}, output_ids)
+                    next_token = sample_next_token(logits[:, -1, :], rng_key)
+                    output_ids = jnp.concatenate([output_ids, next_token[:, None]], axis=1)
+                    
+                return output_ids
+                
+            with jax.disable_jit() if not use_cache else jax.enable_jit():
+                candidates = []
+                for i in range(num_candidates):
+                    rng_key = random.PRNGKey(i)
+                    output_ids = generate_fn(self.params, input_ids, rng_key)
+                    candidate_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                    candidate_text = candidate_text.replace(prompt, "").strip()
+                    if candidate_text:
+                        candidates.append(candidate_text)
+        else:
+            # PyTorch/GPU implementation
+            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+            
+            candidates = []
+            for _ in range(num_candidates):
+                output_ids = self._sample(input_ids, max_length=50, temperature=0.8, top_p=0.9)
+                candidate_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                candidate_text = candidate_text.replace(prompt, "").strip()
+                if candidate_text:
+                    candidates.append(candidate_text)
         
-        return candidates[:num_candidates]  # Ensure we return exactly num_candidates
+        return candidates[:num_candidates]
 
-    def solve_with_tot(self, input_text, tokenizer, search_method="bfs", b=5):
+    def solve_with_tot(self, input_text, tokenizer, search_method="bfs", b=5, use_cache=True):
         """
         Solve the problem using Tree of Thoughts with BFS or DFS.
         

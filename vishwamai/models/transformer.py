@@ -1,19 +1,58 @@
 # /home/kasinadhsarma/VishwamAI/vishwamai/models/transformer.py
 """
-Unique VishwamAI Transformer with Adaptive Reasoning Gate (ARG), Hybrid Attention (DynamicSparse + LearnedPerformer),
-OptimizedMoEAttention, Hybrid MoE-Dense layers, and Reasoning Depth Scaling (RDS). Designed for advanced reasoning tasks.
+Device-agnostic VishwamAI Transformer with support for GPU and TPU execution.
+Combines PyTorch (GPU) and JAX (TPU) implementations with dynamic routing.
 """
 
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
 
-# Import core layers and attention mechanisms from VishwamAI
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random, grad, jit, vmap
+    import flax.linen as flax_nn
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+# Import core layers and attention mechanisms
 from vishwamai.models.kernel_layers import TokenEmbedding, PositionalEncoding, FeedForward
 from vishwamai.models.attention import DynamicSparseAttention, LearnedPerformerAttention, OptimizedMoEAttention
 
-class HybridThoughtAwareAttention(nn.Module):
+# Import device-specific implementations
+from vishwamai.models.gpu.transformer import VishwamAITransformer as GPUTransformer
+from vishwamai.models.tpu.transformer import VishwamAITransformer as TPUTransformer
+
+def get_device_type():
+    """Determine the available device type."""
+    if torch.cuda.is_available():
+        return "gpu"
+    elif HAS_JAX and len(jax.devices("tpu")) > 0:
+        return "tpu"
+    return "cpu"
+
+class DeviceAgnosticModule:
+    """Base class for device-agnostic modules"""
+    def __init__(self):
+        self.device_type = get_device_type()
+        self.gpu_module = None
+        self.tpu_module = None
+    
+    def to_device(self, x):
+        """Convert input to appropriate device format"""
+        if self.device_type == "tpu" and HAS_JAX:
+            if isinstance(x, torch.Tensor):
+                return jnp.array(x.cpu().numpy())
+        elif self.device_type == "gpu":
+            if not isinstance(x, torch.Tensor):
+                return torch.tensor(x)
+        return x
+
+class HybridThoughtAwareAttention(DeviceAgnosticModule, nn.Module):
     """
     Hybrid Thought-Aware Attention combining DynamicSparseAttention and LearnedPerformerAttention
     to prioritize tokens relevant to intermediate thoughts with learned sparsity and efficiency.
@@ -59,7 +98,7 @@ class HybridThoughtAwareAttention(nn.Module):
         return self.dropout(output)
 
 
-class AdaptiveReasoningGate(nn.Module):
+class AdaptiveReasoningGate(DeviceAgnosticModule, nn.Module):
     """
     Adaptive Reasoning Gate (ARG) to dynamically adjust attention and feed-forward computations
     based on reasoning complexity, enhanced with MoE load balancing insights.
@@ -89,7 +128,7 @@ class AdaptiveReasoningGate(nn.Module):
         return attn_weight.unsqueeze(-1).unsqueeze(-1), ffn_weight.unsqueeze(-1).unsqueeze(-1)
 
 
-class VishwamAITransformerLayer(nn.Module):
+class VishwamAITransformerLayer(DeviceAgnosticModule, nn.Module):
     """
     Single layer of the VishwamAI Transformer with OptimizedMoEAttention, HybridThoughtAwareAttention,
     Adaptive Reasoning Gate, Hybrid MoE-Dense layers, and Reasoning Depth Scaling.
@@ -161,12 +200,12 @@ class VishwamAITransformerLayer(nn.Module):
         return self.norm3(x)
 
 
-class VishwamAITransformer(nn.Module):
+class VishwamAITransformer(DeviceAgnosticModule, nn.Module):
     """
     Unique VishwamAI Transformer with advanced reasoning capabilities.
     """
-    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_seq_len=512, 
-                 attention_kwargs=None, dropout=0.1):
+    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_seq_len=512,
+                 attention_kwargs=None, dropout=0.1, force_device=None):
         """
         Initialize the VishwamAI Transformer.
 
@@ -181,8 +220,39 @@ class VishwamAITransformer(nn.Module):
             dropout (float): Dropout rate.
         """
         super(VishwamAITransformer, self).__init__()
+        DeviceAgnosticModule.__init__(self)
+        
+        if force_device:
+            self.device_type = force_device
+            
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
+        
+        # Initialize device-specific implementations
+        if self.device_type == "gpu":
+            self.model = GPUTransformer(
+                vocab_size=vocab_size,
+                embed_dim=embed_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                max_seq_len=max_seq_len,
+                attention_kwargs=attention_kwargs,
+                dropout=dropout
+            )
+        elif self.device_type == "tpu" and HAS_JAX:
+            self.model = TPUTransformer(
+                vocab_size=vocab_size,
+                embed_dim=embed_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                max_seq_len=max_seq_len,
+                attention_kwargs=attention_kwargs,
+                dropout_rate=dropout
+            )
+        else:
+            raise ValueError(f"Unsupported device type: {self.device_type}")
 
         # Embedding layers
         self.token_embedding = TokenEmbedding(vocab_size, embed_dim)
@@ -202,6 +272,18 @@ class VishwamAITransformer(nn.Module):
         self.to(self.device)
 
     def forward(self, x, mask=None, context=None):
+        # Convert inputs to appropriate device format
+        x = self.to_device(x)
+        if mask is not None:
+            mask = self.to_device(mask)
+        if context is not None:
+            context = self.to_device(context)
+            
+        # Route to appropriate implementation
+        if self.device_type == "gpu":
+            return self.model(x, mask, context)
+        elif self.device_type == "tpu":
+            return self.model.apply({'params': self.model.params}, x, mask, context)
         """
         Forward pass of the VishwamAI Transformer.
 
@@ -227,6 +309,18 @@ class VishwamAITransformer(nn.Module):
         return logits
 
     def get_hidden_state(self, x, mask=None, context=None):
+        # Convert inputs to appropriate device format
+        x = self.to_device(x)
+        if mask is not None:
+            mask = self.to_device(mask)
+        if context is not None:
+            context = self.to_device(context)
+            
+        # Route to appropriate implementation
+        if self.device_type == "gpu":
+            return self.model.get_hidden_state(x, mask, context)
+        elif self.device_type == "tpu":
+            return self.model.apply({'params': self.model.params}, x, mask, context, method=self.model.get_hidden_state)
         """
         Get hidden state from the transformer without final projection.
 

@@ -16,14 +16,39 @@ import torch.nn as nn
 import math
 from torch.nn import functional as F
 import torch.utils.checkpoint
-from typing import Optional, Dict, Any
-# Update import to use existing attention mechanism
-from vishwamai.models.attention import OptimizedMoEAttention, FlashMLAttention, TPUOptimizedAttention
-import triton
-import triton.language as tl
+from typing import Optional, Dict, Any, Union
+from abc import ABC, abstractmethod
 
-# GPU Capability Detection
-class HardwareCapabilityDetector:
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random
+    import flax.linen as flax_nn
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+# Import attention mechanisms
+from vishwamai.models.attention import (
+    OptimizedMoEAttention, FlashMLAttention, TPUOptimizedAttention, DeviceAgnosticModule
+)
+
+def get_device_type():
+    """Determine the available device type."""
+    if torch.cuda.is_available():
+        return "gpu"
+    elif HAS_JAX and len(jax.devices("tpu")) > 0:
+        return "tpu"
+    return "cpu"
+
+class HardwareCapabilityDetector(DeviceAgnosticModule):
     """Detects and manages hardware capabilities for optimized training"""
     
     @staticmethod
@@ -145,7 +170,7 @@ def gelu_kernel(
     # Store result
     tl.store(out_ptr + offsets, result, mask=mask)
 
-class PositionalEncoding(nn.Module):
+class PositionalEncoding(DeviceAgnosticModule, nn.Module):
     """
     Positional Encoding layer to add positional information to token embeddings.
     """
@@ -171,6 +196,8 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Add positional encodings to the input embeddings.
 
@@ -183,7 +210,7 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-class TokenEmbedding(nn.Module):
+class TokenEmbedding(DeviceAgnosticModule, nn.Module):
     """
     Token Embedding layer to convert token IDs into dense embeddings.
     """
@@ -200,6 +227,8 @@ class TokenEmbedding(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Convert token IDs to embeddings.
 
@@ -211,7 +240,7 @@ class TokenEmbedding(nn.Module):
         """
         return self.embedding(x) * math.sqrt(self.embed_dim)
 
-class FeedForward(nn.Module):
+class FeedForward(DeviceAgnosticModule, nn.Module):
     """
     Position-wise Feed-Forward Network with GELU activation.
     """
@@ -231,6 +260,8 @@ class FeedForward(nn.Module):
         self.gelu = nn.GELU()
 
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Forward pass of the feed-forward network.
 
@@ -265,7 +296,7 @@ class FeedForward(nn.Module):
             x = self.linear2(x)
             return self.dropout(x)
 
-class GeGLUFeedForward(nn.Module):
+class GeGLUFeedForward(DeviceAgnosticModule, nn.Module):
     """
     Gated Exponential Linear Unit feed-forward network.
     More efficient than standard FFN with better performance.
@@ -285,6 +316,8 @@ class GeGLUFeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Forward pass of the GeGLU feed-forward network.
         
@@ -305,7 +338,7 @@ class GeGLUFeedForward(nn.Module):
         x = self.linear2(self.dropout(x1_gated))
         return self.dropout(x)
 
-class MoEFeedForward(nn.Module):
+class MoEFeedForward(DeviceAgnosticModule, nn.Module):
     """
     Mixture of Experts Feed-Forward network with improved routing and load balancing.
     """
@@ -344,6 +377,8 @@ class MoEFeedForward(nn.Module):
         self.load_balancing_coeff = 0.01
         
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Forward pass of the MoE feed-forward network.
         
@@ -393,7 +428,7 @@ class MoEFeedForward(nn.Module):
         
         return output
 
-class OptimizedLayerNorm(nn.Module):
+class OptimizedLayerNorm(DeviceAgnosticModule, nn.Module):
     """
     Memory-efficient and hardware-optimized Layer Normalization.
     """
@@ -412,6 +447,8 @@ class OptimizedLayerNorm(nn.Module):
         self.dim = dim
         
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Forward pass with optimized computation.
         
@@ -441,7 +478,7 @@ class OptimizedLayerNorm(nn.Module):
             x_norm = (x - mean) / torch.sqrt(var + self.eps)
             return self.weight * x_norm + self.bias
 
-class RMSNorm(nn.Module):
+class RMSNorm(DeviceAgnosticModule, nn.Module):
     """
     Root Mean Square Layer Normalization.
     More efficient than standard LayerNorm with similar performance.
@@ -459,6 +496,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
         
     def forward(self, x):
+        # Convert input to appropriate device format
+        x = self.to_device(x)
         """
         Forward pass of RMSNorm.
         
@@ -472,7 +511,7 @@ class RMSNorm(nn.Module):
         norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x * norm * self.scale
 
-class TreeStateTracker(nn.Module):
+class TreeStateTracker(DeviceAgnosticModule, nn.Module):
     """
     Efficient state tracking for tree-structured thoughts.
     Optimizes memory usage for maintaining tree state during inference.
@@ -500,7 +539,7 @@ class TreeStateTracker(nn.Module):
         """Score branches for pruning decisions"""
         return self.branch_scorer(branch_states).squeeze(-1)
 
-class TreeAttention(nn.Module):
+class TreeAttention(DeviceAgnosticModule, nn.Module):
     """
     Specialized attention mechanism for tree-structured thought processing.
     Optimized for both ToT and CoT operations.
@@ -564,7 +603,7 @@ class TreeAttention(nn.Module):
                         mask[b, :, child, parent] = 1
         return mask
 
-class OptimizedTreeSearch(nn.Module):
+class OptimizedTreeSearch(DeviceAgnosticModule, nn.Module):
     """
     Hardware-optimized implementation of tree search operations.
     Supports both BFS and DFS with efficient memory management.
@@ -610,7 +649,7 @@ class OptimizedTreeSearch(nn.Module):
             _, indices = path_scores.topk(min(self.max_branches, num_nodes), dim=1)
             return indices, scores
 
-class TransformerLayer(nn.Module):
+class TransformerLayer(DeviceAgnosticModule, nn.Module):
     """
     Single Transformer layer with MoE attention and feed-forward network.
     Enhanced with hardware optimizations and specialized computational blocks.
@@ -713,7 +752,7 @@ class TransformerLayer(nn.Module):
                 
             return output
 
-class KernelTransformer(nn.Module):
+class KernelTransformer(DeviceAgnosticModule, nn.Module):
     """
     Core transformer model for VishwamAI, used as the backbone for CoT and ToT models.
     Enhanced with hardware-aware optimizations and specialized computation.

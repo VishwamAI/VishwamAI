@@ -18,13 +18,51 @@ from abc import ABC, abstractmethod
 import math
 import copy
 
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random
+    import flax.linen as flax_nn
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+def get_device_type():
+    """Determine the available device type."""
+    if torch.cuda.is_available():
+        return "gpu"
+    elif HAS_JAX and len(jax.devices("tpu")) > 0:
+        return "tpu"
+    return "cpu"
+
 # Optional TPU support
 # import torch_xla.core.xla_model as xm
 
-class BaseAttention(nn.Module, ABC):
+class DeviceAgnosticModule:
+    """Base class for device-agnostic modules"""
+    def __init__(self):
+        self.device_type = get_device_type()
+        self.gpu_module = None
+        self.tpu_module = None
+    
+    def to_device(self, x):
+        """Convert input to appropriate device format"""
+        if self.device_type == "tpu" and HAS_JAX:
+            if isinstance(x, torch.Tensor):
+                return jnp.array(x.cpu().numpy())
+        elif self.device_type == "gpu":
+            if not isinstance(x, torch.Tensor):
+                return torch.tensor(x)
+        return x
+
+class BaseAttention(DeviceAgnosticModule, nn.Module, ABC):
     """Enhanced base class with hardware-aware initialization"""
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, dropout=0.1, force_device=None):
         super(BaseAttention, self).__init__()
+        DeviceAgnosticModule.__init__(self)
+        
+        if force_device:
+            self.device_type = force_device
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads

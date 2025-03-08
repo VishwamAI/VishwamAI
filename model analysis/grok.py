@@ -20,7 +20,6 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import haiku as hk
 import jax
-import jax.experimental.maps
 import jax.numpy as jnp
 from jax import config, tree_util
 from jax.experimental.shard_map import shard_map

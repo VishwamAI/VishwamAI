@@ -1,21 +1,40 @@
 """
-Chain of Thought (CoT) model for VishwamAI, designed to generate reasoning steps before answers.
-Inspired by DeepSeek-R1, outputs are structured with <think> and <answer> tags.
-Supports deep calculations for tasks like mathematics and coding.
+Device-agnostic Chain of Thought (CoT) model for VishwamAI.
+Supports both GPU (PyTorch) and TPU (JAX) execution with unified interface.
 """
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random, grad, jit, vmap
+    import flax.linen as flax_nn
+    import optax
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
 
 from vishwamai.models.transformer import VishwamAITransformer
+from vishwamai.models.attention import DeviceAgnosticModule
 
-class CoTModel(nn.Module):
+def get_device_type():
+    """Determine the available device type."""
+    if torch.cuda.is_available():
+        return "gpu"
+    elif HAS_JAX and len(jax.devices("tpu")) > 0:
+        return "tpu"
+    return "cpu"
+
+class CoTModel(DeviceAgnosticModule, nn.Module):
     """
     CoT model extending a transformer to generate reasoning steps and answers.
     """
     def __init__(self, embed_dim=512, num_layers=12, num_heads=8, ff_dim=2048, 
-                 vocab_size=50000, max_seq_len=512, num_experts=7):
+                 vocab_size=50000, max_seq_len=512, num_experts=7, force_device=None):
         """
         Initialize the CoT model.
         
@@ -29,6 +48,10 @@ class CoTModel(nn.Module):
             num_experts (int): Number of attention experts for MoE.
         """
         super(CoTModel, self).__init__()
+        DeviceAgnosticModule.__init__(self)
+        
+        if force_device:
+            self.device_type = force_device
         
         # Special tokens for CoT structure
         self.special_tokens = {
@@ -38,7 +61,7 @@ class CoTModel(nn.Module):
             "answer_end": "</answer>"
         }
         
-        # Base transformer with enhanced VishwamAI architecture
+        # Base transformer with device-specific configuration
         attention_kwargs = {"num_experts": num_experts, "taa_kwargs": {"k": 10, "kernel_dim": 256}}
         self.transformer = VishwamAITransformer(
             vocab_size=vocab_size,
@@ -47,14 +70,28 @@ class CoTModel(nn.Module):
             num_heads=num_heads,
             ff_dim=ff_dim,
             max_seq_len=max_seq_len,
-            attention_kwargs=attention_kwargs
+            attention_kwargs=attention_kwargs,
+            force_device=self.device_type
         )
         
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Device-specific setup
+        if self.device_type == "gpu":
+            self.device = torch.device("cuda")
+            self.to(self.device)
+        elif self.device_type == "tpu" and HAS_JAX:
+            # JAX/TPU-specific initialization if needed
+            self.device = jax.devices("tpu")[0]
+        else:
+            self.device = torch.device("cpu")
+            self.to(self.device)
+            
         self.max_seq_len = max_seq_len
-        self.to(self.device)
 
     def forward(self, input_ids, target_ids=None):
+        # Convert inputs to appropriate device format
+        input_ids = self.to_device(input_ids)
+        if target_ids is not None:
+            target_ids = self.to_device(target_ids)
         """
         Forward pass for training or inference.
         
@@ -99,6 +136,8 @@ class CoTModel(nn.Module):
         return output_text
 
     def _sample(self, input_ids, max_length, temperature, top_p):
+        # Convert input to appropriate device format
+        input_ids = self.to_device(input_ids)
         """
         Sample tokens with temperature and top-p filtering.
         """
@@ -156,7 +195,7 @@ def extract_answer(output_text):
     return "Answer not found"
 
 # Training function
-def train_cot_model(model, dataloader, optimizer, num_epochs, device):
+def train_cot_model(model, dataloader, optimizer, num_epochs):
     """
     Train the CoT model with supervised learning.
     
@@ -165,18 +204,44 @@ def train_cot_model(model, dataloader, optimizer, num_epochs, device):
         dataloader: DataLoader with (input_ids, target_ids) pairs.
         optimizer: Optimizer (e.g., Adam).
         num_epochs (int): Number of training epochs.
-        device: Device to train on.
     """
     model.train()
     for epoch in range(num_epochs):
         total_loss = 0
         for batch_idx, (input_ids, target_ids) in enumerate(dataloader):
-            input_ids, target_ids = input_ids.to(device), target_ids.to(device)
-            optimizer.zero_grad()
-            loss = model(input_ids, target_ids)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            # Handle device-specific training
+            if model.device_type == "gpu":
+                input_ids, target_ids = input_ids.to(model.device), target_ids.to(model.device)
+                optimizer.zero_grad()
+                loss = model(input_ids, target_ids)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            elif model.device_type == "tpu" and HAS_JAX:
+                # TPU training using JAX
+                input_ids = jnp.array(input_ids.numpy())
+                target_ids = jnp.array(target_ids.numpy())
+                
+                @jit
+                def update_step(params, inputs, targets):
+                    def loss_fn(params):
+                        logits = model.apply({'params': params}, inputs)
+                        return jnp.mean(
+                            optax.softmax_cross_entropy_with_integer_labels(
+                                logits[:, model.transformer.embed_dim:],
+                                targets
+                            )
+                        )
+                    loss, grads = jax.value_and_grad(loss_fn)(params)
+                    params = jax.tree_map(
+                        lambda p, g: p - 0.01 * g,  # Simple SGD for example
+                        params,
+                        grads
+                    )
+                    return params, loss
+                
+                model.params, loss = update_step(model.params, input_ids, target_ids)
+                total_loss += loss.item()
             
             if batch_idx % 100 == 0:
                 print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}")

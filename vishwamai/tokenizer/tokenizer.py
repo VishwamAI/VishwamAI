@@ -5,11 +5,34 @@ import logging
 from typing import List, Union, Dict, Optional
 import torch
 
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random
+    import flax.linen as nn
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class SentencePieceTokenizer:
+class DeviceAgnosticTokenizer:
+    """Base class for device-agnostic tokenizer implementation"""
+    def __init__(self):
+        self.device_type = "gpu"  # Default to GPU
+        if HAS_JAX:
+            try:
+                jax.devices("tpu")
+                self.device_type = "tpu"
+            except:
+                try:
+                    jax.devices("gpu")
+                except:
+                    pass
+
+class SentencePieceTokenizer(DeviceAgnosticTokenizer):
     """
     A unique tokenizer for VishwamAI using SentencePiece for subword tokenization.
     Supports encoding/decoding text, handling special tokens, and integration with transformer models.
@@ -22,6 +45,7 @@ class SentencePieceTokenizer:
             model_path (str): Path to the SentencePiece model file (.model).
             max_seq_len (int): Maximum sequence length for truncation (default: 512).
         """
+        super().__init__()
         # Load the SentencePiece model
         try:
             self.sp = spm.SentencePieceProcessor()
@@ -51,24 +75,28 @@ class SentencePieceTokenizer:
         self.special_token_ids = {k: self.sp.piece_to_id(v) for k, v in self.special_tokens.items()}
         logger.info(f"Special tokens: {self.special_token_ids}")
 
-    def encode(self, text: str, return_tensors: Optional[str] = None, add_special_tokens: bool = True) -> Union[List[int], torch.Tensor]:
+    def encode(self, text: str, return_tensors: Optional[str] = None, add_special_tokens: bool = True) -> Union[List[int], torch.Tensor, jnp.ndarray]:
         """
-        Encode text into token IDs.
+        Encode text into token IDs with device-specific implementation.
 
         Args:
             text (str): Input text to encode.
-            return_tensors (str, optional): If "pt", returns a PyTorch tensor; otherwise, returns a list.
-            add_special_tokens (bool): Whether to add BOS and EOS tokens (default: True).
+            return_tensors (str, optional): "pt" for PyTorch, "jax" for JAX, None for list.
+            add_special_tokens (bool): Whether to add BOS and EOS tokens.
 
         Returns:
-            Union[List[int], torch.Tensor]: Encoded token IDs.
+            Union[List[int], torch.Tensor, jnp.ndarray]: Encoded token IDs.
         """
         # Preprocess text: ensure it's a string and not empty
         if not isinstance(text, str):
             text = str(text)
         if not text.strip():
             logger.warning("Empty text provided for encoding. Returning empty token list.")
-            return torch.tensor([], dtype=torch.long) if return_tensors == "pt" else []
+            if return_tensors == "pt":
+                return torch.tensor([], dtype=torch.long)
+            elif return_tensors == "jax":
+                return jnp.array([], dtype=jnp.int32)
+            return []
 
         # Add special tokens if requested
         if add_special_tokens:
@@ -85,21 +113,25 @@ class SentencePieceTokenizer:
         # Convert to tensor if requested
         if return_tensors == "pt":
             return torch.tensor(token_ids, dtype=torch.long)
+        elif return_tensors == "jax":
+            return jnp.array(token_ids, dtype=jnp.int32)
         return token_ids
 
-    def decode(self, token_ids: Union[List[int], torch.Tensor], skip_special_tokens: bool = False) -> str:
+    def decode(self, token_ids: Union[List[int], torch.Tensor, jnp.ndarray], skip_special_tokens: bool = False) -> str:
         """
-        Decode token IDs back to text.
+        Decode token IDs back to text with device-specific handling.
 
         Args:
-            token_ids (Union[List[int], torch.Tensor]): Token IDs to decode.
-            skip_special_tokens (bool): Whether to skip special tokens in the output (default: False).
+            token_ids (Union[List[int], torch.Tensor, jnp.ndarray]): Token IDs to decode.
+            skip_special_tokens (bool): Whether to skip special tokens.
 
         Returns:
             str: Decoded text.
         """
         # Convert tensor to list if necessary
         if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.cpu().tolist()
+        elif isinstance(token_ids, jnp.ndarray):
             token_ids = token_ids.tolist()
 
         # Decode token IDs to text
@@ -140,17 +172,17 @@ class SentencePieceTokenizer:
         """
         return self.special_token_ids
 
-    def batch_encode(self, texts: List[str], return_tensors: Optional[str] = None, add_special_tokens: bool = True) -> Union[List[List[int]], torch.Tensor]:
+    def batch_encode(self, texts: List[str], return_tensors: Optional[str] = None, add_special_tokens: bool = True) -> Union[List[List[int]], torch.Tensor, jnp.ndarray]:
         """
-        Encode a batch of texts into token IDs.
+        Encode a batch of texts with device-specific batching.
 
         Args:
             texts (List[str]): List of input texts to encode.
-            return_tensors (str, optional): If "pt", returns a PyTorch tensor; otherwise, returns a list.
-            add_special_tokens (bool): Whether to add BOS and EOS tokens (default: True).
+            return_tensors (str, optional): "pt" for PyTorch, "jax" for JAX, None for list.
+            add_special_tokens (bool): Whether to add special tokens.
 
         Returns:
-            Union[List[List[int]], torch.Tensor]: Encoded token IDs for each text.
+            Union[List[List[int]], torch.Tensor, jnp.ndarray]: Encoded token IDs.
         """
         encoded = [self.encode(text, add_special_tokens=add_special_tokens) for text in texts]
 
@@ -161,6 +193,12 @@ class SentencePieceTokenizer:
             for i, seq in enumerate(encoded):
                 padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
             return padded
+        elif return_tensors == "jax":
+            max_len = max(len(seq) for seq in encoded)
+            padded = jnp.full((len(encoded), max_len), self.special_token_ids['pad'], dtype=jnp.int32)
+            for i, seq in enumerate(encoded):
+                padded = padded.at[i, :len(seq)].set(jnp.array(seq, dtype=jnp.int32))
+            return padded
 
         return encoded
 
@@ -168,15 +206,27 @@ if __name__ == "__main__":
     # Example usage
     tokenizer = SentencePieceTokenizer(model_path="path/to/vishwamai_tokenizer.model")
 
-    # Test encoding
+    # Test encoding with different backends
     text = "Solve 2x + 3 = 7"
-    token_ids = tokenizer.encode(text, return_tensors="pt")
-    print(f"Encoded: {token_ids}")
-
+    
+    # PyTorch encoding
+    token_ids_pt = tokenizer.encode(text, return_tensors="pt")
+    print(f"PyTorch encoded: {token_ids_pt}")
+    
+    if HAS_JAX:
+        # JAX encoding
+        token_ids_jax = tokenizer.encode(text, return_tensors="jax")
+        print(f"JAX encoded: {token_ids_jax}")
+    
     # Test decoding
-    decoded_text = tokenizer.decode(token_ids)
+    decoded_text = tokenizer.decode(token_ids_pt)
     print(f"Decoded: {decoded_text}")
 
-    # Test special tokens
-    print(f"Special tokens: {tokenizer.get_special_tokens()}")
-    print(f"Vocab size: {tokenizer.get_vocab_size()}")
+    # Test batch encoding
+    texts = ["Hello world", "Testing batch encoding"]
+    batch_encoded_pt = tokenizer.batch_encode(texts, return_tensors="pt")
+    print(f"Batch encoded (PyTorch): {batch_encoded_pt.shape}")
+    
+    if HAS_JAX:
+        batch_encoded_jax = tokenizer.batch_encode(texts, return_tensors="jax")
+        print(f"Batch encoded (JAX): {batch_encoded_jax.shape}")

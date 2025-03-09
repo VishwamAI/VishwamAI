@@ -1,7 +1,6 @@
 # /home/kasinadhsarma/VishwamAI/vishwamai/models/transformer.py
 """
-Device-agnostic VishwamAI Transformer with support for GPU and TPU execution.
-Combines PyTorch (GPU) and JAX (TPU) implementations with dynamic routing.
+VishwamAI Transformer with unified GPU/TPU support and optimizations.
 """
 
 import os
@@ -9,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+from typing import Optional, Dict, Any
 
 try:
     import jax
@@ -20,11 +20,11 @@ except ImportError:
     HAS_JAX = False
 
 # Import core layers and attention mechanisms
-from vishwamai.models.kernel_layers import TokenEmbedding, PositionalEncoding, FeedForward
-from vishwamai.models.attention import DynamicSparseAttention, LearnedPerformerAttention, OptimizedMoEAttention
+from vishwamai.models.kernel_layers import TokenEmbedding, PositionalEncoding, FeedForward, OptimizedLayerNorm, DeviceAgnosticModule
+from vishwamai.models.attention import DynamicSparseAttention, LearnedPerformerAttention, OptimizedMoEAttention, FlashMLAttention, TPUOptimizedAttention
 
 # Import device-specific implementations
-from vishwamai.models.gpu.transformer import VishwamAITransformer as GPUTransformer
+from vishwamai.models.gpu.transformer import DualPipeTransformer as GPUTransformer
 from vishwamai.models.tpu.transformer import VishwamAITransformer as TPUTransformer
 
 def get_device_type():
@@ -128,215 +128,149 @@ class AdaptiveReasoningGate(DeviceAgnosticModule, nn.Module):
         return attn_weight.unsqueeze(-1).unsqueeze(-1), ffn_weight.unsqueeze(-1).unsqueeze(-1)
 
 
-class VishwamAITransformerLayer(DeviceAgnosticModule, nn.Module):
-    """
-    Single layer of the VishwamAI Transformer with OptimizedMoEAttention, HybridThoughtAwareAttention,
-    Adaptive Reasoning Gate, Hybrid MoE-Dense layers, and Reasoning Depth Scaling.
-    """
-    def __init__(self, embed_dim, num_heads, ff_dim, attention_kwargs, layer_idx, num_layers, dropout=0.1):
-        """
-        Initialize a VishwamAI Transformer layer.
-
-        Args:
-            embed_dim (int): Embedding dimension.
-            num_heads (int): Number of attention heads.
-            ff_dim (int): Feed-forward hidden dimension.
-            attention_kwargs (dict): Keyword arguments for MoE attention.
-            layer_idx (int): Index of the layer (for depth scaling).
-            num_layers (int): Total number of layers (for depth scaling).
-            dropout (float): Dropout rate.
-        """
-        super(VishwamAITransformerLayer, self).__init__()
+class VishwamAITransformerLayer(DeviceAgnosticModule):
+    """Single transformer layer with hardware-specific optimizations."""
+    def __init__(self, embed_dim: int, num_heads: int, ff_dim: int,
+                 attention_kwargs: Dict[str, Any], layer_idx: int, num_layers: int,
+                 dropout_rate: float = 0.1, force_device: str = None):
+        super().__init__()
+        if force_device:
+            self.device_type = force_device
+            
         self.layer_idx = layer_idx
         self.num_layers = num_layers
-
-        # Hybrid Attention: OptimizedMoEAttention with HybridThoughtAwareAttention as a fallback
-        self.moe_attention = OptimizedMoEAttention(embed_dim, num_heads, **attention_kwargs)
-        self.taa_attention = HybridThoughtAwareAttention(embed_dim, num_heads, **attention_kwargs.get('taa_kwargs', {}))
-        self.attn_gate = nn.Linear(embed_dim, 2)  # Gate for MoE vs. TAA
-
-        # Feed-forward network
-        self.ffn = FeedForward(embed_dim, ff_dim, dropout)
-
-        # Adaptive Reasoning Gate
-        self.arg = AdaptiveReasoningGate(embed_dim)
-
-        # Normalization
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.norm3 = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None, context=None):
-        """
-        Forward pass of the VishwamAI Transformer layer.
-
-        Args:
-            x (torch.Tensor): Input tensor (batch_size, seq_len, embed_dim).
-            mask (torch.Tensor, optional): Attention mask (batch_size, seq_len, seq_len).
-            context (torch.Tensor, optional): Context tensor for cross-domain attention.
-
-        Returns:
-            torch.Tensor: Output tensor (batch_size, seq_len, embed_dim).
-        """
-        # Reasoning Depth Scaling: Increase computation for deeper layers
-        depth_factor = 1.0 + (self.layer_idx / self.num_layers) * 0.5  # Scale from 1.0 to 1.5
-
-        # Adaptive Reasoning Gate weights
-        attn_weight, ffn_weight = self.arg(x)
-
-        # Hybrid Attention with gating
-        moe_output = self.moe_attention(x, context) if context else self.moe_attention(x)
-        taa_output = self.taa_attention(x, mask)
-        attn_gate_weights = F.softmax(self.attn_gate(x.mean(dim=1)), dim=-1)  # (batch_size, 2)
-        moe_weight, taa_weight = attn_gate_weights[:, 0].unsqueeze(-1).unsqueeze(-1), attn_gate_weights[:, 1].unsqueeze(-1).unsqueeze(-1)
-        attn_output = (moe_weight * moe_output + taa_weight * taa_output) * depth_factor
-        x = self.norm1(x + self.dropout(attn_output))
-
-        # Feed-forward block with ARG and depth scaling
-        ffn_output = self.ffn(x) * ffn_weight * depth_factor
-        x = self.norm2(x + self.dropout(ffn_output))
-
-        return self.norm3(x)
-
-
-class VishwamAITransformer(DeviceAgnosticModule, nn.Module):
-    """
-    Unique VishwamAI Transformer with advanced reasoning capabilities.
-    """
-    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_seq_len=512,
-                 attention_kwargs=None, dropout=0.1, force_device=None):
-        """
-        Initialize the VishwamAI Transformer.
-
-        Args:
-            vocab_size (int): Vocabulary size.
-            embed_dim (int): Embedding dimension.
-            num_layers (int): Number of transformer layers.
-            num_heads (int): Number of attention heads.
-            ff_dim (int): Feed-forward hidden dimension.
-            max_seq_len (int): Maximum sequence length.
-            attention_kwargs (dict): Keyword arguments for MoE attention (e.g., num_experts, taa_kwargs).
-            dropout (float): Dropout rate.
-        """
-        super(VishwamAITransformer, self).__init__()
-        DeviceAgnosticModule.__init__(self)
         
+        # Select attention implementation based on device
+        if self.device_type == "tpu" and HAS_JAX:
+            self.attention = TPUOptimizedAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout_rate
+            )
+        elif self.device_type == "gpu":
+            self.attention = FlashMLAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout_rate,
+                **attention_kwargs.get('flash_kwargs', {})
+            )
+        else:
+            self.attention = DynamicSparseAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout_rate
+            )
+            
+        # Device-agnostic components
+        self.norm1 = OptimizedLayerNorm(embed_dim, force_device=self.device_type)
+        self.norm2 = OptimizedLayerNorm(embed_dim, force_device=self.device_type)
+        self.ff = FeedForward(embed_dim, ff_dim, dropout_rate, force_device=self.device_type)
+        
+    def __call__(self, x, mask=None, context=None, layer_states=None, training=False):
+        # Reasoning Depth Scaling factor
+        depth_factor = 1.0 + (self.layer_idx / self.num_layers) * 0.5
+        
+        # Attention block with residual
+        residual = x
+        x = self.norm1(x)
+        x = self.attention(x, context=context, mask=mask)
+        x = x * depth_factor + residual
+        
+        # Feed-forward block with residual
+        residual = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = x * depth_factor + residual
+        
+        return x
+
+class VishwamAITransformer(DeviceAgnosticModule):
+    """
+    Device-agnostic transformer with optimizations for different hardware.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        ff_dim: int,
+        max_seq_len: int = 512,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        dropout_rate: float = 0.1,
+        force_device: str = None
+    ):
+        super().__init__()
         if force_device:
             self.device_type = force_device
             
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         
-        # Initialize device-specific implementations
-        if self.device_type == "gpu":
-            self.model = GPUTransformer(
-                vocab_size=vocab_size,
-                embed_dim=embed_dim,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                ff_dim=ff_dim,
-                max_seq_len=max_seq_len,
-                attention_kwargs=attention_kwargs,
-                dropout=dropout
-            )
-        elif self.device_type == "tpu" and HAS_JAX:
-            self.model = TPUTransformer(
-                vocab_size=vocab_size,
-                embed_dim=embed_dim,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                ff_dim=ff_dim,
-                max_seq_len=max_seq_len,
-                attention_kwargs=attention_kwargs,
-                dropout_rate=dropout
-            )
-        else:
-            raise ValueError(f"Unsupported device type: {self.device_type}")
-
-        # Embedding layers
-        self.token_embedding = TokenEmbedding(vocab_size, embed_dim)
-        self.positional_encoding = PositionalEncoding(embed_dim, max_seq_len, dropout)
-        attention_kwargs = attention_kwargs or {"num_experts": 4, "taa_kwargs": {"k": 10, "kernel_dim": 256}}
-
-        # Stack of VishwamAI transformer layers
-        self.layers = nn.ModuleList([
-            VishwamAITransformerLayer(embed_dim, num_heads, ff_dim, attention_kwargs, idx, num_layers, dropout)
-            for idx in range(num_layers)
-        ])
-
-        # Output projection
-        self.norm = nn.LayerNorm(embed_dim)
-        self.output_projection = nn.Linear(embed_dim, vocab_size)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)
-
-    def forward(self, x, mask=None, context=None):
-        # Convert inputs to appropriate device format
-        x = self.to_device(x)
-        if mask is not None:
-            mask = self.to_device(mask)
-        if context is not None:
-            context = self.to_device(context)
-            
-        # Route to appropriate implementation
-        if self.device_type == "gpu":
-            return self.model(x, mask, context)
-        elif self.device_type == "tpu":
-            return self.model.apply({'params': self.model.params}, x, mask, context)
-        """
-        Forward pass of the VishwamAI Transformer.
-
-        Args:
-            x (torch.Tensor): Input token IDs (batch_size, seq_len).
-            mask (torch.Tensor, optional): Attention mask (batch_size, seq_len, seq_len).
-            context (torch.Tensor, optional): Context tensor for cross-domain attention.
-
-        Returns:
-            torch.Tensor: Logits (batch_size, seq_len, vocab_size).
-        """
-        # Embed tokens and add positional encodings
-        x = self.token_embedding(x)
-        x = self.positional_encoding(x)
-
-        # Pass through transformer layers
-        for layer in self.layers:
-            x = layer(x, mask, context)
-
-        # Final normalization and projection
-        x = self.norm(x)
-        logits = self.output_projection(x)
-        return logits
-
-    def get_hidden_state(self, x, mask=None, context=None):
-        # Convert inputs to appropriate device format
-        x = self.to_device(x)
-        if mask is not None:
-            mask = self.to_device(mask)
-        if context is not None:
-            context = self.to_device(context)
-            
-        # Route to appropriate implementation
-        if self.device_type == "gpu":
-            return self.model.get_hidden_state(x, mask, context)
-        elif self.device_type == "tpu":
-            return self.model.apply({'params': self.model.params}, x, mask, context, method=self.model.get_hidden_state)
-        """
-        Get hidden state from the transformer without final projection.
-
-        Args:
-            x (torch.Tensor): Input token IDs (batch_size, seq_len).
-            mask (torch.Tensor, optional): Attention mask.
-            context (torch.Tensor, optional): Context tensor for cross-domain attention.
-
-        Returns:
-            torch.Tensor: Hidden state (batch_size, seq_len, embed_dim).
-        """
-        x = self.token_embedding(x)
-        x = self.positional_encoding(x)
+        # Device-agnostic embeddings
+        self.token_embedding = TokenEmbedding(
+            vocab_size, embed_dim, force_device=self.device_type
+        )
+        self.pos_embedding = PositionalEncoding(
+            embed_dim, max_seq_len, dropout_rate, force_device=self.device_type
+        )
         
+        # Initialize attention kwargs
+        self.attention_kwargs = attention_kwargs or {
+            "num_experts": 4,
+            "flash_kwargs": {
+                "latent_dim": 64,
+                "block_size": 128
+            }
+        }
+        
+        # Create transformer layers
+        self.layers = [
+            VishwamAITransformerLayer(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                attention_kwargs=self.attention_kwargs,
+                layer_idx=i,
+                num_layers=num_layers,
+                dropout_rate=dropout_rate,
+                force_device=self.device_type
+            )
+            for i in range(num_layers)
+        ]
+        
+        # Final normalization and output projection
+        self.norm = OptimizedLayerNorm(embed_dim, force_device=self.device_type)
+        
+        if self.device_type == "tpu" and HAS_JAX:
+            self.output_projection = flax_nn.Dense(vocab_size)
+        else:
+            import torch.nn as nn
+            self.output_projection = nn.Linear(embed_dim, vocab_size)
+            
+    def __call__(self, x, mask=None, context=None, training=False):
+        x = self.token_embedding(x)
+        x = self.pos_embedding(x)
+        
+        layer_states = []
         for layer in self.layers:
-            x = layer(x, mask, context)
+            layer_output = layer(x, mask, context, layer_states, training)
+            layer_states.append(layer_output)
+            x = layer_output
+            
+        x = self.norm(x)
+        return self.output_projection(x)
+        
+    def get_hidden_state(self, x, mask=None, context=None, training=False):
+        """Get the final hidden state without output projection."""
+        x = self.token_embedding(x)
+        x = self.pos_embedding(x)
+        
+        layer_states = []
+        for layer in self.layers:
+            layer_output = layer(x, mask, context, layer_states, training)
+            layer_states.append(layer_output)
+            x = layer_output
             
         return self.norm(x)
 
@@ -375,7 +309,7 @@ if __name__ == "__main__":
     num_heads = 8
     ff_dim = 2048
     max_seq_len = 512
-    attention_kwargs = {"num_experts": 4, "taa_kwargs": {"k": 10, "kernel_dim": 256}}
+    attention_kwargs = {"num_experts": 4, "flash_kwargs": {"k": 10, "kernel_dim": 256}}
 
     transformer = VishwamAITransformer(
         vocab_size=vocab_size,

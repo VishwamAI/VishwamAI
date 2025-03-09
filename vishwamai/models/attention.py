@@ -1,14 +1,6 @@
-# /home/kasinadhsarma/VishwamAI/vishwamai/models/attention.py
 """
-Enhanced attention mechanisms for VishwamAI with cutting-edge features:
-- Dynamic sparse attention with learned sparsity
-- Cross-domain/multi-modal attention
-- Hierarchical MoE structure
-- Temporal convolution integration
-- Hardware-optimized operations
-- Advanced gating with load balancing
-- Learned performer features
-- FlashMLA for memory-efficient latent attention
+Enhanced attention mechanisms for VishwamAI with hardware-specific optimizations.
+Automatically selects optimal implementation based on available hardware.
 """
 
 import torch
@@ -27,8 +19,21 @@ try:
 except ImportError:
     HAS_JAX = False
 
+# Import hardware-specific implementations
+from .gpu.attention import (
+    FlashMLAAttention as GPUFlashMLAAttention,
+    OptimizedMoEAttention as GPUMoEAttention,
+    DynamicSparseAttention as GPUDynamicSparseAttention
+)
+
+from .tpu.attention import (
+    FlashMLAAttention as TPUFlashMLAAttention,
+    OptimizedMoEAttention as TPUMoEAttention,
+    DynamicSparseAttention as TPUDynamicSparseAttention
+)
+
 def get_device_type():
-    """Determine the available device type."""
+    """Determine the optimal available hardware."""
     if torch.cuda.is_available():
         return "gpu"
     elif HAS_JAX and len(jax.devices("tpu")) > 0:
@@ -707,3 +712,30 @@ class TPUOptimizedAttention(BaseAttention):
         
         # Final projection (reusing existing o_proj)
         return self.o_proj(output)
+
+def create_attention_module(attention_type, config):
+    """Factory function to create the optimal attention implementation."""
+    device_type = get_device_type()
+    
+    if device_type == "gpu":
+        if attention_type == "flash_mla":
+            return GPUFlashMLAAttention(**config)
+        elif attention_type == "moe":
+            return GPUMoEAttention(**config)
+        elif attention_type == "dynamic_sparse":
+            return GPUDynamicSparseAttention(**config)
+    elif device_type == "tpu":
+        if attention_type == "flash_mla":
+            return TPUFlashMLAAttention(**config)
+        elif attention_type == "moe":
+            return TPUMoEAttention(**config)
+        elif attention_type == "dynamic_sparse":
+            return TPUDynamicSparseAttention(**config)
+            
+    # Fall back to base implementations
+    if attention_type == "flash_mla":
+        return FlashMLAttention(**config)
+    elif attention_type == "moe":
+        return OptimizedMoEAttention(**config)
+    elif attention_type == "dynamic_sparse":
+        return DynamicSparseAttention(**config)

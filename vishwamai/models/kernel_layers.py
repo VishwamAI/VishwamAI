@@ -48,6 +48,15 @@ def get_device_type():
         return "tpu"
     return "cpu"
 
+def get_optimizer(device_type: str, params: Any, learning_rate: float = 1e-4):
+    """Get device-appropriate optimizer."""
+    if device_type == "tpu" and HAS_JAX:
+        import optax
+        return optax.adamw(learning_rate)
+    else:
+        import torch.optim as optim
+        return optim.AdamW(params, lr=learning_rate)
+
 class HardwareCapabilityDetector(DeviceAgnosticModule):
     """Detects and manages hardware capabilities for optimized training"""
     

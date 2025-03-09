@@ -1,45 +1,94 @@
-# /home/kasinadhsarma/VishwamAI/vishwamai/models/tpu/attention.py
+# /home/kasinadhsarma/VishwamAI/vishwamai/models/hybrid_attention.py
 """
-Enhanced TPU-optimized attention mechanisms for VishwamAI using JAX, Haiku, and Optax:
-- Dynamic sparse attention with learned sparsity (F dimension)
-- Learned performer features with linear scaling
-- Optimized Mixture of Experts (MoE) with hierarchical routing (E dimension)
-- Cross-domain/multi-modal attention with channels (C dimension)
-- Temporal convolution integration with temporal context (T dimension)
-- Hierarchical MoE with multi-level routing
-- FlashMLA for memory-efficient latent attention
-- TPU-optimized attention with combined QKV
-- Fractal attention with recursive levels (F dimension)
-- Semantic group attention with role-aware processing (S dimension)
-- Temporal cross attention with time and channels (T, C dimensions)
+Hybrid TPU/GPU-optimized attention mechanisms for VishwamAI:
+- GPU: PyTorch with Triton (FlashMLAAttention, MultiModalAttention, TemporalAttention)
+- TPU: JAX with Haiku/Sonnet (FlashMLAttentionTPU, MultiModalAttentionTPU, TemporalAttentionTPU, SonnetFlashAttentionTPU)
+- Features: Dynamic sparse attention, cross-domain attention, temporal convolution, and more.
 """
 
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import triton
+import triton.language as tl
 import jax
 import jax.numpy as jnp
-from jax import random, grad, vmap, jit
-from haiku import Module, transform, initializers
+from jax import random, vmap, jit, lax
 import haiku as hk
 import optax
-from typing import Optional, Tuple, Dict
+import tensorflow as tf
+import sonnet as snt
+from tensorflow.experimental import dlpack
 import math
+from abc import ABC, abstractmethod
 
 # Enable bfloat16 for TPU efficiency
 from jax import config
-config.update("jax_enable_x64", False)  # Use bfloat16 by default
+config.update("jax_enable_x64", False)
 
-class BaseAttention(Module):
-    """Base class for TPU-optimized attention mechanisms."""
+# Triton kernel for Xavier initialization (GPU)
+@triton.jit
+def xavier_init_kernel(output_ptr, n_elements, fan_in, fan_out, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    gain = 1.0 / tl.sqrt(fan_in + fan_out)
+    random_vals = tl.rand(offsets, seed=42) * 2.0 - 1.0
+    values = random_vals * gain
+    tl.store(output_ptr + offsets, values, mask=mask)
+
+# Base Attention Classes (Abstract for GPU and TPU)
+class BaseAttention(ABC):
+    @abstractmethod
+    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
+        pass
+
+# GPU Base Attention (PyTorch)
+class BaseAttentionGPU(nn.Module, BaseAttention):
+    def __init__(self, embed_dim, num_heads, dropout=0.1, use_amp=True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.o_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.use_amp = use_amp
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        def triton_xavier_init(tensor, fan_in, fan_out):
+            n_elements = tensor.numel()
+            grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+            xavier_init_kernel[grid](tensor.data_ptr(), n_elements, fan_in, fan_out, BLOCK_SIZE=1024)
+        triton_xavier_init(self.q_proj.weight, self.embed_dim, self.embed_dim)
+        triton_xavier_init(self.k_proj.weight, self.embed_dim, self.embed_dim)
+        triton_xavier_init(self.v_proj.weight, self.embed_dim, self.embed_dim)
+        triton_xavier_init(self.o_proj.weight, self.embed_dim, self.embed_dim)
+        nn.init.constant_(self.q_proj.bias, 0.0)
+        nn.init.constant_(self.k_proj.bias, 0.0)
+        nn.init.constant_(self.v_proj.bias, 0.0)
+        nn.init.constant_(self.o_proj.bias, 0.0)
+
+    def _reshape_for_multihead(self, x):
+        batch_size, seq_len, _ = x.size()
+        x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+# TPU Base Attention (Haiku)
+class BaseAttentionTPU(hk.Module, BaseAttention):
     def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float = 0.1, name: str = None):
         super().__init__(name=name)
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-
-        self.q_proj = hk.Linear(embed_dim, w_init=initializers.VarianceScaling(1/math.sqrt(2)), b_init=initializers.Zeros())
-        self.k_proj = hk.Linear(embed_dim, w_init=initializers.VarianceScaling(1/math.sqrt(2)), b_init=initializers.Zeros())
-        self.v_proj = hk.Linear(embed_dim, w_init=initializers.VarianceScaling(1/math.sqrt(2)), b_init=initializers.Zeros())
-        self.o_proj = hk.Linear(embed_dim, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
+        self.q_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2)))
+        self.k_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2)))
+        self.v_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2)))
+        self.o_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
         self.dropout = hk.Dropout(dropout_rate)
 
     def _reshape_for_multihead(self, x):
@@ -47,442 +96,319 @@ class BaseAttention(Module):
         x = jnp.reshape(x, (batch_size, seq_len, self.num_heads, self.head_dim))
         return jnp.transpose(x, (0, 2, 1, 3))
 
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        raise NotImplementedError("Subclasses must implement __call__")
+# GPU FlashMLAAttention
+class FlashMLAAttentionGPU(BaseAttentionGPU):
+    def __init__(self, embed_dim, num_heads, dropout=0.1, use_amp=True, causal=False):
+        super().__init__(embed_dim, num_heads, dropout, use_amp)
+        self.causal = causal
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-class DynamicSparseAttention(BaseAttention):
-    """TPU-optimized attention with learned sparsity using Gumbel-Softmax."""
-    def __init__(self, embed_dim: int, num_heads: int, k: int = 10, dropout_rate: float = 0.1, temperature: float = 0.5, name: str = None):
+    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            q = self._reshape_for_multihead(self.q_proj(x))
+            k = self._reshape_for_multihead(self.k_proj(x if context is None else context))
+            v = self._reshape_for_multihead(self.v_proj(x if context is None else context))
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores.masked_fill(mask == 0, -1e9)
+            attn_probs = F.softmax(scores, dim=-1)
+            attn_probs = self.dropout(attn_probs) if is_training else attn_probs
+            output = torch.matmul(attn_probs, v).transpose(1, 2).contiguous()
+            output = output.view(x.size(0), x.size(1), self.embed_dim)
+            return self.o_proj(output)
+
+# TPU FlashMLAttention
+class FlashMLAttentionTPU(BaseAttentionTPU):
+    def __init__(self, embed_dim, num_heads, block_size=128, dropout_rate=0.1, causal=False, sm_scale=0.5, name=None):
         super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.k = k
-        self.temperature = temperature
-        self.sparsity_controller = hk.Linear(1, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        batch_size, seq_len, _ = x.shape
-        rng = rng or random.PRNGKey(0)
-
-        q = self._reshape_for_multihead(self.q_proj(x))
-        k = self._reshape_for_multihead(self.k_proj(x if context is None else context))
-        v = self._reshape_for_multihead(self.v_proj(x if context is None else context))
-
-        attn_scores = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / jnp.sqrt(self.head_dim)
-        token_importance = self.sparsity_controller(x).squeeze(-1)
-
-        if is_training:
-            noise = -jnp.log(-jnp.log(random.uniform(rng, token_importance.shape) + 1e-10) + 1e-10)
-            gumbel_logits = (token_importance.unsqueeze(1).unsqueeze(1) + noise) / self.temperature
-            sparse_mask = jax.nn.gumbel_softmax(gumbel_logits, tau=self.temperature, hard=True)
-            sparse_mask = jnp.repeat(sparse_mask, self.num_heads * seq_len, axis=1).reshape(batch_size, self.num_heads, seq_len, seq_len)
-        else:
-            top_indices = jnp.argsort(token_importance, axis=-1)[:, -min(self.k, seq_len):]
-            sparse_mask = jnp.zeros((batch_size, 1, 1, seq_len))
-            batch_indices = jnp.arange(batch_size)[:, jnp.newaxis]
-            sparse_mask = sparse_mask.at[batch_indices, 0, 0, top_indices].set(1.0)
-            sparse_mask = jnp.repeat(sparse_mask, self.num_heads * seq_len, axis=1).reshape(batch_size, self.num_heads, seq_len, seq_len)
-
-        if mask is not None:
-            attn_scores = jnp.where(mask == 0, -jnp.inf, attn_scores)
-        attn_scores = attn_scores * sparse_mask
-
-        attn_probs = jax.nn.softmax(attn_scores, axis=-1)
-        attn_probs = self.dropout(attn_probs, rng, is_training)
-
-        output = jnp.matmul(attn_probs, v)
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
-        return self.o_proj(output)
-
-class LearnedPerformerAttention(BaseAttention):
-    """TPU-optimized linear attention with learned feature maps."""
-    def __init__(self, embed_dim: int, num_heads: int, kernel_dim: int = 256, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.kernel_dim = kernel_dim
-        self.phi_proj = hk.Linear(kernel_dim, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
-        self.psi_proj = hk.Linear(kernel_dim, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        batch_size, seq_len, _ = x.shape
-        rng = rng or random.PRNGKey(0)
-
-        q = self._reshape_for_multihead(self.q_proj(x))
-        k = self._reshape_for_multihead(self.k_proj(x if context is None else context))
-        v = self._reshape_for_multihead(self.v_proj(x if context is None else context))
-
-        q_phi = jax.nn.elu(self.phi_proj(q)) + 1
-        k_psi = jax.nn.elu(self.psi_proj(k)) + 1
-
-        if mask is not None:
-            k_psi = k_psi * mask.unsqueeze(-1)
-            v = v * mask.unsqueeze(-1)
-
-        kv = jnp.einsum('bhld,bhlm->bhdm', k_psi, v)
-        qkv = jnp.einsum('bhld,bhdm->bhlm', q_phi, kv)
-        normalizer = jnp.einsum('bhld,bhd->bhl', q_phi, jnp.sum(k_psi, axis=2)).unsqueeze(-1) + 1e-8
-
-        output = qkv / normalizer
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
-        return self.o_proj(output)
-
-class OptimizedMoEAttention(BaseAttention):
-    """TPU-optimized Mixture of Experts Attention with load balancing."""
-    def __init__(self, embed_dim: int, num_heads: int, num_experts: int = 4, top_k: int = 2, dropout_rate: float = 0.1, gate_jitter: float = 0.01, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.num_experts = num_experts
-        self.top_k = min(top_k, num_experts)
-        self.gate_jitter = gate_jitter
-        self.experts = [BaseExpertAttention(embed_dim, num_heads, dropout_rate) for _ in range(num_experts)]
-        self.router = hk.Sequential([
-            hk.Linear(embed_dim // 2), hk.LayerNorm(embed_dim // 2), jax.nn.relu, hk.Linear(num_experts)
-        ])
-        self.expert_priors = self.param('priors', lambda shape: jnp.ones(shape) / num_experts, (num_experts,))
-        self.load_balancing_coeff = 0.01
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        batch_size, seq_len, _ = x.shape
-        rng = rng or random.PRNGKey(0)
-
-        router_logits = self.router(x)
-        if is_training and self.gate_jitter > 0:
-            router_logits += random.normal(rng, router_logits.shape) * self.gate_jitter
-
-        routing_probs = jax.nn.softmax(router_logits, axis=-1)
-        top_k_probs, top_k_indices = jax.lax.top_k(routing_probs, self.top_k)
-
-        expert_mask = jnp.zeros((batch_size, seq_len, self.num_experts))
-        for k in range(self.top_k):
-            indices = top_k_indices[:, :, k]
-            probs = top_k_probs[:, :, k]
-            batch_idx = jnp.arange(batch_size)[:, jnp.newaxis]
-            seq_idx = jnp.arange(seq_len)[jnp.newaxis, :]
-            expert_mask = expert_mask.at[batch_idx, seq_idx, indices].add(probs)
-
-        if is_training:
-            expert_usage = jnp.mean(expert_mask, axis=(0, 1))
-            load_balance_loss = jnp.mean((expert_usage - self.expert_priors) ** 2) * self.load_balancing_coeff
-            self.aux_loss = load_balance_loss
-        else:
-            self.aux_loss = 0.0
-
-        expert_outputs = jnp.zeros((batch_size, seq_len, self.embed_dim))
-        for i, expert in enumerate(self.experts):
-            mask_i = expert_mask[:, :, i].unsqueeze(-1)
-            if jnp.sum(mask_i) > 0:
-                expert_output = expert(x, context, mask, rng, is_training)
-                expert_outputs += expert_output * mask_i
-
-        return expert_outputs
-
-class BaseExpertAttention(BaseAttention):
-    """Expert attention module for MoE."""
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        q = self._reshape_for_multihead(self.q_proj(x))
-        k = self._reshape_for_multihead(self.k_proj(x if context is None else context))
-        v = self._reshape_for_multihead(self.v_proj(x if context is None else context))
-
-        attn_scores = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / jnp.sqrt(self.head_dim)
-        if mask is not None:
-            attn_scores = jnp.where(mask == 0, -jnp.inf, attn_scores)
-
-        attn_probs = jax.nn.softmax(attn_scores, axis=-1)
-        attn_probs = self.dropout(attn_probs, rng, is_training)
-
-        output = jnp.matmul(attn_probs, v)
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape)
-        return self.o_proj(output)
-
-class CrossDomainAttention(BaseAttention):
-    """TPU-optimized cross-modal attention with channels (C dimension)."""
-    def __init__(self, embed_dim: int, num_heads: int, num_domains: int = 2, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.num_domains = num_domains
-        self.domain_q_projs = [hk.Linear(embed_dim) for _ in range(num_domains)]
-        self.domain_adapter = hk.Sequential([hk.Linear(embed_dim), hk.LayerNorm(embed_dim), jax.nn.gelu, hk.Linear(embed_dim)])
-        self.domain_gate = hk.Linear(num_domains)
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        q = self._reshape_for_multihead(self.domain_q_projs[domain_id](x))
-        k = self._reshape_for_multihead(self.k_proj(context if context is not None else x))
-        v = self._reshape_for_multihead(self.v_proj(context if context is not None else x))
-
-        if context is not None:
-            k_adapted = self.domain_adapter(k)
-            v_adapted = self.domain_adapter(v)
-            domain_gates = jax.nn.softmax(self.domain_gate(jnp.mean(x, axis=1)), axis=-1)
-            k = k * (1 - domain_gates[:, 1][:, jnp.newaxis, jnp.newaxis, jnp.newaxis]) + k_adapted * domain_gates[:, 1][:, jnp.newaxis, jnp.newaxis, jnp.newaxis]
-            v = v * (1 - domain_gates[:, 1][:, jnp.newaxis, jnp.newaxis, jnp.newaxis]) + v_adapted * domain_gates[:, 1][:, jnp.newaxis, jnp.newaxis, jnp.newaxis]
-
-        attn_scores = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / jnp.sqrt(self.head_dim)
-        if mask is not None:
-            attn_scores = jnp.where(mask == 0, -jnp.inf, attn_scores)
-
-        attn_probs = jax.nn.softmax(attn_scores, axis=-1)
-        attn_probs = self.dropout(attn_probs, rng, is_training)
-
-        output = jnp.matmul(attn_probs, v)
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape)
-        return self.o_proj(output)
-
-class TemporalConvAttention(BaseAttention):
-    """TPU-optimized temporal convolution-enhanced attention with temporal context (T dimension)."""
-    def __init__(self, embed_dim: int, num_heads: int, kernel_size: int = 3, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        padding = (kernel_size - 1) // 2
-        self.temporal_conv = hk.Sequential([
-            hk.Conv1D(embed_dim, kernel_size, padding=padding, feature_group_count=embed_dim),
-            hk.Conv1D(embed_dim, 1),
-            jax.nn.gelu
-        ])
-        self.fusion_layer = hk.Linear(embed_dim * 2)
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        x_conv = jnp.transpose(self.temporal_conv(jnp.transpose(x, (0, 2, 1))), (0, 2, 1))
-        q = self._reshape_for_multihead(self.q_proj(x))
-        k = self._reshape_for_multihead(self.k_proj(x if context is None else context))
-        v = self._reshape_for_multihead(self.v_proj(x if context is None else context))
-
-        attn_scores = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / jnp.sqrt(self.head_dim)
-        if mask is not None:
-            attn_scores = jnp.where(mask == 0, -jnp.inf, attn_scores)
-
-        attn_probs = jax.nn.softmax(attn_scores, axis=-1)
-        attn_probs = self.dropout(attn_probs, rng, is_training)
-
-        attn_out = jnp.matmul(attn_probs, v)
-        attn_out = jnp.transpose(attn_out, (0, 2, 1, 3)).reshape(x.shape)
-        attn_out = self.o_proj(attn_out)
-        return self.fusion_layer(jnp.concatenate([attn_out, x_conv], axis=-1))
-
-class HierarchicalMoEAttention(BaseAttention):
-    """TPU-optimized hierarchical Mixture of Experts Attention with multi-level routing."""
-    def __init__(self, embed_dim: int, num_heads: int, num_experts: int = 4, num_sub_experts: int = 2, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.num_experts = num_experts
-        self.num_sub_experts = num_sub_experts
-        attention_types = [DynamicSparseAttention, LearnedPerformerAttention, BaseExpertAttention, TemporalConvAttention]
-        self.experts = [attention_types[i % len(attention_types)](embed_dim, num_heads, dropout_rate=dropout_rate) for i in range(num_experts)]
-        self.sub_experts = [[hk.Sequential([hk.Linear(embed_dim), hk.LayerNorm(embed_dim), jax.nn.gelu, hk.Linear(embed_dim)]) for _ in range(num_sub_experts)] for _ in range(num_experts)]
-        self.router_l1 = hk.Sequential([hk.Linear(embed_dim // 2), hk.LayerNorm(embed_dim // 2), jax.nn.relu, hk.Linear(num_experts)])
-        self.router_l2 = [hk.Sequential([hk.Linear(embed_dim // 4), hk.LayerNorm(embed_dim // 4), jax.nn.relu, hk.Linear(num_sub_experts)]) for _ in range(num_experts)]
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        router_logits_l1 = self.router_l1(x)
-        routing_probs_l1 = jax.nn.softmax(router_logits_l1, axis=-1)
-
-        expert_outputs = []
-        for i, expert in enumerate(self.experts):
-            expert_output = expert(x, context, mask, rng, is_training)
-            router_logits_l2 = self.router_l2[i](expert_output)
-            routing_probs_l2 = jax.nn.softmax(router_logits_l2, axis=-1)
-
-            sub_expert_output = jnp.zeros_like(expert_output)
-            for j, sub_expert in enumerate(self.sub_experts[i]):
-                sub_output = sub_expert(expert_output)
-                sub_expert_weight = routing_probs_l2[:, :, j].unsqueeze(-1)
-                sub_expert_output += sub_output * sub_expert_weight
-
-            expert_outputs.append(sub_expert_output)
-
-        final_output = jnp.zeros_like(x)
-        for i, expert_output in enumerate(expert_outputs):
-            expert_weight = routing_probs_l1[:, :, i].unsqueeze(-1)
-            final_output += expert_output * expert_weight
-
-        return final_output
-
-class FlashMLAttention(BaseAttention):
-    """TPU-optimized Multi-head Latent Attention with Flash Attention."""
-    def __init__(self, embed_dim: int, num_heads: int, latent_dim: int = 64, dropout_rate: float = 0.1, block_size: int = 128, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.latent_dim = latent_dim
         self.block_size = block_size
-        self.q_latent_proj = hk.Linear(latent_dim, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
-        self.k_latent_proj = hk.Linear(latent_dim, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
-        self.latent_mixer = hk.Sequential([hk.Linear(self.head_dim), jax.nn.gelu])
-        self.block_size_adjuster = hk.get_parameter("block_size", (), init=initializers.Constant(math.log(block_size)))
+        self.causal = causal
+        self.sm_scale = sm_scale
+
+    @staticmethod
+    @jit
+    def _attention_head(q_block, k_block, v_block, mask_block, causal, sm_scale):
+        scores = jnp.matmul(q_block, k_block.transpose(-2, -1)) * sm_scale
+        if causal:
+            causal_mask = jnp.tril(jnp.ones((q_block.shape[-2], k_block.shape[-2]), dtype=jnp.bfloat16))
+            scores = jnp.where(causal_mask[None, :, :], scores, -jnp.inf)
+        if mask_block is not None:
+            scores = jnp.where(mask_block == 0, -jnp.inf, scores)
+        attn_probs = jax.nn.softmax(scores, axis=-1)
+        return jnp.matmul(attn_probs, v_block)
 
     @jit
     def _compute_attention_blockwise(self, q, k, v, mask=None):
-        batch_size, num_heads, seq_len, _ = q.shape
-        output = jnp.zeros_like(v)
+        batch_size, num_heads, seq_len, head_dim = q.shape
+        output = jnp.zeros_like(v, dtype=jnp.bfloat16)
+        vectorized_attention = vmap(self._attention_head, in_axes=(0, 0, 0, 0, None, None))
 
-        q_latent = jax.nn.elu(self.q_latent_proj(q)) + 1
-        k_latent = jax.nn.elu(self.k_latent_proj(k)) + 1
+        def scan_query_block(carry, i):
+            output, q, k, v, mask = carry
+            i_end = lax.min(i + self.block_size, seq_len)
+            q_block = q[:, :, i:i_end, :]
+            k_block = k[:, :, :i_end, :] if self.causal else k
+            v_block = v[:, :, :i_end, :] if self.causal else v
+            mask_block = mask[:, :, i:i_end, :i_end] if mask is not None and self.causal else mask
+            output_block = vectorized_attention(q_block, k_block, v_block, mask_block, self.causal, self.sm_scale)
+            output = output.at[:, :, i:i_end, :].set(output_block)
+            return (output, q, k, v, mask), None
 
-        effective_block_size = min(int(jnp.exp(self.block_size_adjuster)), seq_len)
-        for i in range(0, seq_len, effective_block_size):
-            end_idx = min(i + effective_block_size, seq_len)
-            q_block = q_latent[:, :, i:end_idx]
-
-            for j in range(0, seq_len, effective_block_size * 4):
-                j_end = min(j + effective_block_size * 4, seq_len)
-                k_block = k_latent[:, :, j:j_end]
-                v_block = v[:, :, j:j_end]
-
-                scores = jnp.matmul(q_block, jnp.transpose(k_block, (0, 1, 3, 2))) / jnp.sqrt(self.latent_dim)
-                if mask is not None:
-                    block_mask = mask[:, :, i:end_idx, j:j_end]
-                    scores = jnp.where(block_mask == 0, -jnp.inf, scores)
-
-                attn_probs = jax.nn.softmax(scores, axis=-1)
-                output = output.at[:, :, i:end_idx].add(jnp.matmul(attn_probs, v_block))
-
-        return self.latent_mixer(output)
+        initial_carry = (output, q, k, v, mask)
+        final_carry, _ = lax.scan(scan_query_block, initial_carry, jnp.arange(0, seq_len, self.block_size))
+        return final_carry[0]
 
     @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        q = self._reshape_for_multihead(self.q_proj(x))
-        k = self._reshape_for_multihead(self.k_proj(x if context is None else context))
-        v = self._reshape_for_multihead(self.v_proj(x if context is None else context))
+    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
+        rng = rng or random.PRNGKey(0)
+        q = self._reshape_for_multihead(self.q_proj(x).astype(jnp.bfloat16))
+        k = self._reshape_for_multihead(self.k_proj(x if context is None else context).astype(jnp.bfloat16))
+        v = self._reshape_for_multihead(self.v_proj(x if context is None else context).astype(jnp.bfloat16))
         output = self._compute_attention_blockwise(q, k, v, mask)
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape)
-        return self.o_proj(output)
+        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape[0], x.shape[1], self.embed_dim)
+        output = self.dropout(output, rng, is_training) if is_training else output
+        return self.o_proj(output.astype(jnp.float32))
 
-class TPUOptimizedAttention(BaseAttention):
-    """TPU-optimized attention with combined QKV and gradient checkpointing."""
-    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float = 0.1, name: str = None):
+# GPU MultiModalAttention
+class MultiModalAttentionGPU(BaseAttentionGPU):
+    def __init__(self, embed_dim, num_heads, num_domains=2, dropout=0.1, use_amp=True):
+        super().__init__(embed_dim, num_heads, dropout, use_amp)
+        self.num_domains = num_domains
+        self.domain_projections = nn.ModuleList([nn.Linear(embed_dim, embed_dim) for _ in range(num_domains)])
+        self.domain_mixing = nn.Parameter(torch.ones(num_domains, num_domains))
+        self._reset_parameters_multi_modal()
+
+    def _reset_parameters_multi_modal(self):
+        self._reset_parameters()
+        def triton_xavier_init(tensor, fan_in, fan_out):
+            n_elements = tensor.numel()
+            grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+            xavier_init_kernel[grid](tensor.data_ptr(), n_elements, fan_in, fan_out, BLOCK_SIZE=1024)
+        for proj in self.domain_projections:
+            triton_xavier_init(proj.weight, self.embed_dim, self.embed_dim)
+            nn.init.constant_(proj.bias, 0.0)
+        triton_xavier_init(self.domain_mixing, self.num_domains, self.num_domains)
+
+    def forward(self, x, domain_id=0, context=None, mask=None, temporal_states=None, is_training=True):
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            batch_size, seq_len, _ = x.size()
+            domain_features = [self._reshape_for_multihead(proj(x)) for proj in self.domain_projections]
+            mixed_attention = 0
+            for i in range(self.num_domains):
+                q = domain_features[domain_id]
+                k = v = domain_features[i]
+                scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                if mask is not None:
+                    scores = scores.masked_fill(mask == 0, -1e9)
+                attn_probs = F.softmax(scores, dim=-1)
+                attn_probs = self.dropout(attn_probs) if is_training else attn_probs
+                mixed_attention += self.domain_mixing[domain_id, i] * torch.matmul(attn_probs, v)
+            mixed_attention = mixed_attention.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+            return self.o_proj(mixed_attention)
+
+# TPU MultiModalAttention
+class MultiModalAttentionTPU(BaseAttentionTPU):
+    def __init__(self, embed_dim, num_heads, num_domains=2, dropout_rate=0.1, name=None):
         super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.qkv_combined = hk.Linear(3 * embed_dim, w_init=initializers.VarianceScaling(1.0), b_init=initializers.Zeros())
-        self.use_gradient_checkpointing = True
+        self.num_domains = num_domains
+        self.domain_projections = [hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2))) 
+                                 for _ in range(num_domains)]
+        self.domain_mixing = hk.get_parameter("domain_mixing", (num_domains, num_domains), 
+                                            init=hk.initializers.VarianceScaling(1.0))
 
     @jit
-    def _reshape_qkv(self, qkv):
-        batch_size, seq_len, _ = qkv.shape
-        qkv = jnp.reshape(qkv, (batch_size, seq_len, 3, self.num_heads, self.head_dim))
-        qkv = jnp.transpose(qkv, (2, 0, 3, 1, 4))
-        return qkv[0], qkv[1], qkv[2]
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        input_states = x if context is None else context
-        qkv = jax.checkpoint(self.qkv_combined)(input_states) if self.use_gradient_checkpointing and is_training else self.qkv_combined(input_states)
-        q, k, v = self._reshape_qkv(qkv)
-
-        attn_scores = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / jnp.sqrt(self.head_dim)
-        if mask is not None:
-            attn_scores = jnp.where(mask.unsqueeze(1) == 0, -jnp.inf, attn_scores)
-
-        attn_probs = jax.nn.softmax(attn_scores, axis=-1)
-        attn_probs = self.dropout(attn_probs, rng, is_training)
-
-        output = jnp.matmul(attn_probs, v)
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape)
-        return self.o_proj(output)
-
-class FractalAttention(BaseAttention):
-    """Fractal attention with recursive levels (F dimension) for hierarchical reasoning."""
-    def __init__(self, embed_dim: int, num_heads: int, fractal_levels: int = 3, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.fractal_levels = fractal_levels
-        self.level_attentions = [BaseExpertAttention(embed_dim, num_heads, dropout_rate) for _ in range(fractal_levels)]
-        self.agg_layer = hk.Linear(embed_dim * fractal_levels)
-        self.level_scales = hk.get_parameter("level_scales", (fractal_levels,), init=initializers.Ones())
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
+    def forward(self, x, domain_id=0, context=None, mask=None, temporal_states=None, rng=None, is_training=True):
+        rng = rng or random.PRNGKey(0)
         batch_size, seq_len, _ = x.shape
-        level_outputs = []
-
-        current_input = x
-        current_mask = mask
-        for level in range(self.fractal_levels):
-            level_output = self.level_attentions[level](current_input, context, current_mask, rng, is_training)
-            level_output = level_output * self.level_scales[level]
-            level_outputs.append(level_output)
-            if level < self.fractal_levels - 1:
-                current_input = level_output[:, ::2, :]
-                if current_mask is not None:
-                    current_mask = current_mask[:, :, ::2, ::2]
-
-        combined = jnp.concatenate(level_outputs, axis=-1)
-        output = self.agg_layer(combined)
-        return output
-
-class SemanticGroupAttention(BaseAttention):
-    """Attention with semantic grouping (S dimension) for role-aware processing."""
-    def __init__(self, embed_dim: int, num_heads: int, num_groups: int = 4, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.num_groups = num_groups
-        self.group_assigner = hk.Linear(num_groups)
-        self.group_attentions = [BaseExpertAttention(embed_dim, num_heads, dropout_rate) for _ in range(num_groups)]
-        self.cross_group_attention = BaseExpertAttention(embed_dim, num_heads, dropout_rate)
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        group_logits = self.group_assigner(x)
-        group_probs = jax.nn.softmax(group_logits, axis=-1)
-
-        group_outputs = jnp.zeros_like(x)
-        for s in range(self.num_groups):
-            group_mask = group_probs[:, :, s].unsqueeze(-1)
-            group_output = self.group_attentions[s](x, context, mask, rng, is_training)
-            group_outputs += group_output * group_mask
-
-        final_output = self.cross_group_attention(group_outputs, context, mask, rng, is_training)
-        return final_output
-
-class TemporalCrossAttention(BaseAttention):
-    """Temporal and cross-modal attention with T (time) and C (channels) dimensions."""
-    def __init__(self, embed_dim: int, num_heads: int, num_timesteps: int = 5, num_channels: int = 2, dropout_rate: float = 0.1, name: str = None):
-        super().__init__(embed_dim, num_heads, dropout_rate, name)
-        self.num_timesteps = num_timesteps
-        self.num_channels = num_channels
-        self.time_projs = [hk.Linear(embed_dim) for _ in range(num_timesteps)]
-        self.channel_projs = [hk.Linear(embed_dim) for _ in range(num_channels)]
-        self.fusion_layer = hk.Linear(embed_dim * num_timesteps * num_channels)
-
-    @jit
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
-        batch_size, seq_len, _ = x.shape
-        if temporal_states is None:
-            temporal_states = jnp.zeros((batch_size, self.num_timesteps, seq_len, self.embed_dim))
-
-        time_outputs = []
-        for t in range(self.num_timesteps):
-            time_input = temporal_states[:, t, :, :]
-            time_output = self.time_projs[t](time_input)
-            time_outputs.append(time_output)
-
-        channel_outputs = []
-        for c in range(self.num_channels):
-            channel_input = x if c == 0 else (context if c == 1 and context is not None else x)
-            channel_output = self._reshape_for_multihead(self.channel_projs[c](channel_input))
-            k = self._reshape_for_multihead(self.k_proj(channel_input))
-            v = self._reshape_for_multihead(self.v_proj(channel_input))
-            attn_scores = jnp.matmul(channel_output, jnp.transpose(k, (0, 1, 3, 2))) / jnp.sqrt(self.head_dim)
+        domain_features = [self._reshape_for_multihead(proj(x).astype(jnp.bfloat16)) for proj in self.domain_projections]
+        mixed_attention = 0
+        for i in range(self.num_domains):
+            q = domain_features[domain_id]
+            k = v = domain_features[i]
+            scores = jnp.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if mask is not None:
-                attn_scores = jnp.where(mask == 0, -jnp.inf, attn_scores)
-            attn_probs = jax.nn.softmax(attn_scores, axis=-1)
-            attn_probs = self.dropout(attn_probs, rng, is_training)
-            channel_output = jnp.matmul(attn_probs, v)
-            channel_output = jnp.transpose(channel_output, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
-            channel_outputs.append(channel_output)
+                scores = jnp.where(mask == 0, -jnp.inf, scores)
+            attn_probs = jax.nn.softmax(scores, axis=-1)
+            attn_probs = self.dropout(attn_probs, rng, is_training) if is_training else attn_probs
+            mixed_attention += self.domain_mixing[domain_id, i] * jnp.matmul(attn_probs, v)
+        mixed_attention = jnp.transpose(mixed_attention, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
+        return self.o_proj(mixed_attention.astype(jnp.float32))
 
-        all_outputs = []
-        for t in range(self.num_timesteps):
-            for c in range(self.num_channels):
-                all_outputs.append(time_outputs[t] + channel_outputs[c])
-        combined = jnp.concatenate(all_outputs, axis=-1)
-        output = self.fusion_layer(combined)
-        return output
+# GPU TemporalAttention
+class TemporalAttentionGPU(BaseAttentionGPU):
+    def __init__(self, embed_dim, num_heads, max_temporal_length=512, dropout=0.1, use_amp=True):
+        super().__init__(embed_dim, num_heads, dropout, use_amp)
+        self.max_temporal_length = max_temporal_length
+        self.temporal_embeddings = nn.Parameter(torch.randn(1, max_temporal_length, embed_dim))
+        self.time_mixer = nn.Linear(embed_dim * 2, embed_dim)
+        self._reset_parameters_temporal()
 
-# Example usage with transformation
-def forward_attention(x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
-    model = HierarchicalMoEAttention(512, 8)
-    params = model.init(random.PRNGKey(42), x, context, mask, temporal_states, domain_id, is_training=is_training)
-    return hk.transform(lambda x, c, m, t, d, r, i: model(x, c, m, t, d, r, i))(params, x, context, mask, temporal_states, domain_id, None, is_training)
+    def _reset_parameters_temporal(self):
+        self._reset_parameters()
+        def triton_xavier_init(tensor, fan_in, fan_out):
+            n_elements = tensor.numel()
+            grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+            xavier_init_kernel[grid](tensor.data_ptr(), n_elements, fan_in, fan_out, BLOCK_SIZE=1024)
+        triton_xavier_init(self.temporal_embeddings, self.max_temporal_length, self.embed_dim)
+        triton_xavier_init(self.time_mixer.weight, self.embed_dim * 2, self.embed_dim)
+        nn.init.constant_(self.time_mixer.bias, 0.0)
 
+    def forward(self, x, temporal_positions=None, context=None, mask=None, is_training=True):
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            batch_size, seq_len, _ = x.size()
+            temporal_positions = torch.arange(seq_len, device=x.device) if temporal_positions is None else temporal_positions
+            temporal_emb = self.temporal_embeddings[:, temporal_positions]
+            x_temporal = self.time_mixer(torch.cat([x, temporal_emb], dim=-1))
+            q = self._reshape_for_multihead(self.q_proj(x_temporal))
+            k = self._reshape_for_multihead(self.k_proj(x_temporal if context is None else context))
+            v = self._reshape_for_multihead(self.v_proj(x_temporal if context is None else context))
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores.masked_fill(mask == 0, -1e9)
+            attn_probs = F.softmax(scores, dim=-1)
+            attn_probs = self.dropout(attn_probs) if is_training else attn_probs
+            output = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+            return self.o_proj(output)
+
+# TPU TemporalAttention with Temporal Convolution
+class TemporalAttentionTPU(BaseAttentionTPU):
+    def __init__(self, embed_dim, num_heads, max_temporal_length=512, dropout_rate=0.1, name=None):
+        super().__init__(embed_dim, num_heads, dropout_rate, name)
+        self.max_temporal_length = max_temporal_length
+        self.temporal_embeddings = hk.get_parameter("temporal_embeddings", (1, max_temporal_length, embed_dim),
+                                                  init=hk.initializers.RandomNormal())
+        self.time_mixer = hk.Linear(embed_dim * 2, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2)))
+        self.temporal_conv = hk.Conv1D(output_channels=embed_dim, kernel_shape=3, padding="CAUSAL")
+
+    @jit
+    def forward(self, x, temporal_positions=None, context=None, mask=None, rng=None, is_training=True):
+        rng = rng or random.PRNGKey(0)
+        batch_size, seq_len, _ = x.shape
+        temporal_positions = jnp.arange(seq_len) if temporal_positions is None else temporal_positions
+        temporal_emb = self.temporal_embeddings[:, temporal_positions]
+        x_temporal = self.time_mixer(jnp.concatenate([x, temporal_emb], axis=-1))
+        x_temporal = self.temporal_conv(x_temporal.transpose(0, 2, 1)).transpose(0, 2, 1)  # Temporal convolution
+        q = self._reshape_for_multihead(self.q_proj(x_temporal).astype(jnp.bfloat16))
+        k = self._reshape_for_multihead(self.k_proj(x_temporal if context is None else context).astype(jnp.bfloat16))
+        v = self._reshape_for_multihead(self.v_proj(x_temporal if context is None else context).astype(jnp.bfloat16))
+        scores = jnp.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = jnp.where(mask == 0, -jnp.inf, scores)
+        attn_probs = jax.nn.softmax(scores, axis=-1)
+        attn_probs = self.dropout(attn_probs, rng, is_training) if is_training else attn_probs
+        output = jnp.matmul(attn_probs, v)
+        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
+        return self.o_proj(output.astype(jnp.float32))
+
+# Sonnet Flash Attention TPU
+class SonnetFlashAttentionTPU(snt.Module):
+    def __init__(self, embed_dim, num_heads, block_size=128, dropout_rate=0.1, causal=False, sm_scale=0.5, name="sonnet_flash_tpu"):
+        super().__init__(name=name)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.block_size = block_size
+        self.dropout_rate = dropout_rate
+        self.causal = causal
+        self.sm_scale = sm_scale
+        self.q_proj = snt.Linear(embed_dim)
+        self.k_proj = snt.Linear(embed_dim)
+        self.v_proj = snt.Linear(embed_dim)
+        self.o_proj = snt.Linear(embed_dim)
+        self.dropout = snt.Dropout(dropout_rate)
+
+    def _reshape_for_multihead(self, x):
+        batch_size, seq_len, _ = x.shape
+        return tf.reshape(x, [batch_size, seq_len, self.num_heads, self.head_dim])
+
+    @tf.function(jit_compile=True)
+    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
+        x_tf = tf.experimental.dlpack.from_dlpack(jax.dlpack.to_dlpack(x))
+        context_tf = tf.experimental.dlpack.from_dlpack(jax.dlpack.to_dlpack(context)) if context is not None else x_tf
+        mask_tf = tf.experimental.dlpack.from_dlpack(jax.dlpack.to_dlpack(mask)) if mask is not None else None
+        q = tf.transpose(self._reshape_for_multihead(self.q_proj(x_tf)), [0, 2, 1, 3])
+        k = tf.transpose(self._reshape_for_multihead(self.k_proj(context_tf)), [0, 2, 1, 3])
+        v = tf.transpose(self._reshape_for_multihead(self.v_proj(context_tf)), [0, 2, 1, 3])
+        batch_size, num_heads, seq_len, head_dim = q.shape
+        output = tf.zeros_like(v, dtype=tf.bfloat16)
+        for i in range(0, seq_len, self.block_size):
+            i_end = tf.minimum(i + self.block_size, seq_len)
+            q_block = q[:, :, i:i_end, :]
+            k_block = k[:, :, :i_end, :] if self.causal else k
+            v_block = v[:, :, :i_end, :] if self.causal else v
+            scores = tf.einsum('bhqd,bhkd->bhqk', q_block, k_block) * self.sm_scale
+            if self.causal:
+                causal_mask = tf.linalg.band_part(tf.ones((i_end - i, i_end - i), dtype=tf.bfloat16), -1, 0)
+                scores = tf.where(causal_mask[None, None, :, :], scores, -1e9)
+            if mask_tf is not None:
+                scores = tf.where(mask_tf[:, :, i:i_end, :i_end] == 0, -1e9, scores)
+            attn_probs = tf.nn.softmax(scores, axis=-1)
+            output = tf.tensor_scatter_nd_add(output, [[range(batch_size)] * (i_end - i), [range(i, i_end)] * batch_size],
+                                            tf.einsum('bhqk,bhkd->bhqd', attn_probs, v_block))
+        output = tf.transpose(output, [0, 2, 1, 3]).reshape([batch_size, seq_len, self.embed_dim])
+        output = self.dropout(output, training=is_training)
+        return jax.dlpack.from_dlpack(tf.experimental.dlpack.to_dlpack(self.o_proj(output)))
+
+# Haiku Transformation Wrappers
+def forward_flash_mla_tpu(x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
+    model = FlashMLAttentionTPU(embed_dim=512, num_heads=8, block_size=128, causal=True)
+    return hk.transform(lambda x, c, m, t, d, r, i: model.forward(x, c, m, t, d, r, i))(x, context, mask, temporal_states, domain_id, None, is_training)
+
+def forward_multimodal_tpu(x, domain_id=0, context=None, mask=None, temporal_states=None, is_training=True):
+    model = MultiModalAttentionTPU(embed_dim=512, num_heads=8, num_domains=2)
+    return hk.transform(lambda x, d, c, m, t, r, i: model.forward(x, d, c, m, t, r, i))(x, domain_id, context, mask, temporal_states, None, is_training)
+
+def forward_temporal_tpu(x, temporal_positions=None, context=None, mask=None, is_training=True):
+    model = TemporalAttentionTPU(embed_dim=512, num_heads=8, max_temporal_length=512)
+    return hk.transform(lambda x, t, c, m, r, i: model.forward(x, t, c, m, r, i))(x, temporal_positions, context, mask, None, is_training)
+
+# Hybrid Framework
+class HybridAttention:
+    def __init__(self, device_type="gpu", embed_dim=512, num_heads=8, **kwargs):
+        self.device_type = device_type.lower()
+        if self.device_type == "gpu":
+            self.flash_mla = FlashMLAAttentionGPU(embed_dim, num_heads, **kwargs).cuda()
+            self.multimodal = MultiModalAttentionGPU(embed_dim, num_heads, **kwargs).cuda()
+            self.temporal = TemporalAttentionGPU(embed_dim, num_heads, **kwargs).cuda()
+        elif self.device_type == "tpu":
+            self.flash_mla = forward_flash_mla_tpu
+            self.multimodal = forward_multimodal_tpu
+            self.temporal = forward_temporal_tpu
+            self.flash_mla_params = self.flash_mla.init(random.PRNGKey(0), jnp.ones((2, 64, embed_dim)))
+            self.multimodal_params = self.multimodal.init(random.PRNGKey(0), jnp.ones((2, 64, embed_dim)), domain_id=0)
+            self.temporal_params = self.temporal.init(random.PRNGKey(0), jnp.ones((2, 64, embed_dim)))
+
+    def forward(self, x, attention_type="flash_mla", **kwargs):
+        if self.device_type == "gpu":
+            x = torch.tensor(x, device="cuda") if not torch.is_tensor(x) else x
+            if attention_type == "flash_mla":
+                return self.flash_mla(x, **kwargs)
+            elif attention_type == "multimodal":
+                return self.multimodal(x, **kwargs)
+            elif attention_type == "temporal":
+                return self.temporal(x, **kwargs)
+        elif self.device_type == "tpu":
+            x = jnp.array(x) if not isinstance(x, jnp.ndarray) else x
+            if attention_type == "flash_mla":
+                return self.flash_mla.apply(self.flash_mla_params, random.PRNGKey(0), x, **kwargs)
+            elif attention_type == "multimodal":
+                return self.multimodal.apply(self.multimodal_params, random.PRNGKey(0), x, **kwargs)
+            elif attention_type == "temporal":
+                return self.temporal.apply(self.temporal_params, random.PRNGKey(0), x, **kwargs)
+        raise ValueError(f"Unsupported attention_type: {attention_type}")
+
+# Example Usage
 if __name__ == "__main__":
-    # Test with dummy data
-    key = random.PRNGKey(0)
-    x = random.normal(key, (2, 10, 512))
-    params = forward_attention.init(key, x)
-    output = forward_attention.apply(params, x)
-    print("Output shape:", output.shape)
+    # GPU Test
+    gpu_model = HybridAttention(device_type="gpu")
+    x_gpu = torch.randn(2, 64, 512).cuda()
+    print("GPU FlashMLA:", gpu_model.forward(x_gpu, "flash_mla").shape)
+    print("GPU MultiModal:", gpu_model.forward(x_gpu, "multimodal", domain_id=0).shape)
+    print("GPU Temporal:", gpu_model.forward(x_gpu, "temporal").shape)
+
+    # TPU Test
+    tpu_model = HybridAttention(device_type="tpu")
+    x_tpu = jnp.ones((2, 64, 512))
+    print("TPU FlashMLA:", tpu_model.forward(x_tpu, "flash_mla").shape)
+    print("TPU MultiModal:", tpu_model.forward(x_tpu, "multimodal", domain_id=0).shape)
+    print("TPU Temporal:", tpu_model.forward(x_tpu, "temporal").shape)

@@ -1,184 +1,232 @@
-# /home/kasinadhsarma/VishwamAI/vishwamai/optimisation/performance_tuning.py
+"""
+Performance tuning utilities for VishwamAI attention mechanisms.
+Automatically profiles and selects optimal attention variants based on hardware and input characteristics.
+"""
 
 import torch
-import time
-import logging
+import jax
+import jax.numpy as jnp
 from typing import Dict, Optional, Union, Tuple
-from vishwamai.optimisation.memory_optimization import MemoryOptimizer
-import flax
-try:
-    import jax
-    import jax.numpy as jnp
-    from jax import random, jit, grad, value_and_grad
-    import optax
-    from flax.training import train_state
-    HAS_JAX = True
-except ImportError:
-    HAS_JAX = False
+import logging
+from dataclasses import dataclass
+import time
+import numpy as np
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+@dataclass
+class AttentionConfig:
+    """Configuration for attention mechanism selection and tuning"""
+    batch_size: int
+    seq_length: int
+    embed_dim: int
+    num_heads: int
+    device_type: str  # "gpu" or "tpu"
+    attention_type: str = "auto"  # "base", "flash_mla", "temporal", "multimodal" or "auto"
+    block_size: Optional[int] = None
+    num_domains: Optional[int] = None
+    max_temporal_length: Optional[int] = None
 
-class PerformanceTuner:
-    """A class to tune the performance of VishwamAI models."""
+class AttentionProfiler:
+    """Profiles different attention variants to select optimal configuration"""
     
-    def __init__(self, model: Union[torch.nn.Module, "flax.linen.Module"], device: str = "auto"):
-        """
-        Initialize the PerformanceTuner with a model and target device.
+    def __init__(self, config: AttentionConfig):
+        self.config = config
+        self.results = {}
         
-        Args:
-            model: The VishwamAI model (PyTorch or Flax).
-            device: The device to run the model on ("auto", "tpu", "gpu", or "cpu").
-        """
-        self.model = model
-        self.memory_optimizer = MemoryOptimizer(model, device)
-        self.device_type = self.memory_optimizer.device_type
-        self.device = self.memory_optimizer.device
-        logger.info(f"Initialized PerformanceTuner with model on device: {self.device_type}")
-
-    def enable_hardware_optimizations(self):
-        """Enable hardware-specific optimizations."""
-        if self.device_type == "tpu":
-            # TPU-specific optimizations
-            if HAS_JAX:
-                jax.config.update('jax_default_matmul_precision', 'bfloat16')
-                jax.config.update('jax_enable_x64', False)
-                logger.info("Enabled TPU optimizations (bfloat16, disabled x64)")
-        else:
-            # GPU-specific optimizations
-            torch.backends.cudnn.enabled = True
-            torch.backends.cudnn.benchmark = True
-            self.memory_optimizer.enable_mixed_precision()
-            logger.info("Enabled GPU optimizations (cuDNN, AMP)")
-
-    def tune_batch_size(self, input_shape: Tuple, max_batch_size: int = 128, tolerance: float = 0.1) -> int:
-        """Find optimal batch size for the current device."""
-        optimal_batch_size = 1
-        best_throughput = 0.0
-
-        if self.device_type == "tpu":
-            dummy_input = jnp.ones((1, *input_shape))
+    def profile_attention_variant(self, variant_name: str, attention_cls, **kwargs) -> float:
+        """Profile a specific attention variant and return execution time"""
+        try:
+            # Create sample inputs
+            if self.config.device_type == "gpu":
+                x = torch.randn(
+                    self.config.batch_size,
+                    self.config.seq_length,
+                    self.config.embed_dim,
+                    device="cuda"
+                )
+            else:  # TPU
+                x = jnp.array(
+                    np.random.randn(
+                        self.config.batch_size,
+                        self.config.seq_length,
+                        self.config.embed_dim
+                    )
+                )
             
-            @jit
-            def measure_step(batch):
-                return self.model.apply(self.model.params, batch)
-
-            for batch_size in range(1, max_batch_size + 1, 1):
-                try:
-                    batch = jnp.repeat(dummy_input, batch_size, axis=0)
-                    start_time = time.time()
-                    _ = measure_step(batch)
-                    elapsed_time = time.time() - start_time
-                    
-                    throughput = batch_size / elapsed_time
-                    logger.info(f"TPU batch size {batch_size}: Throughput = {throughput:.2f} samples/sec")
-                    
-                    if throughput > best_throughput * (1 - tolerance):
-                        best_throughput = throughput
-                        optimal_batch_size = batch_size
-                    else:
-                        break
-                except Exception as e:
-                    logger.warning(f"TPU batch size {batch_size} failed: {str(e)}")
-                    break
-        else:
-            dummy_input = torch.randn(1, *input_shape).to(self.device)
+            # Initialize attention
+            attention = attention_cls(
+                embed_dim=self.config.embed_dim,
+                num_heads=self.config.num_heads,
+                **kwargs
+            )
             
-            for batch_size in range(1, max_batch_size + 1, 1):
-                try:
-                    batch = dummy_input.repeat(batch_size, 1, 1)
-                    start_time = time.time()
-                    with torch.no_grad():
-                        _ = self.memory_optimizer.forward_with_mixed_precision(self.model, batch)
-                    elapsed_time = time.time() - start_time
-                    
-                    throughput = batch_size / elapsed_time
-                    logger.info(f"GPU batch size {batch_size}: Throughput = {throughput:.2f} samples/sec")
-                    
-                    if throughput > best_throughput * (1 - tolerance):
-                        best_throughput = throughput
-                        optimal_batch_size = batch_size
-                    else:
-                        break
-                except RuntimeError as e:
-                    logger.warning(f"GPU batch size {batch_size} failed: {str(e)}")
-                    break
-
-        logger.info(f"Optimal batch size: {optimal_batch_size} with throughput {best_throughput:.2f} samples/sec")
-        return optimal_batch_size
-
-    def optimize_inference(self, input_tensor: Union[torch.Tensor, "jnp.ndarray"], use_jit: bool = True) -> Union[torch.Tensor, "jnp.ndarray"]:
-        """Optimize inference with device-specific techniques."""
-        self.enable_hardware_optimizations()
-        
-        if self.device_type == "tpu":
-            if use_jit:
-                @jit
-                def optimized_forward(params, x):
-                    return self.model.apply(params, x)
-                return optimized_forward(self.model.params, input_tensor)
-            return self.model.apply(self.model.params, input_tensor)
-        else:
-            if use_jit:
-                try:
-                    self.model = torch.jit.trace(self.model, input_tensor)
-                    logger.info("Applied TorchScript JIT compilation")
-                except Exception as e:
-                    logger.warning(f"Failed to apply JIT: {str(e)}")
+            # Warmup
+            for _ in range(3):
+                if self.config.device_type == "gpu":
+                    with torch.cuda.amp.autocast():
+                        _ = attention(x)
+                    torch.cuda.synchronize()
+                else:
+                    _ = attention(x)
+                    jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
             
-            with torch.no_grad():
-                return self.memory_optimizer.forward_with_mixed_precision(self.model, input_tensor)
-
-    def measure_latency(self, input_tensor: Union[torch.Tensor, "jnp.ndarray"], num_trials: int = 10) -> Dict[str, float]:
-        """Measure model latency with device-specific implementations."""
-        latencies = []
-        
-        if self.device_type == "tpu":
-            # TPU warmup
-            _ = self.model.apply(self.model.params, input_tensor)
+            # Profile
+            times = []
+            iterations = 10
             
-            for _ in range(num_trials):
-                start_time = time.time()
-                _ = self.model.apply(self.model.params, input_tensor)
-                latencies.append((time.time() - start_time) * 1000)
-                jax.clear_caches()
-        else:
-            with torch.no_grad():
-                # GPU/CPU warmup
-                _ = self.memory_optimizer.forward_with_mixed_precision(self.model, input_tensor)
+            for _ in range(iterations):
+                start = time.perf_counter()
                 
-                for _ in range(num_trials):
-                    start_time = time.time()
-                    _ = self.memory_optimizer.forward_with_mixed_precision(self.model, input_tensor)
-                    latencies.append((time.time() - start_time) * 1000)
-                    self.memory_optimizer.clear_device_memory()
+                if self.config.device_type == "gpu":
+                    with torch.cuda.amp.autocast():
+                        _ = attention(x)
+                    torch.cuda.synchronize()
+                else:
+                    _ = attention(x)
+                    jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
+                
+                end = time.perf_counter()
+                times.append(end - start)
+            
+            avg_time = np.mean(times)
+            self.results[variant_name] = {
+                "avg_time": avg_time,
+                "std_time": np.std(times),
+                "config": kwargs
+            }
+            return avg_time
+            
+        except Exception as e:
+            logging.warning(f"Failed to profile {variant_name}: {str(e)}")
+            return float('inf')
 
-        stats = {
-            "avg_latency_ms": sum(latencies) / len(latencies),
-            "min_latency_ms": min(latencies),
-            "max_latency_ms": max(latencies)
+    def select_optimal_config(self) -> Tuple[str, Dict]:
+        """Select the optimal attention configuration based on profiling results"""
+        if not self.results:
+            raise ValueError("No profiling results available. Run profiling first.")
+            
+        best_variant = min(self.results.items(), key=lambda x: x[1]["avg_time"])
+        return best_variant[0], best_variant[1]["config"]
+
+def tune_attention(config: AttentionConfig) -> Tuple[str, Dict]:
+    """
+    Profile and select optimal attention configuration for given parameters
+    
+    Args:
+        config: AttentionConfig with desired parameters
+        
+    Returns:
+        Tuple of (selected_variant_name, configuration_dict)
+    """
+    profiler = AttentionProfiler(config)
+    
+    if config.device_type == "gpu":
+        from vishwamai.models.gpu.attention import (
+            BaseAttention,
+            FlashMLAAttention,
+            MultiModalAttention,
+            TemporalAttention
+        )
+        
+        # Profile GPU variants
+        profiler.profile_attention_variant("base", BaseAttention)
+        
+        profiler.profile_attention_variant(
+            "flash_mla",
+            FlashMLAAttention,
+            block_size=config.block_size or 128
+        )
+        
+        if config.num_domains:
+            profiler.profile_attention_variant(
+                "multimodal",
+                MultiModalAttention,
+                num_domains=config.num_domains
+            )
+            
+        if config.max_temporal_length:
+            profiler.profile_attention_variant(
+                "temporal",
+                TemporalAttention,
+                max_temporal_length=config.max_temporal_length
+            )
+            
+    else:  # TPU
+        from vishwamai.models.tpu.attention import (
+            BaseAttention,
+            FlashMLAttentionTPU,
+            MultiModalAttentionTPU,
+            TemporalAttentionTPU
+        )
+        
+        # Profile TPU variants
+        profiler.profile_attention_variant("base", BaseAttention)
+        
+        profiler.profile_attention_variant(
+            "flash_mla",
+            FlashMLAttentionTPU,
+            block_size=config.block_size or 128
+        )
+        
+        if config.num_domains:
+            profiler.profile_attention_variant(
+                "multimodal",
+                MultiModalAttentionTPU,
+                num_domains=config.num_domains
+            )
+            
+        if config.max_temporal_length:
+            profiler.profile_attention_variant(
+                "temporal",
+                TemporalAttentionTPU,
+                max_temporal_length=config.max_temporal_length
+            )
+    
+    return profiler.select_optimal_config()
+
+def create_optimized_attention(config: AttentionConfig):
+    """
+    Create an optimized attention instance based on profiling results
+    
+    Args:
+        config: AttentionConfig with desired parameters
+        
+    Returns:
+        Instantiated attention module with optimal configuration
+    """
+    variant_name, variant_config = tune_attention(config)
+    
+    if config.device_type == "gpu":
+        from vishwamai.models.gpu.attention import (
+            BaseAttention,
+            FlashMLAAttention,
+            MultiModalAttention,
+            TemporalAttention
+        )
+        
+        attention_classes = {
+            "base": BaseAttention,
+            "flash_mla": FlashMLAAttention,
+            "multimodal": MultiModalAttention,
+            "temporal": TemporalAttention
         }
-        logger.info(f"Latency stats ({self.device_type}): {stats}")
-        return stats
-
-if __name__ == "__main__":
-    # Example usage
-    from vishwamai.models.cot_model import CoTModel
-    from vishwamai.models.transformer import VishwamAITransformer
+    else:
+        from vishwamai.models.tpu.attention import (
+            BaseAttention,
+            FlashMLAttentionTPU,
+            MultiModalAttentionTPU,
+            TemporalAttentionTPU
+        )
+        
+        attention_classes = {
+            "base": BaseAttention,
+            "flash_mla": FlashMLAttentionTPU,
+            "multimodal": MultiModalAttentionTPU,
+            "temporal": TemporalAttentionTPU
+        }
     
-    # Mock transformer and model
-    transformer = VishwamAITransformer(vocab_size=1000, d_model=512, nhead=8, num_layers=6)
-    model = CoTModel(transformer)
-    
-    # Initialize tuner
-    tuner = PerformanceTuner(model)
-    
-    # Tune batch size
-    input_shape = (100, 512)  # Example input shape (sequence_length, d_model)
-    optimal_batch_size = tuner.tune_batch_size(input_shape)
-    
-    # Measure latency
-    dummy_input = torch.randn(optimal_batch_size, *input_shape).to(tuner.device)
-    latency_stats = tuner.measure_latency(dummy_input)
-    print(latency_stats)
+    attention_cls = attention_classes[variant_name]
+    return attention_cls(
+        embed_dim=config.embed_dim,
+        num_heads=config.num_heads,
+        **variant_config
+    )

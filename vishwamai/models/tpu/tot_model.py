@@ -1,82 +1,45 @@
 """
-Tree of Thoughts (ToT) model for VishwamAI, extending the CoT model with tree search.
-Supports DFS and BFS for thought exploration, thought generation, and evaluation.
-Designed for complex reasoning tasks requiring deep calculations.
-Updated for JAX/Flax/DM-Haiku, optimized for TPUs.
+TPU-optimized Tree of Thoughts (ToT) model using JAX/XLA
 """
 
 import jax
 import jax.numpy as jnp
-from jax import random, jit, lax
-import flax.linen as nn
 import haiku as hk
-from typing import Optional, Tuple, List, Dict
-import numpy as np
+import optax
+from typing import Optional, Dict, List, Tuple
+from collections import deque
 
-from vishwamai.models.transformer import VishwamAITransformer
-from vishwamai.models.cot_model import CoTModel, extract_answer
+from .cot_model import CoTModelTPU
+from .kernel_layers import TPUGEMMLinear
 
-# Define ThoughtNode as a Haiku-transformable structure
-def thought_node_fn(thought_text: str, parent=None, score: float = 0.0):
-    """Haiku-compatible function to create a ThoughtNode."""
-    state = hk.get_state("thought_state", shape=(), init=lambda *args: 0)
-    depth = state + (parent.depth if parent else -1) + 1 if parent else 0
-    hk.set_state("thought_state", depth)
-    return {
-        "thought_text": thought_text,
-        "parent": parent,
-        "children": [],
-        "score": score,
-        "depth": depth
-    }
+class ThoughtNodeTPU:
+    """Represents a node in the thought tree with TPU state management"""
+    def __init__(self, thought_text: str, node_id: str, parent=None, 
+                 score: float = 0.0, hidden_state: Optional[jnp.ndarray] = None):
+        self.thought_text = thought_text
+        self.node_id = node_id
+        self.parent = parent
+        self.children = []
+        self.score = score
+        self.depth = parent.depth + 1 if parent else 0
+        self.hidden_state = hidden_state
 
-class ThoughtNode:
-    """Wrapper for Haiku-transformed ThoughtNode state."""
-    def __init__(self, thought_text: str, parent=None, score: float = 0.0):
-        self._state = hk.transform(lambda: thought_node_fn(thought_text, parent, score))
-        self._rng = None
-
-    def init(self, rng: jnp.ndarray):
-        """Initialize the Haiku state with a random key."""
-        self._rng, sub_rng = jax.random.split(rng)
-        params = self._state.init(sub_rng)
-        return params
-
-    def apply(self, params, rng: jnp.ndarray):
-        """Apply the Haiku function with the given parameters and RNG."""
-        self._rng, sub_rng = jax.random.split(rng)
-        return self._state.apply(params, sub_rng)
-
-    def add_child(self, child):
-        """Add a child node (simplified for JAX compatibility)."""
+    def add_child(self, child: 'ThoughtNodeTPU') -> None:
         self.children.append(child)
 
-    @property
-    def children(self):
-        return self._state.state["children"]
+    def get_state_dict(self) -> Dict[str, any]:
+        """Get node state for persistence"""
+        return {
+            'text': self.thought_text,
+            'node_id': self.node_id,
+            'parent_id': self.parent.node_id if self.parent else None,
+            'score': float(self.score),  # Convert from DeviceArray to float
+            'depth': self.depth,
+            'child_ids': [child.node_id for child in self.children]
+        }
 
-    @children.setter
-    def children(self, value):
-        self._state.state["children"] = value
-
-    @property
-    def thought_text(self):
-        return self._state.state["thought_text"]
-
-    @property
-    def parent(self):
-        return self._state.state["parent"]
-
-    @property
-    def score(self):
-        return self._state.state["score"]
-
-    @property
-    def depth(self):
-        return self._state.state["depth"]
-
-    def path_to_root(self):
-        """Return the path from this node to the root as a list of thoughts."""
+    def path_to_root(self) -> List[str]:
+        """Return path from this node to root"""
         path = []
         current = self
         while current:
@@ -84,265 +47,233 @@ class ThoughtNode:
             current = current.parent
         return list(reversed(path))
 
-class ToTModel(CoTModel):
-    """
-    Tree of Thoughts model extending CoTModel with tree search capabilities.
-    """
-    max_steps: int = 3
-    candidates_per_step: int = 5
-    max_depth: int = 10
+class ToTModelTPU(CoTModelTPU):
+    """Tree of Thoughts model with TPU optimization"""
+    def __init__(self, embed_dim=512, num_layers=12, num_heads=8, ff_dim=2048,
+                 vocab_size=50000, max_seq_len=512, num_experts=7, max_steps=3,
+                 candidates_per_step=5, max_depth=10, dropout_rate=0.1,
+                 name: Optional[str] = None):
+        super().__init__(
+            embed_dim=embed_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            vocab_size=vocab_size,
+            max_seq_len=max_seq_len,
+            num_experts=num_experts,
+            dropout_rate=dropout_rate,
+            name=name
+        )
+        self.max_steps = max_steps
+        self.candidates_per_step = candidates_per_step
+        self.max_depth = max_depth
+        self.eval_head = TPUGEMMLinear(3)  # 3 classes for evaluation
 
-    def setup(self):
-        """
-        Initialize the ToT model with a VishwamAI Transformer and evaluation head.
-        """
-        super().setup()
-        self.eval_head = nn.Dense(3)  # Outputs logits for 3 classes (sure/maybe/impossible)
-
-    @nn.compact
-    def evaluate_thought(self, thought_ids: jnp.ndarray, train: bool = False) -> float:
-        """
-        Evaluate a thought by predicting its likelihood of leading to a solution.
-        
-        Args:
-            thought_ids: Token IDs of the thought (batch_size, seq_len).
-            train: Whether in training mode.
-        
-        Returns:
-            Float: Probability of "sure".
-        """
-        logits = self.transformer(thought_ids, train=train)
-        last_hidden = self.transformer.get_hidden_state(thought_ids, train=train)[:, -1, :]
-        eval_logits = self.eval_head(last_hidden)  # (batch_size, 3)
+    @hk.jit
+    def evaluate_thought(self, thought_ids: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate a thought's likelihood of leading to a solution"""
+        logits, _ = self(thought_ids, is_training=False)
+        last_hidden = logits[:, -1, :]
+        eval_logits = self.eval_head(last_hidden)
         probs = jax.nn.softmax(eval_logits, axis=-1)
-        return probs[:, 0].mean()  # Average "sure" probability across batch
+        return probs[:, 0]  # Return "sure" probability
 
-    def generate_candidates(self, input_text: str, current_thought: str, tokenizer, num_candidates: int, 
-                           rng: jnp.ndarray) -> List[str]:
-        """
-        Generate candidate thoughts for the next step.
-        
-        Args:
-            input_text: Original input problem.
-            current_thought: Current thought text.
-            tokenizer: Tokenizer instance.
-            num_candidates: Number of candidates to generate.
-            rng: Random number generator key.
-        
-        Returns:
-            List of candidate thought texts.
-        """
+    def generate_candidates(self, input_text: str, current_thought: str,
+                          tokenizer, num_candidates: int,
+                          tree_id: Optional[str] = None) -> List[str]:
+        """Generate candidate thoughts using JAX random sampling"""
         prompt = f"{input_text}\nCurrent thought: {current_thought}\nPropose next steps:"
-        input_ids = jnp.array(tokenizer.encode(prompt, return_tensors="jax")[0], dtype=jnp.int32)
+        input_ids = tokenizer.encode(prompt, return_tensors="jax")
 
-        def body_fn(val):
-            i, candidates, rng = val
-            if i >= num_candidates:
-                return i, candidates, rng
-            output_ids = self._sample(input_ids[None, :], 50, 0.8, 0.9, rng)
-            candidate_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            candidate_text = candidate_text.replace(prompt, "").strip()
-            if candidate_text:
-                candidates = candidates.at[i].set(candidate_text)
-            rng, sub_rng = jax.random.split(rng)
-            return i + 1, candidates, sub_rng
+        candidates = []
+        for i in range(num_candidates):
+            rng = hk.next_rng_key()
+            output_ids = self._sample(input_ids, rng, max_length=50)
+            candidate_text = tokenizer.decode(output_ids[0]).replace(prompt, "").strip()
+            if candidate_text and candidate_text not in candidates:
+                candidates.append(candidate_text)
 
-        candidates = jnp.array([""] * num_candidates)
-        _, candidates, _ = lax.while_loop(
-            lambda val: val[0] < num_candidates,
-            body_fn,
-            (0, candidates, rng)
-        )
-        return [cand for cand in candidates if cand]
+        return candidates[:num_candidates]
 
-    @jit
-    def _bfs_search(self, input_text: str, root: ThoughtNode, tokenizer, b: int, rng: jnp.ndarray) -> Optional[ThoughtNode]:
-        """
-        Perform BFS to explore the thought tree.
+    def solve_with_tot(self, input_text: str, tokenizer, search_method: str = "bfs",
+                      b: int = 5, tree_id: Optional[str] = None) -> str:
+        """Solve using Tree of Thoughts with BFS or DFS"""
+        if tree_id is None:
+            tree_id = f"tree_{hash(input_text)}"
+
+        root = ThoughtNodeTPU("Start", node_id=f"{tree_id}_root", score=1.0)
+        search_fn = self._bfs_search if search_method.lower() == "bfs" else self._dfs_search
         
-        Args:
-            input_text: Input problem.
-            root: Root node of the thought tree.
-            tokenizer: Tokenizer instance.
-            b: Number of best candidates to keep at each step.
-            rng: Random number generator key.
-        
-        Returns:
-            ThoughtNode: Node with the final solution, or None.
-        """
-        queue = [root]
-        step = 0
+        final_node = search_fn(input_text, root, tokenizer, b, tree_id)
 
-        def body_fn(val):
-            nonlocal step
-            queue, step = val
-            if not queue or step >= self.max_steps:
-                return queue, step
-            current_nodes = queue
-            new_queue = []
-            for node in current_nodes:
-                if node.depth >= self.max_depth:
-                    continue
-                candidates = self.generate_candidates(input_text, node.thought_text, tokenizer, self.candidates_per_step, rng)
-                for candidate in candidates:
-                    candidate_ids = jnp.array(tokenizer.encode(candidate, return_tensors="jax")[0], dtype=jnp.int32)
-                    score = self.evaluate_thought(candidate_ids[None, :])
-                    child = ThoughtNode(candidate, node, score)
-                    node.add_child(child)
-                    new_queue.append(child)
-            # Keep top b candidates
-            if new_queue:
-                scored_nodes = [(n, n.score) for n in new_queue]
-                scored_nodes.sort(key=lambda x: x[1], reverse=True)
-                new_queue = [n for n, _ in scored_nodes[:b]]
-            step += 1
-            return new_queue, step
-
-        queue, _ = lax.while_loop(
-            lambda val: val[0] and val[1] < self.max_steps,
-            body_fn,
-            (queue, step)
-        )
-
-        if queue:
-            best_node = max(queue, key=lambda x: x.score)
-            if "24" in best_node.thought_text and "=" in best_node.thought_text:
-                return best_node
-        return None
-
-    @jit
-    def _dfs_search(self, input_text: str, root: ThoughtNode, tokenizer, b: int, rng: jnp.ndarray) -> Optional[ThoughtNode]:
-        """
-        Perform DFS to explore the thought tree.
-        
-        Args:
-            input_text: Input problem.
-            root: Root node of the thought tree.
-            tokenizer: Tokenizer instance.
-            b: Number of best candidates to keep at each step.
-            rng: Random number generator key.
-        
-        Returns:
-            ThoughtNode: Node with the final solution, or None.
-        """
-        stack = [(root, 0)]
-        best_node = None
-        best_score = -jnp.inf
-
-        def body_fn(val):
-            nonlocal best_node, best_score
-            stack = val
-            if not stack:
-                return stack
-            current_node, step = stack[-1]
-            stack = stack[:-1]
-            if step >= self.max_steps or current_node.depth >= self.max_depth:
-                return stack
-
-            candidates = self.generate_candidates(input_text, current_node.thought_text, tokenizer, self.candidates_per_step, rng)
-            scored_candidates = []
-            for candidate in candidates:
-                candidate_ids = jnp.array(tokenizer.encode(candidate, return_tensors="jax")[0], dtype=jnp.int32)
-                score = self.evaluate_thought(candidate_ids[None, :])
-                child = ThoughtNode(candidate, current_node, score)
-                current_node.add_child(child)
-                scored_candidates.append(child)
-                if "24" in child.thought_text and "=" in child.thought_text and score > best_score:
-                    best_node = child
-                    best_score = score
-
-            # Keep top b candidates
-            scored_candidates.sort(key=lambda x: x.score, reverse=True)
-            top_candidates = scored_candidates[:b]
-            stack.extend((c, step + 1) for c in top_candidates)
-            return stack
-
-        stack = lax.while_loop(
-            lambda val: val,
-            body_fn,
-            stack
-        )
-
-        return best_node
-
-    def solve_with_tot(self, input_text: str, tokenizer, search_method: str = "bfs", b: int = 5, 
-                       rng: jnp.ndarray = None) -> str:
-        """
-        Solve the problem using Tree of Thoughts with BFS or DFS.
-        
-        Args:
-            input_text: Input problem (e.g., "Game of 24: 4 9 10 13").
-            tokenizer: Tokenizer instance.
-            search_method: "bfs" or "dfs" for search strategy.
-            b: Number of best candidates to keep at each step.
-            rng: Random number generator key.
-        
-        Returns:
-            Final output with <think> and <answer> tags.
-        """
-        if rng is None:
-            rng = random.PRNGKey(0)
-        
-        # Initialize the thought tree
-        root = ThoughtNode(thought_text="Start", score=1.0)
-        root_params = root.init(rng)
-
-        if search_method.lower() == "bfs":
-            final_node = self._bfs_search(input_text, root, tokenizer, b, rng)
-        else:
-            final_node = self._dfs_search(input_text, root, tokenizer, b, rng)
-
-        # Construct the final output
         if final_node:
-            thought_path = final_node.path_to_root()[1:]  # Exclude "Start"
+            thought_path = final_node.path_to_root()[1:]
             thought_text = " -> ".join(thought_path)
             answer = thought_path[-1].split("=")[-1].strip() if "=" in thought_path[-1] else "No solution found"
             return f"<think>{thought_text}</think> <answer>{answer}</answer>"
-        else:
-            return "<think>Failed to find a solution.</think> <answer>No solution</answer>"
+        return "<think>Failed to find a solution.</think> <answer>No solution</answer>"
+
+    def _bfs_search(self, input_text: str, root: ThoughtNodeTPU, tokenizer,
+                    b: int, tree_id: str) -> Optional[ThoughtNodeTPU]:
+        """Perform BFS with TPU-optimized batch processing"""
+        queue = deque([root])
+        step = 0
+        best_node = None
+        best_score = -float('inf')
+
+        while queue and step < self.max_steps:
+            level_size = len(queue)
+            level_nodes = []
+
+            # Process level in batches for TPU efficiency
+            batch_size = 8  # Adjust based on TPU memory
+            for batch_start in range(0, level_size, batch_size):
+                batch_nodes = list(queue)[:batch_size]
+                queue.rotate(-batch_size)
+
+                # Generate candidates for batch
+                all_candidates = []
+                for node in batch_nodes:
+                    candidates = self.generate_candidates(
+                        input_text, node.thought_text,
+                        tokenizer, self.candidates_per_step, tree_id
+                    )
+                    all_candidates.extend([
+                        (cand, node) for cand in candidates
+                    ])
+
+                # Evaluate candidates in parallel
+                if all_candidates:
+                    texts = [c[0] for c in all_candidates]
+                    input_ids = tokenizer.batch_encode(texts, return_tensors="jax")
+                    scores = self.evaluate_thought(input_ids)
+
+                    # Create nodes for all candidates
+                    for i, ((cand_text, parent), score) in enumerate(zip(all_candidates, scores)):
+                        node_id = f"{tree_id}_level{step}_cand{len(level_nodes) + i}"
+                        score = float(score)  # Convert from DeviceArray
+                        child_node = ThoughtNodeTPU(
+                            thought_text=cand_text,
+                            node_id=node_id,
+                            parent=parent,
+                            score=score
+                        )
+                        parent.add_child(child_node)
+                        level_nodes.append(child_node)
+
+                        if score > best_score and "24" in cand_text and "=" in cand_text:
+                            best_node = child_node
+                            best_score = score
+
+            # Sort and filter level nodes
+            level_nodes.sort(key=lambda x: x.score, reverse=True)
+            queue.extend(level_nodes[:b])
+            step += 1
+
+        return best_node
+
+    def _dfs_search(self, input_text: str, root: ThoughtNodeTPU, tokenizer,
+                    b: int, tree_id: str) -> Optional[ThoughtNodeTPU]:
+        """Perform DFS with TPU-optimized batch processing"""
+        stack = [(root, 0)]
+        best_node = None
+        best_score = -float('inf')
+        visited = set()
+
+        while stack:
+            current_node, step = stack.pop()
+            if step >= self.max_steps or current_node.depth >= self.max_depth:
+                continue
+
+            # Generate and evaluate candidates
+            candidates = self.generate_candidates(
+                input_text, current_node.thought_text,
+                tokenizer, self.candidates_per_step, tree_id
+            )
+
+            if candidates:
+                # Batch evaluate candidates
+                input_ids = tokenizer.batch_encode(candidates, return_tensors="jax")
+                scores = self.evaluate_thought(input_ids)
+
+                # Create nodes for all candidates
+                child_nodes = []
+                for i, (cand_text, score) in enumerate(zip(candidates, scores)):
+                    node_id = f"{tree_id}_step{step}_cand{i}"
+                    score = float(score)  # Convert from DeviceArray
+                    child_node = ThoughtNodeTPU(
+                        thought_text=cand_text,
+                        node_id=node_id,
+                        parent=current_node,
+                        score=score
+                    )
+                    current_node.add_child(child_node)
+                    child_nodes.append(child_node)
+
+                    if score > best_score and "24" in cand_text and "=" in cand_text:
+                        best_node = child_node
+                        best_score = score
+
+                # Sort and add best candidates to stack
+                child_nodes.sort(key=lambda x: x.score, reverse=True)
+                stack.extend((node, step + 1) for node in child_nodes[:b])
+
+        return best_node
+
+    def _sample(self, input_ids: jnp.ndarray, rng: jnp.ndarray,
+                max_length: int = 50, temperature: float = 0.8,
+                top_p: float = 0.9) -> jnp.ndarray:
+        """TPU-optimized sampling with JAX"""
+        def sample_step(carry, _):
+            ids, rng = carry
+            rng, new_rng = jax.random.split(rng)
+            logits, _ = self(ids, is_training=False)
+            next_token_logits = logits[:, -1, :] / temperature
+            
+            # Nucleus sampling
+            sorted_logits, sorted_indices = jax.lax.top_k(
+                next_token_logits, k=self.vocab_size
+            )
+            cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits), axis=-1)
+            mask = cumulative_probs < top_p
+            mask = jnp.concatenate([
+                jnp.ones_like(mask[:, :1]),
+                mask[:, :-1]
+            ], axis=-1)
+            
+            next_token_logits = jnp.where(
+                mask,
+                sorted_logits,
+                jnp.full_like(sorted_logits, -float('inf'))
+            )
+            next_token = jax.random.categorical(rng, next_token_logits)
+            next_token = sorted_indices[jnp.arange(next_token.shape[0]), next_token]
+            
+            return (jnp.concatenate([ids, next_token[:, None]], axis=1), new_rng), None
+
+        final_state, _ = jax.lax.scan(
+            sample_step,
+            (input_ids, rng),
+            None,
+            length=max_length - input_ids.shape[1]
+        )
+        return final_state[0]
 
 # Example usage
 if __name__ == "__main__":
-    # Mock tokenizer (same as in cot_model.py)
-    class MockTokenizer:
-        def __init__(self, vocab_size=50000):
-            self.vocab_size = vocab_size
-            self.special_tokens = {
-                "<think>": vocab_size-4, "</think>": vocab_size-3,
-                "<answer>": vocab_size-2, "</answer>": vocab_size-1
-            }
-            self.inverse_vocab = {v: k for k, v in self.special_tokens.items()}
-            self.inverse_vocab.update({i: f"token_{i}" for i in range(vocab_size-4)})
+    def run_tot(x: jnp.ndarray) -> jnp.ndarray:
+        model = ToTModelTPU()
+        return model(x, is_training=False)[0]
 
-        def encode(self, text, return_tensors="jax"):
-            tokens = [self.special_tokens.get(text, i) for i in range(5)]  # Simplified
-            if return_tensors == "jax":
-                return jnp.array([tokens], dtype=jnp.int32)
-            return tokens
+    # Initialize
+    batch_size, seq_len = 2, 64
+    rng = jax.random.PRNGKey(0)
+    input_ids = jax.random.randint(rng, (batch_size, seq_len), 0, 50000)
 
-        def decode(self, token_ids, skip_special_tokens=False):
-            text = []
-            for token in token_ids:
-                token = int(token)
-                if token in self.inverse_vocab:
-                    if not skip_special_tokens or token < self.vocab_size-4:
-                        text.append(self.inverse_vocab[token])
-            return " ".join(text)
+    # Transform and initialize
+    transformed = hk.transform(run_tot)
+    params = transformed.init(rng, input_ids)
 
-    # Initialize model and tokenizer
-    rng = random.PRNGKey(0)
-    rng, init_rng = random.split(rng)
-    tokenizer = MockTokenizer()
-    model = ToTModel(vocab_size=tokenizer.vocab_size)
-    params = model.init(init_rng, jnp.ones((1, 5), dtype=jnp.int32))['params']
-
-    # Example: Solve a Game of 24 problem
-    input_text = "Game of 24: 4 9 10 13"
-    output_bfs = model.solve_with_tot(input_text, tokenizer, search_method="bfs", b=5, rng=rng)
-    print("BFS Output:", output_bfs)
-    print("BFS Extracted Answer:", extract_answer(output_bfs))
-
-    rng, dfs_rng = random.split(rng)
-    output_dfs = model.solve_with_tot(input_text, tokenizer, search_method="dfs", b=5, rng=dfs_rng)
-    print("DFS Output:", output_dfs)
-    print("DFS Extracted Answer:", extract_answer(output_dfs))
+    # Forward pass
+    logits = transformed.apply(params, rng, input_ids)
+    print("ToT Output shape:", logits.shape)

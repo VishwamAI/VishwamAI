@@ -1,6 +1,5 @@
-# /home/kasinadhsarma/VishwamAI/vishwamai/models/transformer.py
 """
-VishwamAI Transformer with unified GPU/TPU support and optimizations.
+Enhanced Transformer architecture with optimized attention mechanisms for both GPU and TPU.
 """
 
 import os
@@ -26,6 +25,9 @@ from vishwamai.models.attention import DynamicSparseAttention, LearnedPerformerA
 # Import device-specific implementations
 from vishwamai.models.gpu.transformer import DualPipeTransformer as GPUTransformer
 from vishwamai.models.tpu.transformer import VishwamAITransformer as TPUTransformer
+
+from vishwamai.optimisation.performance_tuning import AttentionConfig, create_optimized_attention
+from vishwamai.models.attention import UnifiedAttention
 
 def get_device_type():
     """Determine the available device type."""
@@ -184,96 +186,196 @@ class VishwamAITransformerLayer(DeviceAgnosticModule):
         
         return x
 
-class VishwamAITransformer(DeviceAgnosticModule):
+class EnhancedTransformerBlock(nn.Module):
     """
-    Device-agnostic transformer with optimizations for different hardware.
+    Enhanced Transformer block with optimized attention and MLP
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        mlp_dim: int = 2048,
+        dropout: float = 0.1,
+        attention_config: Optional[Dict] = None
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        # Create attention configuration
+        attn_config = AttentionConfig(
+            batch_size=1,  # Will be adjusted dynamically
+            seq_length=1024,  # Default, can be overridden
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            device_type="gpu" if torch.cuda.is_available() else "tpu",
+            **(attention_config or {})
+        )
+        
+        # Initialize optimized attention
+        self.attention = UnifiedAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            attention_type=attn_config.attention_type
+        )
+        
+        # Layer normalization and MLP
+        self.layer_norm1 = nn.LayerNorm(embed_dim)
+        self.layer_norm2 = nn.LayerNorm(embed_dim)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, x, mask=None, context=None):
+        # Pre-norm architecture
+        normed_x = self.layer_norm1(x)
+        
+        # Apply attention
+        attention_output = self.attention(
+            normed_x,
+            mask=mask,
+            context=context
+        )
+        x = x + attention_output
+        
+        # MLP with residual
+        normed_x = self.layer_norm2(x)
+        mlp_output = self.mlp(normed_x)
+        x = x + mlp_output
+        
+        return x
+
+class VishwamAITransformer(nn.Module):
+    """
+    Enhanced Transformer model with optimized attention mechanisms
+    and dynamic hardware adaptation
     """
     def __init__(
         self,
         vocab_size: int,
-        embed_dim: int,
-        num_layers: int,
-        num_heads: int,
-        ff_dim: int,
-        max_seq_len: int = 512,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
-        dropout_rate: float = 0.1,
-        force_device: str = None
+        max_seq_length: int = 1024,
+        embed_dim: int = 768,
+        num_heads: int = 12,
+        num_layers: int = 12,
+        mlp_dim: int = 3072,
+        dropout: float = 0.1,
+        attention_config: Optional[Dict] = None
     ):
         super().__init__()
-        if force_device:
-            self.device_type = force_device
-            
         self.vocab_size = vocab_size
+        self.max_seq_length = max_seq_length
         self.embed_dim = embed_dim
         
-        # Device-agnostic embeddings
-        self.token_embedding = TokenEmbedding(
-            vocab_size, embed_dim, force_device=self.device_type
-        )
-        self.pos_embedding = PositionalEncoding(
-            embed_dim, max_seq_len, dropout_rate, force_device=self.device_type
-        )
+        # Token and position embeddings
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        self.position_embedding = nn.Parameter(torch.zeros(1, max_seq_length, embed_dim))
         
-        # Initialize attention kwargs
-        self.attention_kwargs = attention_kwargs or {
-            "num_experts": 4,
-            "flash_kwargs": {
-                "latent_dim": 64,
-                "block_size": 128
-            }
-        }
-        
-        # Create transformer layers
-        self.layers = [
-            VishwamAITransformerLayer(
+        # Transformer layers with enhanced blocks
+        self.layers = nn.ModuleList([
+            EnhancedTransformerBlock(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
-                ff_dim=ff_dim,
-                attention_kwargs=self.attention_kwargs,
-                layer_idx=i,
-                num_layers=num_layers,
-                dropout_rate=dropout_rate,
-                force_device=self.device_type
+                mlp_dim=mlp_dim,
+                dropout=dropout,
+                attention_config=attention_config
             )
-            for i in range(num_layers)
-        ]
+            for _ in range(num_layers)
+        ])
         
-        # Final normalization and output projection
-        self.norm = OptimizedLayerNorm(embed_dim, force_device=self.device_type)
+        # Output head
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
         
-        if self.device_type == "tpu" and HAS_JAX:
-            self.output_projection = flax_nn.Dense(vocab_size)
-        else:
-            import torch.nn as nn
-            self.output_projection = nn.Linear(embed_dim, vocab_size)
-            
-    def __call__(self, x, mask=None, context=None, training=False):
-        x = self.token_embedding(x)
-        x = self.pos_embedding(x)
+        # Initialize weights
+        self.apply(self._init_weights)
         
-        layer_states = []
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # Get sequence length and device
+        batch_size, seq_length = input_ids.size()
+        device = input_ids.device
+        
+        # Input embedding
+        x = self.token_embedding(input_ids)
+        
+        # Add positional embeddings
+        positions = self.position_embedding[:, :seq_length, :]
+        x = x + positions
+        
+        # Process through transformer layers
         for layer in self.layers:
-            layer_output = layer(x, mask, context, layer_states, training)
-            layer_states.append(layer_output)
-            x = layer_output
-            
-        x = self.norm(x)
-        return self.output_projection(x)
+            x = layer(x, mask=attention_mask, context=context)
         
-    def get_hidden_state(self, x, mask=None, context=None, training=False):
-        """Get the final hidden state without output projection."""
-        x = self.token_embedding(x)
-        x = self.pos_embedding(x)
+        # Output processing
+        x = self.layer_norm(x)
+        logits = self.head(x)
         
-        layer_states = []
-        for layer in self.layers:
-            layer_output = layer(x, mask, context, layer_states, training)
-            layer_states.append(layer_output)
-            x = layer_output
+        return logits
+    
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_length: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None
+    ) -> torch.Tensor:
+        """
+        Generate text using the transformer model
+        """
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+        
+        for _ in range(max_length - input_ids.size(1)):
+            # Get model predictions
+            with torch.no_grad():
+                outputs = self(input_ids)
+                next_token_logits = outputs[:, -1, :] / temperature
             
-        return self.norm(x)
-
+            # Apply top-k filtering
+            if top_k is not None:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = float('-inf')
+            
+            # Apply top-p (nucleus) filtering
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_token_logits[indices_to_remove] = float('-inf')
+            
+            # Sample next token
+            probs = torch.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Concatenate next token to input_ids
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+        
+        return input_ids
 
 # Example usage
 if __name__ == "__main__":

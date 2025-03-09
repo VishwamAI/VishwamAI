@@ -38,6 +38,31 @@ def get_num_sms() -> int:
     props = torch.cuda.get_device_properties(device)
     return props.multi_processor_count
 
+def set_num_sms(num_sms: int) -> None:
+    """
+    Set the number of streaming multiprocessors (SMs) to use.
+    This is useful for testing or when you want to limit GPU utilization.
+    
+    Args:
+        num_sms: Number of SMs to use
+    """
+    if not torch.cuda.is_available():
+        return
+        
+    if num_sms <= 0:
+        raise ValueError("Number of SMs must be positive")
+        
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    if num_sms > props.multi_processor_count:
+        raise ValueError(f"Requested {num_sms} SMs but device only has {props.multi_processor_count}")
+        
+    # Store the value in a module-level variable
+    global _configured_num_sms
+    _configured_num_sms = num_sms
+
+_configured_num_sms = None  # Module-level variable to store configured SM count
+
 def get_best_configs(shape: tuple, device_type: str = "gpu") -> dict:
     """
     Get optimal configurations for parallel operations

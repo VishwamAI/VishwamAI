@@ -270,3 +270,21 @@ class Buffer:
             event.record()
             
         return combined, event
+
+def get_buffer(hidden_bytes: int = 0, num_nvl_bytes: int = 0, num_rdma_bytes: int = 0, group: Optional[Any] = None) -> Buffer:
+    """
+    Get a buffer instance for efficient parallel operations.
+    
+    Args:
+        hidden_bytes: Size of hidden state buffer in bytes
+        num_nvl_bytes: Size of NVLink buffer in bytes  
+        num_rdma_bytes: Size of RDMA buffer in bytes
+        group: Optional process group for distributed operations
+        
+    Returns:
+        Buffer: Configured buffer instance
+    """
+    return Buffer(group=group, 
+                 hidden_bytes=hidden_bytes,
+                 num_nvl_bytes=num_nvl_bytes, 
+                 num_rdma_bytes=num_rdma_bytes)

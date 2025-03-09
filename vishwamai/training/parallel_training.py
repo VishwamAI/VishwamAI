@@ -1,6 +1,6 @@
 """
 Parallel training utilities for VishwamAI.
-Supports multi-GPU (DDP), TPU, and model parallelism.
+Supports multi-GPU (DDP) and model parallelism with smallpond integration.
 """
 
 import os
@@ -13,15 +13,7 @@ import logging
 from typing import Optional, Dict, Any, Type, List
 from dataclasses import dataclass
 import math
-
-# Optional TPU support
-try:
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    HAS_TPU = True
-except ImportError:
-    HAS_TPU = False
+import smallpond
 
 from vishwamai.models.transformer import VishwamAITransformer
 from vishwamai.training.dataset_loader import VishwamAIDataset, create_dataloader
@@ -32,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ParallelConfig:
     """Configuration for parallel training"""
-    backend: str = 'nccl'              # 'nccl', 'gloo', or 'tpu'
+    backend: str = 'nccl'              # 'nccl' or 'gloo'
     world_size: int = 1                # Total number of processes
     local_rank: int = -1               # Local process rank
     device_ids: Optional[List[int]] = None  # GPU device IDs to use
@@ -44,11 +36,12 @@ class ParallelConfig:
     mixed_precision: bool = True       # Whether to use mixed precision training
     optimize_memory: bool = True       # Whether to use memory optimization
     seed: int = 42                     # Random seed
+    smallpond_config: Optional[Dict[str, Any]] = None
 
 class ParallelTrainer:
     """
     Manager for parallel training across multiple devices.
-    Supports DDP, TPU, and model parallelism.
+    Supports DDP and model parallelism.
     """
     
     def __init__(
@@ -90,36 +83,46 @@ class ParallelTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
             
+    def _init_smallpond(self):
+        """Initialize smallpond for distributed data processing"""
+        if self.parallel_config.smallpond_config:
+            config = self.parallel_config.smallpond_config
+            self.sp_session = smallpond.init(
+                num_executors=config.get('num_executors', self.parallel_config.world_size),
+                ray_address=config.get('ray_address'),
+                bind_numa_node=config.get('bind_numa_node', True),
+                data_root=config.get('data_root', '/tmp/vishwamai/smallpond'),
+                platform=config.get('platform'),
+            )
+            
     def _setup_distributed(self):
         """Setup distributed training environment"""
-        if self.parallel_config.backend == 'tpu' and HAS_TPU:
-            # TPU setup
-            self.device = xm.xla_device()
-            self.is_main_process = xm.is_master_ordinal()
+        # GPU setup
+        if self.parallel_config.local_rank != -1:
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is not available for distributed training")
+                
+            # Set environment variables
+            os.environ['MASTER_ADDR'] = self.parallel_config.master_addr
+            os.environ['MASTER_PORT'] = self.parallel_config.master_port
+            
+            # Initialize process group
+            dist.init_process_group(
+                backend=self.parallel_config.backend,
+                world_size=self.parallel_config.world_size,
+                rank=self.parallel_config.local_rank
+            )
+            
+            torch.cuda.set_device(self.parallel_config.local_rank)
+            self.device = torch.device(f"cuda:{self.parallel_config.local_rank}")
+            self.is_main_process = self.parallel_config.local_rank == 0
         else:
-            # GPU setup
-            if self.parallel_config.local_rank != -1:
-                if not torch.cuda.is_available():
-                    raise RuntimeError("CUDA is not available for distributed training")
-                    
-                # Set environment variables
-                os.environ['MASTER_ADDR'] = self.parallel_config.master_addr
-                os.environ['MASTER_PORT'] = self.parallel_config.master_port
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.is_main_process = True
                 
-                # Initialize process group
-                dist.init_process_group(
-                    backend=self.parallel_config.backend,
-                    world_size=self.parallel_config.world_size,
-                    rank=self.parallel_config.local_rank
-                )
-                
-                torch.cuda.set_device(self.parallel_config.local_rank)
-                self.device = torch.device(f"cuda:{self.parallel_config.local_rank}")
-                self.is_main_process = self.parallel_config.local_rank == 0
-            else:
-                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                self.is_main_process = True
-                
+        # Initialize smallpond if configured
+        self._init_smallpond()
+
     def _setup_model_parallel(self):
         """Setup model parallelism"""
         if self.parallel_config.model_parallel_size > 1:
@@ -186,30 +189,12 @@ class ParallelTrainer:
             
     def _setup_data_parallel(self):
         """Setup data parallelism"""
-        if self.parallel_config.backend == 'tpu':
-            # TPU data parallel setup
-            self.model = torch.nn.parallel.DistributedDataParallel(
+        if self.parallel_config.local_rank != -1:
+            self.model = DistributedDataParallel(
                 self.model,
-                device_ids=[self.device] if self.device else None
+                device_ids=[self.parallel_config.local_rank]
             )
-            
-            self.train_loader = pl.MpDeviceLoader(
-                self.train_dataloader,
-                self.device
-            )
-            if self.val_dataset:
-                self.val_loader = pl.MpDeviceLoader(
-                    self.val_dataloader,
-                    self.device
-                )
-        else:
-            # GPU data parallel setup
-            if self.parallel_config.local_rank != -1:
-                self.model = DistributedDataParallel(
-                    self.model,
-                    device_ids=[self.parallel_config.local_rank]
-                )
-                
+
     def prepare(self):
         """Prepare for parallel training"""
         # Initialize model
@@ -236,23 +221,44 @@ class ParallelTrainer:
             )
             
         # Create data loaders
-        self.train_dataloader = create_dataloader(
-            self.train_dataset,
+        self.train_dataloader = self._get_dataloader(
             batch_size=self.training_config.get('batch_size', 32),
-            shuffle=True,
-            num_workers=4,
-            sampler=DistributedSampler(self.train_dataset) 
-                if self.parallel_config.local_rank != -1 else None
+            shuffle=True
         )
         
         if self.val_dataset:
-            self.val_dataloader = create_dataloader(
-                self.val_dataset,
+            self.val_dataloader = self._get_dataloader(
                 batch_size=self.training_config.get('batch_size', 32),
-                shuffle=False,
-                num_workers=4,
-                sampler=DistributedSampler(self.val_dataset)
-                    if self.parallel_config.local_rank != -1 else None
+                shuffle=False
+            )
+            
+    def _get_dataloader(self, batch_size: int, shuffle: bool = True):
+        """Create dataloader with appropriate sampler"""
+        if self.sp_session:
+            # Use smallpond for data loading
+            df = self.sp_session.read_parquet(self.train_dataset.data_path)
+            df = df.repartition(self.parallel_config.world_size)
+            return create_dataloader(
+                df.to_pandas(), 
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=self.parallel_config.num_workers
+            )
+        else:
+            # Standard PyTorch dataloader
+            sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.parallel_config.world_size,
+                rank=self.parallel_config.local_rank,
+                shuffle=shuffle
+            ) if self.parallel_config.local_rank != -1 else None
+            
+            return create_dataloader(
+                self.train_dataset,
+                batch_size=batch_size,
+                shuffle=(sampler is None and shuffle),
+                sampler=sampler,
+                num_workers=self.parallel_config.num_workers
             )
             
     def train_step(self, batch):
@@ -301,7 +307,7 @@ class ParallelTrainer:
                     self.memory_optimizer.enable_mixed_precision(self.scaler)
                     
             # Training epoch
-            for batch in self.train_loader if self.parallel_config.backend == 'tpu' else self.train_dataloader:
+            for batch in self.train_dataloader:
                 loss = self.train_step(batch)
                 epoch_loss += loss
                 num_steps += 1
@@ -312,15 +318,16 @@ class ParallelTrainer:
                 logger.info(f"Epoch {epoch + 1}, Loss: {epoch_loss / num_steps:.4f}")
                 
             # Synchronize processes
-            if self.parallel_config.backend == 'tpu':
-                xm.mark_step()
-            elif self.parallel_config.local_rank != -1:
+            if self.parallel_config.local_rank != -1:
                 dist.barrier()
                 
     def cleanup(self):
         """Cleanup distributed training"""
         if self.parallel_config.local_rank != -1:
             dist.destroy_process_group()
+            
+        if self.sp_session:
+            self.sp_session.shutdown()
 
 def run_parallel_training(
     rank: int,
@@ -335,17 +342,6 @@ def run_parallel_training(
 ):
     """
     Run parallel training on a single process.
-    
-    Args:
-        rank: Process rank
-        world_size: Total number of processes
-        model_class: Model class to train
-        model_config: Model configuration
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-        parallel_config: Parallel training configuration
-        training_config: Training hyperparameters
-        num_epochs: Number of training epochs
     """
     # Update parallel config with process info
     if parallel_config is None:
@@ -407,39 +403,21 @@ def main():
         mode='normal'
     )
     
-    if parallel_config.backend == 'tpu':
-        # TPU training
-        xmp.spawn(
-            run_parallel_training,
-            args=(
-                parallel_config.world_size,
-                VishwamAITransformer,
-                model_config,
-                train_dataset,
-                val_dataset,
-                parallel_config,
-                training_config,
-                10  # num_epochs
-            ),
-            nprocs=parallel_config.world_size,
-            start_method='spawn'
-        )
-    else:
-        # GPU training
-        mp.spawn(
-            run_parallel_training,
-            args=(
-                parallel_config.world_size,
-                VishwamAITransformer,
-                model_config,
-                train_dataset,
-                val_dataset,
-                parallel_config,
-                training_config,
-                10  # num_epochs
-            ),
-            nprocs=parallel_config.world_size
-        )
+    # GPU training
+    mp.spawn(
+        run_parallel_training,
+        args=(
+            parallel_config.world_size,
+            VishwamAITransformer,
+            model_config,
+            train_dataset,
+            val_dataset,
+            parallel_config,
+            training_config,
+            10  # num_epochs
+        ),
+        nprocs=parallel_config.world_size
+    )
 
 if __name__ == "__main__":
     main()

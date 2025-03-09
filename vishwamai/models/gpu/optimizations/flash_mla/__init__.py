@@ -1,99 +1,202 @@
 """
-FlashMLA optimizations for efficient multi-head latent attention
+Flash Multi-head Linformer Attention (Flash MLA) with smallpond integration for distributed processing.
+Implements efficient attention computation using optimized CUDA kernels and distributed resources.
 """
 
 import torch
 import torch.nn.functional as F
 import math
+import os
+import smallpond
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any
+from .kernels import run_mha_fwd_splitkv_mla
 
+@dataclass
 class Flash_fwd_kernel_traits_mla:
-    """MLA kernel configuration traits"""
-    def __init__(self, kHeadDim_, kBlockM_, kBlockN_, kNWarps_):
-        self.kHeadDim = kHeadDim_
-        self.kBlockM = kBlockM_
-        self.kBlockN = kBlockN_
-        self.kNWarps = kNWarps_
-        
-        # Derived parameters
-        self.kBlockKSmem = 32 if kHeadDim_ % 64 == 0 else 64
-        self.kSwizzle = 2 if self.kBlockKSmem == 32 else 3
-        
+    """Configuration for Flash MLA forward kernel"""
+    sm_scale: float = 0.5
+    is_dropout: bool = False
+    is_causal: bool = False
+    use_fp8: bool = True
+    block_k: int = 64
+    block_q: int = 32
+    num_stages: int = 3
+
+@dataclass
 class Flash_fwd_mla_params:
-    """MLA forward pass parameters"""
-    def __init__(self):
-        self.is_causal = False
-        self.scale_softmax = 1.0
-        self.scale_softmax_log2 = math.log2(self.scale_softmax)
-        
-def get_mla_metadata(seqlens_k, num_heads_per_head_k, num_heads_k, num_sm_parts=None):
-    """Calculate metadata for optimized MLA execution"""
-    batch_size = seqlens_k.size(0)
-    device = seqlens_k.device
-    
-    # Get optimal block sizes and SM configuration
-    block_size_m = 64
-    block_size_n = 64
-    
-    # Get device properties
-    if num_sm_parts is None:
-        if torch.cuda.is_available():
-            num_sm_parts = torch.cuda.get_device_properties(0).multi_processor_count
-        else:
-            num_sm_parts = 1
-            
-    # Calculate splits for load balancing
-    splits = []
-    current_split = 0
-    for i in range(batch_size):
-        seqlen = seqlens_k[i].item()
-        num_blocks = (seqlen + block_size_n - 1) // block_size_n
-        current_split += num_blocks
-        splits.append(current_split)
-        
-    # Create metadata tensors
-    tile_scheduler_metadata = torch.zeros(num_sm_parts, 32, dtype=torch.int32, device=device)
-    num_splits = torch.tensor(splits, dtype=torch.int32, device=device)
-    
-    return tile_scheduler_metadata, num_splits
+    """Parameters for Flash MLA forward pass"""
+    batch_size: int
+    seq_len_q: int
+    seq_len_k: int
+    num_heads: int
+    head_size: int
+    causal: bool = False
+    sm_scale: float = 1.0
+    use_fp8: bool = True
 
-def flash_mla_with_kvcache(q, k, v, seqlens_k, head_size=None, tile_scheduler_metadata=None,
-                          num_splits=None, causal=True, sm_scale=0.5):
-    """Optimized MLA with KV-cache"""
-    batch_size, num_heads, seq_len, head_dim = q.shape
-    if head_size is None:
-        head_size = head_dim
-        
-    # Initialize outputs
-    out = torch.zeros_like(q)
-    softmax_lse = torch.zeros(batch_size, num_heads, seq_len, dtype=q.dtype, device=q.device)
+class DistributedFlashMLA:
+    """Distributed Flash MLA computation using smallpond"""
     
-    # Split computation across SMs
-    sm_splits = num_splits.size(0) - 1 if num_splits is not None else 1
-    for i in range(sm_splits):
-        # Get range for this split
-        start_idx = num_splits[i].item() if num_splits is not None else 0
-        end_idx = num_splits[i + 1].item() if num_splits is not None else seq_len
+    def __init__(self,
+                num_executors: Optional[int] = None,
+                cache_dir: Optional[str] = "/tmp/vishwamai/flash_mla_cache"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
         
-        # Calculate attention for this split
-        attn_weights = torch.matmul(q[:,:,start_idx:end_idx], k.transpose(-2, -1))
-        attn_weights = attn_weights * sm_scale / math.sqrt(head_dim)
-        
-        if causal:
-            casual_mask = torch.triu(torch.ones_like(attn_weights, dtype=torch.bool), diagonal=1)
-            attn_weights = attn_weights.masked_fill(casual_mask, float('-inf'))
+        # Initialize smallpond
+        try:
+            self.sp_session = smallpond.init(
+                num_executors=num_executors or torch.cuda.device_count(),
+                data_root=cache_dir,
+                bind_numa_node=True
+            )
+        except:
+            self.sp_session = None
             
-        attn_probs = F.softmax(attn_weights, dim=-1)
-        local_out = torch.matmul(attn_probs, v)
+        # Track stats
+        self.stats = {
+            'total_compute_time': 0.0,
+            'num_computations': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
         
-        # Update outputs
-        out[:,:,start_idx:end_idx] = local_out
-        softmax_lse[:,:,start_idx:end_idx] = attn_weights.max(dim=-1)[0]
+    def distribute_attention(self,
+                          q: torch.Tensor,
+                          k: torch.Tensor,
+                          v: torch.Tensor,
+                          seqlens_k: torch.Tensor,
+                          params: Flash_fwd_mla_params) -> torch.Tensor:
+        """Distribute attention computation across executors"""
+        if self.sp_session is None:
+            return run_mha_fwd_splitkv_mla(q, k, v, seqlens_k, params)
+            
+        # Convert to numpy for smallpond
+        q_np = q.detach().cpu().numpy()
+        k_np = k.detach().cpu().numpy()
+        v_np = v.detach().cpu().numpy()
+        seqlens_k_np = seqlens_k.cpu().numpy()
         
-    return out, softmax_lse
+        # Create dataframe with inputs
+        df = self.sp_session.create_dataframe({
+            'q': [q_np],
+            'k': [k_np],
+            'v': [v_np],
+            'seqlens_k': [seqlens_k_np],
+            'params': [params]
+        })
+        
+        # Partition by sequence length for load balancing
+        df = df.repartition(self.sp_session.num_executors)
+        
+        # Process partitions
+        def process_partition(partition):
+            import torch
+            import numpy as np
+            
+            # Convert back to torch tensors
+            q = torch.from_numpy(np.array(partition['q'].iloc[0]))
+            k = torch.from_numpy(np.array(partition['k'].iloc[0]))
+            v = torch.from_numpy(np.array(partition['v'].iloc[0]))
+            seqlens_k = torch.from_numpy(np.array(partition['seqlens_k'].iloc[0]))
+            params = partition['params'].iloc[0]
+            
+            # Run attention kernel
+            output = run_mha_fwd_splitkv_mla(q, k, v, seqlens_k, params)
+            return output.cpu().numpy()
+            
+        result_df = df.map_partitions(process_partition)
+        
+        # Gather results and convert back to tensor
+        result = torch.from_numpy(result_df.to_pandas()['data'].iloc[0])
+        return result.to(q.device)
+        
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.sp_session:
+            self.sp_session.shutdown()
 
-def run_mha_fwd_splitkv_mla(params, stream):
-    """Run the MLA forward pass"""
-    # For now, this is just a placeholder that marks the stream sync point
-    if stream is not None:
-        stream.synchronize()
-    return True
+def flash_mla_with_kvcache(q: torch.Tensor,
+                          k: torch.Tensor,
+                          v: torch.Tensor,
+                          seqlens_k: torch.Tensor,
+                          head_size: int,
+                          tile_scheduler_metadata: Any,
+                          num_splits: int,
+                          causal: bool = False,
+                          sm_scale: float = 0.5,
+                          distributed: bool = True) -> torch.Tensor:
+    """
+    Run Flash MLA with KV-cache and optional distributed computation.
+    
+    Args:
+        q: Query tensor (batch_size, num_heads, seq_len_q, head_size)
+        k: Key tensor (batch_size, num_heads, seq_len_k, head_size) 
+        v: Value tensor (batch_size, num_heads, seq_len_k, head_size)
+        seqlens_k: Key sequence lengths tensor
+        head_size: Size of attention heads
+        tile_scheduler_metadata: Parameters for tile scheduling
+        num_splits: Number of splits for k/v
+        causal: Whether to use causal masking
+        sm_scale: Scaling factor for softmax
+        distributed: Whether to use distributed computation
+        
+    Returns:
+        Attention output tensor
+    """
+    # Create params
+    params = Flash_fwd_mla_params(
+        batch_size=q.size(0),
+        seq_len_q=q.size(2),
+        seq_len_k=k.size(2),
+        num_heads=q.size(1),
+        head_size=head_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        use_fp8=torch.cuda.get_device_capability()[0] >= 8
+    )
+    
+    if distributed:
+        # Use distributed computation
+        distributed_mla = DistributedFlashMLA()
+        try:
+            output = distributed_mla.distribute_attention(
+                q, k, v, seqlens_k, params
+            )
+            distributed_mla.cleanup()
+            return output
+        except:
+            # Fallback to non-distributed
+            return run_mha_fwd_splitkv_mla(
+                q, k, v, seqlens_k, params
+            )
+    else:
+        # Direct computation
+        return run_mha_fwd_splitkv_mla(
+            q, k, v, seqlens_k, params
+        )
+
+def get_mla_metadata(seqlens_k: torch.Tensor,
+                    num_heads: int,
+                    num_heads_k: int, 
+                    num_splits: int) -> Tuple[Any, int]:
+    """Get metadata for tile scheduling"""
+    tile_meta = {
+        'num_heads': num_heads,
+        'num_heads_k': num_heads_k,
+        'num_splits': num_splits,
+        'head_size': seqlens_k.size(-1),
+        'block_k': 64,
+        'block_q': 32,
+        'num_stages': 3
+    }
+    return tile_meta, num_splits
+
+def init_flash_kernels():
+    """Initialize Flash MLA CUDA kernels"""
+    from .kernels import init_kernels
+    init_kernels()
+    
+# Initialize kernels on import
+init_flash_kernels()

@@ -1,136 +1,177 @@
 """
-Expert state management using 3FS for distributed MoE models.
+Expert state management with distributed storage via smallpond.
 """
 
 import torch
 import os
-from typing import Dict, List, Optional, Tuple
+import smallpond
 import numpy as np
+from typing import Optional, Dict, Any, Tuple, List
+from dataclasses import dataclass
+import time
+import json
+
+@dataclass
+class ExpertStats:
+    """Expert statistics"""
+    compute_time: float = 0.0
+    num_calls: int = 0
+    num_tokens: int = 0
+    hit_rate: float = 0.0
 
 class ExpertStateManager:
-    """Manages expert states and parameters using 3FS distributed storage"""
-    def __init__(
-        self,
-        storage_dir: str,
-        num_experts: int,
-        expert_dim: int,
-        capacity_gb: float = 50
-    ):
+    """Manages expert states with distributed storage"""
+    
+    def __init__(self,
+                storage_dir: str,
+                num_experts: int,
+                expert_dim: int,
+                max_cache_size: int = 1000,
+                use_smallpond: bool = True):
         self.storage_dir = storage_dir
         self.num_experts = num_experts
         self.expert_dim = expert_dim
-        self.capacity = int(capacity_gb * 1024 * 1024 * 1024)  # Convert to bytes
+        self.max_cache_size = max_cache_size
+        self.use_smallpond = use_smallpond
         
-        # Expert access statistics
-        self.access_counts = np.zeros(num_experts)
-        self.last_access = np.zeros(num_experts)
-        self._step = 0
+        os.makedirs(storage_dir, exist_ok=True)
+        os.makedirs(os.path.join(storage_dir, 'experts'), exist_ok=True)
+        os.makedirs(os.path.join(storage_dir, 'stats'), exist_ok=True)
         
-        # Storage paths
-        self.state_dir = os.path.join(storage_dir, 'expert_states')
-        self.stats_dir = os.path.join(storage_dir, 'expert_stats')
-        os.makedirs(self.state_dir, exist_ok=True)
-        os.makedirs(self.stats_dir, exist_ok=True)
-
-        # Initialize statistics tracking
-        self.stats: Dict[str, List[float]] = {
-            'load_times': [],
-            'store_times': [],
-            'hit_rates': []
-        }
+        # Initialize statistics
+        self.stats = {i: ExpertStats() for i in range(num_experts)}
         
-    def _get_expert_path(self, expert_id: int) -> str:
-        """Get storage path for expert state"""
-        return os.path.join(self.state_dir, f'expert_{expert_id}.pt')
-        
-    def _get_stats_path(self, expert_id: int) -> str:
-        """Get storage path for expert statistics"""
-        return os.path.join(self.stats_dir, f'expert_{expert_id}_stats.pt')
-
-    def store_expert_state(
-        self,
-        expert_id: int,
-        state_dict: Dict[str, torch.Tensor],
-        stats: Optional[Dict] = None
-    ) -> None:
-        """Store expert state and statistics in 3FS"""
-        # Save state dictionary
-        state_path = self._get_expert_path(expert_id)
-        torch.save(state_dict, state_path)
-        
-        # Save expert statistics if provided
-        if stats is not None:
-            stats_path = self._get_stats_path(expert_id)
-            torch.save(stats, stats_path)
+        # Initialize smallpond
+        if use_smallpond:
+            try:
+                self.sp_session = smallpond.init(
+                    num_executors=torch.cuda.device_count(),
+                    data_root=storage_dir,
+                    bind_numa_node=True
+                )
+            except:
+                self.sp_session = None
+                self.use_smallpond = False
+                
+    def store_expert_state(self,
+                         expert_id: int,
+                         state_dict: Dict[str, torch.Tensor],
+                         stats: Optional[Dict[str, float]] = None):
+        """Store expert state and stats"""
+        # Update statistics
+        if stats:
+            self.stats[expert_id].compute_time += stats.get('compute_time', 0)
+            self.stats[expert_id].num_calls += 1
+            self.stats[expert_id].num_tokens += stats.get('num_tokens', 0)
             
-        # Update access tracking
-        self.access_counts[expert_id] += 1
-        self.last_access[expert_id] = self._step
-        self._step += 1
-
-    def load_expert_state(
-        self,
-        expert_id: int,
-        load_stats: bool = False
-    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict]]:
-        """Load expert state and optionally statistics from 3FS"""
-        state_path = self._get_expert_path(expert_id)
-        state_dict = torch.load(state_path)
-        
-        stats = None
-        if load_stats:
-            stats_path = self._get_stats_path(expert_id)
-            if os.path.exists(stats_path):
-                stats = torch.load(stats_path)
-                
-        # Update access tracking
-        self.access_counts[expert_id] += 1
-        self.last_access[expert_id] = self._step
-        self._step += 1
-                
-        return state_dict, stats
-        
-    def get_expert_stats(self, expert_id: int) -> Optional[Dict]:
-        """Load expert statistics if available"""
-        stats_path = self._get_stats_path(expert_id)
-        if os.path.exists(stats_path):
-            return torch.load(stats_path)
-        return None
-
-    def clear_expert_state(self, expert_id: int) -> None:
-        """Remove stored state for an expert"""
-        state_path = self._get_expert_path(expert_id)
-        stats_path = self._get_stats_path(expert_id)
-        
-        if os.path.exists(state_path):
-            os.remove(state_path)
-        if os.path.exists(stats_path):
-            os.remove(stats_path)
-
-    def get_access_stats(self) -> Dict[str, np.ndarray]:
-        """Get expert access statistics"""
-        total_accesses = np.sum(self.access_counts)
-        access_fractions = self.access_counts / total_accesses if total_accesses > 0 else np.zeros_like(self.access_counts)
-        
-        return {
-            'access_counts': self.access_counts,
-            'access_fractions': access_fractions,
-            'last_access': self.last_access
+        if not self.use_smallpond or self.sp_session is None:
+            # Save locally
+            state_path = os.path.join(
+                self.storage_dir,
+                'experts',
+                f'expert_{expert_id}.pt'
+            )
+            torch.save(state_dict, state_path)
+            return
+            
+        # Convert state dict to numpy
+        numpy_state = {
+            k: v.cpu().numpy()
+            for k, v in state_dict.items()
         }
         
-    def update_stats(self, load_time: float, store_time: float, hit_rate: float) -> None:
-        """Update timing and efficiency statistics"""
-        self.stats['load_times'].append(load_time)
-        self.stats['store_times'].append(store_time)
-        self.stats['hit_rates'].append(hit_rate)
+        # Create DataFrame
+        df = self.sp_session.create_dataframe({
+            'expert_id': [expert_id],
+            'state': [numpy_state],
+            'stats': [self.stats[expert_id].__dict__]
+        })
         
-    def get_performance_stats(self) -> Dict[str, float]:
-        """Calculate performance statistics"""
-        stats = {}
-        for key, values in self.stats.items():
-            if values:
-                stats[f'avg_{key}'] = np.mean(values)
-                stats[f'std_{key}'] = np.std(values)
-                stats[f'min_{key}'] = np.min(values)
-                stats[f'max_{key}'] = np.max(values)
-        return stats
+        # Save to parquet
+        state_path = os.path.join(
+            self.storage_dir,
+            'experts',
+            f'expert_{expert_id}.parquet'
+        )
+        df.write_parquet(state_path)
+        
+    def load_expert_state(self,
+                        expert_id: int,
+                        load_stats: bool = False) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """Load expert state and optionally stats"""
+        if not self.use_smallpond or self.sp_session is None:
+            # Load locally
+            state_path = os.path.join(
+                self.storage_dir,
+                'experts',
+                f'expert_{expert_id}.pt'
+            )
+            if os.path.exists(state_path):
+                state_dict = torch.load(state_path)
+                stats_dict = self.stats[expert_id].__dict__ if load_stats else None
+                return state_dict, stats_dict
+            return None, None
+            
+        # Load from distributed storage
+        state_path = os.path.join(
+            self.storage_dir,
+            'experts',
+            f'expert_{expert_id}.parquet'
+        )
+        
+        if not os.path.exists(state_path):
+            return None, None
+            
+        df = self.sp_session.read_parquet(state_path)
+        row = df.to_pandas().iloc[0]
+        
+        # Convert back to torch tensors
+        state_dict = {
+            k: torch.from_numpy(v)
+            for k, v in row['state'].items()
+        }
+        
+        stats_dict = row['stats'] if load_stats else None
+        return state_dict, stats_dict
+        
+    def update_stats(self,
+                    expert_id: Optional[int] = None,
+                    load_time: float = 0.0,
+                    store_time: float = 0.0,
+                    hit_rate: float = 0.0):
+        """Update storage statistics"""
+        if expert_id is not None:
+            stats = self.stats[expert_id]
+            stats.hit_rate = (
+                stats.hit_rate * 0.9 + hit_rate * 0.1
+                if stats.num_calls > 0
+                else hit_rate
+            )
+        
+    def get_expert_stats(self,
+                       expert_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get expert statistics"""
+        if expert_id is not None:
+            return self.stats[expert_id].__dict__
+            
+        return {
+            i: stats.__dict__
+            for i, stats in self.stats.items()
+        }
+        
+    def save_stats(self):
+        """Save statistics to file"""
+        stats_path = os.path.join(
+            self.storage_dir,
+            'stats',
+            'expert_stats.json'
+        )
+        with open(stats_path, 'w') as f:
+            json.dump(self.get_expert_stats(), f)
+            
+    def cleanup(self):
+        """Cleanup resources"""
+        self.save_stats()
+        
+        if self.use_smallpond and self.sp_session:
+            self.sp_session.shutdown()

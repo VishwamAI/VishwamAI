@@ -1,67 +1,68 @@
-**VishwamAI Development Phases**
-
----
-
-### **📌 Phase 1: Data Collection & Preprocessing**
-🔹 **Goal:** Gather high-quality datasets for pretraining.
+### 📌 Phase 1: VishwamAI Model Analysis & Data Preparation
+🔹 **Goal:** Conduct a deep analysis of VishwamAI’s architecture and optimize its foundation.  
 🔹 **Tasks:**  
-✅ Collect data using **distillation from Perplexity-AI/r1-1776, Tencent-Hunyuan-Large**.  
-✅ Preprocess text using **tokenization (SentencePiece, BPE, Unigram)**.  
-✅ Save in **`.safetensors` format** for efficient storage.  
-✅ Store datasets in **Hugging Face LFS**.  
+✅ **Analyze VishwamAI’s tokenizer, embedding layers, attention mechanism, and transformer blocks.**  
+✅ **Define optimal configurations** (number of layers, heads, model depth, hidden size, etc.).  
+✅ **Test VishwamAI’s parameter scaling strategy** (7B, 32B, and beyond).  
+✅ **Benchmark VishwamAI’s inference speed, efficiency, and compute requirements.**  
+✅ **Decide on training optimizations** (LoRA, QLoRA, FlashAttention, ALiBi, RoPE).  
+✅ **Prepare `.safetensors` dataset pipeline** for seamless integration into training.  
 
----
-
-### **📌 Phase 2: Initial Pretraining (Standard LLM Training)**
-🔹 **Goal:** Train VishwamAI with foundational knowledge.
+### 📌 Phase 2: Parquet Model Testing & Initial Pretraining
+🔹 **Goal:** Conduct structured model validation before full-scale training.  
 🔹 **Tasks:**  
-✅ Use **Distillation (from LLaMA 3, GPT-4, Mistral, etc.)**.  
-✅ Train on **Google Colab TPUs** with **JAX, Flax** (LoRA + Quantization).  
-✅ Save model checkpoints & track loss/performance.  
+✅ Convert training datasets into **Parquet format** for structured access.  
+✅ Test model performance using **small-scale inference and validation**.  
+✅ Optimize memory usage with **LoRA + Quantization for TPU compatibility**.  
+✅ Run **baseline training with JAX/Flax on TPU/GPU** to ensure smooth execution.  
+✅ Store checkpoints & track **loss convergence, perplexity reduction**.  
 
----
-
-### **📌 Phase 3: Fine-Tuning for Reasoning & Memory**
-🔹 **Goal:** Improve reasoning, coding, math, and knowledge recall.
+### 📌 Phase 3: Distillation Training & Advanced Testing
+🔹 **Goal:** Train VishwamAI efficiently while testing real-world generalization.  
 🔹 **Tasks:**  
-✅ Fine-tune with **domain-specific datasets** (coding, medicine, legal).  
-✅ Integrate **long-context optimization (ALiBi, RoPE, Memory Attention)**.  
-✅ Implement **multi-turn conversation training** for better context handling.  
+✅ Perform **distillation training** using **low-rank adaptation (LoRA), quantized fine-tuning**.  
+✅ Implement **JAX-based TPU/GPU training pipeline**.  
+✅ Test model generalization on **MMLU, GSM8K, OpenBookQA, MBPP (code datasets)**.  
+✅ Evaluate on **domain-specific tasks (coding, medicine, legal, reasoning)**.  
+✅ Save fine-tuned models in **`.safetensors` for efficient storage & retrieval**.  
 
----
-
-### **📌 Phase 4: Tree of Thoughts (ToT) Training**
-🔹 **Goal:** Enhance problem-solving & multi-step reasoning.
+### 📌 Phase 4: Full-Scale Training on TPU/GPU
+🔹 **Goal:** Train VishwamAI with large-scale optimizations for real-world deployment.  
 🔹 **Tasks:**  
-✅ Apply **ToT techniques (BFS, DFS, structured problem-solving)**.  
-✅ Train on **GSM8K (math), BBH (complex tasks), MATH dataset**.  
-✅ Use **RLHF (Reward-Slap training)** to refine response quality.  
+✅ Run full-scale pretraining on **Google Colab TPU/GPU + JAX, Flax**.  
+✅ Implement **ALiBi, RoPE, Memory Attention** for long-context learning.  
+✅ Use **FP8/BF16 mixed precision** for optimal training efficiency.  
+✅ Validate model improvements with **Tree of Thoughts (ToT) reasoning benchmarks**.  
+✅ Track **compute costs & efficiency** for potential optimizations.  
 
----
-
-### **📌 Phase 5: Large-Scale Deployment & API Integration**
-🔹 **Goal:** Make VishwamAI accessible via API or chatbot.
+### 📌 Phase 5: ToT Fine-Tuning & Reinforcement Learning
+🔹 **Goal:** Enhance VishwamAI’s problem-solving and structured reasoning abilities.  
 🔹 **Tasks:**  
-✅ Deploy **low-latency inference (TPU-based serving, quantization)**.  
-✅ Implement **Next.js frontend & FastAPI backend** for user access.  
-✅ Develop **GitHub-based AI agent for bug prediction, automation**.  
+✅ Train using **Tree of Thoughts (BFS, DFS, multi-step reasoning models)**.  
+✅ Fine-tune on **GSM8K, MATH, BBH, reasoning-intensive datasets**.  
+✅ Implement **RLHF (Reward-Slap training) for refining response quality**.  
+✅ Test with **auto-conversation battle arena for reinforcement learning**.  
+✅ Prepare model for **real-world interaction with human-AI feedback loops**.  
 
----
-
-### **📌 Phase 6: Expansion & Research Optimization**
-🔹 **Goal:** Scale VishwamAI beyond chat, explore multimodal capabilities.
+### 📌 Phase 6: Large-Scale Deployment & API Development
+🔹 **Goal:** Deploy VishwamAI with scalable infrastructure for public & enterprise use.  
 🔹 **Tasks:**  
-✅ Train for **image, video, audio understanding (multimodal AI)**.  
-✅ Explore **Self-Refinement, Chain-of-Thought (CoT), Auto-Evolution**.  
-✅ Prepare for **commercialization, funding, and AI research center setup**.  
+✅ Optimize **low-latency inference (TPU/GPU-based serving, quantized models)**.  
+✅ Develop **Next.js frontend & FastAPI backend** for chatbot/API services.  
+✅ Deploy a **GitHub-based AI agent for bug prediction & automation**.  
+✅ Enable **multi-modal capabilities (text, image, video understanding)**.  
+✅ Explore **self-refinement, CoT (Chain-of-Thought), auto-evolution techniques**.  
 
----
+### 📌 Phase 7: Research Expansion & Commercialization
+🔹 **Goal:** Scale VishwamAI beyond chat and establish a dedicated research ecosystem.  
+🔹 **Tasks:**  
+✅ Expand into **multimodal AI (vision-language models, audio processing, video AI)**.  
+✅ Research **advanced model compression, retrieval-augmented generation (RAG)**.  
+✅ Optimize TPU/GPU training for **high-scale efficiency & cost reduction**.  
+✅ Seek **funding, commercialization, and AI research center establishment**.  
 
-### **🚀 Next Steps**
-1️⃣ Identify the **current focus phase** for VishwamAI.  
-2️⃣ Optimize **data distillation & `.safetensors` storage**.  
-3️⃣ Implement **JAX-based TPU training pipeline**.  
-4️⃣ Plan for **Tree of Thoughts fine-tuning**.  
-
----
-
+### 🚀 Next Steps
+1️⃣ **Complete Model Analysis & Data Distillation (Parquet + `.safetensors`).**  
+2️⃣ **Set up the TPU/GPU-based JAX training pipeline.**  
+3️⃣ **Test small-scale Parquet-based models before large-scale distillation training.**  
+4️⃣ **Optimize Tree of Thoughts implementation for fine-tuning.**

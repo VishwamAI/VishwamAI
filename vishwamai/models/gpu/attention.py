@@ -16,6 +16,7 @@ from vishwamai.models.gpu.optimizations.flash_mla import (
     get_mla_metadata
 )
 from vishwamai.models.gpu.optimizations.eplb import EPLB
+from vishwamai.models.gpu.optimizations.deep_ep.utils import init_expert_parallel
 
 # Triton kernel for Xavier initialization
 @triton.jit
@@ -59,6 +60,7 @@ class BaseAttention(nn.Module, ABC):
         self.dropout = nn.Dropout(dropout)
         self.use_amp = use_amp
         self._reset_parameters()
+        init_expert_parallel()
 
     def _reset_parameters(self):
         """Triton-accelerated Xavier initialization for weights"""

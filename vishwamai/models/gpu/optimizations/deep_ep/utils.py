@@ -102,3 +102,22 @@ def get_best_configs(shape: tuple, device_type: str = "gpu") -> dict:
         "num_stages": 3,
         "num_sms": num_sms
     }
+
+def init_expert_parallel() -> None:
+    """
+    Initialize expert parallelism for distributed processing.
+    This function sets up the necessary environment and configurations
+    for expert parallelism using DeepEP.
+    """
+    # Check if CUDA is available
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. Expert parallelism requires CUDA-enabled GPUs.")
+    
+    # Get the number of streaming multiprocessors (SMs)
+    num_sms = get_num_sms()
+    
+    # Set the number of SMs to use for expert parallelism
+    set_num_sms(num_sms)
+    
+    # Additional initialization steps can be added here if needed
+    print(f"Expert parallelism initialized with {num_sms} SMs.")

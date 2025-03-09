@@ -15,7 +15,7 @@ from vishwamai.models.gpu.attention import FlashMLAAttention
 
 # Import GPU optimizations
 from vishwamai.models.gpu.optimizations.deep_ep.buffer import Buffer
-from vishwamai.models.gpu.optimizations.deep_ep.utils import get_num_sms
+from vishwamai.models.gpu.optimizations.deep_ep.utils import get_num_sms, init_expert_parallel
 
 class CoTModel(nn.Module):
     """
@@ -49,6 +49,8 @@ class CoTModel(nn.Module):
 
         self.ep_buffer = None
         self.num_experts = num_experts
+
+        init_expert_parallel()
 
     def init_expert_parallel(self, group, hidden_bytes):
         """Initialize Buffer for expert parallelism"""

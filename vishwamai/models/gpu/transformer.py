@@ -14,6 +14,7 @@ from .kernel_layers import (
     DeepGEMMGroupedLinear,
     get_optimal_kernel_config
 )
+from vishwamai.models.gpu.optimizations.deep_ep.utils import init_expert_parallel
 
 class TransformerComputeLayer(nn.Module):
     """GPU-optimized transformer computation layer"""

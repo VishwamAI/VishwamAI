@@ -62,6 +62,11 @@ For TPU:
 pip install --upgrade "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 
+5. Update dependencies:
+```bash
+poetry update
+```
+
 ## Hardware-Specific Setup
 
 ### NVIDIA GPU Setup (GTX 1650)
@@ -119,6 +124,13 @@ training:
 model:
   hidden_size:     # Model architecture parameters
   num_layers:      # Adjusted for hardware constraints
+```
+
+## Running Tests in Parallel
+
+To run tests in parallel using `pytest-xdist`, use the following command:
+```bash
+pytest -n auto
 ```
 
 ## Contributing

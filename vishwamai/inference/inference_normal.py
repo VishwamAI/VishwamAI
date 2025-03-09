@@ -90,20 +90,8 @@ class NormalInference:
         processed_input = self._preprocess_input(input_data)
         
         # Device-specific tensor creation
-        if self.optimizer.device_type == 'tpu':
-            input_tensor = jnp.array([ord(c) for c in processed_input])
-            
-            @jit
-            def run_prediction(x):
-                return self.model(x)
-                
-            with jax.default_device(self.device):
-                output = run_prediction(input_tensor)
-        else:
-            input_tensor = torch.tensor([ord(c) for c in processed_input], 
-                                      device=self.device).unsqueeze(0)
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.optimizer.precision != 'fp32'):
-                output = self.optimizer.run_model(self.model, input_tensor, temperature=temperature)
+        input_tensor = self._create_input_tensor(processed_input)
+        output = self._run_model(input_tensor, temperature)
 
         # Process output
         prediction = self._decode_output(output)
@@ -119,6 +107,23 @@ class NormalInference:
         })
 
         return prediction, confidence, perf_stats
+
+    def _create_input_tensor(self, processed_input: str):
+        """Create input tensor based on device type."""
+        if self.optimizer.device_type == 'tpu':
+            return jnp.array([ord(c) for c in processed_input])
+        return torch.tensor([ord(c) for c in processed_input], device=self.device).unsqueeze(0)
+
+    def _run_model(self, input_tensor, temperature: float):
+        """Run the model based on device type."""
+        if self.optimizer.device_type == 'tpu':
+            @jit
+            def run_prediction(x):
+                return self.model(x)
+            with jax.default_device(self.device):
+                return run_prediction(input_tensor)
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.optimizer.precision != 'fp32'):
+            return self.optimizer.run_model(self.model, input_tensor, temperature=temperature)
 
     def _preprocess_input(self, input_data: str) -> str:
         """Preprocess the input data with device-specific optimizations."""

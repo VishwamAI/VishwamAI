@@ -89,11 +89,7 @@ class CoTInference:
 
         for step in range(self.max_steps):
             # Generate next reasoning step
-            if self.optimizer.device_type == 'tpu' and HAS_JAX:
-                next_step = self._generate_step_jax(current_context, temperature)
-            else:
-                next_step = self._generate_step_torch(current_context, temperature)
-
+            next_step = self._generate_next_step(current_context, temperature)
             reasoning_chain.append(next_step)
             
             # Update context
@@ -132,6 +128,12 @@ class CoTInference:
             'final_answer': final_answer,
             'metrics': metrics
         }
+
+    def _generate_next_step(self, context: str, temperature: float) -> str:
+        """Generate next reasoning step based on device type."""
+        if self.optimizer.device_type == 'tpu' and HAS_JAX:
+            return self._generate_step_jax(context, temperature)
+        return self._generate_step_torch(context, temperature)
 
     def _generate_step_jax(self, context: str, temperature: float) -> str:
         """Generate next reasoning step using JAX/TPU."""

@@ -1,18 +1,3 @@
-[submodule "vishwamai/models/gpu/integrations/DeepGEMM"]
-	path = vishwamai/models/gpu/integrations/DeepGEMM
-	url = https://github.com/deepseek-ai/DeepGEMM
 [submodule "vishwamai/models/gpu/integrations/3FS"]
 	path = vishwamai/models/gpu/integrations/3FS
-	url = https://github.com/deepseek-ai/3FS
-[submodule "vishwamai/models/gpu/integrations/DeepEP"]
-	path = vishwamai/models/gpu/integrations/DeepEP
-	url = https://github.com/deepseek-ai/DeepEP
-[submodule "vishwamai/models/gpu/integrations/DualPipe"]
-	path = vishwamai/models/gpu/integrations/DualPipe
-	url = https://github.com/deepseek-ai/DualPipe
-[submodule "vishwamai/models/gpu/integrations/FlashMLA"]
-	path = vishwamai/models/gpu/integrations/FlashMLA
-	url = https://github.com/deepseek-ai/FlashMLA
-[submodule "vishwamai/models/gpu/integrations/EPLB"]
-	path = vishwamai/models/gpu/integrations/EPLB
-	url = https://github.com/deepseek-ai/EPLB
+	url = https://github.com/deepseek-ai/3FS.git

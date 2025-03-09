@@ -56,7 +56,7 @@ class DistributedGEMM:
                       b: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Distribute GEMM computation across executors"""
-        start_time = time.time()  # Define start_time at the beginning of the method
+        start_time = time.time()
         
         if self.sp_session is None:
             return gemm_fp8_fp8_bf16_nt(a, b, bias, self.config)

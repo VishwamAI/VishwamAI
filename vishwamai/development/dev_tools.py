@@ -258,6 +258,13 @@ def setup_environment(requirements_file="requirements.txt"):
     subprocess.run(["pip", "install", "-r", requirements_file], check=True)
     print("Development environment set up successfully")
 
+def update_dependencies():
+    """
+    Update project dependencies using poetry.
+    """
+    subprocess.run(["poetry", "update"], check=True)
+    print("Dependencies updated successfully")
+
 # --- Example Usage ---
 
 if __name__ == "__main__":

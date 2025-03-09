@@ -33,7 +33,8 @@ test:
 		--cov=vishwamai \
 		--cov-report=term-missing \
 		--cov-report=html:coverage \
-		-v
+		-v \
+		--disable-warnings
 
 lint:
 	flake8 vishwamai/
@@ -148,3 +149,7 @@ cleanup:
 	rm -rf .pytest_cache
 	rm -rf .mypy_cache
 	rm -rf .coverage
+
+# Update dependencies
+update-deps:
+	poetry update

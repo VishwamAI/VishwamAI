@@ -7,6 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import os
+import math
+import torch.distributed as dist
+from typing import Optional, List
 
 # Import GPU optimizations and integrations
 from vishwamai.models.gpu.optimizations.deep_ep import Buffer, get_num_sms
@@ -16,156 +19,121 @@ from vishwamai.models.gpu.integrations.kvcache_manager import KVCacheManager
 from vishwamai.models.gpu.integrations.expert_state_manager import ExpertStateManager
 
 class OptimizedMoE(nn.Module):
-    def __init__(
-        self,
-        embed_dim,
-        num_experts,
-        dropout=0.1,
-        use_3fs=True, 
-        cache_dir="/tmp/vishwamai/moe_cache"
-    ):
+    def __init__(self, num_experts: int, expert_size: int, input_size: int,
+                 capacity_factor: float = 1.25, use_amp: bool = True,
+                 min_expert_capacity: int = 4):
         super().__init__()
-        self.embed_dim = embed_dim
         self.num_experts = num_experts
-        self.dropout = dropout
-        self.use_3fs = use_3fs
+        self.expert_size = expert_size
+        self.input_size = input_size
+        self.capacity_factor = capacity_factor
+        self.min_expert_capacity = min_expert_capacity
+        self.use_amp = use_amp
+
+        # Expert parallel workers
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
         
-        # Initialize experts with optimized linear layers
-        self.experts = nn.ModuleList([
-            DeepGEMMLinear(embed_dim, embed_dim, use_amp=True) 
-            for _ in range(num_experts)
+        # Create expert modules with load balancing
+        experts_per_rank = (num_experts + self.world_size - 1) // self.world_size
+        self.local_experts = nn.ModuleList([
+            DeepGEMMLinear(input_size, expert_size, use_amp=use_amp)
+            for _ in range(experts_per_rank)
         ])
         
-        # Router with gating
-        self.router = DeepGEMMLinear(embed_dim, num_experts, use_amp=True)
+        # Load balancing parameters
+        self.gate = nn.Linear(input_size, num_experts, bias=False)
+        self.expert_weights = nn.Parameter(torch.ones(num_experts))
         
-        # Expert parallelism buffer 
-        self._buffer = None
-        Buffer.set_num_sms(get_num_sms())
-        
-        # Load balancer
-        self.load_balancer = EPLB(num_experts)
-        
-        # 3FS components
-        if use_3fs:
-            os.makedirs(cache_dir, exist_ok=True)
-            
-            self.kvcache = KVCacheManager(
-                cache_dir=os.path.join(cache_dir, "kvcache"),
-                embed_dim=embed_dim,
-                num_heads=1  # MoE uses single-head attention
-            )
-            
-            self.expert_manager = ExpertStateManager(
-                storage_dir=os.path.join(cache_dir, "expert_states"),
-                num_experts=num_experts,
-                expert_dim=embed_dim
-            )
-        else:
-            self.kvcache = None
-            self.expert_manager = None
+        # Create streams for pipelining
+        self.forward_stream = torch.cuda.Stream()
+        self.backward_stream = torch.cuda.Stream()
+        self.copy_stream = torch.cuda.Stream()
 
-    def get_buffer(self):
-        if self._buffer is None:
-            self._buffer = Buffer.get_buffer(
-                hidden_bytes=self.embed_dim * 2,
-                allocate_sm_parts=True
-            )
-        return self._buffer
-    
-    def _try_load_expert_state(self, expert_id):
-        if not self.use_3fs or self.expert_manager is None:
-            return None, None
-            
-        try:
-            state_dict, stats = self.expert_manager.load_expert_state(expert_id)
-            return state_dict, stats
-        except:
-            return None, None
-            
-    def _store_expert_state(self, expert_id, expert, stats=None):
-        if not self.use_3fs or self.expert_manager is None:
-            return
-            
-        try:
-            self.expert_manager.store_expert_state(
-                expert_id,
-                expert.state_dict(),
-                stats=stats
-            )
-        except:
-            pass
-    
-    def forward(self, x, batch_idx=0, seq_idx=0):
-        batch_size, seq_len, _ = x.shape
+    @torch.cuda.amp.autocast()
+    def forward(self, x: torch.Tensor, expert_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        batch_size, seq_len, _ = x.size()
         
-        # Try cached value first
-        if self.use_3fs and self.kvcache is not None:
-            cached = self.kvcache.retrieve(batch_idx, seq_idx)
-            if cached is not None:
-                return cached[0]
-
-        # Get router logits and load-balanced assignments
-        router_logits = self.router(x)
-        indices, weights = self.load_balancer.get_expert_assignment(
-            router_logits,
-            top_k=2  # Use top-2 gating
-        )
+        # Step 1: Load balancing gate computation
+        with torch.cuda.stream(self.forward_stream):
+            gates = self.compute_load_balanced_gates(x, expert_mask)
+            dispatch_tensor = self.create_dispatch_tensor(gates, batch_size * seq_len)
         
-        # Get parallelism buffer
-        buffer = self.get_buffer()
-        
-        # Optimized parallel dispatch
-        expert_inputs, indices, weights, counts, handle, event = buffer.dispatch(
-            x, indices, weights,
-            async_finish=True
-        )
-
-        # Process with experts
+        # Step 2: Expert computation with pipeline parallelism
         expert_outputs = []
-        expert_stats = {}
-        
-        for i, expert in enumerate(self.experts):
-            if counts[i] > 0:
-                # Try loading expert state
-                state_dict, stats = self._try_load_expert_state(i)
-                if state_dict:
-                    expert.load_state_dict(state_dict)
+        for i, expert in enumerate(self.local_experts):
+            with torch.cuda.stream(self.forward_stream):
+                # Get expert inputs
+                expert_inputs = torch.matmul(dispatch_tensor[i], x.view(-1, self.input_size))
                 
-                # Process inputs 
-                start = time.time()
-                expert_output = expert(expert_inputs[i, :counts[i]])
+                # Process expert computation
+                expert_output = expert(expert_inputs)
                 expert_outputs.append(expert_output)
-                
-                # Update stats
-                process_time = time.time() - start
-                expert_stats[i] = {
-                    'process_time': process_time,
-                    'input_size': counts[i],
-                    'compute_efficiency': process_time / counts[i] 
-                }
-                
-                # Store updated state
-                self._store_expert_state(i, expert, stats=expert_stats[i])
-                
-        expert_outputs = torch.cat(expert_outputs, dim=0)
         
-        # Optimized combine with buffer
-        output, _ = buffer.combine(expert_outputs, handle, weights)
+        # Step 3: Combine expert outputs
+        with torch.cuda.stream(self.copy_stream):
+            combined_output = self.combine_expert_outputs(expert_outputs, dispatch_tensor, batch_size, seq_len)
         
-        # Routing loss
-        routing_probs = F.softmax(router_logits, dim=-1)
-        self.aux_loss = self.load_balancer.get_load_balancing_loss(routing_probs)
+        # Synchronize streams before returning
+        torch.cuda.synchronize()
         
-        # Cache if using 3FS
-        if self.use_3fs and self.kvcache is not None:
-            self.kvcache.store(
-                output, output,
-                batch_idx=batch_idx,
-                seq_idx=seq_idx
+        # All-reduce across devices if distributed
+        if self.world_size > 1:
+            dist.all_reduce(combined_output)
+            combined_output.div_(self.world_size)
+            
+        return combined_output
+        
+    def compute_load_balanced_gates(self, x: torch.Tensor, expert_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """Compute load balanced routing using expert weights"""
+        gates = self.gate(x)
+        
+        # Apply expert weights for load balancing
+        gates = gates * self.expert_weights.view(1, 1, -1)
+        
+        if expert_mask is not None:
+            gates = gates.masked_fill(~expert_mask, float('-inf'))
+            
+        # Normalize gates
+        return F.softmax(gates, dim=-1)
+        
+    def create_dispatch_tensor(self, gates: torch.Tensor, total_tokens: int) -> torch.Tensor:
+        """Create optimized dispatch tensor for token routing"""
+        # Calculate capacity
+        capacity = math.ceil(total_tokens * self.capacity_factor / self.num_experts)
+        capacity = max(capacity, self.min_expert_capacity)
+        
+        # Get top-k gates
+        top_gates, top_indices = torch.topk(gates, k=2, dim=-1)
+        top_gates = top_gates / top_gates.sum(dim=-1, keepdim=True)
+        
+        # Create dispatch tensor
+        dispatch_tensor = torch.zeros(
+            self.num_experts, total_tokens,
+            device=gates.device, dtype=gates.dtype
+        )
+        
+        for i in range(2):
+            pos = top_indices[..., i]
+            gates_i = top_gates[..., i]
+            dispatch_tensor.scatter_add_(
+                0, pos.view(1, -1).expand(1, total_tokens),
+                gates_i.view(1, -1)
             )
+            
+        return dispatch_tensor
         
-        # Reset load balancer
-        self.load_balancer.reset_counts()
+    def combine_expert_outputs(self, expert_outputs: List[torch.Tensor],
+                             dispatch_tensor: torch.Tensor,
+                             batch_size: int, seq_len: int) -> torch.Tensor:
+        """Combine expert outputs efficiently"""
+        # Stack expert outputs
+        stacked_experts = torch.stack(expert_outputs, dim=0)
         
-        return output
+        # Combine using dispatch tensor
+        combined = torch.matmul(
+            dispatch_tensor.transpose(0, 1),
+            stacked_experts
+        )
+        
+        return combined.view(batch_size, seq_len, -1)

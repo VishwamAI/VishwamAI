@@ -201,51 +201,74 @@ class HybridThoughtAwareAttention(nn.Module):
     @autocast()
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with hybrid attention"""
         batch_size = x.size(0)
         
-        # Regular attention
-        q = self.q_proj(x).view(
-            batch_size, -1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        k = self.k_proj(x).view(
-            batch_size, -1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        v = self.v_proj(x).view(
-            batch_size, -1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        # Process regular and thought attentions in parallel streams
+        regular_stream = torch.cuda.Stream()
+        thought_stream = torch.cuda.Stream()
         
-        # Thought-aware processing
-        thought_slots = self.thought_slots.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )
-        t_q = self.thought_q(x).view(
-            batch_size, -1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        t_k = self.thought_k(thought_slots).view(
-            batch_size, -1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        t_v = self.thought_v(thought_slots).view(
-            batch_size, -1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        with torch.cuda.stream(regular_stream):
+            # Regular attention with memory-efficient computation
+            q = self.q_proj(x).view(batch_size, -1, self.num_heads, self.head_dim)
+            k = self.k_proj(x).view(batch_size, -1, self.num_heads, self.head_dim) 
+            v = self.v_proj(x).view(batch_size, -1, self.num_heads, self.head_dim)
+            
+            # Fused transpose for better memory access
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+            
+            # Optimized attention computation
+            attn = torch.baddbmm(
+                torch.empty(1, dtype=q.dtype, device=q.device),
+                q,
+                k.transpose(-2, -1),
+                beta=0.0,
+                alpha=1.0 / math.sqrt(self.head_dim)
+            )
+            
+            if mask is not None:
+                attn = attn.masked_fill(mask == 0, float('-inf'))
+            attn = torch.softmax(attn, dim=-1)
+            attn = self.dropout(attn)
+            regular_out = torch.matmul(attn, v)
+
+        with torch.cuda.stream(thought_stream):
+            # Thought-aware processing with optimized memory layout
+            thought_slots = self._expand_thought_slots(batch_size)
+            t_q = self.thought_q(x).view(batch_size, -1, self.num_heads, self.head_dim)
+            t_k = self.thought_k(thought_slots).view(batch_size, -1, self.num_heads, self.head_dim)
+            t_v = self.thought_v(thought_slots).view(batch_size, -1, self.num_heads, self.head_dim)
+            
+            # Fused transpose operations
+            t_q = t_q.transpose(1, 2).contiguous()
+            t_k = t_k.transpose(1, 2).contiguous()
+            t_v = t_v.transpose(1, 2).contiguous()
+            
+            # Compute thought attention with memory-efficient ops
+            t_attn = torch.baddbmm(
+                torch.empty(1, dtype=t_q.dtype, device=t_q.device),
+                t_q,
+                t_k.transpose(-2, -1),
+                beta=0.0,
+                alpha=1.0 / math.sqrt(self.head_dim)
+            )
+            t_attn = torch.softmax(t_attn, dim=-1)
+            t_attn = self.dropout(t_attn)
+            thought_out = torch.matmul(t_attn, t_v)
+
+        # Synchronize streams before combining results
+        torch.cuda.synchronize()
         
-        # Compute attention scores
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+        # Combine outputs with proper shape restoration
+        regular_out = regular_out.transpose(1, 2).reshape(batch_size, -1, self.embed_dim)
+        thought_out = thought_out.transpose(1, 2).reshape(batch_size, -1, self.embed_dim)
+        combined = regular_out + thought_out
         
-        # Compute thought attention
-        t_attn = (t_q @ t_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        t_attn = torch.softmax(t_attn, dim=-1)
-        t_attn = self.dropout(t_attn)
-        
-        # Combine regular and thought attention
-        out = (attn @ v).transpose(1, 2)
-        t_out = (t_attn @ t_v).transpose(1, 2)
-        
-        # Final output projection
-        combined = out.reshape(batch_size, -1, self.embed_dim) + \
-                  t_out.reshape(batch_size, -1, self.embed_dim)
+        # Apply layer norm and final projection
+        combined = self.norm(combined)
         return self.out_proj(combined)
+        
+    def _expand_thought_slots(self, batch_size: int) -> torch.Tensor:
+        """Efficient thought slot expansion with proper memory layout"""
+        return self.thought_slots.expand(batch_size, -1, -1).contiguous()

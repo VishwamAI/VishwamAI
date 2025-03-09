@@ -183,6 +183,8 @@ class OptimizedStateManager:
         # Check GPU cache first
         if key in self.gpu_cache:
             self._update_cache_score(key)
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()  # Ensure GPU operations are complete
             return self.gpu_cache[key]
             
         # Load using provided function
@@ -193,6 +195,7 @@ class OptimizedStateManager:
         # Cache on GPU if requested
         if to_gpu and self.device.type == 'cuda':
             tensor = tensor.to(self.device)
+            torch.cuda.synchronize()  # Ensure transfer is complete
             self.gpu_cache[key] = tensor
             self._update_cache_score(key)
             self._manage_gpu_cache()
@@ -200,7 +203,8 @@ class OptimizedStateManager:
         return tensor
         
     def clear_gpu_cache(self) -> None:
-        """Clear GPU cache"""
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()  # Ensure all GPU operations complete
         self.gpu_cache.clear()
         self.cache_scores.clear()
         self.access_count.clear()

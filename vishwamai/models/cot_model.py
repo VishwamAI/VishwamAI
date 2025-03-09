@@ -1,212 +1,162 @@
 """
-Chain of Thought (CoT) model with device-agnostic implementation.
+Chain-of-Thought model implementation with GPU optimizations
 """
-from typing import Optional, Dict, Any
-import torch
-import torch.nn.functional as F
-from jax import jit
-from vishwamai.models.transformer import VishwamAITransformer, DeviceAgnosticModule
-try:
-    import jax
-    import jax.numpy as jnp
-    from jax import random
-    import flax.linen as flax_nn
-    import optax
-    HAS_JAX = True
-except ImportError:
-    HAS_JAX = False
 
-class CoTModel(DeviceAgnosticModule):
-    """Chain of Thought model with hardware-specific optimizations."""
-    def __init__(
-        self,
-        embed_dim: int = 512,
-        num_layers: int = 12,
-        num_heads: int = 8,
-        ff_dim: int = 2048,
-        vocab_size: int = 50000,
-        max_seq_len: int = 512,
-        num_experts: int = 7,
-        force_device: str = None
-    ):
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast
+import math
+from typing import Optional, List, Tuple
+
+from vishwamai.models.gpu.transformer import (
+    TransformerComputeLayer,
+    TransformerMemoryLayer,
+    HybridThoughtAwareAttention
+)
+from vishwamai.models.gpu.kernel_layers import (
+    DeepGEMMLinear,
+    DeepGEMMLayerNorm,
+    get_optimal_kernel_config
+)
+
+class CoTModel(nn.Module):
+    """Chain-of-Thought model with GPU optimizations"""
+    
+    def __init__(self, vocab_size: int, embed_dim: int,
+                 num_layers: int = 12, num_heads: int = 8,
+                 ff_dim: int = 2048, max_seq_len: int = 2048,
+                 dropout: float = 0.1, use_amp: bool = True,
+                 distributed: bool = False):
         super().__init__()
-        if force_device:
-            self.device_type = force_device
-            
-        # Special tokens
-        self.special_tokens = {
-            "think_start": "<think>",
-            "think_end": "</think>",
-            "answer_start": "<answer>",
-            "answer_end": "</answer>"
-        }
+        self.embed_dim = embed_dim
+        self.vocab_size = vocab_size
+        self.num_layers = num_layers
         
-        # Initialize transformer with device-specific optimizations
-        attention_kwargs = {
-            "num_experts": num_experts,
-            "taa_kwargs": {"k": 10, "kernel_dim": 256}
-        }
+        # Token embedding with DeepGEMM optimization
+        self.tok_embed = DeepGEMMLinear(
+            vocab_size, embed_dim, bias=False,
+            use_amp=use_amp, distributed=distributed
+        )
         
-        self.transformer = VishwamAITransformer(
-            vocab_size=vocab_size,
+        # Positional embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, embed_dim))
+        
+        # Transformer layers with optimizations
+        self.layers = nn.ModuleList([
+            TransformerComputeLayer(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout,
+                use_amp=use_amp,
+                distributed=distributed
+            ) for _ in range(num_layers)
+        ])
+        
+        # Memory layers for chain-of-thought
+        self.memory_layers = nn.ModuleList([
+            TransformerMemoryLayer(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                use_amp=use_amp
+            ) for _ in range(num_layers // 3)  # Use memory every 3rd layer
+        ])
+        
+        # Thought-aware attention
+        self.thought_attn = HybridThoughtAwareAttention(
             embed_dim=embed_dim,
-            num_layers=num_layers,
             num_heads=num_heads,
-            ff_dim=ff_dim,
-            max_seq_len=max_seq_len,
-            attention_kwargs=attention_kwargs,
-            force_device=self.device_type
+            dropout=dropout,
+            use_amp=use_amp
         )
         
-    def __call__(self, input_ids, target_ids=None, training=False):
-        """Forward pass with device-specific optimizations."""
-        if target_ids is not None:
-            # Training mode
-            if self.device_type == "tpu" and HAS_JAX:
-                # Concatenate for teacher forcing
-                input_to_transformer = jnp.concatenate(
-                    [input_ids, target_ids[:, :-1]], axis=1
-                )
-                logits = self.transformer(input_to_transformer, training=True)
-                
-                # Compute loss over target sequence
-                L = input_ids.shape[1]
-                loss_logits = logits[:, L-1:, :]
-                loss = optax.softmax_cross_entropy_with_integer_labels(
-                    loss_logits, target_ids[:, 1:]
-                )
-                return jnp.mean(loss)
-            else:
-                import torch
-                import torch.nn.functional as F
-                
-                # PyTorch implementation
-                input_to_transformer = torch.cat(
-                    [input_ids, target_ids[:, :-1]], dim=1
-                )
-                logits = self.transformer(input_to_transformer, training=True)
-                
-                L = input_ids.size(1)
-                loss = F.cross_entropy(
-                    logits[:, L-1:, :].reshape(-1, self.transformer.vocab_size),
-                    target_ids[:, 1:].reshape(-1),
-                    ignore_index=-1
-                )
-                return loss
-        else:
-            # Inference mode
-            return self.transformer(input_ids, training=False)
-            
-    def generate_cot(self, input_text, tokenizer, max_length=512, 
-                    temperature=0.6, top_p=0.95, rng=None):
-        """Generate CoT response with unified device handling."""
-        if self.device_type == "tpu" and HAS_JAX:
-            if rng is None:
-                rng = random.PRNGKey(0)
-                
-            input_ids = tokenizer.encode(input_text, return_tensors="jax")
-            generated_ids = self._sample_tpu(
-                input_ids, max_length, temperature, top_p, rng
-            )
-        else:
-            import torch
-            if rng is not None:
-                torch.manual_seed(rng)
-                
-            input_ids = tokenizer.encode(
-                input_text, return_tensors="pt"
-            ).to(self.transformer.device)
-            generated_ids = self._sample_gpu(
-                input_ids, max_length, temperature, top_p
-            )
-            
-        return tokenizer.decode(generated_ids[0], skip_special_tokens=False)
-        
-    def _sample_tpu(self, input_ids, max_length, temperature, top_p, rng):
-        """TPU-optimized sampling."""
-        generated = input_ids
-        end_answer_id = self.transformer.vocab_size - 1
-        
-        def body_fn(state):
-            i, generated, rng = state
-            logits = self.transformer(generated, training=False)
-            next_logits = logits[:, -1, :] / temperature
-            
-            # Top-p filtering
-            sorted_logits = jnp.sort(next_logits, axis=-1)[::-1]
-            cumulative_probs = jnp.cumsum(
-                jax.nn.softmax(sorted_logits, axis=-1), axis=-1
-            )
-            sorted_mask = cumulative_probs <= top_p
-            sorted_mask = sorted_mask.at[0].set(True)
-            
-            next_logits = jnp.where(
-                sorted_mask, next_logits, jnp.full_like(next_logits, -1e10)
-            )
-            
-            # Sample
-            rng, sampling_rng = random.split(rng)
-            next_token = random.categorical(
-                sampling_rng, next_logits, shape=(1,)
-            )
-            generated = jnp.concatenate([generated, next_token[:, None]], axis=1)
-            
-            return i + 1, generated, rng
-            
-        def cond_fn(state):
-            i, generated, _ = state
-            if i >= max_length - input_ids.shape[1]:
-                return False
-            last_token = generated[:, -1]
-            return jnp.logical_not(jnp.any(last_token == end_answer_id))
-            
-        _, generated, _ = jax.lax.while_loop(
-            cond_fn, body_fn, (0, generated, rng)
+        # Output projection
+        self.output = DeepGEMMLinear(
+            embed_dim, vocab_size,
+            use_amp=use_amp,
+            distributed=distributed
         )
-        return generated
         
-    def _sample_gpu(self, input_ids, max_length, temperature, top_p):
-        """GPU-optimized sampling."""
-        import torch
-        import torch.nn.functional as F
+        # Final layer norm
+        self.norm = DeepGEMMLayerNorm(embed_dim, use_amp=use_amp)
+        self.dropout = nn.Dropout(dropout)
         
-        generated = input_ids
-        end_answer_id = self.transformer.vocab_size - 1
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, DeepGEMMLinear)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, (nn.Embedding, nn.Parameter)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            
+    @autocast()
+    def forward(self, x: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass with GPU optimizations"""
+        B, T = x.size()
+        
+        # Token and position embeddings
+        tok_embeds = self.tok_embed(
+            torch.nn.functional.one_hot(x, self.vocab_size).float()
+        )
+        pos_embeds = self.pos_embed[:, :T, :]
+        x = self.dropout(tok_embeds + pos_embeds)
+        
+        # Process through transformer layers
+        mem_idx = 0
+        for i, layer in enumerate(self.layers):
+            # Regular transformer processing
+            x = layer(x, mask)
+            
+            # Apply memory layer every 3rd layer
+            if i % 3 == 2 and mem_idx < len(self.memory_layers):
+                x = self.memory_layers[mem_idx](x)
+                mem_idx += 1
+                
+        # Apply thought-aware attention
+        x = self.thought_attn(x, mask)
+        
+        # Output projection
+        x = self.norm(x)
+        return self.output(x)
+    
+    def generate(self, prompt: torch.Tensor,
+                max_len: int = 100,
+                temperature: float = 1.0,
+                do_sample: bool = True) -> torch.Tensor:
+        """Generate text with chain-of-thought reasoning"""
+        self.eval()
+        cur_len = prompt.size(1)
         
         with torch.no_grad():
-            for _ in range(max_length - input_ids.size(1)):
-                if generated.size(1) >= max_length:
+            # Initialize sequence with prompt
+            seq = prompt
+            
+            # Generate tokens
+            for _ in range(max_len):
+                # Get next token probabilities
+                logits = self(seq)[:, -1, :]
+                
+                if do_sample:
+                    # Sample from distribution
+                    probs = torch.nn.functional.softmax(logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    # Greedy selection
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                    
+                # Append new token
+                seq = torch.cat([seq, next_token], dim=1)
+                
+                # Check for end of sequence
+                if next_token.item() == self.eos_token_id:
                     break
                     
-                logits = self.transformer(generated)
-                next_logits = logits[:, -1, :] / temperature
-                
-                # Top-p filtering
-                sorted_logits, sorted_indices = torch.sort(
-                    next_logits, descending=True
-                )
-                cumulative_probs = torch.cumsum(
-                    F.softmax(sorted_logits, dim=-1), dim=-1
-                )
-                
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                    ..., :-1
-                ].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_logits[:, indices_to_remove] = float('-inf')
-                
-                # Sample
-                probs = F.softmax(next_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                generated = torch.cat([generated, next_token], dim=1)
-                
-                if next_token.item() == end_answer_id:
-                    break
-                    
-        return generated
+        return seq
 
 def extract_answer(output_text: str) -> str:
     """Extract answer from CoT output."""

@@ -81,7 +81,7 @@ class BaseAttentionGPU(nn.Module, BaseAttention):
         return x.transpose(1, 2)
 
 # TPU Base Attention (Haiku)
-class BaseAttentionTPU(hk.Module, BaseAttention):
+class BaseAttentionTPU(hk.Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float = 0.1, name: str = None):
         super().__init__(name=name)
         self.embed_dim = embed_dim
@@ -189,7 +189,7 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         )
         return output
 
-    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
+    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
         """Forward pass for FlashMLAttentionTPU."""
         rng = hk.next_rng_key()
         # Project inputs to Q, K, V
@@ -255,7 +255,7 @@ class MultiModalAttentionTPU(BaseAttentionTPU):
                                             init=hk.initializers.VarianceScaling(1.0))
 
     @jit
-    def forward(self, x, domain_id=0, context=None, mask=None, temporal_states=None, rng=None, is_training=True):
+    def __call__(self, x, domain_id=0, context=None, mask=None, temporal_states=None, rng=None, is_training=True):
         rng = rng or random.PRNGKey(0)
         batch_size, seq_len, _ = x.shape
         domain_features = [self._reshape_for_multihead(proj(x).astype(jnp.bfloat16)) for proj in self.domain_projections]
@@ -319,7 +319,7 @@ class TemporalAttentionTPU(BaseAttentionTPU):
         self.temporal_conv = hk.Conv1D(output_channels=embed_dim, kernel_shape=3, padding="CAUSAL")
 
     @jit
-    def forward(self, x, temporal_positions=None, context=None, mask=None, rng=None, is_training=True):
+    def __call__(self, x, temporal_positions=None, context=None, mask=None, rng=None, is_training=True):
         rng = rng or random.PRNGKey(0)
         batch_size, seq_len, _ = x.shape
         temporal_positions = jnp.arange(seq_len) if temporal_positions is None else temporal_positions
@@ -395,15 +395,15 @@ class SonnetFlashAttentionTPU(snt.Module):
 # Haiku Transformation Wrappers
 def forward_flash_mla_tpu(x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
     model = FlashMLAttentionTPU(embed_dim=512, num_heads=8, block_size=128, causal=True)
-    return hk.transform(lambda x, c, m, t, d, r, i: model.forward(x, c, m, t, d, i))(x, context, mask, temporal_states, domain_id, None, is_training)
+    return hk.transform(lambda x, c, m, t, d, r, i: model(x, c, m, t, d, i))(x, context, mask, temporal_states, domain_id, None, is_training)
 
 def forward_multimodal_tpu(x, domain_id=0, context=None, mask=None, temporal_states=None, is_training=True):
     model = MultiModalAttentionTPU(embed_dim=512, num_heads=8, num_domains=2)
-    return hk.transform(lambda x, d, c, m, t, r, i: model.forward(x, d, c, m, t, r, i))(x, domain_id, context, mask, temporal_states, None, is_training)
+    return hk.transform(lambda x, d, c, m, t, r, i: model(x, d, c, m, t, r, i))(x, domain_id, context, mask, temporal_states, None, is_training)
 
 def forward_temporal_tpu(x, temporal_positions=None, context=None, mask=None, is_training=True):
     model = TemporalAttentionTPU(embed_dim=512, num_heads=8, max_temporal_length=512)
-    return hk.transform(lambda x, t, c, m, r, i: model.forward(x, t, c, m, r, i))(x, temporal_positions, context, mask, None, is_training)
+    return hk.transform(lambda x, t, c, m, r, i: model(x, t, c, m, r, i))(x, temporal_positions, context, mask, None, is_training)
 
 # Hybrid Framework
 class HybridAttention:

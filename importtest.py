@@ -10,6 +10,10 @@ import haiku as hk
 import math
 
 from vishwamai.configs.tpu_config import TPUConfig
+from vishwamai.models.tpu.attention import FlashMLAttentionTPU
+from vishwamai.models.tpu.cot_model import CoTModelTPU
+from vishwamai.models.tpu.tot_model import ToTModelTPU
+from vishwamai.models.tpu.moe import OptimizedMoE
 
 def test_tpu_imports():
     """Test TPU model component imports and initialization"""
@@ -104,6 +108,54 @@ def test_tpu_imports():
             print(f"✓ Detected hardware: {capabilities['device_type']}")
         except Exception as e:
             print("ℹ Hardware detection skipped in this environment")
+        
+        # Initialize test data for additional components
+        batch_size, seq_len, embed_dim = 2, 32, 512
+        num_heads = 8
+        rng = jax.random.PRNGKey(0)
+        test_input = jnp.ones((batch_size, seq_len, embed_dim))
+
+        # Test FlashMLAttentionTPU
+        def init_attention(x):
+            attention = FlashMLAttentionTPU(embed_dim=embed_dim, num_heads=num_heads)
+            return attention(x, is_training=True)
+
+        transformed = hk.transform(init_attention)
+        params = transformed.init(rng, test_input)
+        output = transformed.apply(params, rng, test_input)
+        print("✓ FlashMLAttentionTPU test passed")
+
+        # Test CoTModelTPU
+        def init_cot(x):
+            model = CoTModelTPU(embed_dim=embed_dim, num_heads=num_heads)
+            return model(x, is_training=True)
+
+        transformed_cot = hk.transform(init_cot)
+        params_cot = transformed_cot.init(rng, test_input)
+        output_cot = transformed_cot.apply(params_cot, rng, test_input)
+        print("✓ CoTModelTPU test passed")
+
+        # Test ToTModelTPU
+        def init_tot(x):
+            model = ToTModelTPU(embed_dim=embed_dim, num_heads=num_heads)
+            return model(x, is_training=True)
+
+        transformed_tot = hk.transform(init_tot)
+        params_tot = transformed_tot.init(rng, test_input)
+        output_tot = transformed_tot.apply(params_tot, rng, test_input)
+        print("✓ ToTModelTPU test passed")
+
+        # Test OptimizedMoE
+        def init_moe(x):
+            model = OptimizedMoE(num_experts=4, expert_size=embed_dim, input_size=embed_dim)
+            return model(x, is_training=True)
+
+        transformed_moe = hk.transform(init_moe)
+        params_moe = transformed_moe.init(rng, test_input)
+        output_moe = transformed_moe.apply(params_moe, rng, test_input)
+        print("✓ OptimizedMoE test passed")
+
+        print("\n✓ All TPU component tests passed successfully!")
         
         return True
         

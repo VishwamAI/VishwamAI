@@ -8,12 +8,15 @@ import haiku as hk
 import optax
 from typing import Optional, Dict, Tuple
 
-from .transformer import TransformerComputeLayerTPU
+from .transformer import TransformerComputeLayerTPU, TokenEmbedding
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm
+from .core import DTYPE_CONFIG
 
 def generate_cot(model: 'CoTModelTPU', input_ids: jnp.ndarray, max_length: int = 512,
                 temperature: float = 0.6, top_p: float = 0.95) -> jnp.ndarray:
-    """Standalone generation function for CoT outputs with nucleus sampling"""
+    """Generate CoT output with nucleus sampling"""
+    # Ensure input is int32 for embedding
+    input_ids = input_ids.astype(DTYPE_CONFIG['embedding_dtype'])
     return model.generate_cot(input_ids, max_length, temperature, top_p)
 
 class CoTModelTPU(hk.Module):
@@ -34,8 +37,11 @@ class CoTModelTPU(hk.Module):
 
     def __call__(self, input_ids: jnp.ndarray, target_ids: Optional[jnp.ndarray] = None,
                  is_training: bool = True) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
-        # Token embeddings
-        embeddings = hk.Embed(
+        # Ensure input is int32 for embedding
+        input_ids = input_ids.astype(DTYPE_CONFIG['embedding_dtype'])
+        
+        # Token embeddings using TPU-optimized embedding
+        embeddings = TokenEmbedding(
             vocab_size=self.vocab_size,
             embed_dim=self.embed_dim
         )(input_ids)
@@ -45,6 +51,7 @@ class CoTModelTPU(hk.Module):
         pos_encoding = self._create_positional_encoding(
             positions, self.embed_dim
         )
+        pos_encoding = pos_encoding.astype(DTYPE_CONFIG['compute_dtype'])
         x = embeddings + pos_encoding
 
         # Dropout during training
@@ -53,6 +60,8 @@ class CoTModelTPU(hk.Module):
 
         # Process through transformer layers
         attention_mask = self._create_attention_mask(input_ids)
+        attention_mask = attention_mask.astype(DTYPE_CONFIG['compute_dtype'])
+        
         for _ in range(self.num_layers):
             layer = TransformerComputeLayerTPU(
                 embed_dim=self.embed_dim,
@@ -68,9 +77,23 @@ class CoTModelTPU(hk.Module):
         # If training, compute loss
         loss = None
         if target_ids is not None and is_training:
+            target_ids = target_ids.astype(DTYPE_CONFIG['embedding_dtype'])
             loss = self._compute_loss(logits, target_ids)
 
         return logits, loss
+
+    def _create_attention_mask(self, input_ids: jnp.ndarray) -> jnp.ndarray:
+        # Create causal mask for auto-regressive decoding
+        seq_len = input_ids.shape[1]
+        mask = jnp.triu(jnp.ones((seq_len, seq_len)), k=1)
+        return jnp.where(mask == 0, 1.0, 0.0)
+
+    def _compute_loss(self, logits: jnp.ndarray, target_ids: jnp.ndarray) -> jnp.ndarray:
+        # Compute cross entropy loss
+        targets_onehot = jax.nn.one_hot(target_ids, self.vocab_size)
+        targets_onehot = targets_onehot.astype(DTYPE_CONFIG['compute_dtype'])
+        loss = optax.softmax_cross_entropy(logits, targets_onehot)
+        return jnp.mean(loss)
 
     def _create_positional_encoding(self, positions: jnp.ndarray, d_model: int) -> jnp.ndarray:
         # Create sinusoidal position encoding
@@ -89,21 +112,11 @@ class CoTModelTPU(hk.Module):
         angle_rates = 1 / jnp.power(10000, (2 * (i // 2)) / d_model)
         return pos * angle_rates
 
-    def _create_attention_mask(self, input_ids: jnp.ndarray) -> jnp.ndarray:
-        # Create causal mask for auto-regressive decoding
-        seq_len = input_ids.shape[1]
-        mask = jnp.triu(jnp.ones((seq_len, seq_len)), k=1)
-        return jnp.where(mask == 0, 1.0, 0.0)
-
-    def _compute_loss(self, logits: jnp.ndarray, target_ids: jnp.ndarray) -> jnp.ndarray:
-        # Compute cross entropy loss
-        targets_onehot = jax.nn.one_hot(target_ids, self.vocab_size)
-        loss = optax.softmax_cross_entropy(logits, targets_onehot)
-        return jnp.mean(loss)
-
     def generate_cot(self, input_ids: jnp.ndarray, max_length: int = 512,
                     temperature: float = 0.6, top_p: float = 0.95) -> jnp.ndarray:
         """Generate CoT output with nucleus sampling"""
+        # Ensure input is int32 for embedding
+        input_ids = input_ids.astype(DTYPE_CONFIG['embedding_dtype'])
         batch_size = input_ids.shape[0]
         generated = input_ids
 
@@ -137,6 +150,7 @@ class CoTModelTPU(hk.Module):
                 next_token_logits,
                 shape=(batch_size,)
             )
+            next_token = next_token.astype(DTYPE_CONFIG['embedding_dtype'])
             
             # Update state
             return jnp.concatenate([state, next_token[:, None]], axis=1)
@@ -151,17 +165,16 @@ class CoTModelTPU(hk.Module):
 
         return generated
 
-
 # Example usage and test
 if __name__ == "__main__":
     def run_cot(x: jnp.ndarray) -> jnp.ndarray:
         model = CoTModelTPU()
-        return model(x, is_training=False)[0]
+        return model(x)[0]
 
-    # Initialize
+    # Initialize with proper dtype
     batch_size, seq_len = 2, 64
     rng = jax.random.PRNGKey(0)
-    input_ids = jax.random.randint(rng, (batch_size, seq_len), 0, 50000)
+    input_ids = jax.random.randint(rng, (batch_size, seq_len), 0, 50000, dtype=jnp.int32)
 
     # Transform and initialize
     transformed = hk.transform(run_cot)

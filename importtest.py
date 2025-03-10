@@ -48,10 +48,16 @@ def test_tpu_imports():
         embed_dim = 64
         num_heads = 8
         head_dim = embed_dim // num_heads
+        vocab_size = 32000  # Add vocabulary size for embedding tests
         
         # Initialize random key with TPU-optimized settings
         rng = jax.random.PRNGKey(42)  # Use fixed seed for reproducibility
-        test_input = jnp.ones((batch_size, seq_len, embed_dim), dtype=jnp.bfloat16)
+        
+        # Create separate inputs for embedding and attention tests
+        # Integer input for embedding layers
+        embedding_input = jax.random.randint(rng, (batch_size, seq_len), 0, vocab_size, dtype=jnp.int32)
+        # Float input for attention layers
+        attention_input = jnp.ones((batch_size, seq_len, embed_dim), dtype=jnp.bfloat16)
 
         # Test FlashMLAttentionTPU with static shapes
         def init_attention(x):
@@ -61,36 +67,38 @@ def test_tpu_imports():
                 block_size=16  # Small block size for testing
             )
             return model(x, is_training=True)
-
+        
         transformed = hk.transform(init_attention)
-        params = transformed.init(rng, test_input)
-        output = transformed.apply(params, rng, test_input)
+        params = transformed.init(rng, attention_input)
+        output = transformed.apply(params, rng, attention_input)
         print("✓ FlashMLAttentionTPU test passed")
 
         # Test CoTModelTPU
         def init_cot(x):
             model = CoTModelTPU(
                 embed_dim=embed_dim,
-                num_heads=num_heads
+                num_heads=num_heads,
+                vocab_size=vocab_size
             )
             return model(x, is_training=True)
-
+        
         transformed_cot = hk.transform(init_cot)
-        params_cot = transformed_cot.init(rng, test_input)
-        output_cot = transformed_cot.apply(params_cot, rng, test_input)
+        params_cot = transformed_cot.init(rng, embedding_input)  # Use integer input
+        output_cot = transformed_cot.apply(params_cot, rng, embedding_input)
         print("✓ CoTModelTPU test passed")
 
         # Test ToTModelTPU
         def init_tot(x):
             model = ToTModelTPU(
                 embed_dim=embed_dim,
-                num_heads=num_heads
+                num_heads=num_heads,
+                vocab_size=vocab_size
             )
             return model(x, is_training=True)
-
+        
         transformed_tot = hk.transform(init_tot)
-        params_tot = transformed_tot.init(rng, test_input)
-        output_tot = transformed_tot.apply(params_tot, rng, test_input)
+        params_tot = transformed_tot.init(rng, embedding_input)  # Use integer input
+        output_tot = transformed_tot.apply(params_tot, rng, embedding_input)
         print("✓ ToTModelTPU test passed")
 
         # Test OptimizedMoE
@@ -98,13 +106,14 @@ def test_tpu_imports():
             model = OptimizedMoE(
                 num_experts=4,
                 expert_size=embed_dim,
-                input_size=embed_dim
+                input_size=embed_dim,
+                vocab_size=vocab_size
             )
             return model(x, is_training=True)
-
+        
         transformed_moe = hk.transform(init_moe)
-        params_moe = transformed_moe.init(rng, test_input)
-        output_moe = transformed_moe.apply(params_moe, rng, test_input)
+        params_moe = transformed_moe.init(rng, embedding_input)  # Use integer input
+        output_moe = transformed_moe.apply(params_moe, rng, embedding_input)
         print("✓ OptimizedMoE test passed")
 
         print("\n✓ All TPU component tests passed successfully!")
@@ -130,7 +139,8 @@ if __name__ == "__main__":
     if success:
         print("\n✅ All TPU component tests passed!")
         print("\nComponent shapes:")
-        print("- Test input:", "(batch_size=2, seq_len=32, embed_dim=64)")
+        print("- Embedding input:", "(batch_size=2, seq_len=32)")
+        print("- Attention input:", "(batch_size=2, seq_len=32, embed_dim=64)")
         print("- FlashMLAttention output:", "(batch_size=2, seq_len=32, embed_dim=64)")
         print("- CoTModel output:", "(batch_size=2, seq_len=32, embed_dim=64)")
         print("- ToTModel output:", "(batch_size=2, seq_len=32, embed_dim=64)")

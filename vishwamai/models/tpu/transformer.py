@@ -97,39 +97,46 @@ class FeedForward(hk.Module):
         return x
 
 class TransformerComputeLayerTPU(hk.Module):
-    def __init__(self, embed_dim: int, num_heads: int,
-                 ff_dim: int = 2048, dropout_rate: float = 0.1,
+    """TPU-optimized transformer layer with memory-efficient attention"""
+    def __init__(self, embed_dim: int, num_heads: int, ff_dim: int,
+                 dropout_rate: float = 0.1, block_size: int = 128,
                  name: Optional[str] = None):
         super().__init__(name=name)
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.ff_dim = ff_dim
         self.dropout_rate = dropout_rate
-        self.attention = FlashMLAttentionTPU(embed_dim, num_heads)
-        
-    def __call__(self, x, mask=None, is_training=True):
-        batch_size, seq_len = x.shape[:2]
-        if mask is None:
-            # Pass batch_size to create_causal_mask for proper broadcasting
-            mask = create_causal_mask(seq_len, batch_size)
-        
-        # Self attention
-        normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
-        attention = self.attention(
-            normed, mask=mask, is_training=is_training
+        self.block_size = block_size
+
+        # Initialize attention and feed-forward layers
+        self.attention = FlashMLAttentionTPU(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            block_size=block_size,
+            dropout_rate=dropout_rate
         )
-        if is_training:
-            attention = hk.dropout(hk.next_rng_key(), self.dropout_rate, attention)
-        x = x + attention
+        self.ff_network = FeedForward(
+            embed_dim=embed_dim,
+            ff_dim=ff_dim,
+            dropout_rate=dropout_rate
+        )
         
-        # Feed-forward
-        normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
-        ff = TPUGEMMLinear(self.ff_dim)(normed)
-        ff = jax.nn.relu(ff)
-        ff = TPUGEMMLinear(self.embed_dim)(ff)
-        if is_training:
-            ff = hk.dropout(hk.next_rng_key(), self.dropout_rate, ff)
-        return x + ff
+        # Layer normalization
+        self.norm1 = TPULayerNorm(embed_dim)
+        self.norm2 = TPULayerNorm(embed_dim)
+
+    def __call__(self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None,
+                is_training: bool = True) -> jnp.ndarray:
+        # Pre-norm transformer architecture
+        normed_x = self.norm1(x)
+        attention_output = self.attention(normed_x, mask=mask, is_training=is_training)
+        x = x + attention_output
+
+        normed_x = self.norm2(x)
+        ff_output = self.ff_network(normed_x)
+        x = x + ff_output
+
+        return x
 
 class TransformerMemoryLayerTPU(hk.Module):
     def __init__(self, embed_dim: int, num_heads: int,

@@ -140,7 +140,6 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
                         mask_block: Optional[jnp.ndarray], sm_scale: float) -> jnp.ndarray:
         scores = jnp.matmul(q_block, jnp.swapaxes(k_block, -2, -1)) * sm_scale
         
-        # Create causal mask if needed (now handled outside the function)
         if mask_block is not None:
             scores = jnp.where(mask_block == 0, -1e9, scores)
             
@@ -150,76 +149,86 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
     def __call__(self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None, 
                 context: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
         batch_size, seq_len, _ = x.shape
-        rng = hk.next_rng_key()
-
-        # Project inputs to Q, K, V
+        
+        # Pad sequence to multiple of block_size
+        padded_seq_len = ((seq_len + self.block_size - 1) // self.block_size) * self.block_size
+        pad_amount = padded_seq_len - seq_len
+        
+        # Project and reshape inputs
         q = self._reshape_for_multihead(self.q_proj(x))
         k = self._reshape_for_multihead(self.k_proj(context if context is not None else x))
         v = self._reshape_for_multihead(self.v_proj(context if context is not None else x))
-
-        # Pre-compute causal mask if needed
-        if self.causal:
-            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-            if mask is not None:
-                mask = mask * causal_mask
-            else:
-                mask = causal_mask
-
-        # Process attention in blocks with static shapes
-        output = jnp.zeros_like(v)
         
-        def process_block(i):
+        # Pad Q, K, V
+        q_padded = jnp.pad(q, [(0, 0), (0, 0), (0, pad_amount), (0, 0)])
+        k_padded = jnp.pad(k, [(0, 0), (0, 0), (0, pad_amount), (0, 0)])
+        v_padded = jnp.pad(v, [(0, 0), (0, 0), (0, pad_amount), (0, 0)])
+        
+        # Handle mask padding
+        if mask is not None:
+            mask_padded = jnp.pad(mask, [(0, 0), (0, 0), (0, pad_amount), (0, pad_amount)])
+            mask_padded = mask_padded.at[:, :, -pad_amount:].set(0)
+            mask_padded = mask_padded.at[:, :, :, -pad_amount:].set(0)
+        else:
+            mask_padded = None
+
+        num_blocks = padded_seq_len // self.block_size
+
+        # Initialize output with padded shape
+        output_padded = jnp.zeros_like(q_padded)
+
+        def process_block(i, acc):
             start_idx = i * self.block_size
-            end_idx = jnp.minimum(start_idx + self.block_size, seq_len)
-            
+            end_idx = start_idx + self.block_size
+
+            # Extract fixed-size blocks
             q_block = jax.lax.dynamic_slice(
-                q, (0, 0, start_idx, 0),
-                (batch_size, self.num_heads, end_idx - start_idx, self.head_dim)
+                q_padded, 
+                (0, 0, start_idx, 0),
+                (batch_size, self.num_heads, self.block_size, self.head_dim)
             )
             
             if self.causal:
                 k_block = jax.lax.dynamic_slice(
-                    k, (0, 0, 0, 0),
+                    k_padded,
+                    (0, 0, 0, 0),
                     (batch_size, self.num_heads, end_idx, self.head_dim)
                 )
                 v_block = jax.lax.dynamic_slice(
-                    v, (0, 0, 0, 0),
+                    v_padded,
+                    (0, 0, 0, 0),
                     (batch_size, self.num_heads, end_idx, self.head_dim)
                 )
             else:
-                k_block = k
-                v_block = v
+                k_block = k_padded
+                v_block = v_padded
 
             mask_block = None
-            if mask is not None:
+            if mask_padded is not None:
                 mask_block = jax.lax.dynamic_slice(
-                    mask, (0, 0, start_idx, 0),
-                    (batch_size, 1, end_idx - start_idx, mask.shape[-1])
+                    mask_padded,
+                    (0, 0, start_idx, 0),
+                    (batch_size, 1, self.block_size, mask_padded.shape[-1])
                 )
 
             block_output = self._block_attention(q_block, k_block, v_block, mask_block, self.sm_scale)
             
-            # Update output using dynamic update slice instead of at
             return jax.lax.dynamic_update_slice(
-                output,
+                acc,
                 block_output,
                 (0, 0, start_idx, 0)
             )
 
-        # Use fori_loop instead of scan for better shape handling
-        num_blocks = (seq_len + self.block_size - 1) // self.block_size
-        output = jax.lax.fori_loop(
-            0, num_blocks,
-            lambda i, acc: process_block(i),
-            output
-        )
-
-        # Reshape and apply output projection
+        # Process blocks with fixed shapes
+        output_padded = jax.lax.fori_loop(0, num_blocks, process_block, output_padded)
+        
+        # Remove padding and reshape output
+        output = output_padded[:, :, :seq_len, :]
         output = jnp.transpose(output, (0, 2, 1, 3))
         output = jnp.reshape(output, (batch_size, seq_len, self.embed_dim))
 
         if is_training:
-            output = hk.dropout(rng, self.dropout_rate, output)
+            output = hk.dropout(hk.next_rng_key(), self.dropout_rate, output)
 
         return self.o_proj(output)
 

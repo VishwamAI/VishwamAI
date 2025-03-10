@@ -9,18 +9,17 @@ import jax.numpy as jnp
 import haiku as hk
 import math
 
-# Configure TPU environment
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
-jax.config.update("jax_enable_x64", False)
-jax.config.update("jax_default_matmul_precision", "bfloat16")
-jax.config.update("jax_platforms", "tpu")
-jax.config.update("jax_xla_backend", "tpu")
+from vishwamai.configs.tpu_config import TPUConfig
 
 def test_tpu_imports():
     """Test TPU model component imports and initialization"""
     try:
         print("✓ Successfully imported JAX")
         print("✓ Successfully imported Haiku")
+
+        # Initialize TPU configuration
+        TPUConfig.initialize()
+        print("✓ Successfully initialized TPU configuration")
         
         # Import VishwamAI TPU components
         from vishwamai.models.tpu import (

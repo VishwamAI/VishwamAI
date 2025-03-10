@@ -115,7 +115,7 @@ class TransformerComputeLayerTPU(hk.Module):
         
         # Self attention
         normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
-        attention = self.attention.forward(
+        attention = self.attention(
             normed, mask=mask, is_training=is_training
         )
         if is_training:

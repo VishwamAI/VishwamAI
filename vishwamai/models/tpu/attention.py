@@ -128,7 +128,6 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         self.sm_scale = sm_scale
 
     @staticmethod
-    @jit
     def _attention_head(q_block, k_block, v_block, mask_block, causal, sm_scale):
         scores = jnp.matmul(q_block, k_block.transpose(-2, -1)) * sm_scale
         if causal:
@@ -139,45 +138,73 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         attn_probs = jax.nn.softmax(scores, axis=-1)
         return jnp.matmul(attn_probs, v_block)
 
-    @jit
     def _compute_attention_blockwise(self, q, k, v, mask=None):
         batch_size, num_heads, seq_len, head_dim = q.shape
         output = jnp.zeros_like(v, dtype=jnp.bfloat16)
-        vectorized_attention = vmap(self._attention_head, in_axes=(0, 0, 0, 0, None, None))
         
         # Use centralized causal mask if needed
         causal_mask = create_causal_mask(seq_len) if self.causal else None
 
-        def scan_query_block(carry, i):
+        @jit
+        def process_block(i, carry):
             output, q, k, v, mask = carry
-            i_end = lax.min(i + self.block_size, seq_len)
-            q_block = q[:, :, i:i_end, :]
-            k_block = k[:, :, :i_end, :] if self.causal else k
-            v_block = v[:, :, :i_end, :] if self.causal else v
+            i_end = jnp.minimum(i + self.block_size, seq_len)
+            q_block = lax.dynamic_slice(q, (0, 0, i, 0), 
+                                      (q.shape[0], q.shape[1], i_end - i, q.shape[3]))
+            k_block = k if not self.causal else lax.dynamic_slice(
+                k, (0, 0, 0, 0), 
+                (k.shape[0], k.shape[1], i_end, k.shape[3])
+            )
+            v_block = v if not self.causal else lax.dynamic_slice(
+                v, (0, 0, 0, 0), 
+                (v.shape[0], v.shape[1], i_end, v.shape[3])
+            )
             
-            # Combine causal and attention masks if both present
-            block_mask = mask[:, :, i:i_end, :i_end] if mask is not None else None
+            # Handle masks
+            block_mask = None
+            if mask is not None:
+                block_mask = lax.dynamic_slice(
+                    mask, (0, 0, i, 0), 
+                    (mask.shape[0], mask.shape[1], i_end - i, i_end if self.causal else mask.shape[3])
+                )
             if causal_mask is not None:
-                block_causal = causal_mask[i:i_end, :i_end]
+                block_causal = lax.dynamic_slice(
+                    causal_mask, (i, 0), 
+                    (i_end - i, i_end if self.causal else causal_mask.shape[1])
+                )
                 block_mask = block_causal if block_mask is None else (block_mask & block_causal)
-                
-            output_block = vectorized_attention(q_block, k_block, v_block, block_mask, self.causal, self.sm_scale)
+
+            output_block = vmap(
+                vmap(self._attention_head, in_axes=(0, 0, 0, 0, None, None)),
+                in_axes=(0, 0, 0, 0, None, None)
+            )(q_block, k_block, v_block, block_mask, self.causal, self.sm_scale)
+            
             output = output.at[:, :, i:i_end, :].set(output_block)
-            return (output, q, k, v, mask), None
+            return output, q, k, v, mask
 
-        initial_carry = (output, q, k, v, mask)
-        final_carry, _ = lax.scan(scan_query_block, initial_carry, jnp.arange(0, seq_len, self.block_size))
-        return final_carry[0]
+        output, *_ = lax.fori_loop(
+            0, seq_len, 
+            lambda i, carry: process_block(i, carry),
+            (output, q, k, v, mask)
+        )
+        return output
 
-    @jit
-    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
+    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
+        """Forward pass for FlashMLAttentionTPU."""
         rng = rng or random.PRNGKey(0)
+        # Project inputs to Q, K, V
         q = self._reshape_for_multihead(self.q_proj(x).astype(jnp.bfloat16))
         k = self._reshape_for_multihead(self.k_proj(x if context is None else context).astype(jnp.bfloat16))
         v = self._reshape_for_multihead(self.v_proj(x if context is None else context).astype(jnp.bfloat16))
+        
+        # Compute attention in blocks
         output = self._compute_attention_blockwise(q, k, v, mask)
+        
+        # Reshape and apply output projection
         output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape[0], x.shape[1], self.embed_dim)
-        output = hk.dropout(hk.next_rng_key(), self.dropout_rate, output) if is_training else output
+        if is_training:
+            output = hk.dropout(hk.next_rng_key(), self.dropout_rate, output)
+            
         return self.o_proj(output.astype(jnp.float32))
 
 # GPU MultiModalAttention

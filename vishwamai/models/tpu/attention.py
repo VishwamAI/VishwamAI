@@ -91,7 +91,7 @@ class BaseAttentionTPU(hk.Module, BaseAttention):
         self.k_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2)))
         self.v_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1/math.sqrt(2)))
         self.o_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
-        self.dropout = hk.Dropout(dropout_rate)
+        self.dropout_rate = dropout_rate
 
     def _reshape_for_multihead(self, x):
         batch_size, seq_len, _ = x.shape
@@ -177,7 +177,7 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         v = self._reshape_for_multihead(self.v_proj(x if context is None else context).astype(jnp.bfloat16))
         output = self._compute_attention_blockwise(q, k, v, mask)
         output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape[0], x.shape[1], self.embed_dim)
-        output = self.dropout(output, rng, is_training) if is_training else output
+        output = hk.dropout(hk.next_rng_key(), self.dropout_rate, output) if is_training else output
         return self.o_proj(output.astype(jnp.float32))
 
 # GPU MultiModalAttention
@@ -240,7 +240,7 @@ class MultiModalAttentionTPU(BaseAttentionTPU):
             if mask is not None:
                 scores = jnp.where(mask == 0, -jnp.inf, scores)
             attn_probs = jax.nn.softmax(scores, axis=-1)
-            attn_probs = self.dropout(attn_probs, rng, is_training) if is_training else attn_probs
+            attn_probs = hk.dropout(hk.next_rng_key(), self.dropout_rate, attn_probs) if is_training else attn_probs
             mixed_attention += self.domain_mixing[domain_id, i] * jnp.matmul(attn_probs, v)
         mixed_attention = jnp.transpose(mixed_attention, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
         return self.o_proj(mixed_attention.astype(jnp.float32))
@@ -311,7 +311,7 @@ class TemporalAttentionTPU(BaseAttentionTPU):
         if mask is not None:
             scores = jnp.where(mask == 0, -jnp.inf, scores)
         attn_probs = jax.nn.softmax(scores, axis=-1)
-        attn_probs = self.dropout(attn_probs, rng, is_training) if is_training else attn_probs
+        attn_probs = hk.dropout(hk.next_rng_key(), self.dropout_rate, attn_probs) if is_training else attn_probs
         output = jnp.matmul(attn_probs, v)
         output = jnp.transpose(output, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.embed_dim)
         return self.o_proj(output.astype(jnp.float32))

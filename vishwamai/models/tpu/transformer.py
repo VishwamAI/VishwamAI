@@ -117,14 +117,18 @@ class TransformerComputeLayerTPU(hk.Module):
         attention = FlashMLAttentionTPU(self.embed_dim, self.num_heads)(
             normed, mask=mask, is_training=is_training
         )
-        x = x + hk.dropout(hk.next_rng_key(), self.dropout_rate, attention)
+        if is_training:
+            attention = hk.dropout(hk.next_rng_key(), self.dropout_rate, attention)
+        x = x + attention
         
         # Feed-forward
         normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
         ff = TPUGEMMLinear(self.ff_dim)(normed)
         ff = jax.nn.relu(ff)
         ff = TPUGEMMLinear(self.embed_dim)(ff)
-        return x + hk.dropout(hk.next_rng_key(), self.dropout_rate, ff)
+        if is_training:
+            ff = hk.dropout(hk.next_rng_key(), self.dropout_rate, ff)
+        return x + ff
 
 class TransformerMemoryLayerTPU(hk.Module):
     def __init__(self, embed_dim: int, num_heads: int,

@@ -1,10 +1,11 @@
 """
-TPU configuration and initialization utilities with fallback support
+TPU configuration and initialization utilities with explicit dtype management
 """
 
 import jax
+import jax.numpy as jnp
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 import warnings
 
 class TPUConfig:
@@ -13,18 +14,17 @@ class TPUConfig:
     _instance = None
     _initialized = False
     _platform = None
+    _compute_dtype = jnp.bfloat16
+    _embedding_dtype = jnp.int32  # Explicit dtype for embeddings
     
     @classmethod
     def initialize(cls, force_cpu: bool = False) -> None:
         """Initialize TPU configuration with proper flags and fallback"""
         if not cls._initialized:
-            # Disable float64 for TPU/GPU efficiency
+            # Configure JAX for TPU efficiency
             jax.config.update("jax_enable_x64", False)
-            
-            # Use bfloat16 for matrix operations
             jax.config.update("jax_default_matmul_precision", "bfloat16")
             
-            # Try to initialize TPU, fall back to available platform if not possible
             try:
                 if not force_cpu:
                     jax.config.update("jax_platforms", "tpu")
@@ -35,9 +35,10 @@ class TPUConfig:
                         cls._platform = "tpu"
                     else:
                         raise RuntimeError("No TPU devices found")
+                else:
+                    cls._platform = "cpu"
             except Exception as e:
                 warnings.warn(f"TPU initialization failed: {str(e)}. Falling back to available platform.")
-                # Reset platform config to use available device
                 jax.config.update("jax_platforms", "")
                 devices = jax.devices()
                 cls._platform = devices[0].platform.lower()
@@ -53,7 +54,7 @@ class TPUConfig:
     
     @classmethod
     def get_device_info(cls) -> Dict[str, Any]:
-        """Get information about the current device configuration"""
+        """Get information about current device configuration"""
         if not cls._initialized:
             cls.initialize()
             
@@ -65,22 +66,33 @@ class TPUConfig:
             "memory_per_device": "8GB" if "TPU" in device.device_kind else "Unknown",
             "supports_bfloat16": True,
             "supports_tf32": "GPU" in device.device_kind,
-            "supports_mixed_precision": True
+            "supports_mixed_precision": True,
+            "compute_dtype": str(cls._compute_dtype),
+            "embedding_dtype": str(cls._embedding_dtype)
         }
+    
+    @classmethod
+    def get_compute_dtype(cls) -> Any:
+        """Get the default compute dtype (bfloat16 for TPU)"""
+        if not cls._initialized:
+            cls.initialize()
+        return cls._compute_dtype
+    
+    @classmethod 
+    def get_embedding_dtype(cls) -> Any:
+        """Get the dtype for embedding layers (always int32)"""
+        return cls._embedding_dtype
+
+    @classmethod
+    def convert_dtype(cls, x: jnp.ndarray, target_dtype: Any) -> jnp.ndarray:
+        """Convert array to target dtype safely"""
+        if x.dtype != target_dtype:
+            return x.astype(target_dtype)
+        return x
     
     @staticmethod
     def get_optimal_batch_size(model_dim: int, seq_len: int, dtype_bytes: int = 2) -> int:
-        """Calculate optimal batch size for available hardware
-        
-        Args:
-            model_dim: Model hidden dimension size
-            seq_len: Sequence length
-            dtype_bytes: Bytes per element (2 for bfloat16/float16, 4 for float32)
-        
-        Returns:
-            Optimal batch size for available hardware
-        """
-        # Conservative estimate for available memory
+        """Calculate optimal batch size for available hardware"""
         if TPUConfig._platform == "tpu":
             device_mem = 8 * (1024 ** 3)  # 8GB for TPU
         else:
@@ -92,17 +104,10 @@ class TPUConfig:
     @staticmethod
     def get_optimal_config(hidden_size: int, seq_len: int, vocab_size: int,
                           num_layers: Optional[int] = None) -> Dict[str, Any]:
-        """Get optimal configuration for model parameters
-        
-        Args:
-            hidden_size: Model hidden dimension
-            seq_len: Maximum sequence length
-            vocab_size: Vocabulary size
-            num_layers: Number of transformer layers (optional)
+        """Get optimal configuration for model parameters"""
+        if not TPUConfig._initialized:
+            TPUConfig.initialize()
             
-        Returns:
-            Dictionary with optimal configuration parameters
-        """
         batch_size = TPUConfig.get_optimal_batch_size(hidden_size, seq_len)
         
         config = {
@@ -110,17 +115,25 @@ class TPUConfig:
             "seq_len": seq_len,
             "vocab_size": vocab_size,
             "batch_size": batch_size,
-            "dtype": "bfloat16",
-            "optimizer": {
-                "learning_rate": 1e-4,
-                "warmup_steps": 1000,
-                "grad_clip_norm": 1.0
-            },
+            "compute_dtype": TPUConfig._compute_dtype,
+            "embedding_dtype": TPUConfig._embedding_dtype,
             "hardware": {
                 "platform": TPUConfig.get_platform(),
                 "cores_per_replica": len(jax.devices()),
-                "replicas": 1,
-                "precision": "bfloat16"
+                "replicas": 1
+            },
+            "training": {
+                "optimizer": {
+                    "learning_rate": 1e-4,
+                    "warmup_steps": 1000,
+                    "grad_clip_norm": 1.0
+                },
+                "precision": {
+                    "policy": "mixed_bfloat16",
+                    "compute_type": "bfloat16",
+                    "embed_type": "int32",
+                    "output_type": "float32"
+                }
             }
         }
         

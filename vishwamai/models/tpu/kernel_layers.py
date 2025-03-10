@@ -326,7 +326,12 @@ class TokenEmbedding(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        embedding = DeepGEMMLinear(self.vocab_size, self.embed_dim, bias=False)(nn.one_hot(x, self.vocab_size))
+        # Ensure input tokens are int32
+        x = x.astype(jnp.int32)
+        # Create one-hot with proper dtype
+        one_hot = nn.one_hot(x, self.vocab_size, dtype=jnp.bfloat16)
+        # Project to embedding dimension
+        embedding = DeepGEMMLinear(self.vocab_size, self.embed_dim, bias=False)(one_hot)
         return embedding * jnp.sqrt(self.embed_dim)
 
 class FeedForward(nn.Module):
@@ -376,11 +381,16 @@ class KernelTransformer(nn.Module):
     dropout_rate: float = 0.1
 
     def setup(self):
+        # Initialize TPU configuration first
+        from vishwamai.configs.tpu_config import TPUConfig
+        TPUConfig.initialize()
+        
         self.token_embedding = TokenEmbedding(self.vocab_size, self.embed_dim)
         self.positional_encoding = PositionalEncoding(self.embed_dim, self.max_seq_len, self.dropout_rate)
         self.attention_kwargs = self.attention_kwargs or {"num_experts": 4, "dropout_rate": 0.1}
         self.layers = [
-            TransformerLayer(self.embed_dim, self.num_heads, self.ff_dim, self.attention_class, self.attention_kwargs, self.dropout_rate)
+            TransformerLayer(self.embed_dim, self.num_heads, self.ff_dim, 
+                           self.attention_class, self.attention_kwargs, self.dropout_rate)
             for _ in range(self.num_layers)
         ]
         self.norm = DeepGEMMLayerNorm(self.embed_dim)

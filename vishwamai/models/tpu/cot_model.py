@@ -97,20 +97,22 @@ class CoTModelTPU(hk.Module):
 
     def _create_positional_encoding(self, positions: jnp.ndarray, d_model: int) -> jnp.ndarray:
         # Create sinusoidal position encoding
-        angle_rads = self._get_angles(
-            positions,
-            jnp.arange(d_model)[None, :],
-            d_model
+        positions = positions[:, :, None]  # Add feature dimension for broadcasting
+        frequencies = jnp.exp(
+            -jnp.arange(0, d_model, 2, dtype=jnp.float32) * (jnp.log(10000.0) / d_model)
         )
-
-        angle_rads = angle_rads.at[:, 0::2].set(jnp.sin(angle_rads[:, 0::2]))
-        angle_rads = angle_rads.at[:, 1::2].set(jnp.cos(angle_rads[:, 1::2]))
-
-        return angle_rads
+        angles = positions * frequencies[None, None, :]
+        
+        # Apply sin and cos to alternating positions
+        pos_encoding = jnp.zeros((*positions.shape[:2], d_model), dtype=jnp.float32)
+        pos_encoding = pos_encoding.at[:, :, 0::2].set(jnp.sin(angles))
+        pos_encoding = pos_encoding.at[:, :, 1::2].set(jnp.cos(angles))
+        
+        return pos_encoding
 
     def _get_angles(self, pos: jnp.ndarray, i: jnp.ndarray, d_model: int) -> jnp.ndarray:
-        angle_rates = 1 / jnp.power(10000, (2 * (i // 2)) / d_model)
-        return pos * angle_rates
+        # This method is no longer used since we've simplified the position encoding calculation
+        pass
 
     def generate_cot(self, input_ids: jnp.ndarray, max_length: int = 512,
                     temperature: float = 0.6, top_p: float = 0.95) -> jnp.ndarray:

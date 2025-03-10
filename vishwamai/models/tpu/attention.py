@@ -21,6 +21,7 @@ import sonnet as snt
 from tensorflow.experimental import dlpack
 import math
 from abc import ABC, abstractmethod
+from typing import Optional, Union
 
 from .core import apply_rotary_embedding, create_causal_mask
 
@@ -121,91 +122,102 @@ class FlashMLAAttentionGPU(BaseAttentionGPU):
 
 # TPU FlashMLAttention
 class FlashMLAttentionTPU(BaseAttentionTPU):
-    def __init__(self, embed_dim, num_heads, block_size=128, dropout_rate=0.1, causal=False, sm_scale=0.5, name=None):
+    def __init__(self, embed_dim: int, num_heads: int, block_size: int = 128, 
+                 dropout_rate: float = 0.1, causal: bool = False, sm_scale: float = None, 
+                 name: Optional[str] = None):
         super().__init__(embed_dim, num_heads, dropout_rate, name)
         self.block_size = block_size
         self.causal = causal
-        self.sm_scale = sm_scale
+        self.sm_scale = sm_scale or 1.0 / math.sqrt(self.head_dim)
+        self.q_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
+        self.k_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
+        self.v_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
+        self.o_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
 
     @staticmethod
-    def _attention_head(q_block, k_block, v_block, mask_block, causal, sm_scale):
-        scores = jnp.matmul(q_block, k_block.transpose(-2, -1)) * sm_scale
+    def _block_attention(q_block: jnp.ndarray, k_block: jnp.ndarray, v_block: jnp.ndarray, 
+                        mask_block: Optional[jnp.ndarray], causal: bool, sm_scale: float) -> jnp.ndarray:
+        scores = jnp.matmul(q_block, jnp.swapaxes(k_block, -2, -1)) * sm_scale
+        
         if causal:
-            causal_mask = jnp.tril(jnp.ones((q_block.shape[-2], k_block.shape[-2]), dtype=jnp.bfloat16))
-            scores = jnp.where(causal_mask[None, :, :], scores, -jnp.inf)
+            seq_len = q_block.shape[-2]
+            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=scores.dtype))
+            scores = jnp.where(causal_mask[None, None, :, :], scores, -1e9)
+            
         if mask_block is not None:
-            scores = jnp.where(mask_block == 0, -jnp.inf, scores)
+            scores = jnp.where(mask_block == 0, -1e9, scores)
+            
         attn_probs = jax.nn.softmax(scores, axis=-1)
         return jnp.matmul(attn_probs, v_block)
 
-    def _compute_attention_blockwise(self, q, k, v, mask=None):
-        batch_size, num_heads, seq_len, head_dim = q.shape
-        output = jnp.zeros_like(v, dtype=jnp.bfloat16)
-        
-        # Use centralized causal mask if needed
-        causal_mask = create_causal_mask(seq_len) if self.causal else None
-
-        @jit
-        def process_block(i, carry):
-            output, q, k, v, mask = carry
-            i_end = jnp.minimum(i + self.block_size, seq_len)
-            q_block = lax.dynamic_slice(q, (0, 0, i, 0), 
-                                      (q.shape[0], q.shape[1], i_end - i, q.shape[3]))
-            k_block = k if not self.causal else lax.dynamic_slice(
-                k, (0, 0, 0, 0), 
-                (k.shape[0], k.shape[1], i_end, k.shape[3])
-            )
-            v_block = v if not self.causal else lax.dynamic_slice(
-                v, (0, 0, 0, 0), 
-                (v.shape[0], v.shape[1], i_end, v.shape[3])
-            )
-            
-            # Handle masks
-            block_mask = None
-            if mask is not None:
-                block_mask = lax.dynamic_slice(
-                    mask, (0, 0, i, 0), 
-                    (mask.shape[0], mask.shape[1], i_end - i, i_end if self.causal else mask.shape[3])
-                )
-            if causal_mask is not None:
-                block_causal = lax.dynamic_slice(
-                    causal_mask, (i, 0), 
-                    (i_end - i, i_end if self.causal else causal_mask.shape[1])
-                )
-                block_mask = block_causal if block_mask is None else (block_mask & block_causal)
-
-            output_block = vmap(
-                vmap(self._attention_head, in_axes=(0, 0, 0, 0, None, None)),
-                in_axes=(0, 0, 0, 0, None, None)
-            )(q_block, k_block, v_block, block_mask, self.causal, self.sm_scale)
-            
-            output = output.at[:, :, i:i_end, :].set(output_block)
-            return output, q, k, v, mask
-
-        output, *_ = lax.fori_loop(
-            0, seq_len, 
-            lambda i, carry: process_block(i, carry),
-            (output, q, k, v, mask)
-        )
-        return output
-
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
-        """Forward pass for FlashMLAttentionTPU."""
+    def __call__(self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None, 
+                context: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
+        batch_size, seq_len, _ = x.shape
         rng = hk.next_rng_key()
+
         # Project inputs to Q, K, V
-        q = self._reshape_for_multihead(self.q_proj(x).astype(jnp.bfloat16))
-        k = self._reshape_for_multihead(self.k_proj(x if context is None else context).astype(jnp.bfloat16))
-        v = self._reshape_for_multihead(self.v_proj(x if context is None else context).astype(jnp.bfloat16))
+        q = self._reshape_for_multihead(self.q_proj(x))
+        k = self._reshape_for_multihead(self.k_proj(context if context is not None else x))
+        v = self._reshape_for_multihead(self.v_proj(context if context is not None else x))
+
+        # Pre-compute number of blocks for static shape handling
+        num_blocks = (seq_len + self.block_size - 1) // self.block_size
+
+        def scan_over_blocks(carry, block_idx):
+            output = carry
+            start_idx = block_idx * self.block_size
+            end_idx = jnp.minimum(start_idx + self.block_size, seq_len)
+            
+            q_block = jax.lax.dynamic_slice(
+                q, (0, 0, start_idx, 0),
+                (batch_size, self.num_heads, end_idx - start_idx, self.head_dim)
+            )
+            
+            if self.causal:
+                k_block = jax.lax.dynamic_slice(
+                    k, (0, 0, 0, 0),
+                    (batch_size, self.num_heads, end_idx, self.head_dim)
+                )
+                v_block = jax.lax.dynamic_slice(
+                    v, (0, 0, 0, 0),
+                    (batch_size, self.num_heads, end_idx, self.head_dim)
+                )
+            else:
+                k_block = k
+                v_block = v
+
+            mask_block = None
+            if mask is not None:
+                mask_block = jax.lax.dynamic_slice(
+                    mask, (0, 0, start_idx, 0),
+                    (batch_size, 1, end_idx - start_idx, mask.shape[-1])
+                )
+
+            block_output = self._block_attention(
+                q_block, k_block, v_block, mask_block, self.causal, self.sm_scale
+            )
+            
+            output = output.at[:, :, start_idx:end_idx, :].set(block_output)
+            return output, None
+
+        # Initialize output tensor
+        output = jnp.zeros_like(v)
         
-        # Compute attention in blocks
-        output = self._compute_attention_blockwise(q, k, v, mask)
-        
+        # Use scan instead of fori_loop for better static shape handling
+        output, _ = jax.lax.scan(
+            scan_over_blocks,
+            output,
+            jnp.arange(num_blocks)
+        )
+
         # Reshape and apply output projection
-        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape[0], x.shape[1], self.embed_dim)
+        output = jnp.transpose(output, (0, 2, 1, 3))
+        output = jnp.reshape(output, (batch_size, seq_len, self.embed_dim))
+
         if is_training:
             output = hk.dropout(rng, self.dropout_rate, output)
-            
-        return self.o_proj(output.astype(jnp.float32))
+
+        return self.o_proj(output)
 
 # GPU MultiModalAttention
 class MultiModalAttentionGPU(BaseAttentionGPU):

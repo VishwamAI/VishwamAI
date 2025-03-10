@@ -10,12 +10,41 @@ from typing import Optional, Dict, List, Tuple, Union, Any
 import math
 import os
 
-# TPU and XLA configuration
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'  # Force single host device
+# TPU configuration
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
 jax.config.update("jax_enable_x64", False)  # Disable float64 for TPU
-jax.config.update("jax_default_matmul_precision", "bfloat16")  # Use bfloat16
-jax.config.update("jax_platforms", "tpu")  # Force TPU platform
-jax.config.update("jax_xla_backend", "tpu")  # Use TPU XLA backend
+
+def configure_tpu_dtypes():
+    """Configure TPU dtype settings"""
+    jax.config.update("jax_default_matmul_precision", "bfloat16")
+    # Don't set default dtype to bfloat16 globally to avoid affecting embeddings
+    return {
+        'compute_dtype': jnp.bfloat16,
+        'embedding_dtype': jnp.int32,
+        'default_float': jnp.float32
+    }
+
+def _apply_rotary(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarray:
+    """Internal function to apply rotary embeddings.
+    
+    Args:
+        x: Input tensor [batch, seq_len, num_heads, head_dim]
+        freqs_cis: Complex rotary embeddings [seq_len, head_dim/2]
+    Returns:
+        Tensor with rotary embeddings applied
+    """
+    # Reshape for complex multiplication
+    x_complex = x.reshape(*x.shape[:-1], -1, 2)
+    freqs_cis = freqs_cis.reshape(1, freqs_cis.shape[0], 1, -1)
+    
+    # Convert to complex numbers for rotation
+    x_complex = jnp.complex64(x_complex[..., 0]) + 1j * jnp.complex64(x_complex[..., 1])
+    # Apply rotation through complex multiplication
+    x_rotated = x_complex * freqs_cis
+    
+    # Convert back to real numbers and proper shape
+    x_out = jnp.stack([jnp.real(x_rotated), jnp.imag(x_rotated)], axis=-1)
+    return x_out.reshape(*x.shape)
 
 @jit
 def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarray:
@@ -27,49 +56,38 @@ def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarra
     Returns:
         Tensor with rotary embeddings applied
     """
-    # Split last dimension for rotary computation
-    x_reshape = x.reshape(*x.shape[:-1], -1, 2)
-    
-    # Convert to complex numbers for rotation
-    x_complex = jnp.complex64(x_reshape[..., 0]) + 1j * jnp.complex64(x_reshape[..., 1])
-    
-    # Reshape freqs_cis for broadcasting
-    # Original shape: [seq_len, head_dim/2] -> [1, seq_len, 1, head_dim/2]
-    freqs_cis = freqs_cis.reshape(1, freqs_cis.shape[0], 1, freqs_cis.shape[1])
-    
-    # Apply rotation with proper broadcasting
-    x_rotated = x_complex * freqs_cis
-    
-    # Convert back to real and restore original shape
-    x_out = jnp.stack([jnp.real(x_rotated), jnp.imag(x_rotated)], axis=-1)
-    return x_out.reshape(x.shape)
+    # Ensure compute dtype for rotary embedding
+    x = x.astype(jnp.bfloat16)
+    freqs_cis = freqs_cis.astype(jnp.bfloat16)
+    return _apply_rotary(x, freqs_cis)
 
-def create_causal_mask(seq_len: int, batch_size: Optional[int] = None, dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
+def create_causal_mask(seq_len: int, batch_size: Optional[int] = None) -> jnp.ndarray:
     """Create causal attention mask for transformer decoder.
     
     Args:
         seq_len: Length of the sequence
         batch_size: Optional batch size for broadcasting
-        dtype: Data type of the mask, default float32
     Returns:
         Causal mask of shape [batch_size, 1, seq_len, seq_len] if batch_size is provided,
         otherwise [1, 1, seq_len, seq_len]
     """
-    # Create basic causal mask
-    idxs = jnp.arange(seq_len)
-    mask = (idxs[None, :] >= idxs[:, None])
-    
-    # Reshape for attention broadcasting (batch_size, num_heads, q_len, k_len)
-    mask = mask.reshape(1, 1, seq_len, seq_len)
-    
-    # Broadcast to batch size if provided
-    if batch_size is not None:
-        mask = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len))
-    
-    return mask.astype(dtype)
+    # Use float32 for mask to avoid dtype issues
+    mask = jnp.triu(jnp.ones((seq_len, seq_len), dtype=jnp.float32), k=1)
+    mask = -1e9 * mask
+    if batch_size:
+        mask = jnp.expand_dims(mask, axis=0)
+        mask = jnp.repeat(mask, batch_size, axis=0)
+    return mask
 
 class TPUDeviceManager:
     """Manages TPU device configuration and optimization"""
+    
+    @staticmethod
+    def configure_for_tpu():
+        """Configure TPU settings"""
+        jax.config.update("jax_platforms", "tpu")
+        jax.config.update("jax_xla_backend", "tpu")
+        return configure_tpu_dtypes()
     
     @staticmethod
     def get_device_count() -> int:
@@ -80,11 +98,6 @@ class TPUDeviceManager:
     def get_device_type() -> str:
         """Get TPU device type"""
         return jax.devices()[0].device_kind
-        
-    @staticmethod
-    def configure_for_tpu(dtype: Any = jnp.bfloat16) -> None:
-        """Configure JAX for TPU operation"""
-        jax.config.update("jax_enable_x64", False)
         
     @staticmethod
     def get_optimal_batch_size(model_dim: int, seq_len: int) -> int:
@@ -118,8 +131,13 @@ class TPUOptimizer:
                        dropout_rate: float = 0.0,
                        deterministic: bool = False) -> jnp.ndarray:
         """Fused attention computation optimized for TPU"""
+        # Ensure compute dtype
+        q = q.astype(jnp.bfloat16)
+        k = k.astype(jnp.bfloat16)
+        v = v.astype(jnp.bfloat16)
+        
         d_k = q.shape[-1]
-        scale = jnp.sqrt(d_k).astype(q.dtype)
+        scale = jnp.sqrt(d_k).astype(jnp.bfloat16)
         
         # Attention scores with optimized matmul
         scores = lax.dot_general(
@@ -128,7 +146,9 @@ class TPUOptimizer:
         ) / scale
         
         if mask is not None:
-            scores = jnp.where(mask, scores, -1e10)
+            # Convert mask to same dtype as scores
+            mask = mask.astype(scores.dtype)
+            scores = jnp.where(mask, scores, -1e9)
             
         # Optimized softmax
         scores = jax.nn.softmax(scores, axis=-1)
@@ -149,6 +169,13 @@ class TPUOptimizer:
     def fused_ffn(x: jnp.ndarray, w1: jnp.ndarray, b1: jnp.ndarray,
                   w2: jnp.ndarray, b2: jnp.ndarray) -> jnp.ndarray:
         """Fused feed-forward network computation"""
+        # Ensure compute dtype
+        x = x.astype(jnp.bfloat16)
+        w1 = w1.astype(jnp.bfloat16)
+        w2 = w2.astype(jnp.bfloat16)
+        b1 = b1.astype(jnp.bfloat16)
+        b2 = b2.astype(jnp.bfloat16)
+        
         return lax.dot_general(
             jax.nn.gelu(lax.dot_general(x, w1, ((1,), (0,)), ((), ())) + b1),
             w2, ((1,), (0,)), ((), ())
@@ -234,3 +261,6 @@ if __name__ == "__main__":
     batch = {"input_ids": jnp.ones((16, seq_len))}
     sharded = dp.shard_batch(batch)
     print("Sharded batch shape:", sharded["input_ids"].shape)
+
+# Initialize TPU dtypes on module import
+DTYPE_CONFIG = configure_tpu_dtypes()

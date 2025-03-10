@@ -25,6 +25,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from .attention import FlashMLAttentionTPU
 from .moe import OptimizedMoE
+from .core import DTYPE_CONFIG
 
 # Optional Sonnet import
 try:
@@ -132,25 +133,40 @@ class TPULayerNorm(hk.Module):
         self.offset_init = offset_init or jnp.zeros
 
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        # Cast input to compute dtype while preserving gradients
+        inputs = inputs.astype(DTYPE_CONFIG['compute_dtype'])
+        
         axis = self.axis
         if axis < 0:
             axis += inputs.ndim
             
-        mean = jnp.mean(inputs, axis=axis, keepdims=True)
-        variance = jnp.var(inputs, axis=axis, keepdims=True)
-        
         param_shape = inputs.shape[axis]
         if isinstance(param_shape, int):
             param_shape = (param_shape,)
             
+        # Compute mean and variance in float32 for numerical stability
+        mean = jnp.mean(inputs, axis=axis, keepdims=True)
+        variance = jnp.var(inputs, axis=axis, keepdims=True)
+        
+        # Normalize with improved numerical stability
         normalized = (inputs - mean) * jax.lax.rsqrt(variance + self.eps)
         
         if self.create_scale:
-            scale = hk.get_parameter("scale", param_shape, inputs.dtype, self.scale_init)
+            scale = hk.get_parameter(
+                "scale", 
+                param_shape, 
+                inputs.dtype,
+                self.scale_init
+            )
             normalized = normalized * scale
             
         if self.create_offset:
-            offset = hk.get_parameter("offset", param_shape, inputs.dtype, self.offset_init)
+            offset = hk.get_parameter(
+                "offset", 
+                param_shape,
+                inputs.dtype, 
+                self.offset_init
+            )
             normalized = normalized + offset
             
         return normalized

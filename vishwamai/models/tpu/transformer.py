@@ -11,7 +11,7 @@ import math
 
 from .attention import FlashMLAttentionTPU, MultiModalAttentionTPU, TemporalAttentionTPU
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm, gelu_kernel
-from .core import apply_rotary_embedding, create_causal_mask
+from .core import apply_rotary_embedding, create_causal_mask, DTYPE_CONFIG
 
 class PositionalEncoding(hk.Module):
     """TPU-optimized positional encoding using rotary embeddings."""
@@ -48,13 +48,16 @@ class TokenEmbedding(hk.Module):
         self.embed_dim = embed_dim
         self.scale_grad_by_freq = scale_grad_by_freq
         self.tie_weights = tie_weights
-        
+
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Initialize embedding matrix
+        # Ensure input is int32 for embedding lookup
+        x = x.astype(DTYPE_CONFIG['embedding_dtype'])
+        
+        # Initialize embedding matrix with bfloat16 for compute efficiency
         w_init = hk.initializers.TruncatedNormal(stddev=1.0 / math.sqrt(self.embed_dim))
         w_embed = hk.get_parameter("w_embed", 
                                  shape=[self.vocab_size, self.embed_dim],
-                                 dtype=x.dtype,
+                                 dtype=DTYPE_CONFIG['compute_dtype'],
                                  init=w_init)
         
         # Embedding lookup
@@ -83,15 +86,28 @@ class FeedForward(hk.Module):
         self.ff_dim = ff_dim
         self.dropout_rate = dropout_rate
         self.activation = activation
-        
+
     def __call__(self, x: jnp.ndarray, is_training: bool = True) -> jnp.ndarray:
-        # Project to intermediate dimension
-        x = TPUGEMMLinear(self.ff_dim)(x)
-        x = self.activation(x)
-        x = hk.dropout(hk.next_rng_key(), self.dropout_rate, x) if is_training else x
+        # Ensure compute dtype
+        x = x.astype(DTYPE_CONFIG['compute_dtype'])
         
-        # Project back to embedding dimension
-        x = TPUGEMMLinear(self.embed_dim)(x)
+        w1 = hk.get_parameter("w1", shape=[self.embed_dim, self.ff_dim],
+                             dtype=DTYPE_CONFIG['compute_dtype'],
+                             init=hk.initializers.VarianceScaling(2.0))
+        b1 = hk.get_parameter("b1", shape=[self.ff_dim],
+                             dtype=DTYPE_CONFIG['compute_dtype'],
+                             init=jnp.zeros)
+        
+        w2 = hk.get_parameter("w2", shape=[self.ff_dim, self.embed_dim],
+                             dtype=DTYPE_CONFIG['compute_dtype'],
+                             init=hk.initializers.VarianceScaling(2.0))
+        b2 = hk.get_parameter("b2", shape=[self.embed_dim],
+                             dtype=DTYPE_CONFIG['compute_dtype'],
+                             init=jnp.zeros)
+        
+        x = self.activation(jnp.matmul(x, w1) + b1)
+        x = hk.dropout(hk.next_rng_key(), self.dropout_rate, x) if is_training else x
+        x = jnp.matmul(x, w2) + b2
         x = hk.dropout(hk.next_rng_key(), self.dropout_rate, x) if is_training else x
         
         return x
@@ -127,13 +143,18 @@ class TransformerComputeLayerTPU(hk.Module):
 
     def __call__(self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None,
                 is_training: bool = True) -> jnp.ndarray:
+        # Ensure compute dtype
+        x = x.astype(DTYPE_CONFIG['compute_dtype'])
+        if mask is not None:
+            mask = mask.astype(DTYPE_CONFIG['compute_dtype'])
+            
         # Pre-norm transformer architecture
         normed_x = self.norm1(x)
         attention_output = self.attention(normed_x, mask=mask, is_training=is_training)
         x = x + attention_output
 
         normed_x = self.norm2(x)
-        ff_output = self.ff_network(normed_x)
+        ff_output = self.ff_network(normed_x, is_training)
         x = x + ff_output
 
         return x

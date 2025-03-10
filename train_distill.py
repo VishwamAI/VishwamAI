@@ -9,6 +9,7 @@ import jax
 from typing import Any, Dict
 from vishwamai.training import create_trainer
 from vishwamai.transformer import create_vishwamai_transformer
+from safetensors.flax import save_file
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load model configuration from JSON file."""
@@ -65,9 +66,16 @@ def main():
     # Run training
     trainer.train()
     
+    # Save model as .safetensors
+    save_dir = 'final_model'
+    os.makedirs(save_dir, exist_ok=True)
+    params = jax.device_get(trainer.pipeline.state.params)
+    save_file(params, f"{save_dir}/model.safetensors")
+    
     print("Training completed!")
     print("Final logs exported to 'logs' directory")
     print(f"Database available at: training_logs.db")
+    print(f"Model saved as .safetensors in {save_dir}")
 
 if __name__ == "__main__":
     main()

@@ -135,15 +135,12 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         self.o_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
 
     @staticmethod
+    @jit
     def _block_attention(q_block: jnp.ndarray, k_block: jnp.ndarray, v_block: jnp.ndarray, 
-                        mask_block: Optional[jnp.ndarray], causal: bool, sm_scale: float) -> jnp.ndarray:
+                        mask_block: Optional[jnp.ndarray], sm_scale: float) -> jnp.ndarray:
         scores = jnp.matmul(q_block, jnp.swapaxes(k_block, -2, -1)) * sm_scale
         
-        if causal:
-            seq_len = q_block.shape[-2]
-            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=scores.dtype))
-            scores = jnp.where(causal_mask[None, None, :, :], scores, -1e9)
-            
+        # Create causal mask if needed (now handled outside the function)
         if mask_block is not None:
             scores = jnp.where(mask_block == 0, -1e9, scores)
             
@@ -160,12 +157,19 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         k = self._reshape_for_multihead(self.k_proj(context if context is not None else x))
         v = self._reshape_for_multihead(self.v_proj(context if context is not None else x))
 
-        # Pre-compute number of blocks for static shape handling
-        num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        # Pre-compute causal mask if needed
+        if self.causal:
+            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+            if mask is not None:
+                mask = mask * causal_mask
+            else:
+                mask = causal_mask
 
-        def scan_over_blocks(carry, block_idx):
-            output = carry
-            start_idx = block_idx * self.block_size
+        # Process attention in blocks with static shapes
+        output = jnp.zeros_like(v)
+        
+        def process_block(i):
+            start_idx = i * self.block_size
             end_idx = jnp.minimum(start_idx + self.block_size, seq_len)
             
             q_block = jax.lax.dynamic_slice(
@@ -193,21 +197,21 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
                     (batch_size, 1, end_idx - start_idx, mask.shape[-1])
                 )
 
-            block_output = self._block_attention(
-                q_block, k_block, v_block, mask_block, self.causal, self.sm_scale
-            )
+            block_output = self._block_attention(q_block, k_block, v_block, mask_block, self.sm_scale)
             
-            output = output.at[:, :, start_idx:end_idx, :].set(block_output)
-            return output, None
+            # Update output using dynamic update slice instead of at
+            return jax.lax.dynamic_update_slice(
+                output,
+                block_output,
+                (0, 0, start_idx, 0)
+            )
 
-        # Initialize output tensor
-        output = jnp.zeros_like(v)
-        
-        # Use scan instead of fori_loop for better static shape handling
-        output, _ = jax.lax.scan(
-            scan_over_blocks,
-            output,
-            jnp.arange(num_blocks)
+        # Use fori_loop instead of scan for better shape handling
+        num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        output = jax.lax.fori_loop(
+            0, num_blocks,
+            lambda i, acc: process_block(i),
+            output
         )
 
         # Reshape and apply output projection

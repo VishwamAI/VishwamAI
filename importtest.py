@@ -39,23 +39,28 @@ def test_tpu_imports():
         except ImportError:
             print("ℹ Sonnet components not available (optional)")
 
-        # Initialize test variables
-        batch_size, seq_len = 2, 32
+        # Initialize test variables with concrete shapes
+        batch_size, seq_len = jnp.array(2), jnp.array(32)
         embed_dim = 64
         num_heads = 8
         head_dim = embed_dim // num_heads
         
         # Initialize random key with TPU-optimized settings
         rng = jax.random.PRNGKey(42)  # Use fixed seed for reproducibility
-        x = jnp.ones((batch_size, seq_len, embed_dim))
+        x = jnp.ones((batch_size, seq_len, embed_dim), dtype=jnp.bfloat16)
         x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        x_rot = jnp.ones((batch_size, seq_len, num_heads, head_dim))
+        x_rot = jnp.ones((batch_size, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
         
         def init_components(x, x_ids):
-            mask = create_causal_mask(seq_len)
+            # Create mask with static shape during tracing
+            mask = create_causal_mask(32)  # Use concrete size
+            
+            # Apply rotary embeddings
             rotary_pos = jnp.exp(1j * x_rot)
             rotary_out = apply_rotary_embedding(x_rot, rotary_pos)
-            pos_enc = jnp.zeros((1, seq_len, embed_dim))
+            
+            # Initialize remaining components
+            pos_enc = jnp.zeros((1, seq_len, embed_dim), dtype=jnp.bfloat16)
             embed = hk.Embed(vocab_size=1000, embed_dim=embed_dim)(x_ids)
             ffn = TransformerComputeLayerTPU(
                 embed_dim=embed_dim,
@@ -67,7 +72,7 @@ def test_tpu_imports():
         # Initialize and transform components
         init_fn = hk.transform(init_components)
         
-        # Run initialization
+        # Run initialization with explicit static shapes
         params = init_fn.init(rng, x, x_ids)
         pos_out, embed_out, ffn_out, rotary_out, mask = init_fn.apply(params, rng, x, x_ids)
         
@@ -78,7 +83,7 @@ def test_tpu_imports():
         print("✓ Successfully initialized feed-forward network")
         
         # Test TPU utilities
-        config = get_optimal_tpu_config(hidden_size=embed_dim, seq_len=seq_len, batch_size=batch_size)
+        config = get_optimal_tpu_config(hidden_size=embed_dim, seq_len=32, batch_size=2)
         print("✓ Successfully generated TPU configuration")
         
         # Test hardware detection if available

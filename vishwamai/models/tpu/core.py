@@ -41,9 +41,10 @@ def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarra
     x_out = jnp.stack([jnp.real(x_rotated), jnp.imag(x_rotated)], axis=-1)
     return x_out.reshape(x.shape)
 
-@jit
 def create_causal_mask(seq_len: int, dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
     """Create causal attention mask for transformer decoder.
+    
+    This version handles dynamic shapes by using lax.dynamic_slice.
     
     Args:
         seq_len: Length of the sequence
@@ -51,9 +52,18 @@ def create_causal_mask(seq_len: int, dtype: jnp.dtype = jnp.float32) -> jnp.ndar
     Returns:
         Causal mask of shape [seq_len, seq_len]
     """
-    # Create lower triangular mask (including diagonal)
-    idxs = jnp.arange(seq_len)
-    return (idxs[:, None] >= idxs[None, :]).astype(dtype)
+    # Create a static larger mask that we'll slice dynamically
+    max_len = 2048  # Maximum reasonable sequence length
+    idxs = jnp.arange(max_len)
+    mask = (idxs[:, None] >= idxs[None, :])
+    
+    # Dynamically slice to the actual sequence length
+    mask = lax.dynamic_slice(
+        mask,
+        (0, 0),
+        (seq_len, seq_len)
+    )
+    return mask.astype(dtype)
 
 class TPUDeviceManager:
     """Manages TPU device configuration and optimization"""

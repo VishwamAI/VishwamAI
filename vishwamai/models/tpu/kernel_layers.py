@@ -193,7 +193,7 @@ class HardwareCapabilityDetector:
         return model
 
 # JAX-optimized GELU kernel
-@jit
+@jax.jit
 def gelu_kernel(x: jnp.ndarray) -> jnp.ndarray:
     sqrt_2_pi = 0.7978845608028654
     coef = 0.044715
@@ -414,12 +414,12 @@ def forward_sonnet_deepgemm_linear(x):
     return hk.transform(apply_fn)(x)
 
 # Training Utilities
-@jit
+@jax.jit
 def loss_fn(params, rng, x, target, model_apply):
     logits = model_apply({'params': params}, x, train=True, rng=rng)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, target))
 
-@jit
+@jax.jit
 def update_step(params, opt_state, rng, x, target, model_apply, optimizer):
     loss, grads = jax.value_and_grad(loss_fn)(params, rng, x, target, model_apply)
     updates, opt_state = optimizer.update(grads, opt_state, params)

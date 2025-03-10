@@ -81,66 +81,52 @@ def test_tpu_imports():
         batch_size, seq_len, embed_dim = 2, 64, 512
         num_heads = 8
         
-        # Test causal mask creation
+        # Test causal mask creation using jax.jit
+        @jax.jit
         def test_mask():
-            mask = create_causal_mask(seq_len)
-            return mask
+            return create_causal_mask(seq_len)
             
-        # Test rotary embeddings
-        def test_rotary():
-            x = jnp.ones((batch_size, seq_len, num_heads, embed_dim // num_heads))
-            freqs = jnp.exp(-jnp.arange(seq_len)[:, None] / 10000 ** (2 * jnp.arange(embed_dim // 2) / embed_dim))
-            freqs_cis = jnp.exp(1j * freqs).astype(jnp.complex64)
+        # Test rotary embeddings using jax.jit
+        @jax.jit
+        def test_rotary(x, freqs_cis):
             return apply_rotary_embedding(x, freqs_cis)
-            
-        # Test positional encoding
-        def test_pos_encoding(x):
+        
+        # Initialize components with Haiku transform
+        def init_components(x, x_ids):
             pos_enc = PositionalEncoding(embed_dim=embed_dim, max_seq_len=seq_len)
-            return pos_enc(x)
-            
-        # Test token embedding
-        def test_embedding(x):
             embed = TokenEmbedding(vocab_size=32000, embed_dim=embed_dim)
-            return embed(x)
-            
-        # Test feed-forward
-        def test_ffn(x):
             ffn = FeedForward(embed_dim=embed_dim, ff_dim=embed_dim * 4)
-            return ffn(x)
             
-        # Initialize components
+            # Run forward passes
+            pos_out = pos_enc(x)
+            embed_out = embed(x_ids)
+            ffn_out = ffn(x)
+            
+            return pos_out, embed_out, ffn_out
+            
+        # Initialize components with transform
+        init_fn = hk.transform(init_components)
+        
+        # Generate input data
         rng = jax.random.PRNGKey(0)
-        rng, init_rng = jax.random.split(rng)
+        x = jnp.ones((batch_size, seq_len, embed_dim))
+        x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
         
         # Test mask
-        mask_fn = hk.transform(test_mask)
-        mask = mask_fn.apply({}, init_rng)
+        mask = test_mask()
         print("✓ Successfully created causal mask")
         
         # Test rotary embeddings
-        rotary_fn = hk.transform(test_rotary)
-        rotary = rotary_fn.apply({}, init_rng)
+        x_rot = jnp.ones((batch_size, seq_len, num_heads, embed_dim // num_heads))
+        freqs = jnp.exp(-jnp.arange(seq_len)[:, None] / 10000 ** (2 * jnp.arange(embed_dim // 2) / embed_dim))
+        freqs_cis = jnp.exp(1j * freqs).astype(jnp.complex64)
+        rotary = test_rotary(x_rot, freqs_cis)
         print("✓ Successfully applied rotary embeddings")
         
-        # Test positional encoding
-        x = jnp.ones((batch_size, seq_len, embed_dim))
-        pos_enc_fn = hk.transform(test_pos_encoding)
-        params = pos_enc_fn.init(init_rng, x)
-        pos_enc = pos_enc_fn.apply(params, init_rng, x)
-        print("✓ Successfully initialized positional encoding")
-        
-        # Test token embedding
-        x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        embed_fn = hk.transform(test_embedding)
-        params = embed_fn.init(init_rng, x_ids)
-        embeddings = embed_fn.apply(params, init_rng, x_ids)
-        print("✓ Successfully initialized token embedding")
-        
-        # Test feed-forward
-        ffn_fn = hk.transform(test_ffn)
-        params = ffn_fn.init(init_rng, x)
-        ffn_out = ffn_fn.apply(params, init_rng, x)
-        print("✓ Successfully initialized feed-forward network")
+        # Initialize and test components
+        params = init_fn.init(rng, x, x_ids)
+        pos_out, embed_out, ffn_out = init_fn.apply(params, rng, x, x_ids)
+        print("✓ Successfully initialized all components")
         
         # Test TPU utilities
         config = get_optimal_tpu_config(hidden_size=embed_dim, seq_len=seq_len, batch_size=batch_size)

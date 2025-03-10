@@ -70,8 +70,11 @@ def main():
     save_dir = 'final_model'
     os.makedirs(save_dir, exist_ok=True)
     params = jax.device_get(trainer.pipeline.state.params)
-    save_file(params, f"{save_dir}/model.safetensors")
-    
+    try:
+        save_file(params, f"{save_dir}/model.safetensors")
+    except Exception as e:
+        print(f"Error saving model: {e}")
+        return
     print("Training completed!")
     print("Final logs exported to 'logs' directory")
     print(f"Database available at: training_logs.db")

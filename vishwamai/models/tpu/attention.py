@@ -189,9 +189,9 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         )
         return output
 
-    def __call__(self, x, context=None, mask=None, temporal_states=None, domain_id=0, rng=None, is_training=True):
+    def forward(self, x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
         """Forward pass for FlashMLAttentionTPU."""
-        rng = rng or random.PRNGKey(0)
+        rng = hk.next_rng_key()
         # Project inputs to Q, K, V
         q = self._reshape_for_multihead(self.q_proj(x).astype(jnp.bfloat16))
         k = self._reshape_for_multihead(self.k_proj(x if context is None else context).astype(jnp.bfloat16))
@@ -203,7 +203,7 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         # Reshape and apply output projection
         output = jnp.transpose(output, (0, 2, 1, 3)).reshape(x.shape[0], x.shape[1], self.embed_dim)
         if is_training:
-            output = hk.dropout(hk.next_rng_key(), self.dropout_rate, output)
+            output = hk.dropout(rng, self.dropout_rate, output)
             
         return self.o_proj(output.astype(jnp.float32))
 
@@ -395,7 +395,7 @@ class SonnetFlashAttentionTPU(snt.Module):
 # Haiku Transformation Wrappers
 def forward_flash_mla_tpu(x, context=None, mask=None, temporal_states=None, domain_id=0, is_training=True):
     model = FlashMLAttentionTPU(embed_dim=512, num_heads=8, block_size=128, causal=True)
-    return hk.transform(lambda x, c, m, t, d, r, i: model.forward(x, c, m, t, d, r, i))(x, context, mask, temporal_states, domain_id, None, is_training)
+    return hk.transform(lambda x, c, m, t, d, r, i: model.forward(x, c, m, t, d, i))(x, context, mask, temporal_states, domain_id, None, is_training)
 
 def forward_multimodal_tpu(x, domain_id=0, context=None, mask=None, temporal_states=None, is_training=True):
     model = MultiModalAttentionTPU(embed_dim=512, num_heads=8, num_domains=2)

@@ -105,6 +105,7 @@ class TransformerComputeLayerTPU(hk.Module):
         self.num_heads = num_heads
         self.ff_dim = ff_dim
         self.dropout_rate = dropout_rate
+        self.attention = FlashMLAttentionTPU(embed_dim, num_heads)
         
     def __call__(self, x, mask=None, is_training=True):
         seq_len = x.shape[1]
@@ -114,7 +115,7 @@ class TransformerComputeLayerTPU(hk.Module):
         
         # Self attention
         normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
-        attention = FlashMLAttentionTPU(self.embed_dim, self.num_heads)(
+        attention = self.attention.forward(
             normed, mask=mask, is_training=is_training
         )
         if is_training:

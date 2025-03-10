@@ -48,7 +48,7 @@ def test_tpu_imports():
         
         # Initialize random key with TPU-optimized settings
         rng = jax.random.PRNGKey(42)  # Use fixed seed for reproducibility
-        x = jnp.ones((batch_size, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
+        x = jnp.ones((batch_size, seq_len, embed_dim), dtype=jnp.bfloat16)
         x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
         
         # Create rotary embeddings with matching shape for head_dim
@@ -68,11 +68,15 @@ def test_tpu_imports():
             # Initialize remaining components
             pos_enc = jnp.zeros((1, seq_len, embed_dim), dtype=jnp.bfloat16)
             embed = hk.Embed(vocab_size=1000, embed_dim=embed_dim)(x_ids)
-            ffn = TransformerComputeLayerTPU(
+            
+            # Initialize transformer layer
+            transformer = TransformerComputeLayerTPU(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 ff_dim=embed_dim * 4
-            )(x)
+            )
+            ffn = transformer(x)
+            
             return pos_enc, embed, ffn, rotary_out, mask
 
         # Initialize and transform components

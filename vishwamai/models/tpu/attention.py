@@ -129,108 +129,108 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         self.block_size = block_size
         self.causal = causal
         self.sm_scale = sm_scale or 1.0 / math.sqrt(self.head_dim)
-        self.q_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
-        self.k_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
-        self.v_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
-        self.o_proj = hk.Linear(embed_dim, w_init=hk.initializers.VarianceScaling(1.0))
 
     @staticmethod
     @jit
     def _block_attention(q_block: jnp.ndarray, k_block: jnp.ndarray, v_block: jnp.ndarray, 
                         mask_block: Optional[jnp.ndarray], sm_scale: float) -> jnp.ndarray:
         scores = jnp.matmul(q_block, jnp.swapaxes(k_block, -2, -1)) * sm_scale
-        
         if mask_block is not None:
             scores = jnp.where(mask_block == 0, -1e9, scores)
-            
         attn_probs = jax.nn.softmax(scores, axis=-1)
         return jnp.matmul(attn_probs, v_block)
 
     def __call__(self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None, 
-                context: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
+                context: Optional[jnp.ndarray] = None, is_training: bool = True,
+                rng: Optional[jnp.ndarray] = None) -> jnp.ndarray:
         batch_size, seq_len, _ = x.shape
         
-        # Pad sequence to multiple of block_size
-        padded_seq_len = ((seq_len + self.block_size - 1) // self.block_size) * self.block_size
-        pad_amount = padded_seq_len - seq_len
+        # Ensure x is in bfloat16 for TPU optimization
+        x = x.astype(jnp.bfloat16)
         
-        # Project and reshape inputs
-        q = self._reshape_for_multihead(self.q_proj(x))
-        k = self._reshape_for_multihead(self.k_proj(context if context is not None else x))
-        v = self._reshape_for_multihead(self.v_proj(context if context is not None else x))
+        # Project inputs
+        q = self.q_proj(x)
+        k = self.k_proj(context if context is not None else x)
+        v = self.v_proj(context if context is not None else x)
         
-        # Pad Q, K, V
-        q_padded = jnp.pad(q, [(0, 0), (0, 0), (0, pad_amount), (0, 0)])
-        k_padded = jnp.pad(k, [(0, 0), (0, 0), (0, pad_amount), (0, 0)])
-        v_padded = jnp.pad(v, [(0, 0), (0, 0), (0, pad_amount), (0, 0)])
+        # Reshape for attention
+        q = q.reshape(batch_size, seq_len, self.num_heads, -1)
+        k = k.reshape(batch_size, k.shape[1], self.num_heads, -1)
+        v = v.reshape(batch_size, v.shape[1], self.num_heads, -1)
         
-        # Handle mask padding
-        if mask is not None:
-            mask_padded = jnp.pad(mask, [(0, 0), (0, 0), (0, pad_amount), (0, pad_amount)])
-            mask_padded = mask_padded.at[:, :, -pad_amount:].set(0)
-            mask_padded = mask_padded.at[:, :, :, -pad_amount:].set(0)
-        else:
-            mask_padded = None
-
-        num_blocks = padded_seq_len // self.block_size
-
-        # Initialize output with padded shape
-        output_padded = jnp.zeros_like(q_padded)
-
-        def process_block(i, acc):
-            start_idx = i * self.block_size
-            end_idx = start_idx + self.block_size
-
-            # Extract fixed-size blocks
+        # Transpose for attention
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+        
+        # Compute number of blocks
+        num_q_blocks = math.ceil(seq_len / self.block_size)
+        output_list = []
+        
+        # Process attention in blocks using scan
+        def attention_scan_fn(carry, block_idx):
+            start_idx = block_idx * self.block_size
+            end_idx = min(start_idx + self.block_size, seq_len)
+            block_size = end_idx - start_idx
+            
+            # Extract query block
             q_block = jax.lax.dynamic_slice(
-                q_padded, 
+                q,
                 (0, 0, start_idx, 0),
-                (batch_size, self.num_heads, self.block_size, self.head_dim)
+                (batch_size, self.num_heads, block_size, q.shape[-1])
             )
             
+            # For causal attention, only look at current and previous blocks
             if self.causal:
                 k_block = jax.lax.dynamic_slice(
-                    k_padded,
+                    k,
                     (0, 0, 0, 0),
-                    (batch_size, self.num_heads, end_idx, self.head_dim)
+                    (batch_size, self.num_heads, end_idx, k.shape[-1])
                 )
                 v_block = jax.lax.dynamic_slice(
-                    v_padded,
+                    v,
                     (0, 0, 0, 0),
-                    (batch_size, self.num_heads, end_idx, self.head_dim)
+                    (batch_size, self.num_heads, end_idx, v.shape[-1])
                 )
             else:
-                k_block = k_padded
-                v_block = v_padded
-
-            mask_block = None
-            if mask_padded is not None:
-                mask_block = jax.lax.dynamic_slice(
-                    mask_padded,
-                    (0, 0, start_idx, 0),
-                    (batch_size, 1, self.block_size, mask_padded.shape[-1])
-                )
-
-            block_output = self._block_attention(q_block, k_block, v_block, mask_block, self.sm_scale)
+                k_block = k
+                v_block = v
             
-            return jax.lax.dynamic_update_slice(
-                acc,
-                block_output,
-                (0, 0, start_idx, 0)
-            )
-
-        # Process blocks with fixed shapes
-        output_padded = jax.lax.fori_loop(0, num_blocks, process_block, output_padded)
+            # Handle attention mask for the block
+            mask_block = None
+            if mask is not None:
+                mask_block = jax.lax.dynamic_slice(
+                    mask,
+                    (0, 0, start_idx, 0),
+                    (batch_size, 1, block_size, k_block.shape[2])
+                )
+            
+            # Compute attention for the block
+            block_output = self._block_attention(q_block, k_block, v_block, mask_block, self.sm_scale)
+            output_list.append(block_output)
+            return carry, block_output
         
-        # Remove padding and reshape output
-        output = output_padded[:, :, :seq_len, :]
+        # Initial carry state
+        init_carry = 0
+
+        # Process blocks sequentially
+        _, _ = jax.lax.scan(
+            attention_scan_fn,
+            init_carry,
+            jnp.arange(num_q_blocks)
+        )
+        
+        # Concatenate block outputs
+        output = jnp.concatenate(output_list, axis=2)
+        
+        # Reshape and transpose back
         output = jnp.transpose(output, (0, 2, 1, 3))
-        output = jnp.reshape(output, (batch_size, seq_len, self.embed_dim))
-
-        if is_training:
-            output = hk.dropout(hk.next_rng_key(), self.dropout_rate, output)
-
-        return self.o_proj(output)
+        output = output.reshape(batch_size, seq_len, self.embed_dim)
+        
+        if is_training and rng is not None:
+            output = hk.dropout(rng, self.dropout_rate, output)
+        
+        return self.o_proj(output).astype(jnp.float32)
 
 # GPU MultiModalAttention
 class MultiModalAttentionGPU(BaseAttentionGPU):

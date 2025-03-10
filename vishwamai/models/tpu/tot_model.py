@@ -5,37 +5,14 @@ TPU-optimized Tree of Thoughts (ToT) model using JAX/XLA
 import jax
 import jax.numpy as jnp
 import haiku as hk
+import optax
 from typing import Optional, List, Tuple, Dict, Any
 import math
 from collections import deque
 
-# Configure JAX for TPU
-jax.config.update("jax_enable_x64", False)  # Disable float64 for TPU efficiency
-jax.config.update("jax_default_matmul_precision", "bfloat16")  # Use bfloat16 for matrix operations
-jax.config.update("jax_platforms", "tpu")  # Force TPU platform
-jax.config.update("jax_xla_backend", "tpu")  # Use TPU XLA backend
-
 from .cot_model import CoTModelTPU
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm
-
-def generate_tot(model: 'ToTModelTPU', input_ids: jnp.ndarray, max_length: int = 512,
-                temperature: float = 0.6, top_p: float = 0.95,
-                search_method: str = "bfs", beam_size: int = 5) -> jnp.ndarray:
-    """Standalone generation function for ToT outputs with tree search.
-    
-    Args:
-        model: The ToT model instance
-        input_ids: Input token IDs
-        max_length: Maximum sequence length
-        temperature: Sampling temperature
-        top_p: Nucleus sampling probability threshold
-        search_method: Search strategy ("bfs" or "dfs")
-        beam_size: Number of branches to explore at each step
-        
-    Returns:
-        Generated token IDs incorporating reasoning steps from tree search
-    """
-    return model.generate_tot(input_ids, max_length, temperature, top_p, search_method, beam_size)
+from .core import DTYPE_CONFIG
 
 class ThoughtNodeTPU:
     """Represents a node in the thought tree with TPU state management"""
@@ -55,29 +32,29 @@ class ThoughtNodeTPU:
     def get_state_dict(self) -> Dict[str, any]:
         """Get node state for persistence"""
         return {
-            'text': self.thought_text,
-            'node_id': self.node_id,
-            'parent_id': self.parent.node_id if self.parent else None,
-            'score': float(self.score),  # Convert from DeviceArray to float
-            'depth': self.depth,
-            'child_ids': [child.node_id for child in self.children]
+            "thought_text": self.thought_text,
+            "node_id": self.node_id,
+            "score": float(self.score),
+            "depth": self.depth,
+            "hidden_state": self.hidden_state.tolist() if self.hidden_state is not None else None
         }
 
     def path_to_root(self) -> List[str]:
         """Return path from this node to root"""
-        path = []
+        path = [self.thought_text]
         current = self
-        while current:
-            path.append(current.thought_text)
+        while current.parent:
             current = current.parent
-        return list(reversed(path))
+            path.append(current.thought_text)
+        return path[::-1]
 
 class ToTModelTPU(CoTModelTPU):
     """Tree of Thoughts model with TPU optimization"""
     
     def __init__(self, embed_dim=512, num_layers=12, num_heads=8, ff_dim=2048,
                  vocab_size=50000, max_seq_len=512, num_experts=7, 
-                 max_thoughts=5, max_depth=10, dropout_rate=0.1,
+                 max_thoughts=5, max_depth=10, max_steps=50,
+                 candidates_per_step=10, dropout_rate=0.1,
                  name: Optional[str] = None):
         super().__init__(
             embed_dim=embed_dim,
@@ -92,8 +69,37 @@ class ToTModelTPU(CoTModelTPU):
         )
         self.max_thoughts = max_thoughts
         self.max_depth = max_depth
+        self.max_steps = max_steps
+        self.candidates_per_step = candidates_per_step
         self.eval_head = TPUGEMMLinear(3)  # 3 classes for evaluation
         self.thought_generator = TPUGEMMLinear(vocab_size)
+
+    def __call__(self, input_ids: jnp.ndarray, target_ids: Optional[jnp.ndarray] = None,
+                 is_training: bool = True) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+        # Call parent class method to get base transformer output
+        logits, base_loss = super().__call__(input_ids, target_ids, is_training)
+
+        # Add ToT-specific processing if needed
+        if is_training and target_ids is not None:
+            # Additional ToT-specific loss calculation
+            thought_loss = self._compute_thought_loss(logits, target_ids)
+            total_loss = base_loss + thought_loss if base_loss is not None else thought_loss
+            return logits, total_loss
+        
+        return logits, None
+
+    def _compute_thought_loss(self, logits: jnp.ndarray, target_ids: jnp.ndarray) -> jnp.ndarray:
+        """Compute ToT-specific loss component"""
+        # Get final hidden state
+        hidden = logits[:, -1, :]
+        # Pass through evaluation head
+        eval_logits = self.eval_head(hidden)
+        # Convert target to one-hot
+        target_classes = jnp.zeros(eval_logits.shape[0], dtype=jnp.int32)
+        target_one_hot = jax.nn.one_hot(target_classes, 3)
+        # Compute cross entropy loss
+        thought_loss = optax.softmax_cross_entropy(eval_logits, target_one_hot)
+        return jnp.mean(thought_loss)
 
     @jax.jit
     def evaluate_thought(self, thought_ids: jnp.ndarray) -> jnp.ndarray:
@@ -108,18 +114,25 @@ class ToTModelTPU(CoTModelTPU):
                           tokenizer, num_candidates: int,
                           tree_id: Optional[str] = None) -> List[str]:
         """Generate candidate thoughts using JAX random sampling"""
-        prompt = f"{input_text}\nCurrent thought: {current_thought}\nPropose next steps:"
-        input_ids = tokenizer.encode(prompt, return_tensors="jax")
+        # Encode input context
+        input_ids = tokenizer.encode(input_text, return_tensors="jax")
+        current_ids = tokenizer.encode(current_thought, return_tensors="jax")
+        combined_ids = jnp.concatenate([input_ids, current_ids], axis=1)
 
+        # Get logits for next tokens
+        logits, _ = self(combined_ids, is_training=False)
+        next_token_logits = logits[:, -1, :]
+
+        # Sample candidates
         candidates = []
+        rng = jax.random.PRNGKey(0)  # Should be managed better in practice
         for i in range(num_candidates):
-            rng = hk.next_rng_key()
-            output_ids = self._sample(input_ids, rng, max_length=50)
-            candidate_text = tokenizer.decode(output_ids[0]).replace(prompt, "").strip()
-            if candidate_text and candidate_text not in candidates:
-                candidates.append(candidate_text)
+            rng, sample_rng = jax.random.split(rng)
+            sample = jax.random.categorical(sample_rng, next_token_logits / 0.8)
+            decoded = tokenizer.decode(sample)
+            candidates.append(f"{current_thought} -> {decoded}")
 
-        return candidates[:num_candidates]
+        return candidates
 
     def solve_with_tot(self, input_text: str, tokenizer, search_method: str = "bfs",
                       b: int = 5, tree_id: Optional[str] = None) -> str:
@@ -131,52 +144,12 @@ class ToTModelTPU(CoTModelTPU):
         search_fn = self._bfs_search if search_method.lower() == "bfs" else self._dfs_search
         
         final_node = search_fn(input_text, root, tokenizer, b, tree_id)
-
         if final_node:
             thought_path = final_node.path_to_root()[1:]
             thought_text = " -> ".join(thought_path)
             answer = thought_path[-1].split("=")[-1].strip() if "=" in thought_path[-1] else "No solution found"
             return f"<think>{thought_text}</think> <answer>{answer}</answer>"
         return "<think>Failed to find a solution.</think> <answer>No solution</answer>"
-
-    def _sample(self, input_ids: jnp.ndarray, rng: jnp.ndarray,
-                max_length: int = 50, temperature: float = 0.8,
-                top_p: float = 0.9) -> jnp.ndarray:
-        """TPU-optimized sampling with JAX"""
-        def sample_step(carry, _):
-            ids, rng = carry
-            rng, new_rng = jax.random.split(rng)
-            logits, _ = self(ids, is_training=False)
-            next_token_logits = logits[:, -1, :] / temperature
-            
-            # Nucleus sampling
-            sorted_logits, sorted_indices = jax.lax.top_k(
-                next_token_logits, k=self.vocab_size
-            )
-            cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits), axis=-1)
-            mask = cumulative_probs < top_p
-            mask = jnp.concatenate([
-                jnp.ones_like(mask[:, :1]),
-                mask[:, :-1]
-            ], axis=-1)
-            
-            next_token_logits = jnp.where(
-                mask,
-                sorted_logits,
-                jnp.full_like(sorted_logits, -float('inf'))
-            )
-            next_token = jax.random.categorical(rng, next_token_logits)
-            next_token = sorted_indices[jnp.arange(next_token.shape[0]), next_token]
-            
-            return (jnp.concatenate([ids, next_token[:, None]], axis=1), new_rng), None
-
-        final_state, _ = jax.lax.scan(
-            sample_step,
-            (input_ids, rng),
-            None,
-            length=max_length - input_ids.shape[1]
-        )
-        return final_state[0]
 
     def _bfs_search(self, input_text: str, root: ThoughtNodeTPU, tokenizer,
                     b: int, tree_id: str) -> Optional[ThoughtNodeTPU]:
@@ -226,7 +199,7 @@ class ToTModelTPU(CoTModelTPU):
                         parent.add_child(child_node)
                         level_nodes.append(child_node)
 
-                        if score > best_score and "24" in cand_text and "=" in cand_text:
+                        if score > best_score and "=" in cand_text:
                             best_node = child_node
                             best_score = score
 
@@ -275,7 +248,7 @@ class ToTModelTPU(CoTModelTPU):
                     current_node.add_child(child_node)
                     child_nodes.append(child_node)
 
-                    if score > best_score and "24" in cand_text and "=" in cand_text:
+                    if score > best_score and "=" in cand_text:
                         best_node = child_node
                         best_score = score
 
@@ -284,56 +257,6 @@ class ToTModelTPU(CoTModelTPU):
                 stack.extend((node, step + 1) for node in child_nodes[:b])
 
         return best_node
-
-    def generate_tot(self, input_ids: jnp.ndarray, max_length: int = 512,
-                    temperature: float = 0.6, top_p: float = 0.95,
-                    search_method: str = "bfs", beam_size: int = 5) -> jnp.ndarray:
-        """Generate output using Tree of Thoughts with specified search strategy.
-        
-        Args:
-            input_ids: Input token IDs
-            max_length: Maximum sequence length
-            temperature: Sampling temperature
-            top_p: Nucleus sampling probability threshold
-            search_method: Search strategy ("bfs" or "dfs")
-            beam_size: Number of branches to explore at each step
-            
-        Returns:
-            Generated token IDs incorporating reasoning steps
-        """
-        # Create root thought
-        root = ThoughtNodeTPU("Start", node_id="root", score=1.0)
-        
-        # Use appropriate search strategy
-        search_fn = self._bfs_search if search_method.lower() == "bfs" else self._dfs_search
-        final_node = search_fn(input_ids, root, beam_size)
-        
-        if final_node:
-            # Convert thought path to token sequence
-            thought_path = final_node.path_to_root()[1:]  # Skip root node
-            
-            @jax.jit
-            def generate_sequence():
-                # Initialize with input
-                sequence = input_ids
-                
-                # Add each thought step
-                for thought in thought_path:
-                    # Generate tokens for this thought
-                    thought_ids = self.generate_cot(
-                        sequence,
-                        max_length=max_length,
-                        temperature=temperature,
-                        top_p=top_p
-                    )
-                    sequence = thought_ids
-                
-                return sequence
-                
-            return generate_sequence()
-        
-        # Fallback to standard generation if search fails
-        return self.generate_cot(input_ids, max_length, temperature, top_p)
 
 # Example usage and test
 if __name__ == "__main__":
@@ -344,7 +267,7 @@ if __name__ == "__main__":
     # Initialize
     batch_size, seq_len = 2, 64
     rng = jax.random.PRNGKey(0)
-    input_ids = jax.random.randint(rng, (batch_size, seq_len), 0, 50000)
+    input_ids = jax.random.randint(rng, (batch_size, seq_len), 0, 50000, dtype=jnp.int32)
 
     # Transform and initialize
     transformed = hk.transform(run_tot)

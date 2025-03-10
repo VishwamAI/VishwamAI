@@ -80,10 +80,12 @@ def test_tpu_imports():
                 num_heads=num_heads,
                 vocab_size=vocab_size
             )
-            return model(x, is_training=True)
+            # Only return logits from the tuple (logits, loss)
+            logits, _ = model(x, is_training=True)
+            return logits
         
         transformed_cot = hk.transform(init_cot)
-        params_cot = transformed_cot.init(rng, embedding_input)  # Use integer input
+        params_cot = transformed_cot.init(rng, embedding_input)
         output_cot = transformed_cot.apply(params_cot, rng, embedding_input)
         print("✓ CoTModelTPU test passed")
 
@@ -94,10 +96,12 @@ def test_tpu_imports():
                 num_heads=num_heads,
                 vocab_size=vocab_size
             )
-            return model(x, is_training=True)
+            # ToTModel might also return a tuple
+            output = model(x, is_training=True)
+            return output[0] if isinstance(output, tuple) else output
         
         transformed_tot = hk.transform(init_tot)
-        params_tot = transformed_tot.init(rng, embedding_input)  # Use integer input
+        params_tot = transformed_tot.init(rng, embedding_input)
         output_tot = transformed_tot.apply(params_tot, rng, embedding_input)
         print("✓ ToTModelTPU test passed")
 
@@ -109,10 +113,12 @@ def test_tpu_imports():
                 input_size=embed_dim,
                 vocab_size=vocab_size
             )
-            return model(x, is_training=True)
+            # MoE might also return a tuple
+            output = model(x, is_training=True)
+            return output[0] if isinstance(output, tuple) else output
         
         transformed_moe = hk.transform(init_moe)
-        params_moe = transformed_moe.init(rng, embedding_input)  # Use integer input
+        params_moe = transformed_moe.init(rng, embedding_input)
         output_moe = transformed_moe.apply(params_moe, rng, embedding_input)
         print("✓ OptimizedMoE test passed")
 

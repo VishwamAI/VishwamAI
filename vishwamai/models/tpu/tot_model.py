@@ -5,21 +5,16 @@ TPU-optimized Tree of Thoughts (ToT) model using JAX/XLA
 import jax
 import jax.numpy as jnp
 import haiku as hk
-import optax
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
+import math
 from collections import deque
 
 from .cot_model import CoTModelTPU
-from .kernel_layers import TPUGEMMLinear
-
-def generate_tot(model: 'ToTModelTPU', input_text: str, tokenizer, search_method: str = "bfs",
-                b: int = 5, tree_id: Optional[str] = None) -> str:
-    """Standalone generation function for ToT outputs"""
-    return model.solve_with_tot(input_text, tokenizer, search_method, b, tree_id)
+from .kernel_layers import TPUGEMMLinear, TPULayerNorm
 
 class ThoughtNodeTPU:
     """Represents a node in the thought tree with TPU state management"""
-    def __init__(self, thought_text: str, node_id: str, parent=None, 
+    def __init__(self, thought_text: str, node_id: str, parent=None,
                  score: float = 0.0, hidden_state: Optional[jnp.ndarray] = None):
         self.thought_text = thought_text
         self.node_id = node_id
@@ -54,9 +49,10 @@ class ThoughtNodeTPU:
 
 class ToTModelTPU(CoTModelTPU):
     """Tree of Thoughts model with TPU optimization"""
+    
     def __init__(self, embed_dim=512, num_layers=12, num_heads=8, ff_dim=2048,
-                 vocab_size=50000, max_seq_len=512, num_experts=7, max_steps=3,
-                 candidates_per_step=5, max_depth=10, dropout_rate=0.1,
+                 vocab_size=50000, max_seq_len=512, num_experts=7, 
+                 max_thoughts=5, max_depth=10, dropout_rate=0.1,
                  name: Optional[str] = None):
         super().__init__(
             embed_dim=embed_dim,
@@ -69,12 +65,12 @@ class ToTModelTPU(CoTModelTPU):
             dropout_rate=dropout_rate,
             name=name
         )
-        self.max_steps = max_steps
-        self.candidates_per_step = candidates_per_step
+        self.max_thoughts = max_thoughts
         self.max_depth = max_depth
         self.eval_head = TPUGEMMLinear(3)  # 3 classes for evaluation
+        self.thought_generator = TPUGEMMLinear(vocab_size)
 
-    @hk.jit
+    @jax.jit
     def evaluate_thought(self, thought_ids: jnp.ndarray) -> jnp.ndarray:
         """Evaluate a thought's likelihood of leading to a solution"""
         logits, _ = self(thought_ids, is_training=False)
@@ -117,6 +113,45 @@ class ToTModelTPU(CoTModelTPU):
             answer = thought_path[-1].split("=")[-1].strip() if "=" in thought_path[-1] else "No solution found"
             return f"<think>{thought_text}</think> <answer>{answer}</answer>"
         return "<think>Failed to find a solution.</think> <answer>No solution</answer>"
+
+    def _sample(self, input_ids: jnp.ndarray, rng: jnp.ndarray,
+                max_length: int = 50, temperature: float = 0.8,
+                top_p: float = 0.9) -> jnp.ndarray:
+        """TPU-optimized sampling with JAX"""
+        def sample_step(carry, _):
+            ids, rng = carry
+            rng, new_rng = jax.random.split(rng)
+            logits, _ = self(ids, is_training=False)
+            next_token_logits = logits[:, -1, :] / temperature
+            
+            # Nucleus sampling
+            sorted_logits, sorted_indices = jax.lax.top_k(
+                next_token_logits, k=self.vocab_size
+            )
+            cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits), axis=-1)
+            mask = cumulative_probs < top_p
+            mask = jnp.concatenate([
+                jnp.ones_like(mask[:, :1]),
+                mask[:, :-1]
+            ], axis=-1)
+            
+            next_token_logits = jnp.where(
+                mask,
+                sorted_logits,
+                jnp.full_like(sorted_logits, -float('inf'))
+            )
+            next_token = jax.random.categorical(rng, next_token_logits)
+            next_token = sorted_indices[jnp.arange(next_token.shape[0]), next_token]
+            
+            return (jnp.concatenate([ids, next_token[:, None]], axis=1), new_rng), None
+
+        final_state, _ = jax.lax.scan(
+            sample_step,
+            (input_ids, rng),
+            None,
+            length=max_length - input_ids.shape[1]
+        )
+        return final_state[0]
 
     def _bfs_search(self, input_text: str, root: ThoughtNodeTPU, tokenizer,
                     b: int, tree_id: str) -> Optional[ThoughtNodeTPU]:
@@ -225,46 +260,7 @@ class ToTModelTPU(CoTModelTPU):
 
         return best_node
 
-    def _sample(self, input_ids: jnp.ndarray, rng: jnp.ndarray,
-                max_length: int = 50, temperature: float = 0.8,
-                top_p: float = 0.9) -> jnp.ndarray:
-        """TPU-optimized sampling with JAX"""
-        def sample_step(carry, _):
-            ids, rng = carry
-            rng, new_rng = jax.random.split(rng)
-            logits, _ = self(ids, is_training=False)
-            next_token_logits = logits[:, -1, :] / temperature
-            
-            # Nucleus sampling
-            sorted_logits, sorted_indices = jax.lax.top_k(
-                next_token_logits, k=self.vocab_size
-            )
-            cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits), axis=-1)
-            mask = cumulative_probs < top_p
-            mask = jnp.concatenate([
-                jnp.ones_like(mask[:, :1]),
-                mask[:, :-1]
-            ], axis=-1)
-            
-            next_token_logits = jnp.where(
-                mask,
-                sorted_logits,
-                jnp.full_like(sorted_logits, -float('inf'))
-            )
-            next_token = jax.random.categorical(rng, next_token_logits)
-            next_token = sorted_indices[jnp.arange(next_token.shape[0]), next_token]
-            
-            return (jnp.concatenate([ids, next_token[:, None]], axis=1), new_rng), None
-
-        final_state, _ = jax.lax.scan(
-            sample_step,
-            (input_ids, rng),
-            None,
-            length=max_length - input_ids.shape[1]
-        )
-        return final_state[0]
-
-# Example usage
+# Example usage and test
 if __name__ == "__main__":
     def run_tot(x: jnp.ndarray) -> jnp.ndarray:
         model = ToTModelTPU()

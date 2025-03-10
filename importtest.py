@@ -13,20 +13,17 @@ def test_tpu_imports():
     print("Testing TPU model component imports...")
     
     try:
-        # Import all TPU components
         from vishwamai.models.tpu import (
             # Core attention mechanisms
             FlashMLAttentionTPU,
             MultiModalAttentionTPU,
             TemporalAttentionTPU,
             
-            # Core models
+            # Core models and components
             CoTModelTPU,
             OptimizedMoE,
             ToTModelTPU,
             ThoughtNodeTPU,
-            
-            # Model components
             TransformerComputeLayerTPU,
             TransformerMemoryLayerTPU,
             HybridThoughtAwareAttentionTPU,
@@ -39,7 +36,7 @@ def test_tpu_imports():
             ExpertRouter,
             ExpertGating,
             
-            # TPU core utilities
+            # Core utilities
             TPUDeviceManager,
             TPUOptimizer,
             TPUDataParallel,
@@ -57,11 +54,9 @@ def test_tpu_imports():
             DeepGEMMGroupedLinear,
             gelu_kernel,
             
-            # Generation utilities
+            # Utilities
             generate_cot,
             generate_tot,
-            
-            # Core utilities
             compute_load_balancing_loss,
             get_optimal_tpu_config,
             benchmark_matmul,
@@ -76,57 +71,46 @@ def test_tpu_imports():
         except ImportError:
             warnings.warn("Sonnet components not available. This is optional and won't affect core functionality.")
         
-        # Test basic initialization and utilities
         print("\nTesting component initialization and utilities...")
         batch_size, seq_len, embed_dim = 2, 64, 512
         num_heads = 8
         
-        # Test causal mask creation using jax.jit
-        @jax.jit
-        def test_mask():
-            return create_causal_mask(seq_len)
-            
-        # Test rotary embeddings using jax.jit
-        @jax.jit
-        def test_rotary(x, freqs_cis):
-            return apply_rotary_embedding(x, freqs_cis)
+        # Initialize test data
+        rng = jax.random.PRNGKey(0)
+        x = jnp.ones((batch_size, seq_len, embed_dim))
+        x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        x_rot = jnp.ones((batch_size, seq_len, num_heads, embed_dim // num_heads))
         
-        # Initialize components with Haiku transform
         def init_components(x, x_ids):
+            # Initialize core components
             pos_enc = PositionalEncoding(embed_dim=embed_dim, max_seq_len=seq_len)
             embed = TokenEmbedding(vocab_size=32000, embed_dim=embed_dim)
             ffn = FeedForward(embed_dim=embed_dim, ff_dim=embed_dim * 4)
             
             # Run forward passes
+            mask = create_causal_mask(seq_len)
+            freqs = jnp.exp(-jnp.arange(seq_len)[:, None] / 10000 ** (2 * jnp.arange(embed_dim // 2) / embed_dim))
+            freqs_cis = jnp.exp(1j * freqs).astype(jnp.complex64)
+            
             pos_out = pos_enc(x)
             embed_out = embed(x_ids)
             ffn_out = ffn(x)
+            rotary_out = apply_rotary_embedding(x_rot, freqs_cis)
             
-            return pos_out, embed_out, ffn_out
-            
-        # Initialize components with transform
+            return pos_out, embed_out, ffn_out, rotary_out, mask
+        
+        # Initialize and transform components
         init_fn = hk.transform(init_components)
         
-        # Generate input data
-        rng = jax.random.PRNGKey(0)
-        x = jnp.ones((batch_size, seq_len, embed_dim))
-        x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        
-        # Test mask
-        mask = test_mask()
-        print("✓ Successfully created causal mask")
-        
-        # Test rotary embeddings
-        x_rot = jnp.ones((batch_size, seq_len, num_heads, embed_dim // num_heads))
-        freqs = jnp.exp(-jnp.arange(seq_len)[:, None] / 10000 ** (2 * jnp.arange(embed_dim // 2) / embed_dim))
-        freqs_cis = jnp.exp(1j * freqs).astype(jnp.complex64)
-        rotary = test_rotary(x_rot, freqs_cis)
-        print("✓ Successfully applied rotary embeddings")
-        
-        # Initialize and test components
+        # Run initialization
         params = init_fn.init(rng, x, x_ids)
-        pos_out, embed_out, ffn_out = init_fn.apply(params, rng, x, x_ids)
-        print("✓ Successfully initialized all components")
+        pos_out, embed_out, ffn_out, rotary_out, mask = init_fn.apply(params, rng, x, x_ids)
+        
+        print("✓ Successfully created causal mask")
+        print("✓ Successfully applied rotary embeddings")
+        print("✓ Successfully initialized positional encoding")
+        print("✓ Successfully initialized token embedding")
+        print("✓ Successfully initialized feed-forward network")
         
         # Test TPU utilities
         config = get_optimal_tpu_config(hidden_size=embed_dim, seq_len=seq_len, batch_size=batch_size)
@@ -148,6 +132,7 @@ def test_tpu_imports():
         return False
     except Exception as e:
         print(f"❌ Error during testing: {str(e)}")
+        print("\nError details:", str(e))
         return False
 
 if __name__ == "__main__":
@@ -164,6 +149,7 @@ if __name__ == "__main__":
         print("- Positional encoding:", "(batch_size, seq_len, embed_dim)")
         print("- Token embedding:", "(batch_size, seq_len, embed_dim)")
         print("- Feed-forward:", "(batch_size, seq_len, embed_dim)")
+        print("- Rotary embedding:", "(batch_size, seq_len, num_heads, head_dim)")
     else:
         print("\n❌ TPU component tests failed!")
         sys.exit(1)

@@ -1,51 +1,76 @@
 """
-TPU configuration and initialization utilities
+TPU configuration and initialization utilities with fallback support
 """
 
 import jax
 import os
 from typing import Dict, Any, Optional
+import warnings
 
 class TPUConfig:
-    """TPU configuration management"""
+    """TPU configuration management with fallback to CPU/GPU"""
     
     _instance = None
     _initialized = False
+    _platform = None
     
     @classmethod
     def initialize(cls, force_cpu: bool = False) -> None:
-        """Initialize TPU configuration with proper flags"""
+        """Initialize TPU configuration with proper flags and fallback"""
         if not cls._initialized:
-            # Disable float64 for TPU efficiency
+            # Disable float64 for TPU/GPU efficiency
             jax.config.update("jax_enable_x64", False)
             
             # Use bfloat16 for matrix operations
             jax.config.update("jax_default_matmul_precision", "bfloat16")
             
-            if not force_cpu:
-                # Force TPU platform and backend if available
-                jax.config.update("jax_platforms", "tpu")
-                jax.config.update("jax_xla_backend", "tpu")
-            
+            # Try to initialize TPU, fall back to available platform if not possible
+            try:
+                if not force_cpu:
+                    jax.config.update("jax_platforms", "tpu")
+                    jax.config.update("jax_xla_backend", "tpu")
+                    # Test TPU availability
+                    devices = jax.devices()
+                    if any('TPU' in device.device_kind for device in devices):
+                        cls._platform = "tpu"
+                    else:
+                        raise RuntimeError("No TPU devices found")
+            except Exception as e:
+                warnings.warn(f"TPU initialization failed: {str(e)}. Falling back to available platform.")
+                # Reset platform config to use available device
+                jax.config.update("jax_platforms", "")
+                devices = jax.devices()
+                cls._platform = devices[0].platform.lower()
+                
             cls._initialized = True
+    
+    @classmethod
+    def get_platform(cls) -> str:
+        """Get the current execution platform"""
+        if not cls._initialized:
+            cls.initialize()
+        return cls._platform
     
     @classmethod
     def get_device_info(cls) -> Dict[str, Any]:
         """Get information about the current device configuration"""
+        if not cls._initialized:
+            cls.initialize()
+            
         device = jax.devices()[0]
         return {
             "device_type": device.device_kind,
             "platform": device.platform,
             "device_count": len(jax.devices()),
-            "memory_per_device": "8GB",  # Standard for TPU v3-8
+            "memory_per_device": "8GB" if "TPU" in device.device_kind else "Unknown",
             "supports_bfloat16": True,
-            "supports_tf32": False,
+            "supports_tf32": "GPU" in device.device_kind,
             "supports_mixed_precision": True
         }
     
     @staticmethod
     def get_optimal_batch_size(model_dim: int, seq_len: int, dtype_bytes: int = 2) -> int:
-        """Calculate optimal batch size for TPU memory
+        """Calculate optimal batch size for available hardware
         
         Args:
             model_dim: Model hidden dimension size
@@ -53,16 +78,21 @@ class TPUConfig:
             dtype_bytes: Bytes per element (2 for bfloat16/float16, 4 for float32)
         
         Returns:
-            Optimal batch size for TPU memory
+            Optimal batch size for available hardware
         """
-        device_mem = 8 * (1024 ** 3)  # Assume 8GB per TPU core
+        # Conservative estimate for available memory
+        if TPUConfig._platform == "tpu":
+            device_mem = 8 * (1024 ** 3)  # 8GB for TPU
+        else:
+            device_mem = 4 * (1024 ** 3)  # 4GB for CPU/GPU
+            
         overhead = 1.2  # 20% overhead for activations
         return int(device_mem / (model_dim * seq_len * dtype_bytes * overhead))
     
     @staticmethod
     def get_optimal_config(hidden_size: int, seq_len: int, vocab_size: int,
                           num_layers: Optional[int] = None) -> Dict[str, Any]:
-        """Get optimal TPU configuration for model parameters
+        """Get optimal configuration for model parameters
         
         Args:
             hidden_size: Model hidden dimension
@@ -87,6 +117,7 @@ class TPUConfig:
                 "grad_clip_norm": 1.0
             },
             "hardware": {
+                "platform": TPUConfig.get_platform(),
                 "cores_per_replica": len(jax.devices()),
                 "replicas": 1,
                 "precision": "bfloat16"
@@ -100,18 +131,21 @@ class TPUConfig:
     
     @staticmethod
     def print_configuration() -> None:
-        """Print current TPU configuration"""
-        print("\nTPU Configuration:")
+        """Print current hardware configuration"""
+        if not TPUConfig._initialized:
+            TPUConfig.initialize()
+            
+        print("\nHardware Configuration:")
         print("-" * 50)
+        print(f"Platform: {TPUConfig.get_platform()}")
         print(f"Available devices: {len(jax.devices())}")
         print(f"Device type: {jax.devices()[0].device_kind}")
-        print(f"Platform: {jax.devices()[0].platform}")
         print(f"Using bfloat16: {jax.config.jax_enable_x64 == False}")
         print(f"Default matmul precision: {jax.config.jax_default_matmul_precision}")
         print("-" * 50)
 
 if __name__ == "__main__":
-    # Initialize TPU configuration
+    # Initialize hardware configuration
     TPUConfig.initialize()
     
     # Print current configuration

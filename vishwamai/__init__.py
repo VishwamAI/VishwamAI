@@ -2,6 +2,8 @@
 VishwamAI Transformer Implementation
 """
 
+import safetensors  # Import safetensors library
+
 # Core Model Components
 from .transformer import (
     create_vishwamai_transformer,
@@ -120,5 +122,8 @@ __all__ = [
     'DuckDBLogger',
     
     # Configuration
-    'DEFAULT_CONFIG'
+    'DEFAULT_CONFIG',
+    
+    # Model Saving
+    'safetensors'
 ]

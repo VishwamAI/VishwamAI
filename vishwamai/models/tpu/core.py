@@ -8,6 +8,14 @@ from jax import lax, random, jit, vmap
 import numpy as np
 from typing import Optional, Dict, List, Tuple, Union, Any
 import math
+import os
+
+# TPU and XLA configuration
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'  # Force single host device
+jax.config.update("jax_enable_x64", False)  # Disable float64 for TPU
+jax.config.update("jax_default_matmul_precision", "bfloat16")  # Use bfloat16
+jax.config.update("jax_platforms", "tpu")  # Force TPU platform
+jax.config.update("jax_xla_backend", "tpu")  # Use TPU XLA backend
 
 @jit
 def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarray:

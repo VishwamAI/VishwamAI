@@ -9,6 +9,12 @@ from typing import Optional, List, Tuple, Dict, Any
 import math
 from collections import deque
 
+# Configure JAX for TPU
+jax.config.update("jax_enable_x64", False)  # Disable float64 for TPU efficiency
+jax.config.update("jax_default_matmul_precision", "bfloat16")  # Use bfloat16 for matrix operations
+jax.config.update("jax_platforms", "tpu")  # Force TPU platform
+jax.config.update("jax_xla_backend", "tpu")  # Use TPU XLA backend
+
 from .cot_model import CoTModelTPU
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm
 

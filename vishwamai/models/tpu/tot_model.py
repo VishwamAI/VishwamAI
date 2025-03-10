@@ -12,6 +12,25 @@ from collections import deque
 from .cot_model import CoTModelTPU
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm
 
+def generate_tot(model: 'ToTModelTPU', input_ids: jnp.ndarray, max_length: int = 512,
+                temperature: float = 0.6, top_p: float = 0.95,
+                search_method: str = "bfs", beam_size: int = 5) -> jnp.ndarray:
+    """Standalone generation function for ToT outputs with tree search.
+    
+    Args:
+        model: The ToT model instance
+        input_ids: Input token IDs
+        max_length: Maximum sequence length
+        temperature: Sampling temperature
+        top_p: Nucleus sampling probability threshold
+        search_method: Search strategy ("bfs" or "dfs")
+        beam_size: Number of branches to explore at each step
+        
+    Returns:
+        Generated token IDs incorporating reasoning steps from tree search
+    """
+    return model.generate_tot(input_ids, max_length, temperature, top_p, search_method, beam_size)
+
 class ThoughtNodeTPU:
     """Represents a node in the thought tree with TPU state management"""
     def __init__(self, thought_text: str, node_id: str, parent=None,

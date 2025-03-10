@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from vishwamai.model import ModelConfig, VishwamAIModel, create_integrated_model
+from vishwamai.pipeline import pipeline
 
 def demo_model_usage():
     # Create model configuration
@@ -30,5 +31,30 @@ def demo_model_usage():
     
     return generated_tokens
 
+def main():
+    # Initialize pipeline with Phi-4
+    text_generator = pipeline(
+        "text-generation",
+        model="microsoft/phi-4",
+        model_kwargs={"torch_dtype": "auto"},
+        device_map="auto",
+    )
+
+    # Example chat messages
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a medieval knight and must provide explanations to modern people."
+        },
+        {
+            "role": "user",
+            "content": "How should I explain the Internet?"
+        }
+    ]
+
+    # Generate response
+    outputs = text_generator(messages, max_new_tokens=128)
+    print(outputs[0]["generated_text"])
+
 if __name__ == "__main__":
-    demo_model_usage()
+    main()

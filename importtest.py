@@ -1,156 +1,189 @@
 """
-TPU-optimized model components test
+VishwamAI Transformer Implementation - Import Test
 """
-import os
-import sys
-import warnings
+
+import unittest
 import jax
 import jax.numpy as jnp
-import haiku as hk
-import math
+from vishwamai import (
+    ChainOfThoughtPrompting,
+    TreeOfThoughts,
+    ThoughtNode,
+    evaluate_tot_solution,
+    compute_distillation_loss,
+    create_student_model,
+    initialize_from_teacher,
+    create_vishwamai_transformer,
+    create_train_state,
+    fp8_cast_transpose,
+    fp8_gemm_optimized,
+    block_tpu_matmul,
+    act_quant,
+    multi_head_attention_kernel,
+    flash_attention,
+    rope_embedding,
+    apply_rotary_pos_emb,
+    weight_dequant,
+    batch_norm_tpu,
+    fp8_gemm,
+    MLABlock,
+    MoELayer,
+    VishwamAIPipeline,
+    VishwamAITrainer,
+    create_trainer,
+    DuckDBLogger,
+)
+from vishwamai.transformer import TransformerModel, EnhancedTransformerModel
+from vishwamai.tokenizer import VishwamAITokenizer
+from vishwamai.model import VishwamAI
 
-from vishwamai.configs.tpu_config import TPUConfig
-from vishwamai.models.tpu.attention import FlashMLAttentionTPU
-from vishwamai.models.tpu.cot_model import CoTModelTPU
-from vishwamai.models.tpu.tot_model import ToTModelTPU
-from vishwamai.models.tpu.moe import OptimizedMoE
+class TestImports(unittest.TestCase):
+    """
+    Test cases to ensure all modules and functions are importable.
+    """
 
-def test_tpu_imports():
-    """Test TPU model component imports and initialization"""
-    try:
-        print("✓ Successfully imported JAX")
-        print("✓ Successfully imported Haiku")
+    def test_core_components(self):
+        # Test ChainOfThoughtPrompting
+        self.assertIsNotNone(ChainOfThoughtPrompting)
 
-        # Initialize TPU configuration
-        TPUConfig.initialize()
-        print("✓ Successfully initialized TPU configuration")
+        # Test TreeOfThoughts
+        self.assertIsNotNone(TreeOfThoughts)
+
+        # Test ThoughtNode
+        self.assertIsNotNone(ThoughtNode)
         
-        # Import VishwamAI TPU components
-        from vishwamai.models.tpu import (
-            TPUDeviceManager, TPUOptimizer,
-            TransformerComputeLayerTPU,
-            create_causal_mask,
-            apply_rotary_embedding,
-            get_optimal_tpu_config
-        )
-        print("✓ Successfully imported all TPU model components")
+        # Test evaluate_tot_solution
+        self.assertIsNotNone(evaluate_tot_solution)
 
-        # Optional Sonnet components
-        try:
-            import sonnet as snt
-            print("✓ Successfully imported optional Sonnet components")
-        except ImportError:
-            print("ℹ Sonnet components not available (optional)")
+        # Test compute_distillation_loss
+        self.assertIsNotNone(compute_distillation_loss)
 
-        # Initialize test variables with concrete shapes
-        batch_size = 2
-        seq_len = 32
-        embed_dim = 64
-        num_heads = 8
-        head_dim = embed_dim // num_heads
-        vocab_size = 32000  # Add vocabulary size for embedding tests
+        # Test create_student_model
+        self.assertIsNotNone(create_student_model)
+
+        # Test initialize_from_teacher
+        self.assertIsNotNone(initialize_from_teacher)
+
+        # Test create_vishwamai_transformer
+        self.assertIsNotNone(create_vishwamai_transformer)
+
+        # Test create_train_state
+        self.assertIsNotNone(create_train_state)
         
-        # Initialize random key with TPU-optimized settings
-        rng = jax.random.PRNGKey(42)  # Use fixed seed for reproducibility
         
-        # Create separate inputs for embedding and attention tests
-        # Integer input for embedding layers
-        embedding_input = jax.random.randint(rng, (batch_size, seq_len), 0, vocab_size, dtype=jnp.int32)
-        # Float input for attention layers
-        attention_input = jnp.ones((batch_size, seq_len, embed_dim), dtype=jnp.bfloat16)
+    def test_tpu_optimized_kernels(self):
+        # Test fp8_cast_transpose
+        self.assertIsNotNone(fp8_cast_transpose)
 
-        # Test FlashMLAttentionTPU with static shapes
-        def init_attention(x):
-            model = FlashMLAttentionTPU(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                block_size=16  # Small block size for testing
-            )
-            return model(x, is_training=True)
+        # Test fp8_gemm_optimized
+        self.assertIsNotNone(fp8_gemm_optimized)
+
+        # Test block_tpu_matmul
+        self.assertIsNotNone(block_tpu_matmul)
+
+        # Test act_quant
+        self.assertIsNotNone(act_quant)
+
+        # Test multi_head_attention_kernel
+        self.assertIsNotNone(multi_head_attention_kernel)
+
+        # Test flash_attention
+        self.assertIsNotNone(flash_attention)
+
+        # Test rope_embedding
+        self.assertIsNotNone(rope_embedding)
+
+        # Test apply_rotary_pos_emb
+        self.assertIsNotNone(apply_rotary_pos_emb)
+
+        # Test weight_dequant
+        self.assertIsNotNone(weight_dequant)
+
+        # Test batch_norm_tpu
+        self.assertIsNotNone(batch_norm_tpu)
         
-        transformed = hk.transform(init_attention)
-        params = transformed.init(rng, attention_input)
-        output = transformed.apply(params, rng, attention_input)
-        print("✓ FlashMLAttentionTPU test passed")
+        #Test fp8_gemm
+        self.assertIsNotNone(fp8_gemm)
 
-        # Test CoTModelTPU
-        def init_cot(x):
-            model = CoTModelTPU(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                vocab_size=vocab_size
-            )
-            # Only return logits from the tuple (logits, loss)
-            logits, _ = model(x, is_training=True)
-            return logits
-        
-        transformed_cot = hk.transform(init_cot)
-        params_cot = transformed_cot.init(rng, embedding_input)
-        output_cot = transformed_cot.apply(params_cot, rng, embedding_input)
-        print("✓ CoTModelTPU test passed")
+    def test_advanced_layers(self):
+        # Test MLABlock
+        self.assertIsNotNone(MLABlock)
 
-        # Test ToTModelTPU
-        def init_tot(x):
-            model = ToTModelTPU(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                vocab_size=vocab_size
-            )
-            # ToTModel might also return a tuple
-            output = model(x, is_training=True)
-            return output[0] if isinstance(output, tuple) else output
-        
-        transformed_tot = hk.transform(init_tot)
-        params_tot = transformed_tot.init(rng, embedding_input)
-        output_tot = transformed_tot.apply(params_tot, rng, embedding_input)
-        print("✓ ToTModelTPU test passed")
+        # Test MoELayer
+        self.assertIsNotNone(MoELayer)
 
-        # Test OptimizedMoE
-        def init_moe(x):
-            model = OptimizedMoE(
-                num_experts=4,
-                expert_size=embed_dim,
-                input_size=embed_dim,
-                vocab_size=vocab_size
-            )
-            # MoE might also return a tuple
-            output = model(x, is_training=True)
-            return output[0] if isinstance(output, tuple) else output
-        
-        transformed_moe = hk.transform(init_moe)
-        params_moe = transformed_moe.init(rng, embedding_input)
-        output_moe = transformed_moe.apply(params_moe, rng, embedding_input)
-        print("✓ OptimizedMoE test passed")
+    def test_pipeline_and_training(self):
+        # Test VishwamAIPipeline
+        self.assertIsNotNone(VishwamAIPipeline)
 
-        print("\n✓ All TPU component tests passed successfully!")
-        return True
-        
-    except ImportError as e:
-        print(f"❌ Import error: {str(e)}")
-        print("\nPlease ensure you have installed the required packages:")
-        print("pip install jax jaxlib dm-haiku optax")
-        return False
-    except Exception as e:
-        print(f"❌ Error during testing: {str(e)}")
-        print("\nError details:", str(e))
-        return False
+        # Test VishwamAITrainer
+        self.assertIsNotNone(VishwamAITrainer)
 
-if __name__ == "__main__":
-    print("Python version:", sys.version)
-    print("JAX version:", jax.__version__)
-    print("Haiku version:", hk.__version__)
-    print("\nStarting TPU component tests...")
+        # Test create_trainer
+        self.assertIsNotNone(create_trainer)
+
+    def test_logging(self):
+        # Test DuckDBLogger
+        self.assertIsNotNone(DuckDBLogger)
     
-    success = test_tpu_imports()
-    if success:
-        print("\n✅ All TPU component tests passed!")
-        print("\nComponent shapes:")
-        print("- Embedding input:", "(batch_size=2, seq_len=32)")
-        print("- Attention input:", "(batch_size=2, seq_len=32, embed_dim=64)")
-        print("- FlashMLAttention output:", "(batch_size=2, seq_len=32, embed_dim=64)")
-        print("- CoTModel output:", "(batch_size=2, seq_len=32, embed_dim=64)")
-        print("- ToTModel output:", "(batch_size=2, seq_len=32, embed_dim=64)")
-        print("- MoE output:", "(batch_size=2, seq_len=32, embed_dim=64)")
-    else:
-        print("\n❌ TPU component tests failed!")
-        sys.exit(1)
+    def test_transformer_models(self):
+        self.assertIsNotNone(TransformerModel)
+        self.assertIsNotNone(EnhancedTransformerModel)
+    
+    def test_tokenizer(self):
+        self.assertIsNotNone(VishwamAITokenizer)
+
+    def test_vishwamai_model(self):
+        self.assertIsNotNone(VishwamAI)
+
+    def test_example_usage(self):
+        # Check if we can create an instance of DuckDBLogger
+        logger = DuckDBLogger(db_path=":memory:")
+        self.assertIsNotNone(logger)
+        logger.close()
+
+        # Check if we can create an instance of EnhancedTransformerModel with TPU v2 optimized config
+        config = {
+            'vocab_size': 1000,
+            'num_layers': 2,
+            'num_heads': 4,
+            'head_dim': 32,  # Reduced for TPU v2 memory efficiency
+            'hidden_dim': 128,  # Adjusted for TPU v2
+            'mlp_dim': 256,  # Adjusted for TPU v2
+            'max_seq_len': 64,  # Reduced for testing
+            'use_enhanced': True,
+            'use_rotary': True,
+            'use_flash_attn': True,
+            'use_rms_norm': False,  # Using LayerNorm for TPU v2 stability
+            'dropout_rate': 0.1,
+            'dtype': jnp.float32  # Using float32 for TPU v2
+        }
+
+        # Create model and validate
+        model = create_vishwamai_transformer(config)
+        self.assertIsNotNone(model)
+
+        # Initialize training state
+        rng = jax.random.PRNGKey(0)
+        learning_rate_schedule = lambda step: 1e-3
+        state = create_train_state(rng, config, learning_rate_schedule)
+        self.assertIsNotNone(state)
+
+        # Test forward pass with proper shape
+        batch_size, seq_len = 1, 16
+        input_data = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        output = model.apply({'params': state.params}, input_data, deterministic=True)
+        self.assertEqual(output.shape, (batch_size, seq_len, config['vocab_size']))
+
+        # Test tokenizer
+        tokenizer = VishwamAITokenizer(model_path="test.model")
+        self.assertIsNotNone(tokenizer)
+
+        # Test VishwamAI model
+        vishwamai_model = VishwamAI(vocab_size=1000)
+        self.assertIsNotNone(vishwamai_model)
+        
+        
+if __name__ == '__main__':
+    unittest.main()
+

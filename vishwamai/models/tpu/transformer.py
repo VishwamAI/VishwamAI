@@ -6,10 +6,95 @@ TPU-optimized transformer implementation using JAX/Haiku
 import jax
 import jax.numpy as jnp
 import haiku as hk
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
+import math
 
 from .attention import FlashMLAttentionTPU, MultiModalAttentionTPU, TemporalAttentionTPU
-from .kernel_layers import TPUGEMMLinear
+from .kernel_layers import TPUGEMMLinear, TPULayerNorm, gelu_kernel
+from .core import apply_rotary_embedding, create_causal_mask
+
+class PositionalEncoding(hk.Module):
+    """TPU-optimized positional encoding using rotary embeddings."""
+    
+    def __init__(self, embed_dim: int, max_seq_len: int = 2048,
+                 scale_base: int = 10000, name: Optional[str] = None):
+        super().__init__(name=name)
+        self.embed_dim = embed_dim
+        self.max_seq_len = max_seq_len
+        self.scale_base = scale_base
+
+    def __call__(self, x: jnp.ndarray, positions: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+        if positions is None:
+            positions = jnp.arange(x.shape[1])
+            
+        # Generate frequency bands
+        freqs = self.scale_base ** (2 * (jnp.arange(self.embed_dim//2) // 2) / self.embed_dim)
+        angles = positions[:, None] / freqs[None, :]
+        
+        # Generate rotary embeddings
+        freqs_cis = jnp.exp(1j * angles).astype(jnp.complex64)
+        
+        # Use centralized rotary embedding function
+        return apply_rotary_embedding(x, freqs_cis)
+
+class TokenEmbedding(hk.Module):
+    """TPU-optimized token embedding with weight tying support."""
+    
+    def __init__(self, vocab_size: int, embed_dim: int,
+                 scale_grad_by_freq: bool = False,
+                 tie_weights: bool = False, name: Optional[str] = None):
+        super().__init__(name=name)
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.scale_grad_by_freq = scale_grad_by_freq
+        self.tie_weights = tie_weights
+        
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # Initialize embedding matrix
+        w_init = hk.initializers.TruncatedNormal(stddev=1.0 / math.sqrt(self.embed_dim))
+        w_embed = hk.get_parameter("w_embed", 
+                                 shape=[self.vocab_size, self.embed_dim],
+                                 dtype=x.dtype,
+                                 init=w_init)
+        
+        # Embedding lookup
+        embedded = jnp.take(w_embed, x, axis=0)
+        
+        # Scale embeddings
+        if self.scale_grad_by_freq:
+            # Count token frequencies for scaling
+            counts = jnp.bincount(x.reshape(-1), 
+                                length=self.vocab_size,
+                                minlength=self.vocab_size)
+            scale = 1.0 / jnp.maximum(counts, 1.0)
+            embedded = embedded * scale[x][..., None]
+            
+        return embedded * math.sqrt(self.embed_dim)
+
+class FeedForward(hk.Module):
+    """TPU-optimized feed-forward network with GEGLU activation."""
+    
+    def __init__(self, embed_dim: int, ff_dim: int,
+                 dropout_rate: float = 0.1,
+                 activation=gelu_kernel,
+                 name: Optional[str] = None):
+        super().__init__(name=name)
+        self.embed_dim = embed_dim
+        self.ff_dim = ff_dim
+        self.dropout_rate = dropout_rate
+        self.activation = activation
+        
+    def __call__(self, x: jnp.ndarray, is_training: bool = True) -> jnp.ndarray:
+        # Project to intermediate dimension
+        x = TPUGEMMLinear(self.ff_dim)(x)
+        x = self.activation(x)
+        x = hk.dropout(hk.next_rng_key(), self.dropout_rate, x) if is_training else x
+        
+        # Project back to embedding dimension
+        x = TPUGEMMLinear(self.embed_dim)(x)
+        x = hk.dropout(hk.next_rng_key(), self.dropout_rate, x) if is_training else x
+        
+        return x
 
 class TransformerComputeLayerTPU(hk.Module):
     def __init__(self, embed_dim: int, num_heads: int,
@@ -22,6 +107,11 @@ class TransformerComputeLayerTPU(hk.Module):
         self.dropout_rate = dropout_rate
         
     def __call__(self, x, mask=None, is_training=True):
+        seq_len = x.shape[1]
+        if mask is None:
+            # Use centralized causal mask function
+            mask = create_causal_mask(seq_len)
+        
         # Self attention
         normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
         attention = FlashMLAttentionTPU(self.embed_dim, self.num_heads)(

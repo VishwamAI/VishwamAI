@@ -1,48 +1,66 @@
 """
-TPU-optimized model components initialization using JAX/Haiku
+TPU-optimized model components initialization using JAX/Haiku/XLA
+Provides high-performance implementations of attention mechanisms, 
+transformer layers, and specialized optimizations for TPU hardware.
 """
 
 from .attention import (
     BaseAttentionTPU,
-    FlashMLAttentionTPU,
+    FlashMLAttentionTPU, 
     MultiModalAttentionTPU,
     TemporalAttentionTPU,
     SonnetFlashAttentionTPU
 )
+
 from .cot_model import (
     CoTModelTPU,
-    train_cot_model,
-    extract_answer
+    generate_cot
 )
+
 from .moe import (
     OptimizedMoE,
     ExpertModule,
     ExpertRouter,
-    compute_load_balancing_loss
+    compute_load_balancing_loss,
+    ExpertGating
 )
+
 from .tot_model import (
     ToTModelTPU,
-    ThoughtNodeTPU
+    ThoughtNodeTPU,
+    generate_tot
 )
+
 from .transformer import (
     TransformerComputeLayerTPU,
     TransformerMemoryLayerTPU,
-    HybridThoughtAwareAttentionTPU
+    HybridThoughtAwareAttentionTPU,
+    PositionalEncoding,
+    TokenEmbedding,
+    FeedForward
 )
+
 from .core import (
     TPUDeviceManager,
     TPUOptimizer,
     TPUDataParallel,
     TPUProfiler,
-    TPUModelUtils
+    TPUModelUtils,
+    apply_rotary_embedding,
+    create_causal_mask
 )
+
 from .kernel_layers import (
     TPUGEMMLinear,
     TPUGroupedGEMMLinear,
     TPULayerNorm,
     get_optimal_tpu_config,
     benchmark_matmul,
-    compute_numerical_error
+    compute_numerical_error,
+    DeepGEMMLinear,
+    DeepGEMMLayerNorm,
+    DeepGEMMGroupedLinear,
+    gelu_kernel
 )
 
 __all__ = [
@@ -50,41 +68,56 @@ __all__ = [
     "BaseAttentionTPU",
     "FlashMLAttentionTPU",
     "MultiModalAttentionTPU",
-    "TemporalAttentionTPU",
+    "TemporalAttentionTPU", 
     "SonnetFlashAttentionTPU",
     
-    # Core models
+    # Core models and generation
     "CoTModelTPU",
-    "OptimizedMoE",
+    "generate_cot",
     "ToTModelTPU",
     "ThoughtNodeTPU",
+    "generate_tot",
     
-    # Model components
-    "TransformerComputeLayerTPU",
-    "TransformerMemoryLayerTPU",
-    "HybridThoughtAwareAttentionTPU",
-    
-    # Expert components
+    # Mixture of Experts
+    "OptimizedMoE",
     "ExpertModule",
     "ExpertRouter",
+    "ExpertGating",
+    "compute_load_balancing_loss",
     
-    # TPU core utilities
+    # Transformer components
+    "TransformerComputeLayerTPU",
+    "TransformerMemoryLayerTPU", 
+    "HybridThoughtAwareAttentionTPU",
+    "PositionalEncoding",
+    "TokenEmbedding",
+    "FeedForward",
+    
+    # TPU infrastructure
     "TPUDeviceManager",
     "TPUOptimizer",
     "TPUDataParallel",
     "TPUProfiler",
     "TPUModelUtils",
     
-    # Kernel layers
+    # Core utilities
+    "apply_rotary_embedding",
+    "create_causal_mask",
+    
+    # Optimized kernel layers 
     "TPUGEMMLinear",
     "TPUGroupedGEMMLinear",
     "TPULayerNorm",
+    "DeepGEMMLinear",
+    "DeepGEMMLayerNorm",
+    "DeepGEMMGroupedLinear",
+    "gelu_kernel",
     
-    # Utility functions
-    "train_cot_model",
-    "extract_answer",
-    "compute_load_balancing_loss",
+    # Performance utilities
     "get_optimal_tpu_config",
     "benchmark_matmul",
     "compute_numerical_error"
 ]
+
+# Version
+__version__ = "0.1.0"

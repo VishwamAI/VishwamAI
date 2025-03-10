@@ -7,6 +7,45 @@ import jax.numpy as jnp
 from jax import lax, random, jit, vmap
 import numpy as np
 from typing import Optional, Dict, List, Tuple, Union, Any
+import math
+
+@jit
+def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarray:
+    """Apply rotary position embeddings to input tensor.
+    
+    Args:
+        x: Input tensor of shape [batch_size, seq_len, num_heads, head_dim]
+        freqs_cis: Complex rotary embeddings [seq_len, head_dim/2]
+    Returns:
+        Tensor with rotary embeddings applied
+    """
+    # Split last dimension for rotary computation
+    x_split = x.reshape(*x.shape[:-1], -1, 2)
+    
+    # Convert to complex numbers for rotation
+    x_complex = jnp.complex64(x_split[..., 0]) + 1j * jnp.complex64(x_split[..., 1]) 
+    
+    # Apply rotation
+    freqs = jnp.take(freqs_cis, jnp.arange(x.shape[-2]), axis=0)
+    x_rotated = x_complex * freqs
+    
+    # Convert back to real
+    x_out = jnp.stack([jnp.real(x_rotated), jnp.imag(x_rotated)], axis=-1)
+    return x_out.reshape(x.shape)
+
+@jit
+def create_causal_mask(seq_len: int, dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
+    """Create causal attention mask for transformer decoder.
+    
+    Args:
+        seq_len: Length of the sequence
+        dtype: Data type of the mask, default float32
+    Returns:
+        Causal mask of shape [seq_len, seq_len]
+    """
+    # Create lower triangular mask (including diagonal)
+    idxs = jnp.arange(seq_len)
+    return (idxs[:, None] >= idxs[None, :]).astype(dtype)
 
 class TPUDeviceManager:
     """Manages TPU device configuration and optimization"""
@@ -130,22 +169,6 @@ class TPUProfiler:
 class TPUModelUtils:
     """Utility functions for TPU model operations"""
     
-    @staticmethod
-    @jit
-    def apply_rotary_embedding(x: jnp.ndarray, sin: jnp.ndarray,
-                             cos: jnp.ndarray) -> jnp.ndarray:
-        """Apply rotary embeddings optimized for TPU"""
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-        return jnp.stack([
-            x1 * cos - x2 * sin,
-            x2 * cos + x1 * sin
-        ], axis=-1).reshape(x.shape)
-
-    @staticmethod
-    def create_causal_mask(seq_len: int) -> jnp.ndarray:
-        """Create causal attention mask"""
-        return jnp.triu(jnp.ones((seq_len, seq_len)), k=1) == 0
-
     @staticmethod
     def get_gradient_checkpoint_policy(memory_threshold: float = 0.9):
         """Get gradient checkpointing policy based on memory usage"""

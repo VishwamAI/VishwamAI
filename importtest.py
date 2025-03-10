@@ -1,65 +1,170 @@
-import importlib
+"""
+TPU-optimized model components test
+"""
 import os
+import sys
+import jax
+import jax.numpy as jnp
+import haiku as hk
+import math
 
-# Define the module path
-MODULE_PATH = "vishwamai.models.gpu"
-
-# List of components to test
-components = [
-    "BaseAttention", "FlashMLAAttention", "MultiModalAttention", "TemporalAttention",
-    "CoTModel", "OptimizedMoE", "ToTModel", "ThoughtNode",
-    "TransformerComputeLayer", "TransformerMemoryLayer", "HybridThoughtAwareAttention",
-    "DeepGEMMLinear", "DeepGEMMLayerNorm", "DeepGEMMGroupedLinear",
-    "extract_answer", "train_cot_model", "get_optimal_kernel_config",
-    "benchmark_gemm", "compute_numerical_error"
-]
-
-def test_imports():
-    failed_imports = []
-    for component in components:
-        try:
-            module = importlib.import_module(MODULE_PATH)
-            getattr(module, component)
-            print(f"✅ Successfully imported {component}")
-        except ImportError as e:
-            print(f"❌ Failed to import {component}: {e}")
-            failed_imports.append(component)
-        except AttributeError as e:
-            print(f"❌ Failed to import {component}: {e}")
-            failed_imports.append(component)
-        except Exception as e:
-            print(f"❌ Failed to import {component}: {e}")
-            failed_imports.append(component)
-
-    if failed_imports:
-        print("\nSummary of failed imports:")
-        for fail in failed_imports:
-            print(f" - {fail}")
-    else:
-        print("\nAll imports passed successfully!")
-
-def check_flash_mla_kernels():
-    """Check if flash_mla_kernels are initialized by looking for a marker file."""
-    marker_file_path = "vishwamai/models/gpu/optimizations/flash_mla/kernels_initialized.txt"
-    if not os.path.exists(marker_file_path):
-        print("\n⚠️ Warning: Flash MLA Kernels might not be initialized. Please run the flash MLA kernels install script")
-        return False
-    else:
-        print("\n✅ Flash MLA Kernels are initialized.")
-        return True
-
-def create_flash_mla_marker_file():
-  """Create a dummy marker file for the Flash MLA kernels."""
-  marker_file_path = "vishwamai/models/gpu/optimizations/flash_mla/kernels_initialized.txt"
-  os.makedirs(os.path.dirname(marker_file_path), exist_ok=True)  # Ensure directory exists
-  with open(marker_file_path, "w") as f:
-    f.write("Flash MLA Kernels initialized")
-    print(f"Created marker file: {marker_file_path}")
+def test_tpu_imports():
+    print("Testing TPU model component imports...")
     
+    try:
+        # Import all TPU components
+        from vishwamai.models.tpu import (
+            # Core attention mechanisms
+            FlashMLAttentionTPU,
+            MultiModalAttentionTPU,
+            TemporalAttentionTPU,
+            SonnetFlashAttentionTPU,
+            
+            # Core models
+            CoTModelTPU,
+            OptimizedMoE,
+            ToTModelTPU,
+            ThoughtNodeTPU,
+            
+            # Model components
+            TransformerComputeLayerTPU,
+            TransformerMemoryLayerTPU,
+            HybridThoughtAwareAttentionTPU,
+            PositionalEncoding,
+            TokenEmbedding,
+            FeedForward,
+            
+            # Expert components
+            ExpertModule,
+            ExpertRouter,
+            ExpertGating,
+            
+            # TPU core utilities
+            TPUDeviceManager,
+            TPUOptimizer,
+            TPUDataParallel,
+            TPUProfiler,
+            TPUModelUtils,
+            apply_rotary_embedding,
+            create_causal_mask,
+            
+            # Kernel layers
+            TPUGEMMLinear,
+            TPUGroupedGEMMLinear,
+            TPULayerNorm,
+            DeepGEMMLinear,
+            DeepGEMMLayerNorm,
+            DeepGEMMGroupedLinear,
+            gelu_kernel,
+            
+            # Generation utilities
+            generate_cot,
+            generate_tot,
+            
+            # Core utilities
+            compute_load_balancing_loss,
+            get_optimal_tpu_config,
+            benchmark_matmul,
+            compute_numerical_error
+        )
+        print("✓ Successfully imported all TPU model components")
+        
+        # Test basic initialization and utilities
+        print("\nTesting component initialization and utilities...")
+        batch_size, seq_len, embed_dim = 2, 64, 512
+        num_heads = 8
+        
+        # Test causal mask creation
+        def test_mask():
+            mask = create_causal_mask(seq_len)
+            return mask
+            
+        # Test rotary embeddings
+        def test_rotary():
+            x = jnp.ones((batch_size, seq_len, num_heads, embed_dim // num_heads))
+            freqs = jnp.exp(-jnp.arange(seq_len)[:, None] / 10000 ** (2 * jnp.arange(embed_dim // 2) / embed_dim))
+            freqs_cis = jnp.exp(1j * freqs).astype(jnp.complex64)
+            return apply_rotary_embedding(x, freqs_cis)
+            
+        # Test positional encoding
+        def test_pos_encoding(x):
+            pos_enc = PositionalEncoding(embed_dim=embed_dim, max_seq_len=seq_len)
+            return pos_enc(x)
+            
+        # Test token embedding
+        def test_embedding(x):
+            embed = TokenEmbedding(vocab_size=32000, embed_dim=embed_dim)
+            return embed(x)
+            
+        # Test feed-forward
+        def test_ffn(x):
+            ffn = FeedForward(embed_dim=embed_dim, ff_dim=embed_dim * 4)
+            return ffn(x)
+            
+        # Initialize components
+        rng = jax.random.PRNGKey(0)
+        rng, init_rng = jax.random.split(rng)
+        
+        # Test mask
+        mask_fn = hk.transform(test_mask)
+        mask = mask_fn.apply({}, init_rng)
+        print("✓ Successfully created causal mask")
+        
+        # Test rotary embeddings
+        rotary_fn = hk.transform(test_rotary)
+        rotary = rotary_fn.apply({}, init_rng)
+        print("✓ Successfully applied rotary embeddings")
+        
+        # Test positional encoding
+        x = jnp.ones((batch_size, seq_len, embed_dim))
+        pos_enc_fn = hk.transform(test_pos_encoding)
+        params = pos_enc_fn.init(init_rng, x)
+        pos_enc = pos_enc_fn.apply(params, init_rng, x)
+        print("✓ Successfully initialized positional encoding")
+        
+        # Test token embedding
+        x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        embed_fn = hk.transform(test_embedding)
+        params = embed_fn.init(init_rng, x_ids)
+        embeddings = embed_fn.apply(params, init_rng, x_ids)
+        print("✓ Successfully initialized token embedding")
+        
+        # Test feed-forward
+        ffn_fn = hk.transform(test_ffn)
+        params = ffn_fn.init(init_rng, x)
+        ffn_out = ffn_fn.apply(params, init_rng, x)
+        print("✓ Successfully initialized feed-forward network")
+        
+        # Test TPU utilities
+        config = get_optimal_tpu_config(hidden_size=embed_dim, seq_len=seq_len, batch_size=batch_size)
+        print("✓ Successfully generated TPU configuration")
+        
+        capabilities = TPUDeviceManager.get_hardware_capabilities()
+        print(f"✓ Detected hardware: {capabilities['device_type']}")
+        
+        return True
+        
+    except ImportError as e:
+        print(f"❌ Import error: {str(e)}")
+        return False
+    except Exception as e:
+        print(f"❌ Error during testing: {str(e)}")
+        return False
 
 if __name__ == "__main__":
-    # Simulate running the flash mla install script
-    create_flash_mla_marker_file()
-
-    if check_flash_mla_kernels():
-        test_imports()
+    print("Python version:", sys.version)
+    print("JAX version:", jax.__version__)
+    print("Haiku version:", hk.__version__)
+    print("\nStarting TPU component tests...")
+    
+    success = test_tpu_imports()
+    if success:
+        print("\n✅ All TPU component tests passed!")
+        print("\nComponent shapes:")
+        print("- Causal mask:", "(seq_len, seq_len)")
+        print("- Positional encoding:", "(batch_size, seq_len, embed_dim)")
+        print("- Token embedding:", "(batch_size, seq_len, embed_dim)")
+        print("- Feed-forward:", "(batch_size, seq_len, embed_dim)")
+    else:
+        print("\n❌ TPU component tests failed!")
+        sys.exit(1)

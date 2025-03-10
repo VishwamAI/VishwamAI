@@ -12,6 +12,11 @@ from collections import deque
 from .cot_model import CoTModelTPU
 from .kernel_layers import TPUGEMMLinear
 
+def generate_tot(model: 'ToTModelTPU', input_text: str, tokenizer, search_method: str = "bfs",
+                b: int = 5, tree_id: Optional[str] = None) -> str:
+    """Standalone generation function for ToT outputs"""
+    return model.solve_with_tot(input_text, tokenizer, search_method, b, tree_id)
+
 class ThoughtNodeTPU:
     """Represents a node in the thought tree with TPU state management"""
     def __init__(self, thought_text: str, node_id: str, parent=None, 

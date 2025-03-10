@@ -171,6 +171,59 @@ class ExpertRouter(hk.Module):
         return expert_indices, expert_weights
 
 
+class ExpertGating(hk.Module):
+    """Optimized gating mechanism for expert routing with TPU efficiency"""
+    
+    def __init__(self, num_experts: int, expert_capacity: int,
+                 noise_std: float = 1.0, use_balancing: bool = True,
+                 name: Optional[str] = None):
+        super().__init__(name=name)
+        self.num_experts = num_experts
+        self.expert_capacity = expert_capacity
+        self.noise_std = noise_std
+        self.use_balancing = use_balancing
+        
+    def __call__(self, x: jnp.ndarray, expert_mask: Optional[jnp.ndarray] = None,
+                 is_training: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Compute load-balanced routing"""
+        # Router logits
+        router_logits = hk.Linear(self.num_experts, with_bias=False)(x)
+        
+        if is_training and self.noise_std > 0:
+            # Add noise during training for better load balancing
+            noise = jax.random.normal(hk.next_rng_key(), router_logits.shape) * self.noise_std
+            router_logits = router_logits + noise
+            
+        if expert_mask is not None:
+            router_logits = jnp.where(expert_mask, router_logits, -1e9)
+            
+        # Compute router probabilities
+        router_probs = jax.nn.softmax(router_logits, axis=-1)
+        
+        # Get expert assignments and compute dispatch
+        top_k_gates, top_k_indices = jax.lax.top_k(router_probs, k=2)
+        gates_sum = jnp.sum(top_k_gates, axis=-1, keepdims=True)
+        top_k_gates = top_k_gates / gates_sum  # Normalize
+        
+        # Create dispatch tensors
+        dispatch_tensor = jnp.zeros(
+            (x.shape[0], self.num_experts, self.expert_capacity),
+            dtype=x.dtype
+        )
+        
+        # Expert balancing loss if needed
+        balancing_loss = None
+        if self.use_balancing and is_training:
+            # Compute fraction of tokens going to each expert
+            expert_usage = jnp.mean(router_probs, axis=0)
+            target_usage = jnp.ones_like(expert_usage) / self.num_experts
+            balancing_loss = jnp.sum(
+                expert_usage * jnp.log(expert_usage / target_usage)
+            )
+        
+        return top_k_gates, top_k_indices, dispatch_tensor, balancing_loss
+
+
 # Auxiliary load balancing
 def compute_load_balancing_loss(gates: jnp.ndarray, num_experts: int) -> jnp.ndarray:
     """Compute load balancing loss for better expert utilization"""

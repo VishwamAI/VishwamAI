@@ -11,6 +11,11 @@ from typing import Optional, Dict, Tuple
 from .transformer import TransformerComputeLayerTPU
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm
 
+def generate_cot(model: 'CoTModelTPU', input_ids: jnp.ndarray, max_length: int = 512,
+                temperature: float = 0.6, top_p: float = 0.95) -> jnp.ndarray:
+    """Standalone generation function for CoT outputs with nucleus sampling"""
+    return model.generate_cot(input_ids, max_length, temperature, top_p)
+
 class CoTModelTPU(hk.Module):
     def __init__(self, embed_dim: int = 512, num_layers: int = 12,
                  num_heads: int = 8, ff_dim: int = 2048,

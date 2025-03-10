@@ -22,6 +22,8 @@ from tensorflow.experimental import dlpack
 import math
 from abc import ABC, abstractmethod
 
+from .core import apply_rotary_embedding, create_causal_mask
+
 # Enable bfloat16 for TPU efficiency
 from jax import config
 config.update("jax_enable_x64", False)
@@ -142,6 +144,9 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
         batch_size, num_heads, seq_len, head_dim = q.shape
         output = jnp.zeros_like(v, dtype=jnp.bfloat16)
         vectorized_attention = vmap(self._attention_head, in_axes=(0, 0, 0, 0, None, None))
+        
+        # Use centralized causal mask if needed
+        causal_mask = create_causal_mask(seq_len) if self.causal else None
 
         def scan_query_block(carry, i):
             output, q, k, v, mask = carry
@@ -149,8 +154,14 @@ class FlashMLAttentionTPU(BaseAttentionTPU):
             q_block = q[:, :, i:i_end, :]
             k_block = k[:, :, :i_end, :] if self.causal else k
             v_block = v[:, :, :i_end, :] if self.causal else v
-            mask_block = mask[:, :, i:i_end, :i_end] if mask is not None and self.causal else mask
-            output_block = vectorized_attention(q_block, k_block, v_block, mask_block, self.causal, self.sm_scale)
+            
+            # Combine causal and attention masks if both present
+            block_mask = mask[:, :, i:i_end, :i_end] if mask is not None else None
+            if causal_mask is not None:
+                block_causal = causal_mask[i:i_end, :i_end]
+                block_mask = block_causal if block_mask is None else (block_mask & block_causal)
+                
+            output_block = vectorized_attention(q_block, k_block, v_block, block_mask, self.causal, self.sm_scale)
             output = output.at[:, :, i:i_end, :].set(output_block)
             return (output, q, k, v, mask), None
 
@@ -285,7 +296,12 @@ class TemporalAttentionTPU(BaseAttentionTPU):
         rng = rng or random.PRNGKey(0)
         batch_size, seq_len, _ = x.shape
         temporal_positions = jnp.arange(seq_len) if temporal_positions is None else temporal_positions
-        temporal_emb = self.temporal_embeddings[:, temporal_positions]
+        
+        # Apply rotary embeddings to temporal positions
+        freqs = jnp.exp(-temporal_positions[:, None] / 10000 ** (2 * jnp.arange(self.embed_dim // 2) / self.embed_dim))
+        freqs_cis = jnp.exp(1j * freqs).astype(jnp.complex64)
+        temporal_emb = apply_rotary_embedding(self.temporal_embeddings, freqs_cis)
+        
         x_temporal = self.time_mixer(jnp.concatenate([x, temporal_emb], axis=-1))
         x_temporal = self.temporal_conv(x_temporal.transpose(0, 2, 1)).transpose(0, 2, 1)  # Temporal convolution
         q = self._reshape_for_multihead(self.q_proj(x_temporal).astype(jnp.bfloat16))

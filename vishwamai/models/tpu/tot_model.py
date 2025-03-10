@@ -14,6 +14,38 @@ from .cot_model import CoTModelTPU
 from .kernel_layers import TPUGEMMLinear, TPULayerNorm
 from .core import DTYPE_CONFIG
 
+def generate_tot(model: 'ToTModelTPU', input_text: str, tokenizer,
+                search_method: str = "bfs", max_thoughts: int = 5,
+                temperature: float = 0.8, max_steps: int = 50) -> str:
+    """
+    Generate solution using Tree of Thoughts with automatic search method selection.
+    
+    Args:
+        model: ToTModelTPU instance
+        input_text: Input text prompt
+        tokenizer: Tokenizer instance
+        search_method: Search strategy ("bfs" or "dfs")
+        max_thoughts: Maximum number of thoughts to consider at each step
+        temperature: Sampling temperature for thought generation
+        max_steps: Maximum number of steps to search
+        
+    Returns:
+        Generated solution with thought process
+    """
+    # Ensure model parameters are set
+    model.max_thoughts = max_thoughts
+    model.max_steps = max_steps
+    
+    # Generate solution using Tree of Thoughts
+    solution = model.solve_with_tot(
+        input_text=input_text,
+        tokenizer=tokenizer,
+        search_method=search_method,
+        b=max_thoughts
+    )
+    
+    return solution
+
 class ThoughtNodeTPU:
     """Represents a node in the thought tree with TPU state management"""
     def __init__(self, thought_text: str, node_id: str, parent=None,

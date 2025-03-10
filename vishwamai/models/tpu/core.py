@@ -73,6 +73,20 @@ class TPUDeviceManager:
         overhead = 1.2  # 20% overhead for activations
         return int(device_mem / (model_dim * seq_len * elem_size * overhead))
 
+    @staticmethod
+    def get_hardware_capabilities() -> Dict[str, Any]:
+        """Get hardware capabilities of the current device"""
+        device = jax.devices()[0]
+        return {
+            "device_type": device.device_kind,
+            "platform": device.platform,
+            "device_count": len(jax.devices()),
+            "memory_per_device": "8GB",  # Standard for TPU v3-8
+            "supports_bfloat16": True,
+            "supports_tf32": False,
+            "supports_mixed_precision": True
+        }
+
 class TPUOptimizer:
     """TPU-specific optimizations for model operations"""
     

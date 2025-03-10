@@ -20,12 +20,19 @@ import optax
 import haiku as hk
 import numpy as np
 import tensorflow as tf
-import sonnet as snt
-from tensorflow.experimental import dlpack
+import warnings
 from typing import Optional, Dict, Any, List, Tuple
 
-# Assuming attention mechanisms are available from a separate module
-from vishwamai.models.tpu.attention import OptimizedMoEAttention, FlashMLAttentionTPU
+from .attention import FlashMLAttentionTPU
+from .moe import OptimizedMoE
+
+# Optional Sonnet import
+try:
+    import sonnet as snt
+    SONNET_AVAILABLE = True
+except ImportError:
+    SONNET_AVAILABLE = False
+    warnings.warn("Sonnet not available. SonnetDeepGEMMLinear will not be available.")
 
 # Enable bfloat16 for TPU efficiency
 from jax import config
@@ -269,20 +276,29 @@ class DeepGEMMGroupedLinear(nn.Module):
         output = lax.fori_loop(0, self.num_groups, group_fn, output)
         return output.astype(jnp.float32)
 
-# Sonnet Variants
-class SonnetDeepGEMMLinear(snt.Module):
-    """Sonnet-based DeepGEMM-inspired linear layer."""
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, name: str = "sonnet_deepgemm_linear"):
-        super().__init__(name=name)
-        self.in_features = in_features
-        self.out_features = out_features
-        self.bias = bias
-        self.linear = snt.Linear(out_features, with_bias=bias)
+# Sonnet Variants - Only defined if Sonnet is available
+if SONNET_AVAILABLE:
+    class SonnetDeepGEMMLinear(snt.Module):
+        """Sonnet-based DeepGEMM-inspired linear layer."""
+        def __init__(self, in_features: int, out_features: int, bias: bool = True, name: str = "sonnet_deepgemm_linear"):
+            super().__init__(name=name)
+            self.in_features = in_features
+            self.out_features = out_features
+            self.bias = bias
+            self.linear = snt.Linear(out_features, with_bias=bias)
 
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x_tf = tf.experimental.dlpack.from_dlpack(jax.dlpack.to_dlpack(x))
-        output = self.linear(x_tf)
-        return jax.dlpack.from_dlpack(tf.experimental.dlpack.to_dlpack(output))
+        def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+            x_tf = tf.experimental.dlpack.from_dlpack(jax.dlpack.to_dlpack(x))
+            output = self.linear(x_tf)
+            return jax.dlpack.from_dlpack(tf.experimental.dlpack.to_dlpack(output))
+
+    def forward_sonnet_deepgemm_linear(x):
+        model = SonnetDeepGEMMLinear(in_features=512, out_features=50000)
+        def apply_fn(x): return model(x)
+        return hk.transform(apply_fn)(x)
+else:
+    SonnetDeepGEMMLinear = None
+    forward_sonnet_deepgemm_linear = None
 
 # Core Transformer Layers
 class PositionalEncoding(nn.Module):
@@ -355,7 +371,7 @@ class KernelTransformer(nn.Module):
     num_heads: int
     ff_dim: int
     max_seq_len: int = 512
-    attention_class: type = OptimizedMoEAttention
+    attention_class: type = FlashMLAttentionTPU
     attention_kwargs: dict = None
     dropout_rate: float = 0.1
 

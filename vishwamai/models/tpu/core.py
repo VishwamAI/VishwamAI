@@ -44,28 +44,28 @@ def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarra
     x_out = jnp.stack([jnp.real(x_rotated), jnp.imag(x_rotated)], axis=-1)
     return x_out.reshape(x.shape)
 
-def create_causal_mask(seq_len: int, dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
+def create_causal_mask(seq_len: int, batch_size: Optional[int] = None, dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
     """Create causal attention mask for transformer decoder.
-    
-    This version handles dynamic shapes by using lax.dynamic_slice.
     
     Args:
         seq_len: Length of the sequence
+        batch_size: Optional batch size for broadcasting
         dtype: Data type of the mask, default float32
     Returns:
-        Causal mask of shape [seq_len, seq_len]
+        Causal mask of shape [batch_size, 1, seq_len, seq_len] if batch_size is provided,
+        otherwise [1, 1, seq_len, seq_len]
     """
-    # Create a static larger mask that we'll slice dynamically
-    max_len = 2048  # Maximum reasonable sequence length
-    idxs = jnp.arange(max_len)
-    mask = (idxs[:, None] >= idxs[None, :])
+    # Create basic causal mask
+    idxs = jnp.arange(seq_len)
+    mask = (idxs[None, :] >= idxs[:, None])
     
-    # Dynamically slice to the actual sequence length
-    mask = lax.dynamic_slice(
-        mask,
-        (0, 0),
-        (seq_len, seq_len)
-    )
+    # Reshape for attention broadcasting (batch_size, num_heads, q_len, k_len)
+    mask = mask.reshape(1, 1, seq_len, seq_len)
+    
+    # Broadcast to batch size if provided
+    if batch_size is not None:
+        mask = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len))
+    
     return mask.astype(dtype)
 
 class TPUDeviceManager:

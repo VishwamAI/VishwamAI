@@ -108,10 +108,10 @@ class TransformerComputeLayerTPU(hk.Module):
         self.attention = FlashMLAttentionTPU(embed_dim, num_heads)
         
     def __call__(self, x, mask=None, is_training=True):
-        seq_len = x.shape[1]
+        batch_size, seq_len = x.shape[:2]
         if mask is None:
-            # Use centralized causal mask function
-            mask = create_causal_mask(seq_len)
+            # Pass batch_size to create_causal_mask for proper broadcasting
+            mask = create_causal_mask(seq_len, batch_size)
         
         # Self attention
         normed = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)

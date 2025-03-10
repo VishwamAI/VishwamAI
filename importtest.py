@@ -59,23 +59,26 @@ def test_tpu_imports():
         freqs_cis = jnp.exp(1j * freqs)  # [seq_len, head_dim/2]
         
         def init_components(x, x_ids):
-            # Create mask with static shape during tracing
-            mask = create_causal_mask(32)  # Use concrete size
+            # Create mask with proper broadcasting shape
+            mask = create_causal_mask(seq_len, batch_size)  # [batch_size, 1, seq_len, seq_len]
             
             # Apply rotary embeddings
-            rotary_out = apply_rotary_embedding(x, freqs_cis)
+            rotary_out = apply_rotary_embedding(
+                x.reshape(batch_size, seq_len, num_heads, head_dim),
+                freqs_cis
+            )
             
             # Initialize remaining components
             pos_enc = jnp.zeros((1, seq_len, embed_dim), dtype=jnp.bfloat16)
             embed = hk.Embed(vocab_size=1000, embed_dim=embed_dim)(x_ids)
             
-            # Initialize transformer layer
+            # Initialize transformer layer with explicit mask
             transformer = TransformerComputeLayerTPU(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 ff_dim=embed_dim * 4
             )
-            ffn = transformer(x)
+            ffn = transformer(x, mask=mask)
             
             return pos_enc, embed, ffn, rotary_out, mask
 
@@ -125,7 +128,7 @@ if __name__ == "__main__":
     if success:
         print("\n✅ All TPU component tests passed!")
         print("\nComponent shapes:")
-        print("- Causal mask:", "(seq_len, seq_len)")
+        print("- Causal mask:", "(batch_size, 1, seq_len, seq_len)")
         print("- Positional encoding:", "(batch_size, seq_len, embed_dim)")
         print("- Token embedding:", "(batch_size, seq_len, embed_dim)")
         print("- Feed-forward:", "(batch_size, seq_len, embed_dim)")

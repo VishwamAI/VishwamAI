@@ -40,24 +40,30 @@ def test_tpu_imports():
             print("ℹ Sonnet components not available (optional)")
 
         # Initialize test variables with concrete shapes
-        batch_size, seq_len = jnp.array(2), jnp.array(32)
+        batch_size = 2
+        seq_len = 32
         embed_dim = 64
         num_heads = 8
         head_dim = embed_dim // num_heads
         
         # Initialize random key with TPU-optimized settings
         rng = jax.random.PRNGKey(42)  # Use fixed seed for reproducibility
-        x = jnp.ones((batch_size, seq_len, embed_dim), dtype=jnp.bfloat16)
+        x = jnp.ones((batch_size, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
         x_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        x_rot = jnp.ones((batch_size, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
+        
+        # Create rotary embeddings with matching shape for head_dim
+        freqs = jnp.arange(seq_len)[:, None] / jnp.power(
+            10000, 
+            2 * jnp.arange(head_dim // 2)[None, :] / head_dim
+        )
+        freqs_cis = jnp.exp(1j * freqs)  # [seq_len, head_dim/2]
         
         def init_components(x, x_ids):
             # Create mask with static shape during tracing
             mask = create_causal_mask(32)  # Use concrete size
             
             # Apply rotary embeddings
-            rotary_pos = jnp.exp(1j * x_rot)
-            rotary_out = apply_rotary_embedding(x_rot, rotary_pos)
+            rotary_out = apply_rotary_embedding(x, freqs_cis)
             
             # Initialize remaining components
             pos_enc = jnp.zeros((1, seq_len, embed_dim), dtype=jnp.bfloat16)

@@ -28,16 +28,19 @@ def apply_rotary_embedding(x: jnp.ndarray, freqs_cis: jnp.ndarray) -> jnp.ndarra
         Tensor with rotary embeddings applied
     """
     # Split last dimension for rotary computation
-    x_split = x.reshape(*x.shape[:-1], -1, 2)
+    x_reshape = x.reshape(*x.shape[:-1], -1, 2)
     
     # Convert to complex numbers for rotation
-    x_complex = jnp.complex64(x_split[..., 0]) + 1j * jnp.complex64(x_split[..., 1]) 
+    x_complex = jnp.complex64(x_reshape[..., 0]) + 1j * jnp.complex64(x_reshape[..., 1])
     
-    # Apply rotation
-    freqs = jnp.take(freqs_cis, jnp.arange(x.shape[-2]), axis=0)
-    x_rotated = x_complex * freqs
+    # Reshape freqs_cis for broadcasting
+    # Original shape: [seq_len, head_dim/2] -> [1, seq_len, 1, head_dim/2]
+    freqs_cis = freqs_cis.reshape(1, freqs_cis.shape[0], 1, freqs_cis.shape[1])
     
-    # Convert back to real
+    # Apply rotation with proper broadcasting
+    x_rotated = x_complex * freqs_cis
+    
+    # Convert back to real and restore original shape
     x_out = jnp.stack([jnp.real(x_rotated), jnp.imag(x_rotated)], axis=-1)
     return x_out.reshape(x.shape)
 

@@ -260,6 +260,56 @@ class ToTModelTPU(CoTModelTPU):
 
         return best_node
 
+    def generate_tot(self, input_ids: jnp.ndarray, max_length: int = 512,
+                    temperature: float = 0.6, top_p: float = 0.95,
+                    search_method: str = "bfs", beam_size: int = 5) -> jnp.ndarray:
+        """Generate output using Tree of Thoughts with specified search strategy.
+        
+        Args:
+            input_ids: Input token IDs
+            max_length: Maximum sequence length
+            temperature: Sampling temperature
+            top_p: Nucleus sampling probability threshold
+            search_method: Search strategy ("bfs" or "dfs")
+            beam_size: Number of branches to explore at each step
+            
+        Returns:
+            Generated token IDs incorporating reasoning steps
+        """
+        # Create root thought
+        root = ThoughtNodeTPU("Start", node_id="root", score=1.0)
+        
+        # Use appropriate search strategy
+        search_fn = self._bfs_search if search_method.lower() == "bfs" else self._dfs_search
+        final_node = search_fn(input_ids, root, beam_size)
+        
+        if final_node:
+            # Convert thought path to token sequence
+            thought_path = final_node.path_to_root()[1:]  # Skip root node
+            
+            @jax.jit
+            def generate_sequence():
+                # Initialize with input
+                sequence = input_ids
+                
+                # Add each thought step
+                for thought in thought_path:
+                    # Generate tokens for this thought
+                    thought_ids = self.generate_cot(
+                        sequence,
+                        max_length=max_length,
+                        temperature=temperature,
+                        top_p=top_p
+                    )
+                    sequence = thought_ids
+                
+                return sequence
+                
+            return generate_sequence()
+        
+        # Fallback to standard generation if search fails
+        return self.generate_cot(input_ids, max_length, temperature, top_p)
+
 # Example usage and test
 if __name__ == "__main__":
     def run_tot(x: jnp.ndarray) -> jnp.ndarray:

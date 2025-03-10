@@ -300,27 +300,23 @@ def rope_embedding(
     
     return rotated.reshape(x.shape)
 
-def apply_rotary_pos_emb(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    cos: jnp.ndarray,
-    sin: jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Apply rotary position embeddings to queries and keys.
-    Optimized for TPU with minimal memory overhead.
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Apply rotary position embeddings to queries and keys."""
+    # Rotate queries and keys
+    q_rot = rotate_half(q)
+    k_rot = rotate_half(k)
     
-    Args:
-        q: Query tensor
-        k: Key tensor
-        cos: Cosine part of rotary embedding
-        sin: Sine part of rotary embedding
-    """
-    def rotate_half(x):
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return jnp.stack([-x2, x1], axis=-1).reshape(x.shape)
+    # Apply rotary embeddings
+    q_out = q * cos + q_rot * sin
+    k_out = k * cos + k_rot * sin
     
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+    return q_out, k_out
 
 # TPU performance utilities
 def auto_sharding(x: jnp.ndarray, num_devices: int) -> jnp.ndarray:

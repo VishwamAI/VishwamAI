@@ -410,88 +410,99 @@ class FlashAttention(nn.Module):
                 mask: Optional[jnp.ndarray] = None,
                 deterministic: bool = True) -> jnp.ndarray:
         
-        # Get input dimensions
-        batch_size = query.shape[0]
-        seq_len_q = query.shape[2]  # Input is already [batch, heads, seq, dim]
-        seq_len_kv = key.shape[2]
+        batch_size, seq_len_q = query.shape[0], query.shape[2]
+        _, _, seq_len_k, _ = key.shape
         
         # TPU v2 optimal block sizes
-        block_size = 32  # Reduced from 128 for TPU v2
-        chunk_size = 128  # Process in smaller chunks for better memory usage
+        block_q = min(32, seq_len_q)  # Reduced for TPU v2
+        block_k = min(32, seq_len_k)  # Keep blocks small for TPU v2
         
-        # Pad sequences to multiple of block_size
-        pad_q = (block_size - seq_len_q % block_size) % block_size
-        pad_kv = (block_size - seq_len_kv % block_size) % block_size
+        # Pad sequences if needed
+        def pad_to_multiple(x, block_size):
+            pad_len = (block_size - x.shape[2] % block_size) % block_size
+            return jnp.pad(x, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
         
-        # Apply padding with correct dimensions (batch, heads, seq, dim)
-        if pad_q > 0:
-            query = jnp.pad(query, ((0, 0), (0, 0), (0, pad_q), (0, 0)))
-        if pad_kv > 0:
-            key = jnp.pad(key, ((0, 0), (0, 0), (0, pad_kv), (0, 0)))
-            value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_kv), (0, 0)))
-            
-        # Split into chunks for TPU v2 memory efficiency
-        num_chunks = max(1, seq_len_kv // chunk_size)
+        query = pad_to_multiple(query, block_q)
+        key = pad_to_multiple(key, block_k)
+        value = pad_to_multiple(value, block_k)
         
-        # Initialize accumulators
-        output_chunks = []
+        # Initialize accumulators with proper types for TPU
+        acc_dtype = jnp.float32  # Use float32 for accumulation
+        O = jnp.zeros((batch_size, self.num_heads, seq_len_q, self.head_dim), dtype=acc_dtype)
+        L = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=acc_dtype) * -1e4
+        m = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=acc_dtype) * -1e4
         
-        # Process chunks
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, seq_len_kv)
+        # Scale factor for better numerical stability on TPU
+        scale = 1.0 / jnp.sqrt(self.head_dim)
+        
+        # Process attention in blocks
+        def process_block(carry, block_idx):
+            O, L, m = carry
+            start_idx = block_idx * block_k
+            end_idx = min(start_idx + block_k, seq_len_k)
             
-            # Get current chunk
-            key_chunk = lax.dynamic_slice(key, (0, 0, start_idx, 0), 
-                                        (batch_size, self.num_heads, end_idx - start_idx, self.head_dim))
-            value_chunk = lax.dynamic_slice(value, (0, 0, start_idx, 0),
-                                          (batch_size, self.num_heads, end_idx - start_idx, self.head_dim))
-            
-            # Quantize for TPU with adjusted scale for v2
-            query_chunk_quant, query_chunk_scale = act_quant(query, num_bits=8)
-            key_chunk_quant, key_chunk_scale = act_quant(key_chunk, num_bits=8)
-            value_chunk_quant, value_chunk_scale = act_quant(value_chunk, num_bits=8)
-            
-            # Compute attention scores for current chunk
-            chunk_scores = fp8_gemm_optimized(
-                query_chunk_quant, query_chunk_scale,
-                key_chunk_quant, key_chunk_scale,
-                transpose_b=True
+            # Get current key/value block
+            k_block = lax.dynamic_slice(
+                key,
+                (0, 0, start_idx, 0),
+                (batch_size, self.num_heads, block_k, self.head_dim)
+            )
+            v_block = lax.dynamic_slice(
+                value,
+                (0, 0, start_idx, 0),
+                (batch_size, self.num_heads, block_k, self.head_dim)
             )
             
-            # Scale scores
-            chunk_scores = chunk_scores / jnp.sqrt(self.head_dim)
+            # Compute attention scores with TPU optimization
+            q_scaled = query * scale
+            k_block_scaled = k_block * scale
             
-            # Apply mask if provided
+            # Use FP8 GEMM for attention computation
+            S = fp8_gemm_optimized(
+                q_scaled, jnp.ones_like(scale),
+                k_block_scaled.transpose(0, 1, 3, 2), jnp.ones_like(scale)
+            )
+            
             if mask is not None:
-                mask_chunk = lax.dynamic_slice(mask, (0, 0, 0, start_idx),
-                                             (batch_size, 1, seq_len_q, end_idx - start_idx))
-                chunk_scores = jnp.where(mask_chunk, chunk_scores, -1e10)
-            
-            # Compute attention weights
-            chunk_weights = jax.nn.softmax(chunk_scores, axis=-1)
-            
-            if not deterministic:
-                chunk_weights = nn.Dropout(rate=self.dropout_rate)(
-                    chunk_weights, deterministic=False
+                mask_block = lax.dynamic_slice(
+                    mask,
+                    (0, 0, 0, start_idx),
+                    (batch_size, 1, seq_len_q, block_k)
                 )
+                S = jnp.where(mask_block, S, -1e4)
             
-            # Apply attention to values
-            chunk_output = fp8_gemm_optimized(
-                chunk_weights, jnp.ones_like(query_chunk_scale),
-                value_chunk_quant, value_chunk_scale
-            )
+            # Update running maximum (TPU optimized)
+            m_block = jnp.max(S, axis=-1, keepdims=True)
+            m_new = jnp.maximum(m, m_block)
             
-            output_chunks.append(chunk_output)
+            # Compute attention weights with stable softmax
+            exp_S = jnp.exp(S - m_new)
+            L_new = L * jnp.exp(m - m_new) + jnp.sum(exp_S, axis=-1, keepdims=True)
+            
+            # Update output with optimized GEMM
+            O_new = (O * jnp.exp(m - m_new) + 
+                    fp8_gemm_optimized(
+                        exp_S, jnp.ones_like(scale),
+                        v_block, jnp.ones_like(scale)
+                    )) / L_new
+            
+            return (O_new, L_new, m_new), None
         
-        # Combine chunks
-        output = jnp.concatenate(output_chunks, axis=2)
+        # Run blocked attention
+        num_blocks = (seq_len_k + block_k - 1) // block_k
+        init_carry = (O, L, m)
+        (O_final, _, _), _ = lax.scan(
+            process_block,
+            init_carry,
+            jnp.arange(num_blocks)
+        )
         
         # Remove padding if needed
-        if pad_q > 0:
-            output = output[:, :, :seq_len_q, :]
-            
-        return output  # Returns in shape [batch, heads, seq, dim]
+        if seq_len_q < O_final.shape[2]:
+            O_final = O_final[:, :, :seq_len_q, :]
+        
+        # Cast back to original dtype
+        return O_final.astype(self.dtype)
 
 class RMSNorm(nn.Module):
     """TPU-optimized RMSNorm for better performance than LayerNorm"""

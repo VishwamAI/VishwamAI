@@ -1,0 +1,42 @@
+# Core Dependencies
+jax==0.5.2
+jaxlib==0.5.1
+flax==0.10.4
+optax==0.2.4
+transformers==4.36.0
+torch==2.6.0
+numpy==1.26.4
+safetensors==0.5.3
+
+# TPU Support
+cloud-tpu-client>=0.10
+libtpu-nightly
+
+# Data Processing
+datasets>=2.14.0
+sentencepiece==0.2.0
+tokenizers>=0.15.0
+huggingface-hub==0.29.2
+
+# Training Utilities
+wandb==1.39.2
+duckdb==1.2.1
+tqdm==4.67.1
+pyarrow==16.1.0
+
+# Memory Optimization
+einops==0.8.1
+chex==0.1.89
+jaxtyping==0.2.38
+optree==0.14.1
+orbax-checkpoint==0.11.8
+
+# Development
+ipython==8.20.0
+jupyter==1.0.0
+notebook==6.4.12
+
+# Additional Libraries
+scipy==1.11.4
+ml_collections==1.0.0
+typing_extensions==4.12.2

@@ -55,7 +55,6 @@ traces/
 
 # Data
 data/
-*.txt
 *.csv
 *.tsv
 *.jsonl

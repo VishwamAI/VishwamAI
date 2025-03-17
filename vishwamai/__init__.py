@@ -3,7 +3,7 @@
 from .model import VishwamAI
 from .tokenizer import VishwamAITokenizer
 from .training import TPUTrainingConfig, VishwamAITrainer
-from .distill import DistillationTrainer, compute_distillation_loss
+from .distill import DistillationTrainer, LinearPathDistillation,IntermediateLayerDistillation, ProgressiveLayerDropout, create_layer_mapping, compute_attention_distillation_loss
 from .flash_attention import flash_attention, FlashAttentionLayer
 from .layers import (
     TPUGEMMLinear,
@@ -13,14 +13,13 @@ from .layers import (
     create_layer_factory
 )
 from .pipeline import VishwamAIPipeline
-from .device_mesh import configure_device_mesh, DeviceMesh
-from .profiler import TPUProfiler, profile_memory_usage
+from .device_mesh import TPUMeshContext
+from .profiler import TPUProfiler
 from .logger import DuckDBLogger
 from .tot import TreeOfThoughts, ThoughtNode, evaluate_tot_solution
 from .cot import ChainOfThoughtPrompting
 
 __version__ = "0.1.0"
-
 __all__ = [
     # Core Model
     "VishwamAI",
@@ -30,7 +29,11 @@ __all__ = [
     "TPUTrainingConfig",
     "VishwamAITrainer",
     "DistillationTrainer",
-    "compute_distillation_loss",
+    "LinearPathDistillation",
+    "IntermediateLayerDistillation",
+    "ProgressiveLayerDropout",
+    "create_layer_mapping",
+    "compute_attention_distillation_loss",
     
     # Attention and Layers
     "flash_attention",
@@ -43,10 +46,8 @@ __all__ = [
     
     # Pipeline and Infrastructure
     "VishwamAIPipeline",
-    "configure_device_mesh",
-    "DeviceMesh",
+    "TPUMeshContext",
     "TPUProfiler",
-    "profile_memory_usage",
     "DuckDBLogger",
     
     # Advanced Features

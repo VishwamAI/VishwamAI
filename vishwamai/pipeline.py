@@ -5,7 +5,7 @@ Training pipeline and utilities for VishwamAI transformer.
 import jax
 import jax.numpy as jnp
 import optax
-from typing import Any, Dict, Optional, Tuple, Callable
+from typing import Any, Dict, Optional, Tuple, Callable, Iterator
 from functools import partial
 from .transformer import (
     EnhancedTransformerModel,
@@ -20,6 +20,277 @@ from .distill import (
 from .cot import ChainOfThoughtPrompting
 from .tot import TreeOfThoughts
 import flax
+
+"""TPU-optimized data pipeline"""
+
+import tensorflow as tf
+import numpy as np
+
+class TPUDataPipeline:
+    """Data pipeline optimized for TPU training."""
+    
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        devices: Optional[Any] = None
+    ):
+        self.config = config
+        self.batch_size = config['training']['batch_size']
+        self.block_size = config['optimization']['block_size']
+        self.grad_accum_steps = config['training']['grad_accum_steps']
+        self.devices = devices or jax.devices()
+        self.num_devices = len(self.devices)
+        
+        # Compute global batch size
+        self.global_batch_size = (
+            self.batch_size * 
+            self.grad_accum_steps * 
+            self.num_devices
+        )
+        
+        # Set up TF data pipeline
+        tf.config.set_visible_devices([], 'GPU')  # Prevent TF from using GPU
+        
+    def create_dataset(
+        self,
+        file_pattern: str,
+        is_training: bool = True
+    ) -> tf.data.Dataset:
+        """Create optimized dataset for TPU training."""
+        
+        files = tf.data.Dataset.list_files(file_pattern, shuffle=is_training)
+        
+        def parse_example(example):
+            features = {
+                'input_ids': tf.io.FixedLenFeature([self.block_size], tf.int64),
+                'labels': tf.io.FixedLenFeature([self.block_size], tf.int64),
+            }
+            
+            # For distillation
+            if self.config.get('distillation'):
+                features['teacher_logits'] = tf.io.FixedLenFeature(
+                    [self.block_size * self.config['model']['vocab_size']], 
+                    tf.float32
+                )
+            
+            parsed = tf.io.parse_single_example(example, features)
+            
+            # Cast to optimal TPU dtype
+            if self.config['tpu']['use_bfloat16']:
+                for k, v in parsed.items():
+                    if v.dtype == tf.float32:
+                        parsed[k] = tf.cast(v, tf.bfloat16)
+            
+            return parsed
+        
+        def read_tfrecord(filename):
+            dataset = tf.data.TFRecordDataset(
+                filename,
+                compression_type='GZIP',
+                buffer_size=self.block_size * 1024,  # 128KB buffer
+                num_parallel_reads=tf.data.AUTOTUNE
+            )
+            return dataset
+        
+        # Create dataset pipeline
+        dataset = files.interleave(
+            read_tfrecord,
+            cycle_length=tf.data.AUTOTUNE,
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=not is_training
+        )
+        
+        # Parse examples
+        dataset = dataset.map(
+            parse_example,
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+        
+        if is_training:
+            # Shuffle before batching
+            dataset = dataset.shuffle(
+                self.global_batch_size * 10,
+                reshuffle_each_iteration=True
+            )
+        
+        # Optimize batch size for TPU
+        dataset = dataset.batch(
+            self.global_batch_size,
+            drop_remainder=is_training
+        )
+        
+        # Prefetch to device
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        
+        return dataset
+    
+    def preprocess_batch(
+        self,
+        batch: Dict[str, tf.Tensor]
+    ) -> Dict[str, jnp.ndarray]:
+        """Preprocess batch for TPU training."""
+        # Convert to JAX arrays
+        jax_batch = {
+            k: jnp.array(v) 
+            for k, v in batch.items()
+        }
+        
+        # Reshape for devices and grad accumulation
+        def reshape_for_devices(x):
+            return x.reshape(
+                self.num_devices,
+                self.grad_accum_steps,
+                self.batch_size,
+                *x.shape[1:]
+            )
+        
+        jax_batch = {
+            k: reshape_for_devices(v)
+            for k, v in jax_batch.items()
+        }
+        
+        return jax_batch
+    
+    def get_training_iter(
+        self,
+        dataset: tf.data.Dataset
+    ) -> Iterator[Dict[str, jnp.ndarray]]:
+        """Get iterator for TPU training."""
+        
+        for batch in dataset.as_numpy_iterator():
+            # Preprocess batch
+            jax_batch = self.preprocess_batch(batch)
+            
+            # Split across devices
+            device_batch = {
+                k: jax.device_put_sharded(
+                    list(v), 
+                    self.devices
+                )
+                for k, v in jax_batch.items()
+            }
+            
+            yield device_batch
+
+def create_tpu_data_pipeline(config: Dict[str, Any]) -> TPUDataPipeline:
+    """Create TPU-optimized data pipeline."""
+    # Get TPU devices
+    if config['tpu']['device_strategy'] == 'data_parallel':
+        devices = jax.devices()
+    else:
+        # Set up custom device mesh if needed
+        devices = jax.devices()[:config['tpu']['tpu_cores']]
+    
+    return TPUDataPipeline(config, devices)
+
+class DistillationDataPipeline(TPUDataPipeline):
+    """Data pipeline optimized for knowledge distillation on TPU."""
+    
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        teacher_model: Any,
+        devices: Optional[Any] = None
+    ):
+        super().__init__(config, devices)
+        self.teacher_model = teacher_model
+        
+    def generate_teacher_logits(
+        self,
+        input_ids: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        temperature: float = 2.0
+    ) -> jnp.ndarray:
+        """Generate teacher logits in parallel on TPU."""
+        # Split input across devices
+        device_inputs = jax.device_put_sharded(
+            list(input_ids), 
+            self.devices
+        )
+        
+        if attention_mask is not None:
+            device_masks = jax.device_put_sharded(
+                list(attention_mask),
+                self.devices
+            )
+        else:
+            device_masks = None
+        
+        # Define parallel forward pass
+        def forward_pass(x, mask=None):
+            logits = self.teacher_model(
+                x,
+                attention_mask=mask,
+                training=False
+            )
+            return logits / temperature
+        
+        # Run parallel forward passes
+        p_forward = jax.pmap(forward_pass, axis_name='batch')
+        logits = p_forward(device_inputs, device_masks)
+        
+        # Gather results
+        return jax.device_get(logits)
+    
+    def create_distillation_dataset(
+        self,
+        file_pattern: str,
+        is_training: bool = True,
+        cache_teacher_outputs: bool = True
+    ) -> tf.data.Dataset:
+        """Create dataset for distillation with teacher outputs."""
+        base_dataset = super().create_dataset(
+            file_pattern,
+            is_training
+        )
+        
+        if not cache_teacher_outputs:
+            # Generate teacher logits on the fly
+            def add_teacher_outputs(batch):
+                input_ids = batch['input_ids']
+                attention_mask = batch.get('attention_mask')
+                
+                teacher_logits = self.generate_teacher_logits(
+                    input_ids,
+                    attention_mask,
+                    temperature=self.config['distillation']['temperature']
+                )
+                
+                batch['teacher_logits'] = teacher_logits
+                return batch
+                
+            base_dataset = base_dataset.map(
+                add_teacher_outputs,
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
+        
+        return base_dataset
+
+def prepare_distillation_data(
+    config: Dict[str, Any],
+    teacher_model: Any,
+    train_files: str,
+    eval_files: str
+) -> Tuple[TPUDataPipeline, tf.data.Dataset, tf.data.Dataset]:
+    """Prepare data pipeline and datasets for distillation."""
+    
+    pipeline = DistillationDataPipeline(
+        config,
+        teacher_model
+    )
+    
+    train_dataset = pipeline.create_distillation_dataset(
+        train_files,
+        is_training=True
+    )
+    
+    eval_dataset = pipeline.create_distillation_dataset(
+        eval_files,
+        is_training=False
+    )
+    
+    return pipeline, train_dataset, eval_dataset
+
 class VishwamAIPipeline:
     """Pipeline for training and inference with VishwamAI transformer."""
     

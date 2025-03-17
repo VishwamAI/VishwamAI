@@ -215,7 +215,7 @@ class MultiHeadAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer block with TPU optimizations"""
     num_heads: int
-    head_dim: int
+    head_dim: int 
     mlp_dim: int
     dropout_rate: float = 0.1
     dtype: Any = jnp.float32
@@ -226,20 +226,35 @@ class TransformerBlock(nn.Module):
                  mask: Optional[jnp.ndarray] = None,
                  deterministic: bool = True) -> jnp.ndarray:
         
-        # Self-attention
+        # TPU-optimized attention with memory savings
+        # Use block size of 128 for optimal TPU v2/v3 performance
+        BLOCK_SIZE = 128
+        
+        # Self-attention with chunked computation
         x = TPULayerNorm(dtype=self.dtype)(inputs)
-        x = MultiHeadAttention(
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            dropout_rate=self.dropout_rate,
-            dtype=self.dtype
-        )(x, x, mask, deterministic)
+        attention_chunks = []
+        
+        for i in range(0, inputs.shape[1], BLOCK_SIZE):
+            chunk = inputs[:, i:i+BLOCK_SIZE]
+            chunk_mask = mask[:, :, :, i:i+BLOCK_SIZE] if mask is not None else None
+            
+            # Process chunk with attention
+            chunk_attn = MultiHeadAttention(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype
+            )(x, x, chunk_mask, deterministic)
+            
+            attention_chunks.append(chunk_attn)
+            
+        x = jnp.concatenate(attention_chunks, axis=1)
         
         if not deterministic:
             x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=False)
         x = x + inputs
 
-        # MLP block
+        # MLP block with TPU-optimized GEMM
         y = TPULayerNorm(dtype=self.dtype)(x)
         y = TPUGEMMLinear(features=self.mlp_dim, dtype=self.dtype)(y)
         y = jax.nn.gelu(y)

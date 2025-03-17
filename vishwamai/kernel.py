@@ -8,6 +8,7 @@ from jax import lax
 from typing import Tuple, Optional
 import numpy as np
 from functools import partial
+from .fp8_cast_bf16 import fp8_cast, optimize_kernel_layout
 
 def fp8_cast_transpose(x: jnp.ndarray) -> jnp.ndarray:
     """Transpose with FP8 casting for TPU optimization."""
@@ -18,7 +19,8 @@ def fp8_gemm_optimized(
     A_scale: jnp.ndarray,
     B: jnp.ndarray,
     B_scale: jnp.ndarray,
-    transpose_b: bool = False
+    transpose_b: bool = False,
+    block_size: int = 128
 ) -> jnp.ndarray:
     """
     Optimized matrix multiplication using FP8 precision for TPU.
@@ -29,19 +31,28 @@ def fp8_gemm_optimized(
         B: Second input matrix
         B_scale: Scale factor for B
         transpose_b: Whether to transpose B
+        block_size: Block size for tiling (default optimal for TPU)
     """
+    # Cast inputs to FP8
+    A_fp8, _ = fp8_cast(A, A_scale, block_size)
+    B_fp8, _ = fp8_cast(B, B_scale, block_size)
+    
+    # Optimize memory layout
+    A_fp8 = optimize_kernel_layout(A_fp8)
+    B_fp8 = optimize_kernel_layout(B_fp8)
+    
     # Ensure inputs are in optimal layout
     if transpose_b:
-        B = fp8_cast_transpose(B)
+        B_fp8 = fp8_cast_transpose(B_fp8)
     
     # For 4D tensors (batch, heads, seq, dim)
-    if A.ndim == 4 and B.ndim == 4:
+    if A_fp8.ndim == 4 and B_fp8.ndim == 4:
         dimension_numbers = (
             ((3,), (2,)),  # Contracting dimensions
             ((0, 1), (0, 1))  # Batch dimensions
         )
     # For 3D tensors (batch, seq, dim)
-    elif A.ndim == 3 and B.ndim == 3:
+    elif A_fp8.ndim == 3 and B_fp8.ndim == 3:
         dimension_numbers = (
             ((2,), (1,)),  # Contracting dimensions
             ((0,), (0,))  # Batch dimensions
@@ -49,12 +60,12 @@ def fp8_gemm_optimized(
     # For 2D matrices
     else:
         dimension_numbers = (
-            ((A.ndim - 1,), (B.ndim - 2,)),
+            ((A_fp8.ndim - 1,), (B_fp8.ndim - 2,)),
             ((), ())  # No batch dimensions
         )
     
     # Perform scaled matrix multiplication
-    C = lax.dot_general(A, B, dimension_numbers=dimension_numbers)
+    C = lax.dot_general(A_fp8, B_fp8, dimension_numbers=dimension_numbers)
     
     # Apply scales
     return C * (A_scale * B_scale)
@@ -62,7 +73,8 @@ def fp8_gemm_optimized(
 def act_quant(
     x: jnp.ndarray,
     num_bits: int = 8,
-    axis: Optional[int] = None
+    axis: Optional[int] = None,
+    block_size: int = 128
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Quantize activations to reduced precision with automatic scale determination.
@@ -71,24 +83,52 @@ def act_quant(
         x: Input tensor
         num_bits: Number of bits for quantization
         axis: Axis along which to compute scaling factors
+        block_size: Block size for tiling
     """
     if axis is None:
         axis = tuple(range(x.ndim))
     
-    # Compute scale factor
-    abs_max = jnp.max(jnp.abs(x), axis=axis, keepdims=True)
-    scale = (2 ** (num_bits - 1) - 1) / (abs_max + 1e-5)
+    # Process in blocks for better TPU utilization
+    def _process_block(block):
+        # Compute scale factor
+        abs_max = jnp.max(jnp.abs(block), axis=axis, keepdims=True)
+        scale = (2 ** (num_bits - 1) - 1) / (abs_max + 1e-5)
+        
+        # Quantize and dequantize
+        x_quant = jnp.clip(jnp.round(block * scale), -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1)
+        x_dequant = x_quant / scale
+        
+        return x_dequant, scale
     
-    # Quantize and dequantize
-    x_quant = jnp.clip(jnp.round(x * scale), -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1)
-    x_dequant = x_quant / scale
+    # Split into blocks
+    orig_shape = x.shape
+    reshaped = x.reshape(-1, block_size)
+    
+    # Process each block
+    results = []
+    scales = []
+    for i in range(0, reshaped.shape[0], block_size):
+        block = jax.lax.dynamic_slice(
+            reshaped,
+            (i, 0),
+            (min(block_size, reshaped.shape[0] - i), block_size)
+        )
+        block_dequant, block_scale = _process_block(block)
+        results.append(block_dequant)
+        scales.append(block_scale)
+    
+    # Concatenate results and reshape
+    x_dequant = jnp.concatenate(results, axis=0).reshape(orig_shape)
+    scale = jnp.concatenate(scales, axis=0).reshape(orig_shape[0], 1, 1, 1)
     
     return x_dequant, scale
 
 def block_tpu_matmul(
     A: jnp.ndarray,
     B: jnp.ndarray,
-    block_size: int = 128
+    block_size: int = 128,
+    transpose_b: bool = False,
+    precision: Optional[lax.Precision] = None
 ) -> jnp.ndarray:
     """
     Blocked matrix multiplication optimized for TPU memory hierarchy.
@@ -97,9 +137,11 @@ def block_tpu_matmul(
         A: First input matrix
         B: Second input matrix
         block_size: Size of blocks for tiling
+        transpose_b: Whether to transpose B
+        precision: XLA precision setting
     """
     M, K = A.shape
-    K, N = B.shape
+    K, N = B.shape if not transpose_b else B.shape[::-1]
     
     # Pad dimensions to multiples of block_size
     M_pad = (block_size - M % block_size) % block_size
@@ -107,20 +149,25 @@ def block_tpu_matmul(
     N_pad = (block_size - N % block_size) % block_size
     
     A_padded = jnp.pad(A, ((0, M_pad), (0, K_pad)))
-    B_padded = jnp.pad(B, ((0, K_pad), (0, N_pad)))
+    B_padded = jnp.pad(B, ((0, K_pad), (0, N_pad)) if not transpose_b else ((0, N_pad), (0, K_pad)))
     
-    # Define N_padded
-    N_padded = B_padded.shape
+    if transpose_b:
+        B_padded = B_padded.T
     
     # Reshape into blocks
     A_blocks = A_padded.reshape(-1, block_size, A_padded.shape[1] // block_size, block_size)
-    B_blocks = B_padded.reshape(-1, block_size, N_padded[1] // block_size, block_size)
+    B_blocks = B_padded.reshape(-1, block_size, B_padded.shape[1] // block_size, block_size)
+    
+    # Optimize block layout for TPU
+    A_blocks = optimize_kernel_layout(A_blocks)
+    B_blocks = optimize_kernel_layout(B_blocks)
     
     # Perform blocked matrix multiplication
     C_blocks = jax.lax.dot_general(
         A_blocks,
         B_blocks.transpose(0, 2, 1, 3),
-        dimension_numbers=(((2,), (1,)), ((0,), (0,)))
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+        precision=precision
     )
     
     # Reshape result back
@@ -135,65 +182,64 @@ def multi_head_attention_kernel(
     dropout_rng: Optional[jnp.ndarray] = None,
     dropout_rate: float = 0.0,
     deterministic: bool = False,
-    precision: Optional[lax.Precision] = None
+    precision: Optional[lax.Precision] = None,
+    block_size: int = 128,
+    use_fp8: bool = True
 ) -> jnp.ndarray:
     """
-    Optimized multi-head attention computation kernel for TPU.
+    TPU-optimized multi-head attention kernel.
     
     Args:
-        Q: Query tensor
-        K: Key tensor
-        V: Value tensor
-        mask: Attention mask
-        dropout_rng: Random key for dropout
-        dropout_rate: Dropout rate
+        Q, K, V: Query, Key, and Value tensors
+        mask: Optional attention mask
+        dropout_rng: Optional RNG for dropout
+        dropout_rate: Dropout probability
         deterministic: Whether to use deterministic operations
-        precision: Precision of matrix multiplication
+        precision: XLA precision setting
+        block_size: Block size for tiling
+        use_fp8: Whether to use FP8 precision
     """
-    # Extract shapes
-    batch_size, num_heads, seq_len_q, head_dim = Q.shape
-    _, _, seq_len_k, _ = K.shape
+    # Convert to optimal precision
+    if use_fp8:
+        Q_fp8, Q_scale = fp8_cast(Q, block_size=block_size)
+        K_fp8, K_scale = fp8_cast(K, block_size=block_size)
+        V_fp8, V_scale = fp8_cast(V, block_size=block_size)
+    else:
+        Q_fp8, K_fp8, V_fp8 = Q, K, V
+        Q_scale = K_scale = V_scale = 1.0
     
-    # Compute attention scores with automatic mixed precision
-    scale = 1. / jnp.sqrt(head_dim)
-    
-    # Quantize inputs for TPU efficiency
-    Q_quant, Q_scale = act_quant(Q)
-    K_quant, K_scale = act_quant(K)
-    V_quant, V_scale = act_quant(V)
-    
-    # Compute attention scores using optimized GEMM
-    attention_scores = fp8_gemm_optimized(
-        Q_quant, Q_scale,
-        K_quant, K_scale,
-        transpose_b=True
-    ) * scale
+    # Compute attention scores
+    scores = block_tpu_matmul(
+        Q_fp8,
+        K_fp8,
+        block_size=block_size,
+        transpose_b=True,
+        precision=precision
+    )
     
     # Apply mask if provided
     if mask is not None:
-        attention_scores = jnp.where(mask, attention_scores, -1e10)
+        scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
     
-    # Compute attention weights with stable softmax
-    attention_weights = jax.nn.softmax(attention_scores, axis=-1)
+    # Apply softmax
+    scores = jax.nn.softmax(scores / jnp.sqrt(Q.shape[-1]), axis=-1)
     
-    # Apply dropout if training
-    if not deterministic and dropout_rate > 0.:
-        if dropout_rng is None:
-            dropout_rng = jax.random.PRNGKey(0)
+    # Apply dropout
+    if dropout_rate > 0.0 and not deterministic:
+        dropout_shape = list(scores.shape)
         keep_prob = 1.0 - dropout_rate
-        attention_weights = jax.random.dropout(
-            dropout_rng,
-            attention_weights,
-            keep_prob
-        )
+        keep = jax.random.bernoulli(dropout_rng, keep_prob, dropout_shape)
+        scores = jnp.where(keep, scores / keep_prob, 0.0)
     
-    # Compute output using optimized GEMM
-    output = fp8_gemm_optimized(
-        attention_weights, jnp.ones_like(Q_scale),
-        V_quant, V_scale
+    # Compute attention output
+    output = block_tpu_matmul(
+        scores,
+        V_fp8,
+        block_size=block_size,
+        precision=precision
     )
     
-    return output
+    return output if not use_fp8 else output * (Q_scale * V_scale)
 
 def flash_attention(
     Q: jnp.ndarray,

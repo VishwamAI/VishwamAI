@@ -12,6 +12,314 @@ from .pipeline import VishwamAIPipeline
 from .transformer import create_learning_rate_schedule
 from .logger import DuckDBLogger
 
+"""TPU-optimized training configuration and initialization"""
+
+import flax
+from flax.training import train_state
+
+from .transformer import EnhancedTransformerModel
+from .distill import DistillationTrainer
+
+class TPUTrainingConfig:
+    """Configuration for TPU-optimized training"""
+    def __init__(
+        self,
+        model_config: Dict[str, Any],
+        batch_size: int = 32,
+        grad_accum_steps: int = 4,  # Effective batch size = batch_size * grad_accum_steps * num_devices
+        learning_rate: float = 1e-4,
+        warmup_steps: int = 2000,
+        max_steps: int = 100000,
+        weight_decay: float = 0.01,
+        max_grad_norm: float = 1.0,
+        dtype: str = 'bfloat16',
+        enable_pjit: bool = True,
+        block_size: int = 128,  # Optimal for TPU v2
+        use_flash_attn: bool = True,
+        mixed_precision: bool = True
+    ):
+        self.model_config = model_config
+        self.batch_size = batch_size
+        self.grad_accum_steps = grad_accum_steps
+        self.learning_rate = learning_rate
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.weight_decay = weight_decay
+        self.max_grad_norm = max_grad_norm
+        self.dtype = getattr(jnp, dtype)
+        self.enable_pjit = enable_pjit
+        self.block_size = block_size
+        self.use_flash_attn = use_flash_attn
+        self.mixed_precision = mixed_precision
+
+def create_train_state_tpu(
+    config: TPUTrainingConfig,
+    rng: Any,
+    mesh: Optional[Any] = None
+) -> Any:
+    """
+    Create training state optimized for TPU execution.
+    
+    Args:
+        config: Training configuration
+        rng: PRNG key
+        mesh: Optional device mesh for model parallelism
+    """
+    # Create learning rate schedule
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0,
+        end_value=config.learning_rate,
+        transition_steps=config.warmup_steps
+    )
+    decay_fn = optax.cosine_decay_schedule(
+        init_value=config.learning_rate,
+        decay_steps=config.max_steps - config.warmup_steps
+    )
+    lr_schedule = optax.join_schedules(
+        schedules=[warmup_fn, decay_fn],
+        boundaries=[config.warmup_steps]
+    )
+    
+    # Create optimizer with TPU-optimized gradient transforms
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.95,  # Increased for better TPU stability
+            eps=1e-8,
+            weight_decay=config.weight_decay
+        )
+    )
+
+    # Create model with TPU optimizations
+    model = EnhancedTransformerModel(
+        vocab_size=config.model_config['vocab_size'],
+        num_layers=config.model_config['num_layers'],
+        num_heads=config.model_config['num_heads'],
+        head_dim=config.model_config['head_dim'],
+        hidden_dim=config.model_config['hidden_dim'],
+        mlp_dim=config.model_config['mlp_dim'],
+        max_seq_len=config.model_config['max_seq_len'],
+        dropout_rate=config.model_config.get('dropout_rate', 0.1),
+        use_flash_attn=config.use_flash_attn,
+        use_rms_norm=True,
+        dtype=config.dtype
+    )
+    
+    # Initialize parameters with optimal TPU layout
+    dummy_input = jnp.ones((2, config.model_config['max_seq_len']), dtype=jnp.int32)
+    variables = model.init(rng, dummy_input, deterministic=False)
+    
+    return train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=variables['params'],
+        tx=optimizer
+    )
+
+def create_train_step_tpu(
+    config: TPUTrainingConfig,
+    state: Any,
+    trainer: Optional[DistillationTrainer] = None
+) -> Callable:
+    """
+    Create TPU-optimized training step function.
+    
+    Args:
+        config: Training configuration
+        state: Training state
+        trainer: Optional distillation trainer
+    """
+    def train_step(
+        state: Any,
+        batch: Dict[str, jnp.ndarray],
+        dropout_rng: Any
+    ) -> Tuple[Any, Dict[str, float]]:
+        # Split batch into chunks for gradient accumulation
+        chunk_size = batch['input_ids'].shape[0] // config.grad_accum_steps
+        
+        def compute_loss(params, chunk):
+            if trainer is not None:
+                # Distillation training
+                return trainer.compute_distillation_loss(
+                    state.apply_fn(
+                        {'params': params},
+                        chunk['input_ids'],
+                        deterministic=False,
+                        rngs={'dropout': dropout_rng}
+                    ),
+                    chunk['teacher_logits'],
+                    chunk['labels'],
+                    chunk.get('attention_mask')
+                )
+            else:
+                # Standard training
+                logits = state.apply_fn(
+                    {'params': params},
+                    chunk['input_ids'],
+                    deterministic=False,
+                    rngs={'dropout': dropout_rng}
+                )
+                return optax.softmax_cross_entropy_with_integer_labels(
+                    logits=logits,
+                    labels=chunk['labels']
+                ).mean()
+        
+        # Accumulate gradients across chunks
+        grad_fn = jax.value_and_grad(compute_loss)
+        total_loss = 0.0
+        total_grads = None
+        
+        for i in range(config.grad_accum_steps):
+            start_idx = i * chunk_size
+            end_idx = start_idx + chunk_size
+            chunk = {
+                k: v[start_idx:end_idx] 
+                for k, v in batch.items()
+            }
+            
+            loss, grads = grad_fn(state.params, chunk)
+            total_loss += loss
+            
+            if total_grads is None:
+                total_grads = grads
+            else:
+                total_grads = jax.tree_map(
+                    lambda x, y: x + y,
+                    total_grads,
+                    grads
+                )
+        
+        # Average gradients and update
+        total_grads = jax.tree_map(
+            lambda x: x / config.grad_accum_steps,
+            total_grads
+        )
+        
+        new_state = state.apply_gradients(grads=total_grads)
+        metrics = {'loss': total_loss / config.grad_accum_steps}
+        
+        return new_state, metrics
+    
+    # Enable pjit for TPU if configured
+    if config.enable_pjit:
+        train_step = jax.pjit(
+            train_step,
+            in_axis_resources=None,
+            out_axis_resources=None
+        )
+    else:
+        train_step = jax.jit(train_step)
+        
+    return train_step
+
+def create_eval_step_tpu(
+    config: TPUTrainingConfig,
+    state: Any
+) -> Callable:
+    """Create TPU-optimized evaluation step function."""
+    
+    def eval_step(
+        params: Any,
+        batch: Dict[str, jnp.ndarray]
+    ) -> Dict[str, float]:
+        # Process in chunks to handle long sequences
+        logits_chunks = []
+        for i in range(0, batch['input_ids'].shape[1], config.block_size):
+            chunk = jax.lax.dynamic_slice(
+                batch['input_ids'],
+                (0, i),
+                (batch['input_ids'].shape[0], 
+                 min(config.block_size, batch['input_ids'].shape[1] - i))
+            )
+            chunk_logits = state.apply_fn(
+                {'params': params},
+                chunk,
+                deterministic=True
+            )
+            logits_chunks.append(chunk_logits)
+            
+        logits = jnp.concatenate(logits_chunks, axis=1)
+        
+        # Compute metrics
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits,
+            labels=batch['labels']
+        ).mean()
+        
+        accuracy = jnp.mean(
+            jnp.argmax(logits, axis=-1) == batch['labels']
+        )
+        
+        return {
+            'loss': loss,
+            'accuracy': accuracy,
+            'perplexity': jnp.exp(loss)
+        }
+    
+    if config.enable_pjit:
+        eval_step = jax.pjit(
+            eval_step,
+            in_axis_resources=None,
+            out_axis_resources=None
+        )
+    else:
+        eval_step = jax.jit(eval_step)
+        
+    return eval_step
+
+def setup_tpu_training(
+    config: TPUTrainingConfig,
+    seed: int = 42
+) -> Tuple[Any, Any, Callable, Callable]:
+    """
+    Set up complete TPU training pipeline.
+    
+    Args:
+        config: Training configuration
+        seed: Random seed
+    
+    Returns:
+        Tuple containing:
+        - Training state
+        - Device mesh
+        - Training step function
+        - Evaluation step function
+    """
+    # Set up device mesh for TPU
+    devices = jax.devices()
+    mesh_shape = (len(devices),)
+    device_mesh = jax.sharding.Mesh(devices, ('batch',))
+    
+    # Initialize random keys
+    rng = jax.random.PRNGKey(seed)
+    rng, init_rng = jax.random.split(rng)
+    
+    # Create training state
+    with device_mesh:
+        state = create_train_state_tpu(config, init_rng, device_mesh)
+        
+    # Create step functions
+    train_step_fn = create_train_step_tpu(config, state)
+    eval_step_fn = create_eval_step_tpu(config, state)
+    
+    return state, device_mesh, train_step_fn, eval_step_fn
+
+def get_tpu_compile_options(
+    config: TPUTrainingConfig
+) -> Dict[str, Any]:
+    """Get XLA compilation options optimized for TPU."""
+    return {
+        "num_partitions": 1,
+        "enable_xla": True,
+        "enable_checkpointing": True,
+        "preserve_host_calls": True,
+        "parameter_formation": "xla",
+        "xla_shape_checks": "error",
+        "allow_host_callbacks": True,
+        "xla_gpu_autotune_level": 0,  # Disable for TPU
+    }
+
 class VishwamAITrainer:
     """Training manager for VishwamAI models."""
     

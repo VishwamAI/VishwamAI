@@ -1,359 +1,355 @@
-"""
-Tree of Thoughts (ToT) implementation for VishwamAI transformer.
-Enables sophisticated multi-path reasoning with branching thought processes.
-"""
+
+"""TPU-optimized Tree of Thoughts reasoning"""
 
 import jax
 import jax.numpy as jnp
-import haiku as hk
-from typing import Any, Dict, List, Optional, Tuple, Set
-from dataclasses import dataclass
-from queue import PriorityQueue
 import numpy as np
-from .transformer import EnhancedTransformerModel
-from .cot import format_cot_prompt, extract_reasoning_steps
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from .kernel import fp8_gemm_optimized, act_quant
 
 @dataclass
 class ThoughtNode:
-    """Represents a node in the thought tree."""
+    """Node in the thought tree"""
     thought: str
-    score: float
-    parent: Optional['ThoughtNode'] = None
+    parent: Optional['ThoughtNode']
+    score: float = 0.0
     children: List['ThoughtNode'] = None
-    depth: int = 0
+    state: Any = None
     
     def __post_init__(self):
         if self.children is None:
             self.children = []
-    
-    def __lt__(self, other):
-        return self.score > other.score  # Higher scores have priority
 
-class TreeOfThoughts:
-    """
-    Implements Tree of Thoughts reasoning with beam search and pruning.
-    """
+class TPUTreeofThoughts:
+    """TPU-optimized Tree of Thoughts implementation"""
     
     def __init__(
         self,
         model: Any,
         tokenizer: Any,
+        max_branches: int = 3,
+        max_depth: int = 3,
+        beam_width: int = 5,
         temperature: float = 0.7,
-        max_depth: int = 5,
-        beam_width: int = 3,
-        num_samples: int = 5,
-        max_length: int = 512
+        block_size: int = 128,  # Optimal for TPU v2
+        batch_size: int = 32,
+        use_fp8: bool = True
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.temperature = temperature
+        self.max_branches = max_branches
         self.max_depth = max_depth
         self.beam_width = beam_width
-        self.num_samples = num_samples
-        self.max_length = max_length
+        self.temperature = temperature
+        self.block_size = block_size
+        self.batch_size = batch_size
+        self.use_fp8 = use_fp8
+        
+        # Initialize thought cache for efficiency
+        self.thought_cache = {}
     
-    def evaluate_thought(
+    def _generate_thoughts_batched(
         self,
-        thought: str,
-        context: str,
-        criteria: Dict[str, float]
-    ) -> float:
-        """
-        Evaluate a thought based on multiple criteria.
+        prompts: List[str],
+        state: Optional[Any] = None
+    ) -> List[List[str]]:
+        """Generate multiple thoughts in parallel using TPU."""
+        # Tokenize all prompts
+        inputs = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.block_size,
+            return_tensors='jax'
+        )
         
-        Args:
-            thought: The thought to evaluate
-            context: Context including previous thoughts
-            criteria: Dictionary of evaluation criteria and weights
-        """
-        score = 0.0
-        total_weight = sum(criteria.values())
-        
-        # Evaluate coherence
-        if 'coherence' in criteria:
-            # Check for logical connectors and flow
-            coherence_score = sum(1 for connector in 
-                ['because', 'therefore', 'thus', 'so', 'hence']
-                if connector in thought.lower())
-            score += criteria['coherence'] * (coherence_score / 3)  # Normalize
-        
-        # Evaluate relevance to context
-        if 'relevance' in criteria:
-            # Simple keyword matching for now
-            context_keywords = set(context.lower().split())
-            thought_keywords = set(thought.lower().split())
-            overlap = len(context_keywords.intersection(thought_keywords))
-            relevance_score = overlap / max(len(context_keywords), 1)
-            score += criteria['relevance'] * relevance_score
-        
-        # Evaluate specificity
-        if 'specificity' in criteria:
-            # Count specific details (numbers, named entities, etc.)
-            specifics = sum(c.isdigit() or c == '$' for c in thought)
-            specificity_score = min(specifics / 10, 1.0)  # Normalize
-            score += criteria['specificity'] * specificity_score
-        
-        return score / total_weight
-    
-    def generate_thoughts(
-        self,
-        prompt: str,
-        context: str,
-        num_samples: Optional[int] = None
-    ) -> List[str]:
-        """
-        Generate multiple possible next thoughts.
-        
-        Args:
-            prompt: The current prompt
-            context: Previous context
-            num_samples: Number of thoughts to generate
-        """
-        if num_samples is None:
-            num_samples = self.num_samples
+        # Process in optimal batch sizes for TPU
+        all_thoughts = []
+        for i in range(0, len(prompts), self.batch_size):
+            batch_inputs = {
+                k: v[i:i+self.batch_size] 
+                for k, v in inputs.items()
+            }
             
-        thoughts = []
-        for _ in range(num_samples):
-            # Generate next thought
-            input_ids = self.tokenizer.encode(prompt + context)
-            output = self.model.generate(
-                input_ids,
-                max_length=self.max_length,
+            # Generate thoughts for batch
+            outputs = self.model.generate(
+                input_ids=batch_inputs['input_ids'],
+                attention_mask=batch_inputs['attention_mask'],
+                max_length=self.block_size,
+                num_return_sequences=self.max_branches,
                 temperature=self.temperature,
-                top_p=0.95
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                state=state
             )
-            decoded = self.tokenizer.decode(output[0])
             
-            # Extract the new thought
-            new_thought = decoded[len(prompt + context):].strip()
-            thoughts.append(new_thought)
+            # Decode outputs
+            batch_thoughts = self.tokenizer.batch_decode(
+                outputs,
+                skip_special_tokens=True
+            )
             
-        return thoughts
+            # Reshape to [batch_size, max_branches]
+            batch_thoughts = np.array(batch_thoughts).reshape(
+                -1, self.max_branches
+            )
+            all_thoughts.extend(batch_thoughts)
+            
+        return all_thoughts
     
-    def build_thought_tree(
+    def _evaluate_thoughts_batched(
         self,
-        question: str,
-        evaluation_criteria: Optional[Dict[str, float]] = None
-    ) -> ThoughtNode:
-        """
-        Build a tree of thoughts using beam search.
+        thoughts: List[str],
+        context: str,
+        state: Optional[Any] = None
+    ) -> jnp.ndarray:
+        """Evaluate multiple thoughts in parallel using TPU."""
+        # Combine context with each thought
+        prompts = [
+            context + " " + thought
+            for thought in thoughts
+        ]
         
-        Args:
-            question: The question to reason about
-            evaluation_criteria: Criteria for evaluating thoughts
-        """
-        if evaluation_criteria is None:
-            evaluation_criteria = {
-                'coherence': 0.4,
-                'relevance': 0.4,
-                'specificity': 0.2
+        # Tokenize all prompts
+        inputs = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.block_size,
+            return_tensors='jax'
+        )
+        
+        # Process in batches
+        all_scores = []
+        for i in range(0, len(prompts), self.batch_size):
+            batch_inputs = {
+                k: v[i:i+self.batch_size]
+                for k, v in inputs.items()
             }
             
-        # Initialize root
-        root_prompt = format_cot_prompt(question)
-        root_thoughts = self.generate_thoughts(root_prompt, "")
-        
-        # Create root nodes
-        root_nodes = []
-        for thought in root_thoughts:
-            score = self.evaluate_thought(thought, "", evaluation_criteria)
-            root_nodes.append(ThoughtNode(thought=thought, score=score))
-        
-        # Sort and keep top-k
-        root_nodes.sort(reverse=True, key=lambda x: x.score)
-        beam = root_nodes[:self.beam_width]
-        
-        # Build tree level by level
-        for depth in range(1, self.max_depth):
-            candidates = []
-            
-            # Generate children for each node in beam
-            for parent in beam:
-                context = self._get_thought_path(parent)
-                prompt = root_prompt + "\n".join(context) + "\n"
-                
-                # Generate and evaluate children
-                child_thoughts = self.generate_thoughts(prompt, context[-1])
-                for thought in child_thoughts:
-                    score = self.evaluate_thought(
-                        thought,
-                        "\n".join(context),
-                        evaluation_criteria
+            # Get logits from model
+            if self.use_fp8:
+                # Use FP8 GEMM for faster computation
+                logits_quant, logits_scale = act_quant(
+                    self.model(
+                        batch_inputs['input_ids'],
+                        attention_mask=batch_inputs['attention_mask'],
+                        state=state
                     )
-                    child = ThoughtNode(
-                        thought=thought,
-                        score=score,
-                        parent=parent,
-                        depth=depth
-                    )
-                    candidates.append(child)
-                    parent.children.append(child)
+                )
+                logits = fp8_gemm_optimized(
+                    logits_quant,
+                    logits_scale,
+                    jnp.ones_like(logits_quant),
+                    jnp.ones_like(logits_scale)
+                )
+            else:
+                logits = self.model(
+                    batch_inputs['input_ids'],
+                    attention_mask=batch_inputs['attention_mask'],
+                    state=state
+                )
             
-            # Update beam with top-k candidates
-            candidates.sort(reverse=True, key=lambda x: x.score)
-            beam = candidates[:self.beam_width]
+            # Compute scores (can be customized based on task)
+            scores = jax.nn.softmax(logits, axis=-1).max(axis=-1).mean(axis=1)
+            all_scores.append(scores)
             
-            # Early stopping if no good candidates
-            if not beam or beam[0].score < 0.2:
-                break
-        
-        return root_nodes[0]  # Return root of best tree
+        return jnp.concatenate(all_scores)
     
-    def _get_thought_path(self, node: ThoughtNode) -> List[str]:
-        """Get the path of thoughts from root to node."""
-        path = []
-        current = node
-        while current:
-            path.append(current.thought)
-            current = current.parent
-        return path[::-1]
-    
-    def search_best_path(
+    def _select_best_thoughts(
         self,
-        root: ThoughtNode,
-        evaluation_criteria: Optional[Dict[str, float]] = None
+        thoughts: List[str],
+        scores: jnp.ndarray,
+        k: int
+    ) -> List[Tuple[str, float]]:
+        """Select k best thoughts based on scores."""
+        # Get indices of top k scores
+        top_k_idx = jax.lax.top_k(scores, k)[1]
+        
+        # Return thoughts and scores
+        return [
+            (thoughts[idx], float(scores[idx]))
+            for idx in top_k_idx
+        ]
+    
+    def search(
+        self,
+        initial_prompt: str,
+        objective: str,
+        state: Optional[Any] = None
     ) -> List[str]:
         """
-        Search for the best path in the thought tree.
+        Perform tree search with thoughts using TPU optimization.
         
         Args:
-            root: Root node of the thought tree
-            evaluation_criteria: Criteria for path evaluation
+            initial_prompt: Starting prompt
+            objective: Goal/objective description
+            state: Optional model state
         """
-        if evaluation_criteria is None:
-            evaluation_criteria = {
-                'coherence': 0.4,
-                'relevance': 0.4,
-                'specificity': 0.2
-            }
-            
-        # Use priority queue for best-first search
-        queue = PriorityQueue()
-        queue.put((1.0, root))  # Start with root
-        visited = set()
-        best_path = None
-        best_score = float('-inf')
+        # Initialize root node
+        root = ThoughtNode(
+            thought=initial_prompt,
+            parent=None,
+            state=state
+        )
         
-        while not queue.empty():
-            score, node = queue.get()
+        # Keep track of best nodes at each level
+        level_nodes = [[root]]
+        
+        # Expand tree level by level
+        for depth in range(self.max_depth):
+            current_nodes = level_nodes[-1]
+            next_nodes = []
             
-            # Get current path
-            current_path = self._get_thought_path(node)
-            path_key = tuple(current_path)
+            # Generate thoughts for all nodes in current level
+            all_prompts = []
+            for node in current_nodes:
+                # Create prompt with thought chain
+                chain = self._get_thought_chain(node)
+                prompt = (
+                    f"{initial_prompt}\n"
+                    f"Previous thoughts: {' -> '.join(chain)}\n"
+                    f"Objective: {objective}\n"
+                    "Next thought:"
+                )
+                all_prompts.append(prompt)
             
-            if path_key in visited:
-                continue
+            # Generate thoughts in parallel
+            all_new_thoughts = self._generate_thoughts_batched(
+                all_prompts,
+                state=current_nodes[0].state
+            )
+            
+            # Evaluate all new thoughts
+            for node_idx, node_thoughts in enumerate(all_new_thoughts):
+                parent_node = current_nodes[node_idx]
                 
-            visited.add(path_key)
-            
-            # Evaluate complete path
-            if len(current_path) > 1:  # At least 2 thoughts
-                path_score = self.evaluate_thought(
-                    " ".join(current_path),
-                    current_path[0],  # Use first thought as context
-                    evaluation_criteria
+                # Evaluate thoughts for this node
+                scores = self._evaluate_thoughts_batched(
+                    node_thoughts,
+                    objective,
+                    state=parent_node.state
                 )
                 
-                if path_score > best_score:
-                    best_score = path_score
-                    best_path = current_path
+                # Select best thoughts
+                best_thoughts = self._select_best_thoughts(
+                    node_thoughts,
+                    scores,
+                    self.beam_width
+                )
+                
+                # Create child nodes
+                for thought, score in best_thoughts:
+                    child = ThoughtNode(
+                        thought=thought,
+                        parent=parent_node,
+                        score=score,
+                        state=parent_node.state
+                    )
+                    parent_node.children.append(child)
+                    next_nodes.append(child)
             
-            # Add children to queue
-            for child in node.children:
-                if tuple(self._get_thought_path(child)) not in visited:
-                    queue.put((child.score, child))
+            # Sort nodes by score for beam search
+            next_nodes.sort(key=lambda x: x.score, reverse=True)
+            next_nodes = next_nodes[:self.beam_width]
+            
+            # Update level nodes
+            level_nodes.append(next_nodes)
         
-        return best_path or self._get_thought_path(root)
+        # Get best path from highest scoring leaf
+        best_leaf = max(
+            level_nodes[-1],
+            key=lambda x: x.score
+        )
+        return self._get_thought_chain(best_leaf)
     
-    def reason(
-        self,
-        question: str,
-        evaluation_criteria: Optional[Dict[str, float]] = None
-    ) -> Dict[str, Any]:
-        """
-        Perform tree of thoughts reasoning.
+    def _get_thought_chain(self, node: ThoughtNode) -> List[str]:
+        """Get chain of thoughts from root to node."""
+        thoughts = []
+        current = node
+        while current is not None:
+            thoughts.append(current.thought)
+            current = current.parent
+        return list(reversed(thoughts))
+    
+    @staticmethod
+    def create_state_factory(
+        config: Dict[str, Any],
+        block_size: int = 128
+    ) -> Any:
+        """Create a function to manage TPU-optimized model state."""
         
-        Args:
-            question: Question to reason about
-            evaluation_criteria: Criteria for evaluating thoughts
-        """
-        # Build thought tree
-        root = self.build_thought_tree(question, evaluation_criteria)
+        def init_state(batch_size: int) -> Any:
+            # Create initial state optimized for TPU
+            return {
+                'key_cache': jnp.zeros(
+                    (batch_size, config['num_layers'], block_size, config['num_heads'], config['head_dim'])
+                ),
+                'value_cache': jnp.zeros(
+                    (batch_size, config['num_layers'], block_size, config['num_heads'], config['head_dim'])
+                ),
+                'cache_index': jnp.zeros((batch_size,), dtype=jnp.int32)
+            }
         
-        # Find best reasoning path
-        best_path = self.search_best_path(root, evaluation_criteria)
-        
-        # Extract final answer
-        reasoning = "\n".join(best_path)
-        steps, answer = extract_reasoning_steps(reasoning)
-        
-        return {
-            'reasoning_steps': steps,
-            'answer': answer,
-            'thought_tree': root,
-            'best_path': best_path,
-            'full_reasoning': reasoning
-        }
+        return init_state
 
-def evaluate_tot_solution(
-    reasoning_output: Dict[str, Any],
-    criteria: Optional[Dict[str, float]] = None
-) -> Dict[str, float]:
+def batch_search_tot(
+    model: Any,
+    tokenizer: Any,
+    prompts: List[str],
+    objectives: List[str],
+    config: Dict[str, Any]
+) -> List[List[str]]:
     """
-    Evaluate a ToT reasoning solution.
+    Perform batched Tree of Thoughts search for multiple prompts.
     
     Args:
-        reasoning_output: Output from ToT reasoning
-        criteria: Evaluation criteria and weights
+        model: Language model
+        tokenizer: Tokenizer
+        prompts: List of initial prompts
+        objectives: List of objectives
+        config: Configuration dictionary
     """
-    if criteria is None:
-        criteria = {
-            'path_length': 0.3,
-            'reasoning_depth': 0.4,
-            'answer_clarity': 0.3
-        }
+    tot = TPUTreeofThoughts(
+        model=model,
+        tokenizer=tokenizer,
+        max_branches=config.get('max_branches', 3),
+        max_depth=config.get('max_depth', 3),
+        beam_width=config.get('beam_width', 5),
+        temperature=config.get('temperature', 0.7),
+        block_size=config.get('block_size', 128),
+        batch_size=config.get('batch_size', 32),
+        use_fp8=config.get('use_fp8', True)
+    )
+    
+    # Initialize state manager
+    state_factory = TPUTreeofThoughts.create_state_factory(
+        config,
+        block_size=config.get('block_size', 128)
+    )
+    
+    # Process prompts in batches
+    results = []
+    batch_size = config.get('batch_size', 32)
+    
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i+batch_size]
+        batch_objectives = objectives[i:i+batch_size]
         
-    scores = {}
-    
-    # Evaluate path length
-    if 'path_length' in criteria:
-        optimal_length = 5
-        path_length = len(reasoning_output['reasoning_steps'])
-        scores['path_length'] = (
-            criteria['path_length'] *
-            max(0, 1 - abs(path_length - optimal_length) / optimal_length)
-        )
-    
-    # Evaluate reasoning depth
-    if 'reasoning_depth' in criteria:
-        def count_branches(node: ThoughtNode) -> int:
-            if not node.children:
-                return 1
-            return 1 + sum(count_branches(child) for child in node.children)
+        # Initialize state for batch
+        state = state_factory(len(batch_prompts))
         
-        total_branches = count_branches(reasoning_output['thought_tree'])
-        scores['reasoning_depth'] = (
-            criteria['reasoning_depth'] *
-            min(total_branches / 10, 1.0)  # Normalize to [0, 1]
-        )
+        # Process each prompt in batch
+        batch_results = []
+        for prompt, objective in zip(batch_prompts, batch_objectives):
+            thought_chain = tot.search(
+                initial_prompt=prompt,
+                objective=objective,
+                state=state
+            )
+            batch_results.append(thought_chain)
+            
+        results.extend(batch_results)
     
-    # Evaluate answer clarity
-    if 'answer_clarity' in criteria:
-        answer = reasoning_output['answer']
-        # Simple heuristics for answer clarity
-        has_clear_statement = any(
-            marker in answer.lower()
-            for marker in ['therefore', 'thus', 'conclusion', 'answer is']
-        )
-        has_supporting_evidence = any(
-            marker in answer.lower()
-            for marker in ['because', 'since', 'as shown by']
-        )
-        
-        clarity_score = (has_clear_statement + has_supporting_evidence) / 2
-        scores['answer_clarity'] = criteria['answer_clarity'] * clarity_score
-    
-    # Calculate total score
-    scores['total'] = sum(scores.values())
-    
-    return scores
+    return results

@@ -37,12 +37,13 @@ def test_imports():
             'import typing_extensions'
         ],
         'VishwamAI Modules': [
-            'from vishwamai.model import VishwamAI',
+            'from vishwamai.transformer import EnhancedTransformerModel',
             'from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer',
-            'from vishwamai.multimodal.encoder import MultimodalEncoder',
             'from vishwamai.flash_attention import FlashAttention',
             'from vishwamai.kernels.kernel import fp8_gemm_optimized',
-            'from vishwamai.thoughts import ThoughtNode, TreeOfThoughts'
+            'from vishwamai.thoughts.tot import TreeOfThoughts, ThoughtNode',
+            'from vishwamai.thoughts.cot import ChainOfThoughtPrompting',
+            'from vishwamai.distill import compute_distillation_loss, create_student_model, initialize_from_teacher'
         ],
         'SONAR Dependencies': [
             'import fairseq2',

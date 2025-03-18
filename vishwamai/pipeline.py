@@ -511,10 +511,17 @@ class VishwamAIPipeline:
                 num_paths=self.config.get('num_reasoning_paths', 3)
             )
         elif mode == 'tot':
-            return self.tot.reason(
-                prompt,
-                evaluation_criteria=self.config.get('tot_evaluation_criteria')
+            # Fix: Call search() instead of reason()
+            objective = self.config.get('tot_evaluation_criteria', "Provide a logical and comprehensive answer")
+            thoughts = self.tot.search(
+                initial_prompt=prompt,
+                objective=objective,
+                max_steps=self.config.get('tot_max_steps', 10)
             )
+            return {
+                'thoughts': thoughts,
+                'text': '\n'.join(thoughts) if thoughts else ''
+            }
         else:
             # Standard generation
             input_ids = self.tokenizer.encode(prompt)

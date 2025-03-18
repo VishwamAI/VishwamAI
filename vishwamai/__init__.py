@@ -1,10 +1,34 @@
-"""VishwamAI: A TPU-optimized transformer model with multimodal capabilities."""
+"""
+VishwamAI: TPU-optimized generative model framework
+==================================================
 
+This package provides TPU-optimized implementations for transformer models
+with support for training, inference, and specialized features like
+Tree of Thoughts reasoning.
+"""
+
+# Version information
+__version__ = '0.1.0'
+
+# Make sure the subpackages are correctly initialized
+import os
+import sys
+
+# Add the parent directory to sys.path to ensure correct imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import commonly used modules
+from . import kernels
+from . import layers
+from . import thoughts
+
+# Core components
 from .model import VishwamAI
 from .tokenizer import VishwamAITokenizer
 from .training import TPUTrainingConfig, VishwamAITrainer
-from .distill import DistillationTrainer, LinearPathDistillation,IntermediateLayerDistillation, ProgressiveLayerDropout, create_layer_mapping, compute_attention_distillation_loss
-from .flash_attention import flash_attention, FlashAttentionLayer
+from .transformer import EnhancedTransformerModel, create_vishwamai_transformer
+
+# Specialized layers
 from .layers.layers import (
     TPUGEMMLinear,
     TPULayerNorm,
@@ -12,95 +36,70 @@ from .layers.layers import (
     TPUMoELayer,
     create_layer_factory
 )
-from .pipeline import VishwamAIPipeline, load_multimodal_pipeline
+
+# Flash attention optimizations
+from .flash_attention import FlashAttention
+
+# Knowledge distillation
+from .distill import (
+    compute_distillation_loss,
+    create_student_model,
+    initialize_from_teacher,
+    DistillationTrainer
+)
+
+# Pipeline and infrastructure
+from .pipeline import VishwamAIPipeline
 from .device_mesh import TPUMeshContext
 from .profiler import TPUProfiler
 from .logger import DuckDBLogger
-from .thoughts.tot import TreeOfThoughts, ThoughtNode, evaluate_tot_solution
-from .thoughts.cot import ChainOfThoughtPrompting
-from .multimodal import (
-    MultimodalEncoder,
-    MultimodalProcessor,
-    MultimodalConfig,
-    ImageCaptioningPipeline,
-    VisualQuestionAnswering, 
-    AudioCaptioningPipeline,
-    MultimodalChatPipeline,
-    pipeline
-)
 
-__version__ = "0.1.0"
+# Advanced reasoning capabilities
+from .thoughts.tot import TreeOfThoughts, ThoughtNode
+from .thoughts.cot import ChainOfThoughtPrompting
 
 def pipeline(
     task: str,
     model: str = None,
     **kwargs
-) -> VishwamAIPipeline:
-    """Create a pipeline for the specified task.
-    
-    Args:
-        task: Task to create pipeline for. One of:
-            - "text-generation"
-            - "chat"
-            - "image-captioning"
-            - "visual-qa"
-            - "audio-captioning"
-            - "multimodal-chat"
-        model: Model name or path
-        **kwargs: Additional arguments passed to pipeline
-        
-    Returns:
-        Appropriate pipeline for the task
-    """
-    if task in ["image-captioning", "visual-qa", "audio-captioning", "multimodal-chat"]:
-        return load_multimodal_pipeline(model, task=task, **kwargs)
-    else:
-        # Standard text pipeline
-        return VishwamAIPipeline(model, **kwargs)
+) -> 'VishwamAIPipeline':
+    """Create a pipeline for the specified task."""
+    return VishwamAIPipeline(model, task=task, **kwargs)
 
 __all__ = [
-    # Model and Core Components
+    # Core components
     "VishwamAI",
     "VishwamAITokenizer",
+    "EnhancedTransformerModel",
+    "create_vishwamai_transformer",
+    
+    # Training and optimization
     "TPUTrainingConfig",
     "VishwamAITrainer",
+    "TPUMeshContext",
+    "TPUProfiler",
+    "DuckDBLogger",
     
-    # Distillation Features
+    # Distillation features
+    "compute_distillation_loss",
+    "create_student_model",
+    "initialize_from_teacher",
     "DistillationTrainer",
-    "LinearPathDistillation",
-    "IntermediateLayerDistillation",
-    "ProgressiveLayerDropout",
-    "create_layer_mapping",
-    "compute_attention_distillation_loss",
     
-    # Layer Components
+    # Layer components
     "TPUGEMMLinear",
     "TPULayerNorm", 
     "TPUMultiHeadAttention",
     "TPUMoELayer",
     "create_layer_factory",
-    "flash_attention",
-    "FlashAttentionLayer",
+    "FlashAttention",
     
-    # Pipeline and Infrastructure
+    # Pipeline
     "VishwamAIPipeline",
-    "TPUMeshContext",
-    "TPUProfiler",
-    "DuckDBLogger",
+    "pipeline",
     
-    # Advanced Features
+    # Advanced reasoning
     "TreeOfThoughts",
     "ThoughtNode",
-    "evaluate_tot_solution",
     "ChainOfThoughtPrompting",
-    
-    # Multimodal components
-    'MultimodalEncoder',
-    'MultimodalProcessor',
-    'MultimodalConfig',
-    'ImageCaptioningPipeline',
-    'VisualQuestionAnswering', 
-    'AudioCaptioningPipeline',
-    'MultimodalChatPipeline',
-    'pipeline'
 ]

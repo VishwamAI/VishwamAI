@@ -189,7 +189,7 @@ The implementation is based on several research papers which can be found in the
 importtest results 
 
 ```
-kasinadhsarma@bgentech:~/VishwamAI$ python3 importtest.py 
+kasinadhsarma@bgentech:~/VishwamAI$ cd /home/kasinadhsarma/VishwamAI && python3 importtest.py
 
 Testing Core Dependencies:
 ✓ import jax
@@ -226,16 +226,17 @@ Testing Additional Libraries:
 ✓ import typing_extensions
 
 Testing VishwamAI Modules:
-2025-03-18 12:36:30.697747: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2025-03-18 14:51:46.618136: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1742281590.757745   32413 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1742281590.775724   32413 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
-✗ from vishwamai.model import VishwamAI - Error: No module named 'kernels'
+E0000 00:00:1742289706.641993   51288 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1742289706.649172   51288 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+! from vishwamai.transformer import EnhancedTransformerModel - Unexpected error: module 'jax.experimental.mesh_utils' has no attribute 'Mesh'
 ✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer
-✗ from vishwamai.multimodal.encoder import MultimodalEncoder - Error: No module named 'kernels'
 ✓ from vishwamai.flash_attention import FlashAttention
 ✓ from vishwamai.kernels.kernel import fp8_gemm_optimized
-✗ from vishwamai.thoughts import ThoughtNode, TreeOfThoughts - Error: No module named 'kernels'
+✓ from vishwamai.thoughts.tot import TreeOfThoughts, ThoughtNode
+✓ from vishwamai.thoughts.cot import ChainOfThoughtPrompting
+✓ from vishwamai.distill import compute_distillation_loss, create_student_model, initialize_from_teacher
 
 Testing SONAR Dependencies:
 ✓ import fairseq2
@@ -251,11 +252,10 @@ Data Processing: 4/4 successful
 Training Utilities: 4/4 successful
 Memory Optimization: 5/5 successful
 Additional Libraries: 3/3 successful
-VishwamAI Modules: 3/6 successful
+VishwamAI Modules: 6/7 successful
 SONAR Dependencies: 5/5 successful
 
-Overall: 32/35 imports successful (91.4%)
+Overall: 35/36 imports successful (97.2%)
 kasinadhsarma@bgentech:~/VishwamAI$ 
-
 
 ```

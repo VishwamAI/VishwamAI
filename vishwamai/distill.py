@@ -2,10 +2,13 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Any, Dict, Optional, Tuple
-from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant
-from vishwamai.layers.layers import TPUGEMMLinear, TPURMSNorm
-from vishwamai.transformer import EnhancedTransformerModel
+import optax
+import copy
+from typing import Any, Dict, Optional, Tuple, List, Union, Callable
+from .kernels.kernel import fp8_gemm_optimized, act_quant
+from .layers.layers import TPUGEMMLinear, TPURMSNorm
+from .transformer import EnhancedTransformerModel, create_train_state
+
 class LinearPathDistillation(nn.Module):
     """Linear path embedding distillation layer"""
     hidden_dim: int
@@ -294,3 +297,299 @@ def compute_attention_distillation_loss(
         loss = loss * mask
         
     return jnp.mean(loss) * (temperature ** 2)
+
+def compute_distillation_loss(
+    student_logits: jnp.ndarray,
+    teacher_logits: jnp.ndarray,
+    labels: Optional[jnp.ndarray] = None,
+    temperature: float = 2.0,
+    alpha: float = 0.5,
+    mask: Optional[jnp.ndarray] = None
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    """
+    Compute distillation loss between student and teacher models.
+    
+    Args:
+        student_logits: Logits from student model, shape [batch, seq_len, vocab_size]
+        teacher_logits: Logits from teacher model, shape [batch, seq_len, vocab_size]
+        labels: Optional ground truth labels for hard loss, shape [batch, seq_len]
+        temperature: Distillation temperature (higher = softer probabilities)
+        alpha: Weight for soft loss vs hard loss (1.0 = only soft loss)
+        mask: Optional attention mask, shape [batch, seq_len]
+        
+    Returns:
+        Tuple of (total loss, dictionary of metrics)
+    """
+    # Compute soft distillation loss (KL-divergence)
+    teacher_probs = jax.nn.softmax(teacher_logits / temperature, axis=-1)
+    student_logits_temp = student_logits / temperature
+    student_log_probs = jax.nn.log_softmax(student_logits_temp, axis=-1)
+    
+    # KL divergence: teacher_probs * (log(teacher_probs) - log(student_probs))
+    # Simplifying to: teacher_probs * -log(student_probs) since teacher_probs part is constant
+    soft_loss = -jnp.sum(teacher_probs * student_log_probs, axis=-1)
+    soft_loss = soft_loss * (temperature ** 2)  # Scale by temperature²
+    
+    if mask is not None:
+        soft_loss = soft_loss * mask
+        
+    metrics = {"soft_loss": jnp.mean(soft_loss)}
+    
+    # Compute hard loss if labels are provided
+    if labels is not None:
+        hard_loss = jax.nn.sparse_categorical_crossentropy(
+            logits=student_logits,
+            labels=labels,
+            from_logits=True
+        )
+        
+        if mask is not None:
+            hard_loss = hard_loss * mask
+            
+        metrics["hard_loss"] = jnp.mean(hard_loss)
+        
+        # Weighted combination of soft and hard loss
+        total_loss = alpha * jnp.mean(soft_loss) + (1 - alpha) * jnp.mean(hard_loss)
+    else:
+        total_loss = jnp.mean(soft_loss)
+    
+    # Calculate additional metrics
+    student_preds = jnp.argmax(student_logits, axis=-1)
+    teacher_preds = jnp.argmax(teacher_logits, axis=-1)
+    
+    if labels is not None:
+        student_accuracy = jnp.mean(student_preds == labels)
+        teacher_accuracy = jnp.mean(teacher_preds == labels)
+        metrics.update({
+            "student_accuracy": student_accuracy,
+            "teacher_accuracy": teacher_accuracy
+        })
+    
+    # Agreement between student and teacher
+    agreement = jnp.mean(student_preds == teacher_preds)
+    metrics["teacher_student_agreement"] = agreement
+    
+    return total_loss, metrics
+
+def create_student_model(
+    config: Dict[str, Any],
+    teacher_model: Any = None,
+    reduction_factor: float = 0.5,
+    rng: Optional[jnp.ndarray] = None
+) -> Tuple[EnhancedTransformerModel, Any, Dict[str, Any]]:
+    """
+    Create a student model from a teacher model or configuration.
+    
+    Args:
+        config: Configuration dictionary with model parameters
+        teacher_model: Optional teacher model to derive student architecture
+        reduction_factor: Factor to reduce model size (if creating from teacher)
+        rng: Optional JAX PRNGKey for initialization
+        
+    Returns:
+        Tuple of (student model, initialized variables, student config)
+    """
+    if rng is None:
+        rng = jax.random.PRNGKey(42)
+    
+    # If teacher model is provided, derive student config from it
+    if teacher_model is not None:
+        teacher_config = teacher_model.config
+        
+        # Calculate reduced dimensions based on reduction factor
+        student_config = {
+            "vocab_size": teacher_config.vocab_size,  # Keep same vocabulary
+            "num_layers": max(2, int(teacher_config.num_layers * reduction_factor)),
+            "num_heads": max(2, int(teacher_config.num_heads * reduction_factor)),
+            "head_dim": teacher_config.head_dim,  # Usually keep same head dimension
+            "hidden_dim": max(256, int(teacher_config.hidden_dim * reduction_factor)),
+            "mlp_dim": max(512, int(teacher_config.mlp_dim * reduction_factor)),
+            "max_seq_len": teacher_config.max_seq_len,
+            "dropout_rate": config.get("dropout_rate", 0.1),
+            "attention_dropout": config.get("attention_dropout", 0.1)
+        }
+    else:
+        # Use provided config directly
+        student_config = config
+    
+    # TPU-specific optimizations
+    use_flash_attn = config.get("use_flash_attn", True)
+    use_rms_norm = config.get("use_rms_norm", True)
+    dtype = config.get("dtype", jnp.bfloat16)  # TPU optimal
+    
+    # Create student model with TPU optimizations
+    student_model = EnhancedTransformerModel(
+        vocab_size=student_config.get("vocab_size"),
+        num_layers=student_config.get("num_layers"),
+        num_heads=student_config.get("num_heads"),
+        head_dim=student_config.get("head_dim"),
+        hidden_dim=student_config.get("hidden_dim"),
+        mlp_dim=student_config.get("mlp_dim"),
+        max_seq_len=student_config.get("max_seq_len"),
+        dropout_rate=student_config.get("dropout_rate", 0.1),
+        attention_dropout=student_config.get("attention_dropout", 0.1),
+        use_flash_attn=use_flash_attn,
+        use_rms_norm=use_rms_norm,
+        dtype=dtype
+    )
+    
+    # Initialize model variables with dummy input
+    dummy_input = jnp.ones((1, 16), dtype=jnp.int32)
+    variables = student_model.init(rng, dummy_input, deterministic=False)
+    
+    return student_model, variables, student_config
+
+def initialize_from_teacher(
+    student_state: Any,
+    teacher_state: Any,
+    method: str = "layer_mapping",
+    mapping_strategy: str = "uniform"
+) -> Any:
+    """
+    Initialize student model parameters from teacher model.
+    
+    Args:
+        student_state: Student model training state
+        teacher_state: Teacher model training state
+        method: Initialization method - 'layer_mapping', 'first_layers', 'layer_random'
+        mapping_strategy: Strategy for layer mapping ('uniform', 'last_layers')
+        
+    Returns:
+        Updated student model training state
+    """
+    student_params = student_state.params
+    teacher_params = teacher_state.params
+    
+    # Count student and teacher layers
+    student_num_layers = sum(1 for k in student_params.keys() if k.startswith("layers_"))
+    teacher_num_layers = sum(1 for k in teacher_params.keys() if k.startswith("layers_"))
+    
+    # Create deep copy of student params to modify
+    new_student_params = copy.deepcopy(student_params)
+    
+    # Initialize embedding and output layers from teacher (vocabulary must match)
+    if "embedding" in student_params and "embedding" in teacher_params:
+        # Check shape compatibility
+        s_emb_shape = student_params["embedding"]["embedding"].shape
+        t_emb_shape = teacher_params["embedding"]["embedding"].shape
+        
+        if s_emb_shape[0] == t_emb_shape[0]:  # Vocab size must match
+            if s_emb_shape[1] <= t_emb_shape[1]:  # Student embedding size <= teacher
+                # Copy part or all of teacher embeddings
+                new_student_params["embedding"]["embedding"] = teacher_params["embedding"]["embedding"][:, :s_emb_shape[1]]
+    
+    # Output projection has to match exactly, so only copy if dimensions match
+    if "output_proj" in student_params and "output_proj" in teacher_params:
+        s_out_shape = student_params["output_proj"]["kernel"].shape
+        t_out_shape = teacher_params["output_proj"]["kernel"].shape
+        
+        if s_out_shape == t_out_shape:
+            new_student_params["output_proj"] = teacher_params["output_proj"]
+    
+    # Handle layer initialization based on method
+    if method == "layer_mapping":
+        # Create mapping between teacher and student layers
+        layer_map = create_layer_mapping(
+            teacher_num_layers,
+            student_num_layers,
+            strategy=mapping_strategy
+        )
+        
+        # Copy parameters from teacher to student based on mapping
+        for student_idx, teacher_idx in layer_map.items():
+            student_key = f"layers_{student_idx}"
+            teacher_key = f"layers_{teacher_idx}"
+            
+            if student_key in student_params and teacher_key in teacher_params:
+                # For each parameter in the layer
+                for param_name in student_params[student_key]:
+                    if param_name in teacher_params[teacher_key]:
+                        s_param = student_params[student_key][param_name]
+                        t_param = teacher_params[teacher_key][param_name]
+                        
+                        # Handle different parameter shapes
+                        if isinstance(s_param, dict):
+                            # Handle nested dictionaries (e.g., attention heads)
+                            for sub_name in s_param:
+                                if sub_name in t_param:
+                                    s_shape = s_param[sub_name].shape
+                                    t_shape = t_param[sub_name].shape
+                                    
+                                    if s_shape == t_shape:
+                                        new_student_params[student_key][param_name][sub_name] = t_param[sub_name]
+                                    elif len(s_shape) == len(t_shape):
+                                        # Try to copy compatible parts
+                                        slices = tuple(slice(0, min(s, t)) for s, t in zip(s_shape, t_shape))
+                                        new_student_params[student_key][param_name][sub_name] = t_param[sub_name][slices]
+                        else:
+                            # Direct parameter tensors
+                            s_shape = s_param.shape
+                            t_shape = t_param.shape
+                            
+                            if s_shape == t_shape:
+                                new_student_params[student_key][param_name] = t_param
+                            elif len(s_shape) == len(t_shape):
+                                # Try to copy compatible parts 
+                                slices = tuple(slice(0, min(s, t)) for s, t in zip(s_shape, t_shape))
+                                new_student_params[student_key][param_name] = t_param[slices]
+    
+    elif method == "first_layers":
+        # Copy only the first N layers directly
+        copy_layers = min(student_num_layers, teacher_num_layers // 2)
+        
+        for i in range(copy_layers):
+            student_key = f"layers_{i}"
+            teacher_key = f"layers_{i}"
+            
+            if student_key in student_params and teacher_key in teacher_params:
+                # Similar parameter copying logic as above
+                for param_name in student_params[student_key]:
+                    if param_name in teacher_params[teacher_key]:
+                        s_param = student_params[student_key][param_name]
+                        t_param = teacher_params[teacher_key][param_name]
+                        
+                        if isinstance(s_param, dict):
+                            for sub_name in s_param:
+                                if sub_name in t_param:
+                                    s_shape = s_param[sub_name].shape
+                                    t_shape = t_param[sub_name].shape
+                                    
+                                    if s_shape == t_shape:
+                                        new_student_params[student_key][param_name][sub_name] = t_param[sub_name]
+                                    elif len(s_shape) == len(t_shape):
+                                        slices = tuple(slice(0, min(s, t)) for s, t in zip(s_shape, t_shape))
+                                        new_student_params[student_key][param_name][sub_name] = t_param[sub_name][slices]
+                        else:
+                            s_shape = s_param.shape
+                            t_shape = t_param.shape
+                            
+                            if s_shape == t_shape:
+                                new_student_params[student_key][param_name] = t_param
+                            elif len(s_shape) == len(t_shape):
+                                slices = tuple(slice(0, min(s, t)) for s, t in zip(s_shape, t_shape))
+                                new_student_params[student_key][param_name] = t_param[slices]
+    
+    elif method == "layer_random":
+        # Only keep embeddings and output layer from teacher, leave other layers random
+        # (Already handled above)
+        pass
+    
+    else:
+        raise ValueError(f"Unknown initialization method: {method}")
+    
+    # Update student state with new parameters
+    new_student_state = student_state.replace(params=new_student_params)
+    return new_student_state
+
+# Export public API
+__all__ = [
+    'compute_distillation_loss',
+    'create_student_model',
+    'initialize_from_teacher',
+    'DistillationTrainer',
+    'IntermediateLayerDistillation',
+    'LinearPathDistillation',
+    'ProgressiveLayerDropout',
+    'compute_attention_distillation_loss',
+    'create_layer_mapping'
+]

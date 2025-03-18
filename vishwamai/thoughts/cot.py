@@ -1,10 +1,10 @@
 """
-Chain-of-thought implementation for VishwamAI transformer.
+Chain of Thought implementation for VishwamAI.
 """
-
 import jax
 import jax.numpy as jnp
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+from ..kernels.kernel import fp8_gemm_optimized
 
 def format_cot_prompt(question: str, examples: List[Dict[str, str]] = None) -> str:
     """

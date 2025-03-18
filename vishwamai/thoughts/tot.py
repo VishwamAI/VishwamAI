@@ -1,9 +1,12 @@
 """Tree of Thoughts implementation for VishwamAI."""
-
-from typing import List, Optional, Tuple, Dict, Any
 import jax
 import jax.numpy as jnp
-from dataclasses import dataclass
+import flax.linen as nn
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable, Set
+import random
+import heapq
+import numpy as np
+from dataclasses import dataclass, field
 from ..kernels.kernel import fp8_gemm_optimized
 
 @dataclass
@@ -31,7 +34,7 @@ class TreeOfThoughts:
         self.tokenizer = tokenizer
         self.max_branches = max_branches
         self.max_depth = max_depth
-        self.beam_width = self.beam_width
+        self.beam_width = beam_width  # Fixed: was self.beam_width = self.beam_width
         self.temperature = temperature
         
     def generate_thoughts(

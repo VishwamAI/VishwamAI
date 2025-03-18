@@ -709,6 +709,275 @@ def create_layer_factory(config: Dict[str, Any]) -> Dict[str, Any]:
     }
     return layers
 
+class TPUMultiQueryAttention(nn.Module):
+    """TPU-optimized Multi-Query Attention for efficient text generation.
+    
+    Multi-Query Attention uses a single key-value head for multiple query heads,
+    significantly reducing memory usage and computation during inference while
+    maintaining quality.
+    """
+    num_heads: int
+    head_dim: int
+    dropout_rate: float = 0.0
+    dtype: Any = jnp.float32
+    qkv_bias: bool = True
+    use_flash_attn: bool = True
+    use_fp8: bool = True
+    block_size: int = 128
+    
+    def setup(self):
+        # Project queries with multiple heads
+        self.q_proj = TPUGEMMLinear(
+            features=self.num_heads * self.head_dim,
+            use_bias=self.qkv_bias,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+        
+        # Project keys and values with single head
+        self.kv_proj = TPUGEMMLinear(
+            # Only one head for keys and values
+            features=2 * self.head_dim,
+            use_bias=self.qkv_bias,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+        
+        self.out = TPUGEMMLinear(
+            features=self.num_heads * self.head_dim,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+    
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+        past_key_value: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
+    ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]]:
+        batch_size, seq_len, _ = x.shape
+        
+        # Project to queries with multiple heads
+        q = self.q_proj(x)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Project to keys and values with single head
+        kv = self.kv_proj(x)
+        kv = kv.reshape(batch_size, seq_len, 2, 1, self.head_dim)
+        k, v = kv[:, :, 0], kv[:, :, 1]
+        
+        # Repeat single k/v head for all query heads
+        k = jnp.broadcast_to(k, (batch_size, seq_len, self.num_heads, self.head_dim))
+        v = jnp.broadcast_to(v, (batch_size, seq_len, self.num_heads, self.head_dim))
+        
+        # Transpose for attention calculation
+        q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq_len, head_dim]
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        
+        # Add past key/values for inference
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = jnp.concatenate([past_k, k], axis=2)
+            v = jnp.concatenate([past_v, v], axis=2)
+        
+        # Apply attention
+        if self.use_flash_attn:
+            if deterministic:
+                attn_output, present = flash_attention_inference(
+                    q, k, v,
+                    mask=mask,
+                    past_key_values=past_key_value,
+                    block_size=self.block_size,
+                    head_dim=self.head_dim,
+                    num_heads=self.num_heads,
+                    use_fp8=self.use_fp8
+                )
+            else:
+                # For training, we use the regular flash attention implementation
+                from vishwamai.flash_attention import flash_attention
+                attn_output, _ = flash_attention(
+                    q=q.transpose(0, 2, 1, 3),  # [batch, seq, heads, dim]
+                    k=k.transpose(0, 2, 1, 3),
+                    v=v.transpose(0, 2, 1, 3),
+                    mask=mask,
+                    dropout_rate=self.dropout_rate if not deterministic else 0.0,
+                    dropout_rng=jax.random.PRNGKey(0) if not deterministic else None
+                )
+                attn_output = attn_output.transpose(0, 2, 1, 3)  # [batch, heads, seq, dim]
+                present = (k, v) if past_key_value is not None else None
+        else:
+            # Standard scaled dot-product attention
+            scale = 1.0 / jnp.sqrt(self.head_dim)
+            attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+            
+            if mask is not None:
+                attn_weights = jnp.where(mask, attn_weights, jnp.finfo(self.dtype).min)
+            
+            attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+            
+            if not deterministic and self.dropout_rate > 0.0:
+                keep_prob = 1.0 - self.dropout_rate
+                dropout_rng = jax.random.PRNGKey(0)  # Should use proper RNG handling
+                keep_mask = jax.random.bernoulli(dropout_rng, keep_prob, shape=attn_weights.shape)
+                keep_mask = keep_mask / keep_prob  # Scale to preserve expectation
+                attn_weights = attn_weights * keep_mask
+            
+            attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+            present = (k, v) if past_key_value is not None else None
+        
+        # Reshape and project output
+        attn_output = attn_output.transpose(0, 2, 1, 3)
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        attn_output = self.out(attn_output)
+        
+        return attn_output, present
+
+class TPUGroupedQueryAttention(nn.Module):
+    """TPU-optimized Grouped Query Attention (GQA) for efficient text generation.
+    
+    GQA groups multiple query heads to share the same key and value heads,
+    offering a flexible compromise between MQA and standard attention.
+    """
+    num_heads: int
+    num_kv_heads: int  # Number of key-value heads (smaller than query heads)
+    head_dim: int
+    dropout_rate: float = 0.0
+    dtype: Any = jnp.float32
+    qkv_bias: bool = True
+    use_flash_attn: bool = True
+    use_fp8: bool = True
+    block_size: int = 128
+    
+    def setup(self):
+        # Project queries with full number of heads
+        self.q_proj = TPUGEMMLinear(
+            features=self.num_heads * self.head_dim,
+            use_bias=self.qkv_bias,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+        
+        # Project keys and values with reduced number of heads
+        self.kv_proj = TPUGEMMLinear(
+            features=2 * self.num_kv_heads * self.head_dim,
+            use_bias=self.qkv_bias,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+        
+        self.out = TPUGEMMLinear(
+            features=self.num_heads * self.head_dim,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+        
+        # For mapping KV heads to Q heads
+        assert self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+    
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+        past_key_value: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
+    ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]]:
+        batch_size, seq_len, _ = x.shape
+        
+        # Project to queries with full number of heads
+        q = self.q_proj(x)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Project to keys and values with reduced number of heads
+        kv = self.kv_proj(x)
+        kv = kv.reshape(batch_size, seq_len, 2, self.num_kv_heads, self.head_dim)
+        k, v = kv[:, :, 0], kv[:, :, 1]
+        
+        # Repeat and interleave k/v heads to match query heads
+        # This maps each KV head to multiple query heads according to groups
+        k_expanded = jnp.repeat(k, self.num_queries_per_kv, axis=2)
+        v_expanded = jnp.repeat(v, self.num_queries_per_kv, axis=2)
+        
+        # Transpose for attention calculation
+        q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq_len, head_dim]
+        k = k_expanded.transpose(0, 2, 1, 3)
+        v = v_expanded.transpose(0, 2, 1, 3)
+        
+        # Add past key/values for inference
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            # The cached k/v are already expanded to match query heads
+            k = jnp.concatenate([past_k, k], axis=2)
+            v = jnp.concatenate([past_v, v], axis=2)
+        
+        # Apply attention (using the same mechanism as in TPUMultiQueryAttention)
+        if self.use_flash_attn:
+            if deterministic:
+                attn_output, present = flash_attention_inference(
+                    q, k, v,
+                    mask=mask,
+                    past_key_values=past_key_value,
+                    block_size=self.block_size,
+                    head_dim=self.head_dim,
+                    num_heads=self.num_heads,
+                    use_fp8=self.use_fp8
+                )
+            else:
+                # For training, we use the regular flash attention implementation
+                from vishwamai.flash_attention import flash_attention
+                attn_output, _ = flash_attention(
+                    q=q.transpose(0, 2, 1, 3),  # [batch, seq, heads, dim]
+                    k=k.transpose(0, 2, 1, 3),
+                    v=v.transpose(0, 2, 1, 3),
+                    mask=mask,
+                    dropout_rate=self.dropout_rate if not deterministic else 0.0,
+                    dropout_rng=jax.random.PRNGKey(0) if not deterministic else None
+                )
+                attn_output = attn_output.transpose(0, 2, 1, 3)  # [batch, heads, seq, dim]
+                # For present state, we store the unexpanded k/v to save memory
+                if past_key_value is not None:
+                    # Extract just the new part that was added during this step
+                    k_new = k[:, :, -seq_len:]
+                    v_new = v[:, :, -seq_len:]
+                    present = (k, v)
+                else:
+                    present = None
+        else:
+            # Standard scaled dot-product attention
+            # ... (similar to TPUMultiQueryAttention implementation)
+            scale = 1.0 / jnp.sqrt(self.head_dim)
+            attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+            
+            if mask is not None:
+                attn_weights = jnp.where(mask, attn_weights, jnp.finfo(self.dtype).min)
+            
+            attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+            
+            if not deterministic and self.dropout_rate > 0.0:
+                keep_prob = 1.0 - self.dropout_rate
+                dropout_rng = jax.random.PRNGKey(0)  # Should use proper RNG handling
+                keep_mask = jax.random.bernoulli(dropout_rng, keep_prob, shape=attn_weights.shape)
+                keep_mask = keep_mask / keep_prob  # Scale to preserve expectation
+                attn_weights = attn_weights * keep_mask
+            
+            attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+            present = (k, v) if past_key_value is not None else None
+        
+        # Reshape and project output
+        attn_output = attn_output.transpose(0, 2, 1, 3)
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        attn_output = self.out(attn_output)
+        
+        return attn_output, present
+
 # Update __all__
 __all__ = [
     'TPUGEMMLinear',

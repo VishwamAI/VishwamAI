@@ -173,6 +173,117 @@ class DistillationTrainer:
         
         return new_student_state, metrics
 
+    def advanced_loss_functions(
+        self,
+        student_logits: jnp.ndarray,
+        teacher_logits: jnp.ndarray,
+        student_embeddings: Optional[jnp.ndarray] = None,
+        teacher_embeddings: Optional[jnp.ndarray] = None,
+        labels: jnp.ndarray = None,
+        mask: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
+        """Advanced loss functions for improved distillation performance"""
+        # Compute regular distillation loss
+        teacher_probs = jax.nn.softmax(teacher_logits / self.temperature, axis=-1)
+        student_logits_temp = student_logits / self.temperature
+        student_log_probs = jax.nn.log_softmax(student_logits_temp, axis=-1)
+        distill_loss = -jnp.sum(teacher_probs * student_log_probs, axis=-1)
+        distill_loss = distill_loss * (self.temperature ** 2)
+        
+        # Add embedding path loss if enabled
+        if self.use_linear_path and student_embeddings is not None and teacher_embeddings is not None:
+            embedding_loss = jnp.mean(jnp.square(
+                self.embedding_distill(student_embeddings) - teacher_embeddings
+            ))
+            distill_loss = distill_loss + 0.1 * embedding_loss  # Weighted combination
+        
+        # Hard target cross entropy loss
+        if labels is not None:
+            hard_loss = jax.nn.sparse_categorical_crossentropy(
+                logits=student_logits,
+                labels=labels,
+                from_logits=True
+            )
+            if mask is not None:
+                hard_loss = hard_loss * mask
+                distill_loss = distill_loss * mask
+            
+            loss = self.alpha * jnp.mean(distill_loss) + (1 - self.alpha) * jnp.mean(hard_loss)
+        else:
+            loss = jnp.mean(distill_loss)
+            
+        return loss
+
+    def improved_training_strategies(
+        self,
+        student_state: Any,
+        batch: Dict[str, jnp.ndarray],
+        dropout_rng: Any
+    ) -> Tuple[Any, Dict[str, float]]:
+        """
+        Improved training strategies for better distillation performance.
+        """
+        def loss_fn(params):
+            # Get teacher logits in chunks to save memory
+            teacher_chunks = []
+            for i in range(0, batch['input_ids'].shape[1], self.block_size):
+                chunk = jax.lax.dynamic_slice(
+                    batch['input_ids'],
+                    (0, i),
+                    (batch['input_ids'].shape[0], min(self.block_size, batch['input_ids'].shape[1] - i))
+                )
+                teacher_chunk = self.teacher_model(
+                    chunk,
+                    deterministic=True
+                )
+                teacher_chunks.append(teacher_chunk)
+            teacher_logits = jnp.concatenate(teacher_chunks, axis=1)
+            
+            # Student forward pass
+            student_logits = self.student_model.apply(
+                {'params': params},
+                batch['input_ids'],
+                deterministic=False,
+                rngs={'dropout': dropout_rng}
+            )
+            
+            # Compute loss
+            loss = self.advanced_loss_functions(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                labels=batch['labels'],
+                mask=batch.get('attention_mask')
+            )
+            
+            return loss, (student_logits, teacher_logits)
+        
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (student_logits, teacher_logits)), grads = grad_fn(student_state.params)
+        
+        # Update student model
+        new_student_state = student_state.apply_gradients(grads=grads)
+        
+        # Compute metrics
+        metrics = {
+            'loss': loss,
+            'student_perplexity': jnp.exp(jnp.mean(
+                jax.nn.sparse_categorical_crossentropy(
+                    logits=student_logits,
+                    labels=batch['labels'],
+                    from_logits=True
+                )
+            )),
+            'teacher_perplexity': jnp.exp(jnp.mean(
+                jax.nn.sparse_categorical_crossentropy(
+                    logits=teacher_logits,
+                    labels=batch['labels'],
+                    from_logits=True
+                )
+            ))
+        }
+        
+        return new_student_state, metrics
+
 class IntermediateLayerDistillation(nn.Module):
     """
     TPU-optimized intermediate layer distillation.

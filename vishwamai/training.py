@@ -11,6 +11,8 @@ from tqdm.auto import tqdm
 from .pipeline import VishwamAIPipeline
 from .transformer import create_learning_rate_schedule
 from .logger import DuckDBLogger
+from .device_mesh import TPUMeshContext
+from .profiler import TPUProfiler
 
 """TPU-optimized training configuration and initialization"""
 
@@ -548,6 +550,12 @@ class VishwamAITrainer:
             experiment_name=experiment_name,
             config=config
         )
+        
+        # Initialize TPU Profiler
+        self.profiler = TPUProfiler(config=config)
+        
+        # Initialize TPU Mesh Context
+        self.mesh_context = TPUMeshContext(config=config)
     
     def train(self):
         """Run the training loop."""

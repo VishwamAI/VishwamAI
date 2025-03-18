@@ -296,6 +296,46 @@ class TPUMeshContext:
         """Remove padding from tensor."""
         original_shape = metadata["original_shape"]
         return x[tuple(slice(0, dim) for dim in original_shape)]
+    
+    def dynamic_mesh_reshaping(
+        self,
+        new_shape: Tuple[int, ...]
+    ):
+        """Dynamically reshape the device mesh."""
+        self.mesh_shape = new_shape
+        self.device_mesh = self._create_device_mesh()
+        self.sharding_rules = self._create_sharding_rules()
+    
+    def optimal_sharding_strategy(
+        self,
+        tensor_shape: Tuple[int, ...],
+        tensor_type: str = "weights"
+    ) -> P:
+        """Determine the optimal sharding strategy for a given tensor."""
+        if tensor_type == "weights":
+            if len(tensor_shape) == 2:
+                # For 2D weight matrices, shard along the first dimension
+                return P("model", None)
+            elif len(tensor_shape) == 4:
+                # For 4D weight tensors, shard along the first and second dimensions
+                return P("model", "pipe", None, None)
+        elif tensor_type == "activations":
+            if len(tensor_shape) == 3:
+                # For 3D activation tensors, shard along the first dimension
+                return P("data", None, None)
+            elif len(tensor_shape) == 4:
+                # For 4D activation tensors, shard along the first and second dimensions
+                return P("data", "model", None, None)
+        elif tensor_type == "gradients":
+            if len(tensor_shape) == 2:
+                # For 2D gradient matrices, shard along the first dimension
+                return P("data", "model")
+            elif len(tensor_shape) == 4:
+                # For 4D gradient tensors, shard along the first and second dimensions
+                return P("data", "model", None, None)
+        
+        # Default sharding strategy
+        return P(None)
 
 def create_device_mesh(
     config: Dict[str, Any]

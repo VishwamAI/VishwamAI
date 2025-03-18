@@ -272,9 +272,92 @@ class TPUProfiler:
             print(f"Memory profiling failed: {e}")
             return {}
 
+    def add_detailed_metrics(self):
+        """Add detailed metrics for TPU performance."""
+        self.metrics["compute_efficiency"] = []
+        self.metrics["memory_bandwidth"] = []
+        self.metrics["latency"] = []
+        self.metrics["energy_consumption"] = []
+
+    def record_detailed_metrics(
+        self,
+        computation: Any
+    ):
+        """Record detailed metrics for a JAX computation."""
+        try:
+            analysis = jax.jit(computation).lower().compile().cost_analysis()
+            self.metrics["compute_efficiency"].append(analysis.get("compute_efficiency", 0))
+            self.metrics["memory_bandwidth"].append(analysis.get("memory_bandwidth", 0))
+            self.metrics["latency"].append(analysis.get("latency", 0))
+            self.metrics["energy_consumption"].append(analysis.get("energy_consumption", 0))
+        except:
+            pass
+
+    def get_detailed_metrics_summary(self) -> Dict[str, float]:
+        """Get summary of detailed metrics."""
+        summary = {}
+        
+        for metric, values in self.metrics.items():
+            if values:
+                summary[f"{metric}_mean"] = float(np.mean(values))
+                summary[f"{metric}_std"] = float(np.std(values))
+                summary[f"{metric}_min"] = float(np.min(values))
+                summary[f"{metric}_max"] = float(np.max(values))
+        
+        return summary
+
+    def get_actionable_recommendations(self) -> List[str]:
+        """Generate actionable recommendations for optimizing TPU performance."""
+        recommendations = []
+        metrics = self.get_detailed_metrics_summary()
+        
+        # Check compute efficiency
+        compute_efficiency = metrics.get("compute_efficiency_mean", 0)
+        if compute_efficiency < 0.7:
+            recommendations.append(
+                "Low compute efficiency detected. Consider:"
+                "\n- Optimizing kernel implementations"
+                "\n- Reducing data transfer overhead"
+                "\n- Using mixed precision training"
+            )
+        
+        # Check memory bandwidth
+        memory_bandwidth = metrics.get("memory_bandwidth_mean", 0)
+        if memory_bandwidth < 0.5:
+            recommendations.append(
+                "Low memory bandwidth utilization detected. Consider:"
+                "\n- Optimizing memory access patterns"
+                "\n- Using larger batch sizes"
+                "\n- Reducing memory fragmentation"
+            )
+        
+        # Check latency
+        latency = metrics.get("latency_mean", 0)
+        if latency > 1.0:
+            recommendations.append(
+                "High latency detected. Consider:"
+                "\n- Reducing synchronization points"
+                "\n- Using asynchronous operations"
+                "\n- Optimizing data pipeline"
+            )
+        
+        # Check energy consumption
+        energy_consumption = metrics.get("energy_consumption_mean", 0)
+        if energy_consumption > 100:
+            recommendations.append(
+                "High energy consumption detected. Consider:"
+                "\n- Using energy-efficient kernels"
+                "\n- Reducing unnecessary computations"
+                "\n- Optimizing power management settings"
+            )
+        
+        return recommendations
+
 def create_profiler(
     config: Dict[str, Any],
     log_dir: Optional[str] = None
 ) -> TPUProfiler:
     """Create TPU profiler instance."""
-    return TPUProfiler(config=config, log_dir=log_dir)
+    profiler = TPUProfiler(config=config, log_dir=log_dir)
+    profiler.add_detailed_metrics()
+    return profiler

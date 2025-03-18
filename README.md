@@ -189,7 +189,7 @@ The implementation is based on several research papers which can be found in the
 importtest results 
 
 ```
-kasinadhsarma@bgentech:~/VishwamAI$ python3 importtest.py
+kasinadhsarma@bgentech:~/VishwamAI$ python3 importtest.py 
 
 Testing Core Dependencies:
 ✓ import jax
@@ -226,12 +226,12 @@ Testing Additional Libraries:
 ✓ import typing_extensions
 
 Testing VishwamAI Modules:
-2025-03-18 12:09:52.148310: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2025-03-18 12:36:30.697747: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1742279992.207020   29204 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1742279992.227575   29204 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
-✗ from vishwamai.model import VishwamAI - Error: cannot import name 'bf16_cast_to_fp8' from 'vishwamai.kernels.fp8_cast_bf16' (/home/kasinadhsarma/VishwamAI/vishwamai/kernels/fp8_cast_bf16.py)
-✗ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer - Error: No module named 'kernels'
+E0000 00:00:1742281590.757745   32413 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1742281590.775724   32413 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+✗ from vishwamai.model import VishwamAI - Error: No module named 'kernels'
+✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer
 ✗ from vishwamai.multimodal.encoder import MultimodalEncoder - Error: No module named 'kernels'
 ✓ from vishwamai.flash_attention import FlashAttention
 ✓ from vishwamai.kernels.kernel import fp8_gemm_optimized
@@ -251,73 +251,11 @@ Data Processing: 4/4 successful
 Training Utilities: 4/4 successful
 Memory Optimization: 5/5 successful
 Additional Libraries: 3/3 successful
-VishwamAI Modules: 2/6 successful
+VishwamAI Modules: 3/6 successful
 SONAR Dependencies: 5/5 successful
 
-Overall: 31/35 imports successful (88.6%)
+Overall: 32/35 imports successful (91.4%)
 kasinadhsarma@bgentech:~/VishwamAI$ 
 
-@kasinadhsarma ➜ /workspaces/VishwamAI (copilot-workspace-22e) $ python3 importtest.py 
 
-Testing Core Dependencies:
-✓ import jax
-✓ import jax.numpy as jnp
-✓ import flax.linen as nn
-✓ import optax
-✓ import numpy as np
-✓ import torch
-✓ from transformers import AutoTokenizer
-✓ from safetensors import safe_open
-
-Testing Data Processing:
-✓ import datasets
-✓ import sentencepiece
-✓ import tokenizers
-✓ from huggingface_hub import snapshot_download
-
-Testing Training Utilities:
-✓ import wandb
-✓ import duckdb
-✓ import tqdm
-✓ import pyarrow
-
-Testing Memory Optimization:
-✓ import einops
-✓ import chex
-✓ import jaxtyping
-✓ import optree
-✓ import orbax.checkpoint
-
-Testing Additional Libraries:
-✓ import scipy
-✓ from ml_collections import ConfigDict
-✓ import typing_extensions
-
-Testing VishwamAI Modules:
-WARNING:absl:Tensorflow library not found, tensorflow.io.gfile operations will use native shim calls. GCS paths (i.e. 'gs://...') cannot be accessed.
-✗ from vishwamai.model import VishwamAI - Error: No module named 'kernels'
-✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer
-✗ from vishwamai.multimodal.encoder import MultimodalEncoder - Error: No module named 'kernels'
-✓ from vishwamai.flash_attention import FlashAttention
-✓ from vishwamai.kernels.kernel import fp8_gemm_optimized
-✗ from vishwamai.thoughts import ThoughtNode, TreeOfThoughts - Error: No module named 'kernels'
-
-Testing SONAR Dependencies:
-! import fairseq2 - Unexpected error: fairseq2 requires libsndfile. Use your system package manager to install it (e.g. `apt install libsndfile1`).
-✓ import editdistance
-✓ import importlib_metadata
-✓ import importlib_resources
-✓ import sacrebleu
-
-Import Test Summary:
--------------------
-Core Dependencies: 8/8 successful
-Data Processing: 4/4 successful
-Training Utilities: 4/4 successful
-Memory Optimization: 5/5 successful
-Additional Libraries: 3/3 successful
-VishwamAI Modules: 3/6 successful
-SONAR Dependencies: 4/5 successful
-
-Overall: 31/35 imports successful (88.6%)
 ```

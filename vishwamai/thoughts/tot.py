@@ -31,7 +31,7 @@ class TreeOfThoughts:
         self.tokenizer = tokenizer
         self.max_branches = max_branches
         self.max_depth = max_depth
-        self.beam_width = beam_width
+        self.beam_width = self.beam_width
         self.temperature = temperature
         
     def generate_thoughts(

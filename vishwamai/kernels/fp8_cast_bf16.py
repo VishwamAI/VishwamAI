@@ -425,6 +425,27 @@ def fp8_cast_to_bf16(x: jnp.ndarray) -> jnp.ndarray:
     # Cast to BF16
     return (x_fp32 * scale).astype(jnp.bfloat16)
 
+def bf16_cast_to_fp8(x: jnp.ndarray) -> jnp.ndarray:
+    """Cast BF16 tensor to FP8 format.
+    
+    Args:
+        x: Input tensor in BF16 format
+        
+    Returns:
+        Tensor cast to FP8
+    """
+    if x.dtype == jnp.int8:
+        return x
+    
+    # First convert to FP32 for better precision in intermediate calculations
+    x_fp32 = x.astype(jnp.float32)
+    
+    # Get the dynamic scale
+    scale = dynamic_scale_finder(x_fp32)
+    
+    # Cast to FP8
+    return (x_fp32 * scale).astype(jnp.int8)
+
 class FP8Scaler:
     """Dynamic loss scaler for mixed FP8 training."""
     

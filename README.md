@@ -256,4 +256,68 @@ SONAR Dependencies: 5/5 successful
 
 Overall: 31/35 imports successful (88.6%)
 kasinadhsarma@bgentech:~/VishwamAI$ 
+
+@kasinadhsarma ➜ /workspaces/VishwamAI (copilot-workspace-22e) $ python3 importtest.py 
+
+Testing Core Dependencies:
+✓ import jax
+✓ import jax.numpy as jnp
+✓ import flax.linen as nn
+✓ import optax
+✓ import numpy as np
+✓ import torch
+✓ from transformers import AutoTokenizer
+✓ from safetensors import safe_open
+
+Testing Data Processing:
+✓ import datasets
+✓ import sentencepiece
+✓ import tokenizers
+✓ from huggingface_hub import snapshot_download
+
+Testing Training Utilities:
+✓ import wandb
+✓ import duckdb
+✓ import tqdm
+✓ import pyarrow
+
+Testing Memory Optimization:
+✓ import einops
+✓ import chex
+✓ import jaxtyping
+✓ import optree
+✓ import orbax.checkpoint
+
+Testing Additional Libraries:
+✓ import scipy
+✓ from ml_collections import ConfigDict
+✓ import typing_extensions
+
+Testing VishwamAI Modules:
+WARNING:absl:Tensorflow library not found, tensorflow.io.gfile operations will use native shim calls. GCS paths (i.e. 'gs://...') cannot be accessed.
+✗ from vishwamai.model import VishwamAI - Error: No module named 'kernels'
+✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer
+✗ from vishwamai.multimodal.encoder import MultimodalEncoder - Error: No module named 'kernels'
+✓ from vishwamai.flash_attention import FlashAttention
+✓ from vishwamai.kernels.kernel import fp8_gemm_optimized
+✗ from vishwamai.thoughts import ThoughtNode, TreeOfThoughts - Error: No module named 'kernels'
+
+Testing SONAR Dependencies:
+! import fairseq2 - Unexpected error: fairseq2 requires libsndfile. Use your system package manager to install it (e.g. `apt install libsndfile1`).
+✓ import editdistance
+✓ import importlib_metadata
+✓ import importlib_resources
+✓ import sacrebleu
+
+Import Test Summary:
+-------------------
+Core Dependencies: 8/8 successful
+Data Processing: 4/4 successful
+Training Utilities: 4/4 successful
+Memory Optimization: 5/5 successful
+Additional Libraries: 3/3 successful
+VishwamAI Modules: 3/6 successful
+SONAR Dependencies: 4/5 successful
+
+Overall: 31/35 imports successful (88.6%)
 ```

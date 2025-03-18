@@ -189,7 +189,7 @@ The implementation is based on several research papers which can be found in the
 importtest results 
 
 ```
-kasinadhsarma@bgentech:~/VishwamAI$ python3 importtest.py
+kasinadhsarma@bgentech:~/VishwamAI$ python3 importtest.py 
 
 Testing Core Dependencies:
 ✓ import jax
@@ -198,6 +198,8 @@ Testing Core Dependencies:
 ✓ import optax
 ✓ import numpy as np
 ✓ import torch
+/home/kasinadhsarma/.local/lib/python3.12/site-packages/transformers/utils/generic.py:441: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
 ✓ from transformers import AutoTokenizer
 ✓ from safetensors import safe_open
 
@@ -226,10 +228,10 @@ Testing Additional Libraries:
 ✓ import typing_extensions
 
 Testing VishwamAI Modules:
-2025-03-18 22:57:10.597488: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2025-03-19 00:34:24.580806: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1742318830.616442   31631 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1742318830.621911   31631 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+E0000 00:00:1742324664.601755   51753 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1742324664.607933   51753 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
 ✓ from vishwamai.transformer import EnhancedTransformerModel
 ✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer
 ✓ from vishwamai.layers.attention import FlashAttention
@@ -250,13 +252,15 @@ Testing Multimodal Dependencies:
 ✓ from PIL import Image
 ✓ import torchvision
 ✓ import timm
+/home/kasinadhsarma/.local/lib/python3.12/site-packages/transformers/utils/generic.py:309: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
 ✓ from transformers import CLIPProcessor, CLIPModel
 ✓ import cv2
 ✓ import albumentations
 ✓ import kornia
-✗ from vishwamai.multimodal.vision import ViTEncoder, CLIPAdapter - Error: No module named 'audio_processor'
+✓ from vishwamai.multimodal.vision import ViTEncoder, CLIPAdapter
 ✓ from vishwamai.multimodal.fusion import CrossAttentionFuser, MultimodalProjector
-✗ from vishwamai.multimodal.processor import ImageProcessor, MultimodalBatchProcessor - Error: No module named 'audio_processor'
+✓ from vishwamai.multimodal.processor import ImageProcessor, MultimodalBatchProcessor
 
 Testing TPU Kernels:
 ✓ from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant
@@ -284,18 +288,18 @@ Memory Optimization: 5/5 successful
 Additional Libraries: 3/3 successful
 VishwamAI Modules: 7/7 successful
 SONAR Dependencies: 5/5 successful
-Multimodal Dependencies: 9/11 successful
+Multimodal Dependencies: 11/11 successful
 TPU Kernels: 7/7 successful
 TPU Optimized Layers: 6/6 successful
 
-Overall: 58/60 imports successful (96.7%)
+Overall: 60/60 imports successful (100.0%)
 
 Testing multimodal functionality:
 1. Testing image processing...
-✗ Image processor failed: No module named 'audio_processor'
-2. Testing vision encoder...
-WARNING:2025-03-18 22:57:14,225:jax._src.xla_bridge:966: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+WARNING:2025-03-19 00:34:30,296:jax._src.xla_bridge:966: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
 WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+✗ Image processor failed: convolution dimension_numbers[1] must contain the characters 'O' and 'I' exactly once, got HWCO.
+2. Testing vision encoder...
 ✗ Vision encoder failed: FlashAttention.__init__() got an unexpected keyword argument 'use_fp8'
 3. Testing multimodal fusion...
 ✗ Multimodal fusion failed: Module construction attributes are frozen. (https://flax.readthedocs.io/en/latest/api_reference/flax.errors.html#flax.errors.SetAttributeInModuleSetupError)
@@ -304,9 +308,9 @@ Multimodal functionality tests completed
 
 Testing kernel performance:
 1. Testing GEMM performance...
-✗ GEMM performance test failed: cannot reshape array of shape (64, 1) (size 64) into shape (1024, 1, 1, 1) (size 1024)
+✓ GEMM performance - Standard: 0.0000s, Optimized: 0.0001s, Speedup: 0.21x
 2. Testing activation functions...
-✓ Activation performance - Standard: 0.2270s, Optimized: 0.1472s, Speedup: 1.54x
+✓ Activation performance - Standard: 0.1619s, Optimized: 0.0078s, Speedup: 20.82x
 
 Kernel performance tests completed
 kasinadhsarma@bgentech:~/VishwamAI$ 

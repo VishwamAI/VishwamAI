@@ -60,7 +60,7 @@ class TPUMeshContext:
             # Use 1D mesh for data parallelism only
             return (self.num_devices,)
     
-    def _create_device_mesh(self) -> mesh_utils.Mesh:
+    def _create_device_mesh(self) -> Mesh:
         """Create TPU device mesh."""
         devices = mesh_utils.create_device_mesh(self.mesh_shape)
         

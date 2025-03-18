@@ -2,7 +2,7 @@
 
 import jax
 import jax.numpy as jnp
-from contextlib import contextmanager, Tuple
+from contextlib import contextmanager
 from typing import Dict, Any, Optional, List, Tuple
 import time
 import numpy as np

@@ -1,55 +1,32 @@
 from setuptools import setup, find_packages
 
+with open("requirements.txt") as f:
+    install_requires = f.read().splitlines()
+
 setup(
     name="vishwamai",
     version="0.1.0",
     packages=find_packages(),
-    install_requires=[
-        "jax>=0.5.2",
-        "jaxlib>=0.5.1",
-        "flax>=0.10.4",
-        "optax>=0.2.4",
-        "transformers>=4.36.0",
-        "torch>=2.6.0",
-        "numpy>=1.26.4",
-        "safetensors>=0.5.3",
-        "sentencepiece==0.2.0",
-        "tokenizers>=0.15.0",
-        "huggingface-hub==0.29.2",
-        "wandb==0.15.10",
-        "duckdb==1.2.1",
-        "tqdm==4.67.1",
-        "pyarrow==16.1.0",
-        "einops==0.8.1",
-        "chex==0.1.89",
-        "jaxtyping==0.2.38",
-        "optree==0.14.1",
-        "orbax-checkpoint==0.11.8",
-        "scipy==1.11.4",
-        "ml_collections==1.0.0",
-        "typing_extensions==4.12.2",
-        "hydra-core>=1.1.0,<1.4.0",
-        "datasets>=2.14.0",
-        "editdistance~=0.8",
-        "importlib_metadata~=7.0",
-        "importlib_resources~=6.4",
-        "sacrebleu~=2.4"
-    ],
+    install_requires=install_requires,
     extras_require={
         "dev": [
-            "ipython==8.20.0",
-            "jupyter==1.0.0",
-            "notebook==6.4.12"
+            "pytest==8.3.5",
+            "pytest-cov==6.0.0",
+            "black==24.1.1",
+            "isort==5.13.0",
+            "flake8==7.1.2",
+            "mypy==1.6.0",
+            "pytest-xdist==3.3.0"
         ],
         "tpu": [
-            "cloud-tpu-client>=0.10",
+            "cloud-tpu-client==0.10",
             "libtpu-nightly"
         ],
         "fairseq2": [
-            "fairseq2 @ https://fair.pkg.atmeta.com/fairseq2/whl/pt2.6.0/cu124"
+            "fairseq2"
         ]
     },
-    description="TPU-optimized text-to-text generation model with knowledge distillation",
+    description="Advanced language model training system with Hydra configuration, hyperparameter tuning, and distributed training support",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Kasinadh Sarma",
@@ -60,9 +37,10 @@ setup(
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    python_requires=">=3.9",
+    python_requires=">=3.8, <4.0",
 )

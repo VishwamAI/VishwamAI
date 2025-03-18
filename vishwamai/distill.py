@@ -5,9 +5,9 @@ import flax.linen as nn
 import optax
 import copy
 from typing import Any, Dict, Optional, Tuple, List, Union, Callable
-from .kernels.kernel import fp8_gemm_optimized, act_quant
-from .layers.layers import TPUGEMMLinear, TPURMSNorm
-from .transformer import EnhancedTransformerModel, create_train_state
+from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant
+from vishwamai.layers.layers import TPUGEMMLinear, TPURMSNorm
+from vishwamai.transformer import EnhancedTransformerModel, create_train_state
 
 class LinearPathDistillation(nn.Module):
     """Linear path embedding distillation layer"""

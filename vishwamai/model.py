@@ -11,9 +11,9 @@ from .layers.layers import (
     TPUMultiHeadAttention,
     TPUMoELayer
 )
-from .kernels.kernel import fp8_gemm_optimized
-from .flash_attention import FlashAttention
-from .kernels.fp8_cast_bf16 import bf16_cast_to_fp8
+from vishwamai.kernels.kernel import fp8_gemm_optimized
+from vishwamai.layers.attention import FlashAttention
+from vishwamai.kernels.fp8_cast_bf16 import bf16_cast_to_fp8
 
 class VishwamAI(nn.Module):
     """VishwamAI transformer model."""

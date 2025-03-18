@@ -3,11 +3,8 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass
-import fairseq2.models.sonar
-from fairseq2.models.sonar import SonarModel, SonarConfig
-from fairseq2.data.text import TextTokenizer
 
 class SonarEncoder(nn.Module):
     """SONAR encoder for multilingual text and speech embeddings."""
@@ -15,10 +12,19 @@ class SonarEncoder(nn.Module):
     config: Dict[str, Any]
     
     def setup(self):
-        # Initialize SONAR model
-        self.sonar = SonarModel(self.config["fairseq2_model_path"])
-        self.tokenizer = TextTokenizer()
-        
+        # Lazy import fairseq2 to avoid startup dependency
+        try:
+            import fairseq2.models.sonar
+            from fairseq2.models.sonar import SonarModel
+            from fairseq2.data.text import TextTokenizer
+            
+            self.sonar = SonarModel(self.config["fairseq2_model_path"])
+            self.tokenizer = TextTokenizer()
+            self._has_sonar = True
+        except ImportError:
+            print("Warning: fairseq2 not found, some features will be disabled")
+            self._has_sonar = False
+    
     def embed_text(
         self,
         text: List[str],
@@ -35,6 +41,9 @@ class SonarEncoder(nn.Module):
         Returns:
             Dictionary with embeddings and optional attention mask
         """
+        if not self._has_sonar:
+            raise ImportError("fairseq2 is required for text embedding")
+            
         # Tokenize text
         tokens = self.tokenizer.encode(text, language=src_lang)
         
@@ -68,6 +77,9 @@ class SonarEncoder(nn.Module):
         Returns:
             Dictionary with embeddings and optional attention mask
         """
+        if not self._has_sonar:
+            raise ImportError("fairseq2 is required for speech embedding")
+            
         # Get speech embeddings from SONAR
         embeddings = self.sonar.encode_speech(
             speech,
@@ -100,6 +112,9 @@ class SonarEncoder(nn.Module):
         Returns:
             List of decoded text sequences
         """
+        if not self._has_sonar:
+            raise ImportError("fairseq2 is required for text decoding")
+            
         # Decode embeddings using SONAR
         decoded = self.sonar.decode_text(
             embeddings,

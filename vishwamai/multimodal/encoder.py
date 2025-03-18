@@ -5,12 +5,12 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Dict, Optional, Tuple
 
-from ..kernels.kernel import fp8_gemm_optimized
-from ..layers.layers import TPUGEMMLinear, TPULayerNorm
-from ..flash_attention import FlashAttention
+from vishwamai.kernels.kernel import fp8_gemm_optimized
+from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm
+from vishwamai.layers.attention import FlashAttention
 from vishwamai.transformer import TransformerBlock
-from .vision import VisionEncoder
-from .sonar import SonarEncoder
+from vishwamai.multimodal.vision import VisionEncoder
+from vishwamai.multimodal.sonar import SonarEncoder
 
 class AudioEncoder(nn.Module):
     """Audio encoder for processing spectrogram inputs."""

@@ -1,18 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Vision utility functions for multimodal processing."""
+"""Utility functions for vision models."""
 
 from __future__ import annotations
 from collections.abc import Sequence
@@ -35,80 +21,108 @@ P = TypeVar('P')  # Image width dimension
 def _posemb_sincos_2d(
     h: int,
     w: int,
-    *,
     width: int,
-    temperature: float = 10_000.0,
-    dtype: jnp.dtype = jnp.float32,
-) -> jnp.ndarray:  # Changed from string literal to jnp.ndarray
-  """Follows the MoCo v3 logic."""
-  y, x = jnp.mgrid[:h, :w]
-
-  assert width % 4 == 0, "Width must be mult of 4 for sincos posemb"
-  omega = jnp.arange(width // 4) / (width // 4 - 1)
-  omega = 1.0 / (temperature**omega)
-  y = jnp.einsum("m,d->md", y.flatten(), omega)
-  x = jnp.einsum("m,d->md", x.flatten(), omega)
-  pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
-  return jnp.asarray(pe, dtype)[None, :, :]
+    temperature: float = 10000.0,
+    dtype: Any = jnp.float32
+) -> jnp.ndarray:
+    """Generate 2D sinusoidal position embeddings.
+    
+    Args:
+        h: Height (patches)
+        w: Width (patches)
+        width: Hidden dimension size
+        temperature: Temperature for frequencies
+        dtype: Data type for outputs
+        
+    Returns:
+        Position embeddings [h*w, width]
+    """
+    y, x = jnp.meshgrid(
+        jnp.arange(h, dtype=jnp.float32),
+        jnp.arange(w, dtype=jnp.float32),
+        indexing='ij'
+    )
+    
+    if width % 4 != 0:
+        raise ValueError(f"Width {width} must be divisible by 4 for 2D position embeddings")
+        
+    omega = jnp.arange(width // 4, dtype=jnp.float32) / (width // 4 - 1)
+    omega = 1. / (temperature ** omega)
+    
+    y = y.reshape(-1)[:, None] * omega[None, :]
+    x = x.reshape(-1)[:, None] * omega[None, :]
+    
+    pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
+    
+    return pe.astype(dtype)
 
 
 class MlpBlock(nn.Module):
-  """Transformer MLP / feed-forward block."""
-
-  block_id: int
-  mlp_dim: int | None = None  # Defaults to 4x input dim
-  dropout: float = 0.0
-  dtype_mm: str = "float32"
-
-  @nn.compact
-  def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
-    """Applies Transformer MlpBlock module."""
-    inits = dict(
-        kernel_init=nn.initializers.xavier_uniform(),
-        bias_init=nn.initializers.normal(stddev=1e-6),
-    )
-
-    d = x.shape[-1]
-    x = nn.Dense(features=self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(
-        x
-    )
-    x = nn.gelu(x)
-    x = nn.Dropout(rate=self.dropout)(x, deterministic)
-    x = nn.Dense(
-        features=d,
-        dtype=self.dtype_mm,
-        **inits,
-    )(x)
-    return x
+    """Transformer MLP / feed-forward block."""
+    
+    mlp_dim: Optional[int] = None
+    dropout_rate: float = 0.0
+    dtype: Any = jnp.float32
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        """Apply MLP block.
+        
+        Args:
+            x: Input tensor
+            deterministic: Whether in inference mode
+            
+        Returns:
+            Transformed tensor
+        """
+        actual_mlp_dim = self.mlp_dim or x.shape[-1] * 4
+        
+        y = nn.Dense(features=actual_mlp_dim, dtype=self.dtype)(x)
+        y = nn.gelu(y)
+        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=deterministic)
+        y = nn.Dense(features=x.shape[-1], dtype=self.dtype)(y)
+        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=deterministic)
+        
+        return y
 
 
 class MAPHead(nn.Module):
-  """Multihead Attention Pooling."""
+    """Multi-head Attention Pooling."""
+    
+    block_id: int
+    mlp_dim: Optional[int] = None  # Defaults to 4x input dim
+    num_heads: int = 12
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        """Apply multi-head attention pooling.
+        
+        Args:
+            x: Input tensor [batch, length, channels]
+            deterministic: Whether in inference mode
+            
+        Returns:
+            Pooled features [batch, channels]  
+        """
+        n, l, d = x.shape
+        probe = self.param(
+            'probe',
+            nn.initializers.xavier_uniform(),
+            (1, 1, d)
+        )
+        probe = jnp.tile(probe, [n, 1, 1])
 
-  block_id: int
-  mlp_dim: int | None = None  # Defaults to 4x input dim
-  num_heads: int = 12
-  buggy: bool = False
+        # Self attention
+        x = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            kernel_init=nn.initializers.xavier_uniform()
+        )(probe, x)
 
-  @nn.compact
-  def __call__(self, x: jax.Array) -> jax.Array:
-    # TODO(lbeyer): condition on GAP(x)
-    n, l, d = x.shape  # pylint: disable=unused-variable
-    probe = self.param(
-        "probe", nn.initializers.xavier_uniform(), (1, 1, d), x.dtype
-    )
-    probe = jnp.tile(probe, [n, 1, 1])
-
-    x = nn.MultiHeadDotProductAttention(
-        num_heads=self.num_heads, kernel_init=nn.initializers.xavier_uniform()
-    )(probe, x)
-
-    # TODO(lbeyer): dropout on head?
-    y = nn.LayerNorm()(x)
-    if self.buggy:
-      x = y
-    x = x + MlpBlock(self.block_id, mlp_dim=self.mlp_dim)(y)
-    return x[:, 0]
+        # Layer norm and MLP
+        y = nn.LayerNorm()(x)
+        x = x + MlpBlock(mlp_dim=self.mlp_dim)(y)
+        
+        return x[:, 0]  # Return CLS token only
 
 
 class Encoder1DBlock(nn.Module):

@@ -8,17 +8,17 @@ import optax
 import time
 from typing import Any, Dict, Optional, Tuple, Callable, Iterator
 from tqdm.auto import tqdm
-from .pipeline import VishwamAIPipeline
-from .transformer import create_learning_rate_schedule
-from .logger import DuckDBLogger
+from vishwamai.pipeline import VishwamAIPipeline
+from vishwamai.transformer import create_learning_rate_schedule
+from vishwamai.logger import DuckDBLogger
 
 """TPU-optimized training configuration and initialization"""
 
 import flax
 from flax.training import train_state
 
-from .transformer import EnhancedTransformerModel
-from .distill import DistillationTrainer
+from vishwamai.transformer import EnhancedTransformerModel
+from vishwamai.distill import DistillationTrainer
 
 class TPUTrainingConfig:
     """Configuration for TPU-optimized training"""

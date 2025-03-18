@@ -3,10 +3,10 @@
 from typing import Optional, List, Dict, Any, Union
 import jax.numpy as jnp
 import numpy as np
-from .processor import MultimodalProcessor
-from .config import MultimodalConfig, create_default_multimodal_config
-from ..model import VishwamAI
-from ..tokenizer import VishwamAITokenizer
+from vishwamai.multimodal.processor import MultimodalProcessor
+from vishwamai.multimodal.config import MultimodalConfig, create_default_multimodal_config
+from vishwamai.model import VishwamAI
+from vishwamai.tokenizer import VishwamAITokenizer
 
 class ImageCaptioningPipeline:
     """Pipeline for generating image captions."""

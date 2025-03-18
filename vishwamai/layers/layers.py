@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Optional, Tuple, Dict, List, Callable
-from vishwamai.flash_attention import FlashAttention, flash_attention_inference
+from vishwamai.layers.attention import FlashAttention, flash_attention_inference
 from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant, optimize_kernel_layout
 
 class TPUGEMMLinear(nn.Module):
@@ -799,7 +799,7 @@ class TPUMultiQueryAttention(nn.Module):
                 )
             else:
                 # For training, we use the regular flash attention implementation
-                from vishwamai.flash_attention import flash_attention
+                from vishwamai.layers.attention import flash_attention
                 attn_output, _ = flash_attention(
                     q=q.transpose(0, 2, 1, 3),  # [batch, seq, heads, dim]
                     k=k.transpose(0, 2, 1, 3),
@@ -932,7 +932,7 @@ class TPUGroupedQueryAttention(nn.Module):
                 )
             else:
                 # For training, we use the regular flash attention implementation
-                from vishwamai.flash_attention import flash_attention
+                from vishwamai.layers.attention import flash_attention
                 attn_output, _ = flash_attention(
                     q=q.transpose(0, 2, 1, 3),  # [batch, seq, heads, dim]
                     k=k.transpose(0, 2, 1, 3),

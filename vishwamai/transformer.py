@@ -12,7 +12,8 @@ import flax
 import time
 import jax.lax as lax
 from flax.training import train_state
-from .kernels.kernel import fp8_gemm_optimized, act_quant
+from vishwamai.layers.attention import FlashAttention
+from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant, optimize_kernel_layout
 
 class TPUGEMMLinear(nn.Module):
     """TPU v2-optimized linear layer using FP8 GEMM operations"""

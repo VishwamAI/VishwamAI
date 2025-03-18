@@ -1,44 +1,14 @@
-"""Multimodal components for VishwamAI."""
+"""Multimodal components of VishwamAI."""
 
-from .encoder import MultimodalEncoder, VisionEncoder, AudioEncoder
-from .processor import MultimodalProcessor
-from .config import (
-    MultimodalConfig,
-    VisionConfig,
-    AudioConfig,
-    create_default_multimodal_config
-)
-from .pipelines import (
-    ImageCaptioningPipeline,
-    VisualQuestionAnswering,
-    AudioCaptioningPipeline,
-    MultimodalChatPipeline,
-    load_multimodal_pipeline
-)
-from .image_processor import ImageProcessor
-from .audio_processor import AudioProcessor
+from .vision import ViTEncoder, CLIPAdapter
+from .fusion import CrossAttentionFuser, MultimodalProjector
+from .processor import ImageProcessor, MultimodalBatchProcessor
 
 __all__ = [
-    # Core components
-    'MultimodalEncoder',
-    'VisionEncoder',
-    'AudioEncoder',
-    'MultimodalProcessor',
-    
-    # Configuration
-    'MultimodalConfig',
-    'VisionConfig',
-    'AudioConfig',
-    'create_default_multimodal_config',
-    
-    # Pipelines
-    'ImageCaptioningPipeline',
-    'VisualQuestionAnswering',
-    'AudioCaptioningPipeline',
-    'MultimodalChatPipeline',
-    'load_multimodal_pipeline',
-    
-    # Processors
+    'ViTEncoder',
+    'CLIPAdapter',
+    'CrossAttentionFuser',
+    'MultimodalProjector',
     'ImageProcessor',
-    'AudioProcessor',
+    'MultimodalBatchProcessor'
 ]

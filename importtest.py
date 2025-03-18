@@ -41,7 +41,8 @@ def test_imports():
             'from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer',
             'from vishwamai.multimodal.encoder import MultimodalEncoder',
             'from vishwamai.flash_attention import FlashAttention',
-            'from vishwamai.kernels.kernel import fp8_gemm_optimized'
+            'from vishwamai.kernels.kernel import fp8_gemm_optimized',
+            'from vishwamai.thoughts import ThoughtNode, TreeOfThoughts'
         ],
         'SONAR Dependencies': [
             'import fairseq2',

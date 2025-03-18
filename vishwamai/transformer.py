@@ -6,16 +6,12 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Callable, Optional, Dict, Tuple, Generator
-from .kernels.kernel import flash_attention, multi_head_attention_kernel
 from .layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention
-from .thoughts.tot import TreeOfThoughts, ThoughtNode, evaluate_tot_solution
-from .thoughts.cot import ChainOfThoughtPrompting
 import optax
 import flax
 import time
 import jax.lax as lax
 from flax.training import train_state
-
 from kernels.kernel import fp8_gemm_optimized, act_quant
 
 class TPUGEMMLinear(nn.Module):

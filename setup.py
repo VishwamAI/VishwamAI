@@ -1,3 +1,5 @@
+"""Setup configuration for VishwamAI package."""
+
 from setuptools import setup, find_packages
 
 setup(

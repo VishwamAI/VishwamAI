@@ -4,8 +4,13 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Dict, Optional, Tuple
-from ..layers import TPUGEMMLinear, TPULayerNorm
-from ..transformer import TransformerBlock
+
+from ..kernels.kernel import fp8_gemm_optimized
+from ..layers.layers import TPUGEMMLinear, TPULayerNorm
+from ..flash_attention import FlashAttention
+from vishwamai.transformer import TransformerBlock
+from .vision import VisionEncoder
+from .sonar import SonarEncoder
 
 class AudioEncoder(nn.Module):
     """Audio encoder for processing spectrogram inputs."""
@@ -90,96 +95,45 @@ class VisionEncoder(nn.Module):
         return x
 
 class MultimodalEncoder(nn.Module):
-    """Combined vision, audio, and text encoder."""
-    config: Dict[str, Any]
-
+    """Multimodal encoder that combines vision, text and audio."""
+    hidden_dim: int
+    num_heads: int
+    num_layers: int
+    dropout_rate: float = 0.1
+    
     def setup(self):
-        # Vision encoder
-        if self.config.get('vision_config'):
-            self.vision_encoder = VisionEncoder(
-                hidden_dim=self.config['hidden_dim'],
-                num_layers=self.config['vision_layers'],
-                num_heads=self.config['num_heads'],
-                mlp_dim=self.config['mlp_dim'],
-                patch_size=self.config.get('patch_size', 14),
-                image_size=self.config.get('image_size', 896),
-                dropout_rate=self.config.get('dropout_rate', 0.1),
-                dtype=self.config.get('dtype', jnp.float32)
-            )
-            
-        # Audio encoder
-        if self.config.get('audio_config'):
-            self.audio_encoder = AudioEncoder(
-                hidden_dim=self.config['hidden_dim'],
-                num_layers=self.config['audio_layers'],
-                num_heads=self.config['num_heads'],
-                mlp_dim=self.config['mlp_dim'],
-                dropout_rate=self.config.get('dropout_rate', 0.1),
-                dtype=self.config.get('dtype', jnp.float32)
-            )
-        
-        # Cross-attention for modality fusion
-        self.cross_attention = TransformerBlock(
-            num_heads=self.config['num_heads'],
-            head_dim=self.config['hidden_dim'] // self.config['num_heads'],
-            mlp_dim=self.config['mlp_dim'],
-            dropout_rate=self.config.get('dropout_rate', 0.1),
-            dtype=self.config.get('dtype', jnp.float32)
+        self.vision_encoder = VisionEncoder(
+            hidden_dim=self.hidden_dim,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            dropout_rate=self.dropout_rate
         )
         
-        # Final layer norm
-        self.norm = TPULayerNorm(dtype=self.config.get('dtype', jnp.float32))
-
+        self.cross_attention = FlashAttention(
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate
+        )
+        
+        self.ln = TPULayerNorm()
+        self.proj = TPUGEMMLinear(features=self.hidden_dim)
+        
     def __call__(
         self,
-        image_input: Optional[jnp.ndarray] = None,
-        audio_input: Optional[jnp.ndarray] = None,
-        text_input: Optional[jnp.ndarray] = None,
-        training: bool = True
-    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-        outputs = {}
-        features_to_fuse = []
+        vision_inputs: jnp.ndarray,
+        text_inputs: jnp.ndarray,
+        training: bool = False
+    ) -> jnp.ndarray:
+        vision_embed = self.vision_encoder(vision_inputs, training=training)
         
-        # Process vision input if provided
-        if image_input is not None and hasattr(self, 'vision_encoder'):
-            vision_features = self.vision_encoder(
-                image_input,
-                deterministic=not training
-            )
-            outputs['vision_features'] = vision_features
-            features_to_fuse.append(vision_features)
+        # Cross attention between vision and text
+        x = self.cross_attention(
+            text_inputs,
+            k=vision_embed,
+            v=vision_embed,
+            training=training
+        )
         
-        # Process audio input if provided
-        if audio_input is not None and hasattr(self, 'audio_encoder'):
-            audio_features = self.audio_encoder(
-                audio_input,
-                deterministic=not training
-            )
-            outputs['audio_features'] = audio_features
-            features_to_fuse.append(audio_features)
+        x = self.ln(x)
+        x = self.proj(x)
         
-        # Process text input if provided
-        if text_input is not None:
-            outputs['text_features'] = text_input
-            features_to_fuse.append(text_input)
-        
-        # Fuse modalities if multiple are present
-        if len(features_to_fuse) > 1:
-            # Concatenate features along sequence dimension
-            fused_features = jnp.concatenate(features_to_fuse, axis=1)
-            
-            # Apply cross-attention for modality fusion
-            fused_features = self.cross_attention(
-                fused_features,
-                mask=None,
-                deterministic=not training
-            )
-            fused_features = self.norm(fused_features)
-            outputs['fused_features'] = fused_features
-            return fused_features, outputs
-        
-        # Return single modality features if only one is provided
-        elif len(features_to_fuse) == 1:
-            return features_to_fuse[0], outputs
-        else:
-            raise ValueError("At least one input modality must be provided")
+        return x

@@ -247,3 +247,99 @@ def create_flash_attention_layer(
 ) -> FlashAttentionLayer:
     """Create a Flash Attention layer."""
     return FlashAttentionLayer(config=config, name=name)
+
+class FlashAttention:
+    """Main Flash Attention interface for VishwamAI."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize Flash Attention.
+        
+        Args:
+            config: Model configuration dictionary
+        """
+        self.layer = FlashAttentionLayer(config)
+    
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> jnp.ndarray:
+        """Apply Flash Attention.
+        
+        Args:
+            x: Input tensor [batch, seq_len, hidden_dim]
+            mask: Optional attention mask
+            deterministic: Whether to use deterministic attention
+            
+        Returns:
+            Output tensor [batch, seq_len, hidden_dim]
+        """
+        return self.layer(x, mask, deterministic)
+
+    @staticmethod
+    def create(config: Dict[str, Any]) -> 'FlashAttention':
+        """Factory method to create FlashAttention instance."""
+        return FlashAttention(config)
+
+def flash_attention_inference(
+    q: jnp.ndarray,
+    k: jnp.ndarray, 
+    v: jnp.ndarray,
+    mask: Optional[jnp.ndarray] = None,
+    past_key_values: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
+    block_size: int = 128,
+    head_dim: int = 64,
+    num_heads: int = 8,
+    use_fp8: bool = True
+) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]]:
+    """Optimized Flash Attention implementation for inference.
+    
+    Args:
+        q: Query tensor [batch, heads, seq_len, head_dim]
+        k: Key tensor [batch, heads, seq_len, head_dim]
+        v: Value tensor [batch, heads, seq_len, head_dim]
+        mask: Optional attention mask
+        past_key_values: Optional cached key/values from previous forward pass
+        block_size: Size of blocks for tiled attention
+        head_dim: Size of attention head dimension
+        num_heads: Number of attention heads
+        use_fp8: Whether to use FP8 quantization
+        
+    Returns:
+        Tuple of:
+        - Output tensor [batch, heads, seq_len, head_dim]
+        - New key/value cache tuple
+    """
+    # Add past key/values if provided
+    if past_key_values is not None:
+        past_k, past_v = past_key_values
+        k = jnp.concatenate([past_k, k], axis=2)
+        v = jnp.concatenate([past_v, v], axis=2)
+    
+    # Initialize output
+    batch_size = q.shape[0]
+    seq_len = q.shape[2]
+    
+    # Compute attention scores in blocks
+    scale = 1.0 / jnp.sqrt(head_dim)
+    scores = jnp.einsum('bhsd,bhtd->bhst', q, k) * scale
+    
+    if mask is not None:
+        scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+    
+    # Apply softmax    
+    probs = jax.nn.softmax(scores, axis=-1)
+    
+    # Compute weighted values
+    output = jnp.einsum('bhst,bhtd->bhsd', probs, v)
+    
+    # Cache key/values for next forward pass
+    present = (k, v) if past_key_values is not None else None
+    
+    return output, present
+
+# For backwards compatibility
+create_flash_attention = FlashAttention.create
+
+__all__ = ['FlashAttention', 'flash_attention_inference', 'create_flash_attention', 'flash_attention', 'mha_with_flash_attention']

@@ -484,6 +484,86 @@ class RLBasedConditionalLayer(nn.Module):
             
         return output, aux
 
+class MLABlock(nn.Module):
+    """Multi-Level Attention block with TPU optimizations."""
+    num_heads: int
+    head_dim: Optional[int] = None
+    qkv_dim: Optional[int] = None
+    dropout_rate: float = 0.0
+    deterministic: Optional[bool] = None
+    dtype: Any = jnp.float32
+    use_fp8: bool = True
+    block_size: int = 128
+
+    def setup(self):
+        # Determine dimensions
+        self.qkv_dim = self.qkv_dim or self.num_heads * (self.head_dim or 64)
+        self.head_dim = self.head_dim or self.qkv_dim // self.num_heads
+
+        # QKV projections
+        self.qkv = TPUGEMMLinear(
+            features=3 * self.qkv_dim,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+
+        # Output projection
+        self.out = TPUGEMMLinear(
+            features=self.qkv_dim,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+
+        # Flash Attention for efficient computation
+        self.flash_attention = FlashAttention(
+            block_size=self.block_size,
+            use_fp8=self.use_fp8,
+            head_dim=self.head_dim,
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate
+        )
+
+    def __call__(self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None, deterministic: Optional[bool] = None) -> jnp.ndarray:
+        """
+        Apply multi-level attention to input.
+        Args:
+            x: Input of shape [batch, sequence, hidden_dim]
+            mask: Optional attention mask
+            deterministic: Whether to run in deterministic mode (no dropout)
+        Returns:
+            Output of shape [batch, sequence, hidden_dim]
+        """
+        deterministic = deterministic if deterministic is not None else self.deterministic
+        batch_size, seq_len, _ = x.shape
+
+        # QKV projection
+        qkv = self.qkv(x)
+        qkv = jnp.reshape(qkv, (batch_size, seq_len, 3, self.num_heads, self.head_dim))
+        q, k, v = jnp.split(qkv, indices_or_sections=3, axis=2)
+        q = q.squeeze(2)
+        k = k.squeeze(2)
+        v = v.squeeze(2)
+
+        # Apply Flash Attention
+        x = self.flash_attention(
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            deterministic=deterministic
+        )
+
+        # Project output
+        x = jnp.reshape(x, (batch_size, seq_len, self.qkv_dim))
+        x = self.out(x)
+
+        if not deterministic:
+            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=False)
+
+        return x
+
 def create_layer_factory(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -540,3 +620,18 @@ def create_conditional_layer_factory(
             dtype=config["model"].get("dtype", jnp.float32)
         )
     }
+
+# Alias TPUMoELayer as MoELayer for compatibility
+MoELayer = TPUMoELayer
+
+__all__ = [
+    'TPUGEMMLinear',
+    'TPULayerNorm', 
+    'TPUMultiHeadAttention',
+    'TPUMoELayer',
+    'MoELayer',
+    'DynamicChannelGating',
+    'ConditionalInfoGainNode',
+    'CIGTLayer',
+    'RLBasedConditionalLayer'
+]

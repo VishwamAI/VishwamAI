@@ -5,7 +5,6 @@ Chain-of-thought implementation for VishwamAI transformer.
 import jax
 import jax.numpy as jnp
 from typing import Any, Dict, List, Optional, Tuple
-from vishwamai.transformer import EnhancedTransformerModel
 
 def format_cot_prompt(question: str, examples: List[Dict[str, str]] = None) -> str:
     """

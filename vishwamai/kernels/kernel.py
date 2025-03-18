@@ -5,7 +5,7 @@ TPU-optimized kernel operations for VishwamAI transformer.
 import jax
 import jax.numpy as jnp
 from jax import lax
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
 import numpy as np
 from functools import partial
 from .fp8_cast_bf16 import fp8_cast, optimize_kernel_layout
@@ -15,60 +15,31 @@ def fp8_cast_transpose(x: jnp.ndarray) -> jnp.ndarray:
     return lax.transpose(x, (0, 2, 1, 3)) if x.ndim == 4 else x.T
 
 def fp8_gemm_optimized(
-    A: jnp.ndarray,
-    A_scale: jnp.ndarray,
-    B: jnp.ndarray,
-    B_scale: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    transpose_a: bool = False,
     transpose_b: bool = False,
-    block_size: int = 128
+    dtype: Any = jnp.float32
 ) -> jnp.ndarray:
-    """
-    Optimized matrix multiplication using FP8 precision for TPU.
+    """Optimized FP8 GEMM implementation.
     
     Args:
-        A: First input matrix
-        A_scale: Scale factor for A
-        B: Second input matrix
-        B_scale: Scale factor for B
-        transpose_b: Whether to transpose B
-        block_size: Block size for tiling (default optimal for TPU)
+        a: First input matrix
+        b: Second input matrix
+        transpose_a: Whether to transpose first matrix
+        transpose_b: Whether to transpose second matrix
+        dtype: Output data type
+        
+    Returns:
+        Matrix multiplication result
     """
-    # Cast inputs to FP8
-    A_fp8, _ = fp8_cast(A, A_scale, block_size)
-    B_fp8, _ = fp8_cast(B, B_scale, block_size)
-    
-    # Optimize memory layout
-    A_fp8 = optimize_kernel_layout(A_fp8)
-    B_fp8 = optimize_kernel_layout(B_fp8)
-    
-    # Ensure inputs are in optimal layout
-    if transpose_b:
-        B_fp8 = fp8_cast_transpose(B_fp8)
-    
-    # For 4D tensors (batch, heads, seq, dim)
-    if A_fp8.ndim == 4 and B_fp8.ndim == 4:
-        dimension_numbers = (
-            ((3,), (2,)),  # Contracting dimensions
-            ((0, 1), (0, 1))  # Batch dimensions
-        )
-    # For 3D tensors (batch, seq, dim)
-    elif A_fp8.ndim == 3 and B_fp8.ndim == 3:
-        dimension_numbers = (
-            ((2,), (1,)),  # Contracting dimensions
-            ((0,), (0,))  # Batch dimensions
-        )
-    # For 2D matrices
-    else:
-        dimension_numbers = (
-            ((A_fp8.ndim - 1,), (B_fp8.ndim - 2,)),
-            ((), ())  # No batch dimensions
-        )
-    
-    # Perform scaled matrix multiplication
-    C = lax.dot_general(A_fp8, B_fp8, dimension_numbers=dimension_numbers)
-    
-    # Apply scales
-    return C * (A_scale * B_scale)
+    # For now, use standard matmul as placeholder
+    # TODO: Implement actual FP8 optimization
+    return jnp.matmul(
+        jnp.asarray(a, dtype),
+        jnp.asarray(b, dtype),
+        precision=jax.lax.Precision.HIGHEST
+    )
 
 def act_quant(
     x: jnp.ndarray,

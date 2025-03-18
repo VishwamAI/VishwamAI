@@ -3,9 +3,8 @@
 from typing import List, Optional, Tuple, Dict, Any
 import jax
 import jax.numpy as jnp
-import numpy as np
 from dataclasses import dataclass
-from vishwamai.model import VishwamAI
+from ..kernels.kernel import fp8_gemm_optimized
 
 @dataclass
 class ThoughtNode:
@@ -21,22 +20,15 @@ class TreeOfThoughts:
     
     def __init__(
         self,
-        model: VishwamAI,
+        model: Any,
+        tokenizer: Any,
         max_branches: int = 3,
         max_depth: int = 3,
         beam_width: int = 5,
         temperature: float = 0.7
     ):
-        """Initialize Tree of Thoughts.
-        
-        Args:
-            model: Base language model
-            max_branches: Maximum branching factor at each node
-            max_depth: Maximum tree depth
-            beam_width: Number of paths to maintain
-            temperature: Sampling temperature
-        """
         self.model = model
+        self.tokenizer = tokenizer
         self.max_branches = max_branches
         self.max_depth = max_depth
         self.beam_width = beam_width
@@ -61,7 +53,7 @@ class TreeOfThoughts:
         temperature = temperature or self.temperature
         
         # Prepare input
-        inputs = self.model.tokenizer.encode(
+        inputs = self.tokenizer.encode(
             context,
             return_tensors="jax",
             max_length=self.model.config.max_seq_len,
@@ -80,7 +72,7 @@ class TreeOfThoughts:
             )
             
             # Decode and clean up output
-            thought = self.model.tokenizer.decode(
+            thought = self.tokenizer.decode(
                 outputs[0],
                 skip_special_tokens=True
             )
@@ -110,7 +102,7 @@ class TreeOfThoughts:
             + "\n\nOn a scale of 0 to 1, rate how well this thought sequence achieves the objective."
         )
         
-        inputs = self.model.tokenizer.encode(
+        inputs = self.tokenizer.encode(
             eval_prompt,
             return_tensors="jax",
             max_length=self.model.config.max_seq_len,
@@ -124,7 +116,7 @@ class TreeOfThoughts:
         )
         
         # Extract numerical rating
-        response = self.model.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         try:
             # Find first number in response
             value = float(next(
@@ -251,7 +243,8 @@ class TreeOfThoughts:
         return best_sequence if best_sequence else []
 
 def evaluate_tot_solution(
-    model: VishwamAI,
+    model: Any,
+    tokenizer: Any,
     solution: List[str],
     objective: str
 ) -> Tuple[float, str]:
@@ -259,6 +252,7 @@ def evaluate_tot_solution(
     
     Args:
         model: Language model
+        tokenizer: Tokenizer
         solution: Sequence of thoughts
         objective: Original objective
         
@@ -272,7 +266,7 @@ def evaluate_tot_solution(
         + "\n\nProvide:\n1. A score from 0 to 1\n2. Brief feedback"
     )
     
-    inputs = model.tokenizer.encode(
+    inputs = tokenizer.encode(
         eval_prompt,
         return_tensors="jax",
         max_length=model.config.max_seq_len,
@@ -285,7 +279,7 @@ def evaluate_tot_solution(
         temperature=0.3
     )
     
-    response = model.tokenizer.decode(outputs[0], skip_special_tokens=True)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     # Extract score and feedback
     try:

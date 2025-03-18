@@ -145,7 +145,6 @@ def test_multimodal_functionality():
         print("2. Testing vision encoder...")
         try:
             from vishwamai.multimodal.vision import ViTEncoder
-            from vishwamai.layers.attention import FlashAttention
             
             rng = jax.random.PRNGKey(0)
             encoder = ViTEncoder(
@@ -155,15 +154,9 @@ def test_multimodal_functionality():
                 mlp_dim=3072,
                 patch_size=16,
                 image_size=224,
-                attention_cls=lambda: FlashAttention(
-                    hidden_dim=768,
-                    num_heads=12,
-                    dropout_rate=0.0,
-                    causal=False,
-                    block_size=128,
-                    tpu_block_multiple=128,
-                    dtype=jnp.float32
-                )
+                dropout_rate=0.0,
+                attention_dropout_rate=0.0,
+                dtype=jnp.float32
             )
             
             dummy_image = jnp.ones((1, 224, 224, 3))
@@ -185,8 +178,8 @@ def test_multimodal_functionality():
             
             vision_feats = jnp.ones((1, 196, 768))
             text_feats = jnp.ones((1, 32, 768))
-            variables = fuser.init(rng, vision_feats, text_feats)
-            output = fuser.apply(variables, vision_feats, text_feats)
+            variables = fuser.init(rng, vision_feats, text_feats, deterministic=True)
+            output = fuser.apply(variables, vision_feats, text_feats, deterministic=True)
             print(f"✓ Multimodal fusion - Output shape: {output['vision_output'].shape}")
         except Exception as e:
             print(f"✗ Multimodal fusion failed: {str(e)}")

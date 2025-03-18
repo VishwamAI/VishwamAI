@@ -4,17 +4,19 @@ TPU-optimized Transformer implementation for VishwamAI
 
 import jax
 import jax.numpy as jnp
-import jax.lax as lax
 import flax.linen as nn
-from typing import Any, Callable, Optional, Tuple, Dict, Generator
-from functools import partial
+from typing import Any, Callable, Optional, Dict, Tuple, Generator
+from .kernels.kernel import flash_attention, multi_head_attention_kernel
+from .layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention
+from .thoughts.tot import TreeOfThoughts, ThoughtNode, evaluate_tot_solution
+from .thoughts.cot import ChainOfThoughtPrompting
 import optax
-from flax.training import train_state
 import flax
-
 import time
+import jax.lax as lax
+from flax.training import train_state
 
-from .kernel import fp8_gemm_optimized, act_quant
+from kernels.kernel import fp8_gemm_optimized, act_quant
 
 class TPUGEMMLinear(nn.Module):
     """TPU v2-optimized linear layer using FP8 GEMM operations"""

@@ -17,8 +17,8 @@ from .distill import (
     create_student_model,
     initialize_from_teacher
 )
-from .cot import ChainOfThoughtPrompting
-from .tot import TreeOfThoughts
+from vishwamai.thoughts.cot import ChainOfThoughtPrompting
+from vishwamai.thoughts.tot import TreeOfThoughts
 import flax
 
 """TPU-optimized data pipeline"""

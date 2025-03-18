@@ -1,10 +1,10 @@
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Any, Callable, List, Dict, Union
+from typing import Any, Callable, List, Dict, Union, Optional
 from safetensors import safe_open
 import os
 from huggingface_hub import snapshot_download
-from .layers import MLABlock, MoELayer
+from .layers.layers import MLABlock, MoELayer
 import json
 import jax
 class VishwamAI(nn.Module):
@@ -15,12 +15,38 @@ class VishwamAI(nn.Module):
     num_experts: int = 8  # MoE layer experts
     ffn_dim: int = 16384  # 4x hidden size
     dropout_rate: float = 0.1
+    # Add multimodal config
+    vision_config: Optional[Dict[str, Any]] = None
     
     @nn.compact
-    def __call__(self, x, training=True):
+    def __call__(self, x, image_input=None, training=True):
         # Token embeddings
         x = nn.Embed(num_embeddings=self.vocab_size, 
                     features=self.hidden_size)(x)
+        
+        # Handle image input if provided
+        if image_input is not None and self.vision_config is not None:
+            # Import here to avoid circular imports
+            from .multimodal.encoder import MultimodalEncoder
+            
+            # Initialize multimodal encoder
+            multimodal_config = {
+                'hidden_dim': self.hidden_size,
+                'vision_layers': self.vision_config.get('num_layers', 12),
+                'num_heads': self.num_heads,
+                'mlp_dim': self.ffn_dim,
+                'dropout_rate': self.dropout_rate
+            }
+            
+            multimodal_encoder = MultimodalEncoder(multimodal_config)
+            
+            # Process image and fuse with text
+            fused_features, _ = multimodal_encoder(
+                image_input=image_input,
+                text_input=x,
+                training=training
+            )
+            x = fused_features
         
         # Training-specific dropout
         if training:
@@ -55,13 +81,15 @@ class VishwamAI(nn.Module):
         return logits / temperature
         
     def generate_chat(self, messages: List[Dict[str, str]], 
+                     image_input: Optional[jnp.ndarray] = None,
                      max_new_tokens: int = 128,
                      temperature: float = 0.7,
                      top_p: float = 0.9) -> str:
-        """Generate chat responses in Phi-4 style
+        """Generate chat responses with optional image input
         
         Args:
             messages: List of message dicts with 'role' and 'content' keys
+            image_input: Optional image input tensor
             max_new_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature
             top_p: Nucleus sampling probability threshold
@@ -89,8 +117,15 @@ class VishwamAI(nn.Module):
                                         add_special_tokens=True,
                                         return_tensors="jax")
         
+        # Process image if provided
+        if image_input is not None:
+            from .multimodal.image_processor import ImageProcessor
+            processor = ImageProcessor()
+            image_input = processor(image_input)
+        
         # Generate with nucleus sampling
         output_ids = self.generate(input_ids,
+                                 image_input=image_input,
                                  max_length=len(input_ids[0]) + max_new_tokens,
                                  temperature=temperature,
                                  top_p=top_p,
@@ -105,7 +140,8 @@ class VishwamAI(nn.Module):
         return response.strip()
         
     def generate(self, input_ids: jnp.ndarray,
-                max_length: int,
+                image_input: Optional[jnp.ndarray] = None,
+                max_length: int = None,
                 temperature: float = 1.0,
                 top_p: float = 0.9,
                 do_sample: bool = True):
@@ -120,7 +156,7 @@ class VishwamAI(nn.Module):
         # Generate tokens auto-regressively
         for _ in range(max_length - input_ids.shape[1]):
             # Get logits for next token
-            logits = self(generated)[:, -1, :]
+            logits = self(generated, image_input=image_input)[:, -1, :]
             
             if do_sample:
                 # Temperature scaling

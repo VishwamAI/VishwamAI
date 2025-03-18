@@ -3,8 +3,8 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Dict, Optional, Tuple
-from .kernel import fp8_gemm_optimized, act_quant
-from .transformer import EnhancedTransformerModel, TPUGEMMLinear, RMSNorm
+from .kernels.kernel import fp8_gemm_optimized, act_quant
+from .layers.layers import TPUGEMMLinear, RMSNorm
 
 class LinearPathDistillation(nn.Module):
     """Linear path embedding distillation layer"""

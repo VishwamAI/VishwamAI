@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from dataclasses import dataclass
-from .model import VishwamAI
+from vishwamai.model import VishwamAI
 
 @dataclass
 class ThoughtNode:

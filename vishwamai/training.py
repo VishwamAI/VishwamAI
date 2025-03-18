@@ -52,6 +52,21 @@ class TPUTrainingConfig:
         self.use_flash_attn = use_flash_attn
         self.mixed_precision = mixed_precision
 
+class MultimodalTrainingConfig(TPUTrainingConfig):
+    """Configuration for multimodal training"""
+    def __init__(
+        self,
+        model_config: Dict[str, Any],
+        vision_config: Optional[Dict[str, Any]] = None,
+        contrastive_loss_weight: float = 0.5,
+        image_text_alignment_loss_weight: float = 0.3,
+        **kwargs
+    ):
+        super().__init__(model_config, **kwargs)
+        self.vision_config = vision_config
+        self.contrastive_loss_weight = contrastive_loss_weight
+        self.image_text_alignment_loss_weight = image_text_alignment_loss_weight
+
 def create_train_state_tpu(
     config: TPUTrainingConfig,
     rng: Any,
@@ -110,6 +125,72 @@ def create_train_state_tpu(
     # Initialize parameters with optimal TPU layout
     dummy_input = jnp.ones((2, config.model_config['max_seq_len']), dtype=jnp.int32)
     variables = model.init(rng, dummy_input, deterministic=False)
+    
+    return train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=variables['params'],
+        tx=optimizer
+    )
+
+def create_multimodal_train_state(
+    config: MultimodalTrainingConfig,
+    rng: Any,
+    mesh: Optional[Any] = None
+) -> Any:
+    """Create training state for multimodal model"""
+    # Add vision config to model config
+    model_config = config.model_config.copy()
+    model_config['vision_config'] = config.vision_config
+    
+    # Create learning rate schedule
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0,
+        end_value=config.learning_rate,
+        transition_steps=config.warmup_steps
+    )
+    decay_fn = optax.cosine_decay_schedule(
+        init_value=config.learning_rate,
+        decay_steps=config.max_steps - config.warmup_steps
+    )
+    lr_schedule = optax.join_schedules(
+        schedules=[warmup_fn, decay_fn],
+        boundaries=[config.warmup_steps]
+    )
+    
+    # TPU-optimized optimizer chain
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=config.weight_decay
+        )
+    )
+    
+    # Create model with vision encoder
+    model = EnhancedTransformerModel(
+        vocab_size=model_config['vocab_size'],
+        num_layers=model_config['num_layers'],
+        num_heads=model_config['num_heads'],
+        head_dim=model_config['head_dim'],
+        hidden_dim=model_config['hidden_dim'],
+        mlp_dim=model_config['mlp_dim'],
+        max_seq_len=model_config['max_seq_len'],
+        dropout_rate=model_config.get('dropout_rate', 0.1),
+        vision_config=config.vision_config,
+        dtype=config.dtype
+    )
+    
+    # Initialize with dummy inputs
+    text_input = jnp.ones((2, model_config['max_seq_len']), dtype=jnp.int32)
+    image_input = None
+    if config.vision_config:
+        image_size = config.vision_config.get('image_size', 896)
+        image_input = jnp.ones((2, image_size, image_size, 3), dtype=config.dtype)
+    
+    variables = model.init(rng, text_input, image_input, deterministic=False)
     
     return train_state.TrainState.create(
         apply_fn=model.apply,
@@ -200,6 +281,115 @@ def create_train_step_tpu(
         metrics = {'loss': total_loss / config.grad_accum_steps}
         
         return new_state, metrics
+    
+    # Enable pjit for TPU if configured
+    if config.enable_pjit:
+        train_step = jax.pjit(
+            train_step,
+            in_axis_resources=None,
+            out_axis_resources=None
+        )
+    else:
+        train_step = jax.jit(train_step)
+        
+    return train_step
+
+def create_multimodal_train_step(
+    config: MultimodalTrainingConfig,
+    state: Any,
+    trainer: Optional[DistillationTrainer] = None
+) -> Callable:
+    """Create training step function for multimodal model"""
+    
+    def compute_contrastive_loss(image_features, text_features, temperature=1.0):
+        # Normalize features
+        image_features = image_features / jnp.linalg.norm(image_features, axis=-1, keepdims=True)
+        text_features = text_features / jnp.linalg.norm(text_features, axis=-1, keepdims=True)
+        
+        # Compute similarity matrix
+        logits = jnp.einsum('bd,nd->bn', text_features, image_features) * temperature
+        
+        # Contrastive loss in both directions
+        labels = jnp.arange(len(logits))
+        loss_i2t = optax.softmax_cross_entropy(logits, labels)
+        loss_t2i = optax.softmax_cross_entropy(logits.T, labels)
+        
+        return (loss_i2t + loss_t2i) / 2.0
+    
+    def compute_alignment_loss(image_features, text_features, attention_mask=None):
+        # Compute alignment between image and text features
+        alignment_scores = jnp.einsum('bld,bmd->blm', text_features, image_features)
+        if attention_mask is not None:
+            alignment_scores = jnp.where(attention_mask[..., None], alignment_scores, -1e9)
+        
+        # Bidirectional alignment loss
+        text2image = jnp.mean(jax.nn.softmax(alignment_scores, axis=-1), axis=1)
+        image2text = jnp.mean(jax.nn.softmax(alignment_scores, axis=1), axis=1)
+        
+        return -jnp.mean(jnp.log(text2image + 1e-9) + jnp.log(image2text + 1e-9))
+    
+    def train_step(
+        state: Any,
+        batch: Dict[str, jnp.ndarray],
+        dropout_rng: Any
+    ) -> Tuple[Any, Dict[str, float]]:
+        
+        def compute_loss(params, batch):
+            # Standard text loss
+            outputs = state.apply_fn(
+                {'params': params},
+                batch['input_ids'],
+                batch.get('image_input'),
+                deterministic=False,
+                rngs={'dropout': dropout_rng}
+            )
+            
+            if trainer is not None:
+                text_loss = trainer.compute_distillation_loss(
+                    outputs['text_logits'],
+                    batch['teacher_logits'],
+                    batch['labels'],
+                    batch.get('attention_mask')
+                )
+            else:
+                text_loss = optax.softmax_cross_entropy_with_integer_labels(
+                    logits=outputs['text_logits'],
+                    labels=batch['labels']
+                ).mean()
+            
+            total_loss = text_loss
+            loss_dict = {'text_loss': text_loss}
+            
+            # Add multimodal losses if image input present
+            if 'image_input' in batch:
+                # Contrastive loss
+                contrastive_loss = compute_contrastive_loss(
+                    outputs['image_features'],
+                    outputs['text_features']
+                )
+                loss_dict['contrastive_loss'] = contrastive_loss
+                total_loss += config.contrastive_loss_weight * contrastive_loss
+                
+                # Alignment loss
+                alignment_loss = compute_alignment_loss(
+                    outputs['image_features'],
+                    outputs['text_features'],
+                    batch.get('attention_mask')
+                )
+                loss_dict['alignment_loss'] = alignment_loss
+                total_loss += config.image_text_alignment_loss_weight * alignment_loss
+            
+            loss_dict['total_loss'] = total_loss
+            return total_loss, loss_dict
+        
+        # Accumulate gradients across chunks
+        grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
+        (total_loss, loss_dict), grads = grad_fn(state.params, batch)
+        
+        # Update state
+        new_state = state.apply_gradients(grads=grads)
+        
+        return new_state, loss_dict
     
     # Enable pjit for TPU if configured
     if config.enable_pjit:

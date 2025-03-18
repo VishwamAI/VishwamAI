@@ -199,10 +199,7 @@ def test_kernel_performance():
         # Test GEMM performance
         print("1. Testing GEMM performance...")
         try:
-            # Create a deterministic key for testing
-            rng_key = jax.random.PRNGKey(0)
-            
-            # Standard matmul
+            # Standard matmul with stable deterministic values
             x = jnp.ones((1024, 1024), dtype=jnp.float32)
             y = jnp.ones((1024, 1024), dtype=jnp.float32)
             

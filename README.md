@@ -189,7 +189,7 @@ The implementation is based on several research papers which can be found in the
 importtest results 
 
 ```
-kasinadhsarma@bgentech:~/VishwamAI$ cd /home/kasinadhsarma/VishwamAI && python3 importtest.py
+kasinadhsarma@bgentech:~/VishwamAI$ python3 importtest.py 
 
 Testing Core Dependencies:
 ✓ import jax
@@ -226,11 +226,11 @@ Testing Additional Libraries:
 ✓ import typing_extensions
 
 Testing VishwamAI Modules:
-2025-03-18 14:51:46.618136: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2025-03-18 21:39:50.423095: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1742289706.641993   51288 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1742289706.649172   51288 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
-! from vishwamai.transformer import EnhancedTransformerModel - Unexpected error: module 'jax.experimental.mesh_utils' has no attribute 'Mesh'
+E0000 00:00:1742314190.442939   17647 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1742314190.448855   17647 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+✓ from vishwamai.transformer import EnhancedTransformerModel
 ✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer
 ✓ from vishwamai.flash_attention import FlashAttention
 ✓ from vishwamai.kernels.kernel import fp8_gemm_optimized
@@ -245,6 +245,36 @@ Testing SONAR Dependencies:
 ✓ import importlib_resources
 ✓ import sacrebleu
 
+Testing Multimodal Dependencies:
+✓ import PIL
+✓ from PIL import Image
+✓ import torchvision
+✓ import timm
+✗ from transformers import CLIPProcessor, CLIPModel, VisionTextDualEncoder - Error: cannot import name 'VisionTextDualEncoder' from 'transformers' (/home/kasinadhsarma/.local/lib/python3.12/site-packages/transformers/__init__.py)
+✓ import cv2
+✓ import albumentations
+✓ import kornia
+✗ from vishwamai.multimodal.vision import ViTEncoder, CLIPAdapter - Error: No module named 'fairseq2.models.sonar'
+✗ from vishwamai.multimodal.fusion import CrossAttentionFuser, MultimodalProjector - Error: No module named 'fairseq2.models.sonar'
+✗ from vishwamai.multimodal.processor import ImageProcessor, MultimodalBatchProcessor - Error: No module named 'fairseq2.models.sonar'
+
+Testing TPU Kernels:
+✓ from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant
+✓ from vishwamai.kernels.fp8_cast_bf16 import bf16_cast_to_fp8
+✓ from vishwamai.kernels.activation import gelu_approx, silu_optimized
+✓ from vishwamai.kernels.quantization import dynamic_quant, static_quant
+✓ from vishwamai.kernels.tensor_parallel import shard_params, all_gather, all_reduce
+✓ from vishwamai.kernels.sparse import sparse_gemm, sparse_attention
+✓ from vishwamai.kernels.moe_dispatch import load_balance_loss, compute_routing_prob
+
+Testing TPU Optimized Layers:
+✓ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention
+✓ from vishwamai.layers.moe import TPUMoELayer, TPUSparseMoEDispatch
+✓ from vishwamai.layers.rotary import TPURotaryEmbedding, apply_rotary_pos_emb
+✓ from vishwamai.layers.activation import GELUActivation, SwiGLUActivation
+✓ from vishwamai.layers.normalization import RMSNorm, AdaNorm
+✓ from vishwamai.layers.attention import FlashAttention, ChunkwiseCausalAttention
+
 Import Test Summary:
 -------------------
 Core Dependencies: 8/8 successful
@@ -252,10 +282,32 @@ Data Processing: 4/4 successful
 Training Utilities: 4/4 successful
 Memory Optimization: 5/5 successful
 Additional Libraries: 3/3 successful
-VishwamAI Modules: 6/7 successful
+VishwamAI Modules: 7/7 successful
 SONAR Dependencies: 5/5 successful
+Multimodal Dependencies: 7/11 successful
+TPU Kernels: 7/7 successful
+TPU Optimized Layers: 6/6 successful
 
-Overall: 35/36 imports successful (97.2%)
+Overall: 56/60 imports successful (93.3%)
+
+Testing multimodal functionality:
+1. Testing image processing...
+✗ Image processor failed: No module named 'fairseq2.models.sonar'
+2. Testing vision encoder...
+✗ Vision encoder failed: cannot import name 'ViTEncoder' from 'vishwamai.multimodal.vision' (/home/kasinadhsarma/VishwamAI/vishwamai/multimodal/vision.py)
+3. Testing multimodal fusion...
+WARNING:2025-03-18 21:39:53,954:jax._src.xla_bridge:966: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+✓ Multimodal fusion - Output shape: (1, 228, 512)
+
+Multimodal functionality tests completed
+
+Testing kernel performance:
+1. Testing GEMM performance...
+✗ GEMM performance test failed: cannot access local variable 'rng_key' where it is not associated with a value
+2. Testing activation functions...
+✓ Activation performance - Standard: 0.1943s, Optimized: 0.1406s, Speedup: 1.38x
+
+Kernel performance tests completed
 kasinadhsarma@bgentech:~/VishwamAI$ 
-
 ```

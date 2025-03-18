@@ -1,10 +1,10 @@
-"""Tree of Thoughts and Chain of Thought implementations."""
+"""VishwamAI thought process implementations."""
 
-from .tot import ThoughtNode, TreeOfThoughts
+from .tot import TreeOfThoughts, ThoughtNode
 from .cot import ChainOfThoughtPrompting
 
 __all__ = [
-    'ThoughtNode',
     'TreeOfThoughts',
+    'ThoughtNode',
     'ChainOfThoughtPrompting'
 ]

@@ -290,7 +290,8 @@ class TPUProfiler:
             self.metrics["memory_bandwidth"].append(analysis.get("memory_bandwidth", 0))
             self.metrics["latency"].append(analysis.get("latency", 0))
             self.metrics["energy_consumption"].append(analysis.get("energy_consumption", 0))
-        except:
+        except Exception as e:
+            print(f"Error during cost analysis: {e}") # Log the exception
             pass
 
     def get_detailed_metrics_summary(self) -> Dict[str, float]:

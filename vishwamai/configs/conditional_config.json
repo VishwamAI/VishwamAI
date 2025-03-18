@@ -1,0 +1,45 @@
+{
+    "model": {
+        "hidden_size": 4096,
+        "num_layers": 32,
+        "num_heads": 32,
+        "num_experts": 8,
+        "ffn_dim": 16384,
+        "dropout_rate": 0.1,
+        "dtype": "bfloat16"
+    },
+    "conditional_computation": {
+        "dynamic_gating": {
+            "enabled": true,
+            "gating_dim": 256,
+            "temperature": 1.0,
+            "apply_every_n_layers": 2
+        },
+        "cign": {
+            "enabled": true,
+            "hidden_dim": 1024,
+            "num_splits": 2,
+            "temperature": 2.0
+        },
+        "cigt": {
+            "enabled": true,
+            "num_paths": 4,
+            "info_threshold": 0.1,
+            "use_gumbel": true
+        },
+        "rl_conditional": {
+            "enabled": true,
+            "num_experts": 8,
+            "temperature": 1.0,
+            "reward_scale": 0.1,
+            "entropy_weight": 0.01
+        }
+    },
+    "optimization": {
+        "use_fp8": true,
+        "use_flash_attention": true,
+        "block_size": 128,
+        "tpu_block_multiple": 128,
+        "gradient_checkpointing": true
+    }
+}

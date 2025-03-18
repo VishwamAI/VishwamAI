@@ -33,10 +33,21 @@ class AudioConfig:
     attention_dropout_rate: float = 0.1
 
 @dataclass
+class SonarConfig:
+    """SONAR model configuration."""
+    num_languages: int = 200
+    embedding_dim: int = 1024
+    use_speech: bool = True
+    use_text_decoder: bool = True
+    fairseq2_model_path: Optional[str] = None
+    language_codes: Optional[List[str]] = None
+
+@dataclass
 class MultimodalConfig:
     """Configuration for multimodal model."""
     vision_config: Optional[VisionConfig] = None
     audio_config: Optional[AudioConfig] = None
+    sonar_config: Optional[SonarConfig] = None
     hidden_size: int = 4096
     fusion_layers: int = 2
     num_attention_heads: int = 32
@@ -58,6 +69,10 @@ class MultimodalConfig:
         if 'audio_config' in config_dict:
             config_dict['audio_config'] = AudioConfig(
                 **config_dict['audio_config']
+            )
+        if 'sonar_config' in config_dict:
+            config_dict['sonar_config'] = SonarConfig(
+                **config_dict['sonar_config']
             )
         return cls(**config_dict)
 
@@ -109,6 +124,16 @@ class MultimodalConfig:
                 'dropout_rate': self.audio_config.dropout_rate,
                 'attention_dropout_rate': self.audio_config.attention_dropout_rate
             }
+        
+        if self.sonar_config:
+            config_dict['sonar_config'] = {
+                'num_languages': self.sonar_config.num_languages,
+                'embedding_dim': self.sonar_config.embedding_dim,
+                'use_speech': self.sonar_config.use_speech,
+                'use_text_decoder': self.sonar_config.use_text_decoder,
+                'fairseq2_model_path': self.sonar_config.fairseq2_model_path,
+                'language_codes': self.sonar_config.language_codes
+            }
             
         return config_dict
 
@@ -123,6 +148,7 @@ class MultimodalConfig:
 def create_default_multimodal_config(
     include_vision: bool = True,
     include_audio: bool = True,
+    include_sonar: bool = False,
     **kwargs
 ) -> MultimodalConfig:
     """Create default multimodal configuration.
@@ -130,6 +156,7 @@ def create_default_multimodal_config(
     Args:
         include_vision: Whether to include vision config
         include_audio: Whether to include audio config
+        include_sonar: Whether to include sonar config
         **kwargs: Override default config values
         
     Returns:
@@ -172,6 +199,16 @@ def create_default_multimodal_config(
             'normalize': True,
             'dropout_rate': 0.1,
             'attention_dropout_rate': 0.1
+        }
+    
+    if include_sonar:
+        config_dict['sonar_config'] = {
+            'num_languages': 200,
+            'embedding_dim': 1024,
+            'use_speech': True,
+            'use_text_decoder': True,
+            'fairseq2_model_path': None,
+            'language_codes': None
         }
     
     # Override defaults with any provided values

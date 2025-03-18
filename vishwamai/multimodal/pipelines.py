@@ -203,17 +203,155 @@ class MultimodalChatPipeline:
         
         return response
 
+class MultilingualPipeline:
+    """Pipeline for multilingual text and speech processing using SONAR."""
+    
+    def __init__(
+        self,
+        model: VishwamAI,
+        processor: MultimodalProcessor,
+        config: Optional[MultimodalConfig] = None,
+        **kwargs
+    ):
+        self.model = model
+        self.processor = processor
+        self.config = config or create_default_multimodal_config(include_sonar=True)
+        
+        if not self.config.sonar_config:
+            raise ValueError("SONAR configuration is required for MultilingualPipeline")
+    
+    def translate(
+        self,
+        text: Optional[Union[str, List[str]]] = None,
+        speech: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
+        src_lang: str = "eng",
+        tgt_lang: str = "fra",
+        **kwargs
+    ) -> Union[str, List[str]]:
+        """Translate text or speech between languages.
+        
+        Args:
+            text: Optional text input in source language
+            speech: Optional speech input in source language
+            src_lang: Source language code
+            tgt_lang: Target language code
+            **kwargs: Additional generation arguments
+            
+        Returns:
+            Translated text in target language
+        """
+        # Process inputs
+        inputs = self.processor.prepare_multilingual_inputs(
+            text=text,
+            speech=speech,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang
+        )
+        
+        # Generate translation
+        outputs = self.model.generate_chat(
+            [{"role": "user", "content": f"Translate to {tgt_lang}:"}],
+            **inputs,
+            **kwargs
+        )
+        
+        return outputs
+    
+    def embed(
+        self,
+        text: Optional[Union[str, List[str]]] = None,
+        speech: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
+        src_lang: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, np.ndarray]:
+        """Get SONAR embeddings for text or speech input.
+        
+        Args:
+            text: Optional text input
+            speech: Optional speech input
+            src_lang: Source language code
+            **kwargs: Additional processing arguments
+            
+        Returns:
+            Dictionary with embeddings
+        """
+        return self.processor.prepare_multilingual_inputs(
+            text=text,
+            speech=speech,
+            src_lang=src_lang,
+            **kwargs
+        )
+    
+    def compute_similarity(
+        self,
+        texts1: List[str],
+        texts2: List[str],
+        lang1: str = "eng",
+        lang2: str = "eng"
+    ) -> np.ndarray:
+        """Compute similarity scores between text pairs.
+        
+        Args:
+            texts1: First list of texts
+            texts2: Second list of texts 
+            lang1: Language code for first texts
+            lang2: Language code for second texts
+            
+        Returns:
+            Array of similarity scores
+        """
+        # Get embeddings
+        emb1 = self.embed(text=texts1, src_lang=lang1)["text_embeddings"]
+        emb2 = self.embed(text=texts2, src_lang=lang2)["text_embeddings"]
+        
+        # Compute similarity
+        return self.processor.sonar_encoder.get_similarity_score(emb1, emb2)
+    
+    def batch_translate(
+        self,
+        texts: List[str],
+        src_lang: str,
+        tgt_lang: str,
+        batch_size: int = 32,
+        **kwargs
+    ) -> List[str]:
+        """Translate a batch of texts.
+        
+        Args:
+            texts: List of texts to translate
+            src_lang: Source language code
+            tgt_lang: Target language code
+            batch_size: Batch size for processing
+            **kwargs: Additional arguments
+            
+        Returns:
+            List of translated texts
+        """
+        translations = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_translations = self.translate(
+                text=batch,
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
+                **kwargs
+            )
+            translations.extend(batch_translations)
+        return translations
+
 def load_multimodal_pipeline(
     model_name_or_path: str,
     task: str = "chat",
     **kwargs
 ) -> Union[MultimodalChatPipeline, ImageCaptioningPipeline, 
-           VisualQuestionAnswering, AudioCaptioningPipeline]:
+           VisualQuestionAnswering, AudioCaptioningPipeline,
+           MultilingualPipeline]:
     """Load a multimodal pipeline.
     
     Args:
         model_name_or_path: Path to pretrained model
-        task: Pipeline task (chat, image-captioning, vqa, audio-captioning)
+        task: Pipeline task (chat, image-captioning, vqa, audio-captioning,
+              multilingual)
         **kwargs: Additional arguments
         
     Returns:
@@ -233,5 +371,17 @@ def load_multimodal_pipeline(
         return VisualQuestionAnswering(model, processor, **kwargs)
     elif task == "audio-captioning":
         return AudioCaptioningPipeline(model, processor, **kwargs)
+    elif task == "multilingual":
+        config = create_default_multimodal_config(include_sonar=True)
+        return MultilingualPipeline(model, processor, config=config, **kwargs)
     else:
         raise ValueError(f"Unknown task: {task}")
+        
+__all__ = [
+    "ImageCaptioningPipeline",
+    "VisualQuestionAnswering",
+    "AudioCaptioningPipeline",
+    "MultimodalChatPipeline",
+    "MultilingualPipeline",
+    "load_multimodal_pipeline"
+]

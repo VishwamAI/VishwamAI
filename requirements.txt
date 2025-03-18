@@ -40,3 +40,10 @@ notebook==6.4.12
 scipy==1.11.4
 ml_collections==1.0.0
 typing_extensions==4.12.2
+
+# SONAR Dependencies
+fairseq2 --extra-index-url https://fair.pkg.atmeta.com/fairseq2/whl/pt2.6.0/cu124
+editdistance~=0.8
+importlib_metadata~=7.0
+importlib_resources~=6.4
+sacrebleu~=2.4

@@ -4,9 +4,17 @@ from typing import Any, Callable, List, Dict, Union, Optional
 from safetensors import safe_open
 import os
 from huggingface_hub import snapshot_download
-from .layers.layers import MLABlock, MoELayer
+from .layers.layers import (
+    MLABlock, 
+    MoELayer,
+    DynamicChannelGating,
+    ConditionalInfoGainNode, 
+    CIGTLayer,
+    RLBasedConditionalLayer
+)
 import json
 import jax
+
 class VishwamAI(nn.Module):
     vocab_size: int
     hidden_size: int = 4096  # Scale for 14B params
@@ -17,6 +25,8 @@ class VishwamAI(nn.Module):
     dropout_rate: float = 0.1
     # Add multimodal config
     vision_config: Optional[Dict[str, Any]] = None
+    # Add conditional computation config
+    conditional_config: Optional[Dict[str, Any]] = None
     
     @nn.compact
     def __call__(self, x, image_input=None, training=True):
@@ -24,9 +34,28 @@ class VishwamAI(nn.Module):
         x = nn.Embed(num_embeddings=self.vocab_size, 
                     features=self.hidden_size)(x)
         
+        # Initialize conditional layers if config provided
+        if self.conditional_config:
+            dynamic_gating = DynamicChannelGating(
+                channels=self.hidden_size,
+                hidden_dim=self.conditional_config.get('gating_dim', 256)
+            )
+            cign_node = ConditionalInfoGainNode(
+                hidden_dim=self.hidden_size,
+                output_dim=self.hidden_size,
+                num_splits=self.conditional_config.get('num_splits', 2)
+            )
+            cigt_layer = CIGTLayer(
+                features=self.hidden_size,
+                num_paths=self.conditional_config.get('num_paths', 4)
+            )
+            rl_layer = RLBasedConditionalLayer(
+                features=self.hidden_size,
+                num_experts=self.conditional_config.get('num_experts', 8)
+            )
+        
         # Handle image input if provided
         if image_input is not None and self.vision_config is not None:
-            # Import here to avoid circular imports
             from .multimodal.encoder import MultimodalEncoder
             
             # Initialize multimodal encoder
@@ -52,15 +81,39 @@ class VishwamAI(nn.Module):
         if training:
             x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not training)
             
-        # Process through transformer layers
-        for _ in range(self.num_layers):
-            # Layer normalization and residual connections
+        # Process through transformer layers with conditional computation
+        prev_info = None  # Track information state for CIGT
+        prev_rewards = None  # Track rewards for RL-based layer
+        layer_outputs = []
+        
+        for layer_idx in range(self.num_layers):
             residual = x
             x = nn.LayerNorm()(x)
+            
+            # Apply conditional computation if configured
+            if self.conditional_config:
+                # Dynamic channel gating
+                if layer_idx % 2 == 0:
+                    x, gates = dynamic_gating(x, training=training)
+                
+                # CIGN routing
+                if self.conditional_config.get('use_cign', False):
+                    x, split_probs = cign_node(x, training=training)
+                
+                # CIGT layer
+                if self.conditional_config.get('use_cigt', False):
+                    x, prev_info = cigt_layer(x, prev_info, training=training)
+                
+                # RL-based conditional computation
+                if self.conditional_config.get('use_rl', False):
+                    x, aux = rl_layer(x, prev_rewards, training=training)
+                    if training:
+                        prev_rewards = aux['actions']  # Use actions as rewards signal
+            
+            # Standard attention and MoE
             x = MLABlock(num_heads=self.num_heads)(x)
             x = x + residual
             
-            # Feed-forward network with MoE
             residual = x
             x = nn.LayerNorm()(x)
             x = MoELayer(num_experts=self.num_experts, 
@@ -69,10 +122,25 @@ class VishwamAI(nn.Module):
             
             if training:
                 x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not training)
+            
+            layer_outputs.append(x)
                 
         # Final layer norm
         x = nn.LayerNorm()(x)
-        return nn.Dense(self.vocab_size)(x)
+        logits = nn.Dense(self.vocab_size)(x)
+        
+        if training and self.conditional_config:
+            # Return logits and conditional computation metrics
+            return {
+                'logits': logits,
+                'layer_outputs': layer_outputs,
+                'gates': gates if 'gates' in locals() else None,
+                'split_probs': split_probs if 'split_probs' in locals() else None,
+                'info_state': prev_info,
+                'rl_metrics': aux if 'aux' in locals() else None
+            }
+        
+        return logits
         
     def get_distillation_outputs(self, x, temperature=2.0, training=True):
         """Get logits and hidden states for knowledge distillation"""

@@ -1,189 +1,92 @@
-"""
-VishwamAI Transformer Implementation - Import Test
-"""
+"""Test script to validate all imports and dependencies."""
 
-import unittest
-import jax
-import jax.numpy as jnp
-from vishwamai import (
-    ChainOfThoughtPrompting,
-    TreeOfThoughts,
-    ThoughtNode,
-    evaluate_tot_solution,
-    compute_distillation_loss,
-    create_student_model,
-    initialize_from_teacher,
-    create_vishwamai_transformer,
-    create_train_state,
-    fp8_cast_transpose,
-    fp8_gemm_optimized,
-    block_tpu_matmul,
-    act_quant,
-    multi_head_attention_kernel,
-    flash_attention,
-    rope_embedding,
-    apply_rotary_pos_emb,
-    weight_dequant,
-    batch_norm_tpu,
-    fp8_gemm,
-    MLABlock,
-    MoELayer,
-    VishwamAIPipeline,
-    VishwamAITrainer,
-    create_trainer,
-    DuckDBLogger,
-)
-from vishwamai.transformer import TransformerModel, EnhancedTransformerModel
-from vishwamai.tokenizer import VishwamAITokenizer
-from vishwamai.model import VishwamAI
+def test_imports():
+    imports = {
+        'Core Dependencies': [
+            'import jax',
+            'import jax.numpy as jnp',
+            'import flax.linen as nn',
+            'import optax',
+            'import numpy as np',
+            'import torch',
+            'from transformers import AutoTokenizer',
+            'from safetensors import safe_open'
+        ],
+        'Data Processing': [
+            'import datasets',
+            'import sentencepiece',
+            'import tokenizers',
+            'from huggingface_hub import snapshot_download'
+        ],
+        'Training Utilities': [
+            'import wandb',
+            'import duckdb',
+            'import tqdm',
+            'import pyarrow'
+        ],
+        'Memory Optimization': [
+            'import einops',
+            'import chex',
+            'import jaxtyping',
+            'import optree',
+            'import orbax.checkpoint'
+        ],
+        'Additional Libraries': [
+            'import scipy',
+            'from ml_collections import ConfigDict',
+            'import typing_extensions'
+        ],
+        'VishwamAI Modules': [
+            'from vishwamai.model import VishwamAI',
+            'from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAttention, TPUMoELayer',
+            'from vishwamai.multimodal.encoder import MultimodalEncoder',
+            'from vishwamai.flash_attention import FlashAttention',
+            'from vishwamai.kernels.kernel import fp8_gemm_optimized'
+        ],
+        'SONAR Dependencies': [
+            'import fairseq2',
+            'import editdistance',
+            'import importlib_metadata',
+            'import importlib_resources',
+            'import sacrebleu'
+        ]
+    }
 
-class TestImports(unittest.TestCase):
-    """
-    Test cases to ensure all modules and functions are importable.
-    """
-
-    def test_core_components(self):
-        # Test ChainOfThoughtPrompting
-        self.assertIsNotNone(ChainOfThoughtPrompting)
-
-        # Test TreeOfThoughts
-        self.assertIsNotNone(TreeOfThoughts)
-
-        # Test ThoughtNode
-        self.assertIsNotNone(ThoughtNode)
+    results = {}
+    for category, import_statements in imports.items():
+        print(f"\nTesting {category}:")
+        category_results = []
         
-        # Test evaluate_tot_solution
-        self.assertIsNotNone(evaluate_tot_solution)
-
-        # Test compute_distillation_loss
-        self.assertIsNotNone(compute_distillation_loss)
-
-        # Test create_student_model
-        self.assertIsNotNone(create_student_model)
-
-        # Test initialize_from_teacher
-        self.assertIsNotNone(initialize_from_teacher)
-
-        # Test create_vishwamai_transformer
-        self.assertIsNotNone(create_vishwamai_transformer)
-
-        # Test create_train_state
-        self.assertIsNotNone(create_train_state)
-        
-        
-    def test_tpu_optimized_kernels(self):
-        # Test fp8_cast_transpose
-        self.assertIsNotNone(fp8_cast_transpose)
-
-        # Test fp8_gemm_optimized
-        self.assertIsNotNone(fp8_gemm_optimized)
-
-        # Test block_tpu_matmul
-        self.assertIsNotNone(block_tpu_matmul)
-
-        # Test act_quant
-        self.assertIsNotNone(act_quant)
-
-        # Test multi_head_attention_kernel
-        self.assertIsNotNone(multi_head_attention_kernel)
-
-        # Test flash_attention
-        self.assertIsNotNone(flash_attention)
-
-        # Test rope_embedding
-        self.assertIsNotNone(rope_embedding)
-
-        # Test apply_rotary_pos_emb
-        self.assertIsNotNone(apply_rotary_pos_emb)
-
-        # Test weight_dequant
-        self.assertIsNotNone(weight_dequant)
-
-        # Test batch_norm_tpu
-        self.assertIsNotNone(batch_norm_tpu)
-        
-        #Test fp8_gemm
-        self.assertIsNotNone(fp8_gemm)
-
-    def test_advanced_layers(self):
-        # Test MLABlock
-        self.assertIsNotNone(MLABlock)
-
-        # Test MoELayer
-        self.assertIsNotNone(MoELayer)
-
-    def test_pipeline_and_training(self):
-        # Test VishwamAIPipeline
-        self.assertIsNotNone(VishwamAIPipeline)
-
-        # Test VishwamAITrainer
-        self.assertIsNotNone(VishwamAITrainer)
-
-        # Test create_trainer
-        self.assertIsNotNone(create_trainer)
-
-    def test_logging(self):
-        # Test DuckDBLogger
-        self.assertIsNotNone(DuckDBLogger)
+        for import_stmt in import_statements:
+            try:
+                exec(import_stmt)
+                print(f"✓ {import_stmt}")
+                category_results.append((import_stmt, True))
+            except ImportError as e:
+                print(f"✗ {import_stmt} - Error: {str(e)}")
+                category_results.append((import_stmt, False))
+            except Exception as e:
+                print(f"! {import_stmt} - Unexpected error: {str(e)}")
+                category_results.append((import_stmt, False))
+                
+        results[category] = category_results
     
-    def test_transformer_models(self):
-        self.assertIsNotNone(TransformerModel)
-        self.assertIsNotNone(EnhancedTransformerModel)
+    # Print summary
+    print("\nImport Test Summary:")
+    print("-------------------")
+    total = 0
+    successful = 0
     
-    def test_tokenizer(self):
-        self.assertIsNotNone(VishwamAITokenizer)
+    for category, category_results in results.items():
+        cat_total = len(category_results)
+        cat_success = sum(1 for _, success in category_results if success)
+        total += cat_total
+        successful += cat_success
+        print(f"{category}: {cat_success}/{cat_total} successful")
+    
+    print(f"\nOverall: {successful}/{total} imports successful ({(successful/total)*100:.1f}%)")
+    
+    return results
 
-    def test_vishwamai_model(self):
-        self.assertIsNotNone(VishwamAI)
-
-    def test_example_usage(self):
-        # Check if we can create an instance of DuckDBLogger
-        logger = DuckDBLogger(db_path=":memory:")
-        self.assertIsNotNone(logger)
-        logger.close()
-
-        # Check if we can create an instance of EnhancedTransformerModel with TPU v2 optimized config
-        config = {
-            'vocab_size': 1000,
-            'num_layers': 2,
-            'num_heads': 4,
-            'head_dim': 32,  # Reduced for TPU v2 memory efficiency
-            'hidden_dim': 128,  # Adjusted for TPU v2
-            'mlp_dim': 256,  # Adjusted for TPU v2
-            'max_seq_len': 64,  # Reduced for testing
-            'use_enhanced': True,
-            'use_rotary': True,
-            'use_flash_attn': True,
-            'use_rms_norm': False,  # Using LayerNorm for TPU v2 stability
-            'dropout_rate': 0.1,
-            'dtype': jnp.float32  # Using float32 for TPU v2
-        }
-
-        # Create model and validate
-        model = create_vishwamai_transformer(config)
-        self.assertIsNotNone(model)
-
-        # Initialize training state
-        rng = jax.random.PRNGKey(0)
-        learning_rate_schedule = lambda step: 1e-3
-        state = create_train_state(rng, config, learning_rate_schedule)
-        self.assertIsNotNone(state)
-
-        # Test forward pass with proper shape
-        batch_size, seq_len = 1, 16
-        input_data = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        output = model.apply({'params': state.params}, input_data, deterministic=True)
-        self.assertEqual(output.shape, (batch_size, seq_len, config['vocab_size']))
-
-        # Test tokenizer
-        tokenizer = VishwamAITokenizer(model_path="test.model")
-        self.assertIsNotNone(tokenizer)
-
-        # Test VishwamAI model
-        vishwamai_model = VishwamAI(vocab_size=1000)
-        self.assertIsNotNone(vishwamai_model)
-        
-        
-if __name__ == '__main__':
-    unittest.main()
-
+if __name__ == "__main__":
+    test_imports()

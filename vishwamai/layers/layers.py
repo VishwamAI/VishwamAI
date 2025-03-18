@@ -1,9 +1,9 @@
-"""TPU-optimized neural network layers"""
+"""TPU-optimized neural network layers with conditional computation"""
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Any, Optional, Tuple, Dict
+from typing import Any, Optional, Tuple, Dict, List, Callable
 from vishwamai.flash_attention import FlashAttention, flash_attention_inference
 from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant, optimize_kernel_layout
 
@@ -290,6 +290,200 @@ class TPUMoELayer(nn.Module):
         
         return output
 
+class DynamicChannelGating(nn.Module):
+    """Dynamic channel gating layer for conditional computation."""
+    channels: int
+    hidden_dim: int = 256
+    temperature: float = 1.0
+    dtype: Any = jnp.float32
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        # Gate generation network
+        gate_net = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype
+        )(x)
+        gate_net = jax.nn.gelu(gate_net)
+        gate_logits = TPUGEMMLinear(
+            features=self.channels,
+            dtype=self.dtype
+        )(gate_net)
+        
+        # Apply temperature scaling and gumbel softmax for training
+        if training:
+            gates = jax.nn.gumbel_softmax(
+                gate_logits,
+                temperature=self.temperature,
+                axis=-1
+            )
+        else:
+            gates = jax.nn.softmax(gate_logits / self.temperature, axis=-1)
+            
+        # Apply gates to channels
+        gated_output = x * gates
+        
+        return gated_output, gates
+
+class ConditionalInfoGainNode(nn.Module):
+    """Node for Conditional Information Gain Networks."""
+    hidden_dim: int
+    output_dim: int
+    num_splits: int = 2
+    dtype: Any = jnp.float32
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        # Split function network
+        split_net = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype
+        )(x)
+        split_net = jax.nn.gelu(split_net)
+        
+        # Generate split probabilities
+        split_logits = TPUGEMMLinear(
+            features=self.num_splits,
+            dtype=self.dtype
+        )(split_net)
+        
+        # Compute split probabilities
+        if training:
+            split_probs = jax.nn.gumbel_softmax(split_logits, axis=-1)
+        else:
+            split_probs = jax.nn.softmax(split_logits, axis=-1)
+            
+        # Transform input based on split
+        transforms = []
+        for i in range(self.num_splits):
+            transform = TPUGEMMLinear(
+                features=self.output_dim,
+                dtype=self.dtype
+            )(x)
+            transforms.append(transform)
+            
+        transforms = jnp.stack(transforms, axis=1)
+        output = jnp.sum(transforms * split_probs[..., None], axis=1)
+        
+        return output, split_probs
+
+class CIGTLayer(nn.Module):
+    """Conditional Information Gain Trellis layer."""
+    features: int
+    num_paths: int = 4
+    info_threshold: float = 0.1
+    dtype: Any = jnp.float32
+    
+    @nn.compact
+    def __call__(
+        self, 
+        x: jnp.ndarray,
+        prev_info: Optional[jnp.ndarray] = None,
+        training: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        batch_size = x.shape[0]
+        
+        # Information gain computation network
+        info_net = TPUGEMMLinear(
+            features=self.num_paths,
+            dtype=self.dtype
+        )(x)
+        info_gains = jax.nn.sigmoid(info_net)
+        
+        # Update cumulative information
+        if prev_info is None:
+            prev_info = jnp.zeros((batch_size, self.num_paths), dtype=self.dtype)
+        cumul_info = prev_info + info_gains
+        
+        # Path selection based on information gain
+        active_paths = cumul_info > self.info_threshold
+        if training:
+            # Use soft masks during training
+            path_weights = jax.nn.sigmoid((cumul_info - self.info_threshold) * 10.0)
+        else:
+            path_weights = active_paths.astype(self.dtype)
+            
+        # Process through parallel paths
+        path_outputs = []
+        for i in range(self.num_paths):
+            path_transform = TPUGEMMLinear(
+                features=self.features // self.num_paths,
+                dtype=self.dtype
+            )(x)
+            path_outputs.append(path_transform)
+            
+        path_outputs = jnp.concatenate(path_outputs, axis=-1)
+        output = path_outputs * path_weights[..., None]
+        
+        return output, cumul_info
+
+class RLBasedConditionalLayer(nn.Module):
+    """Reinforcement learning based conditional computation layer."""
+    features: int
+    num_experts: int = 8
+    temperature: float = 1.0
+    dtype: Any = jnp.float32
+    
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        prev_rewards: Optional[jnp.ndarray] = None,
+        training: bool = True
+    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+        # Policy network
+        policy_net = TPUGEMMLinear(
+            features=256,
+            dtype=self.dtype
+        )(x)
+        policy_net = jax.nn.gelu(policy_net)
+        action_logits = TPUGEMMLinear(
+            features=self.num_experts,
+            dtype=self.dtype
+        )(policy_net)
+        
+        # Action selection
+        if training:
+            # Use Gumbel-Softmax for differentiable sampling
+            actions = jax.nn.gumbel_softmax(
+                action_logits,
+                temperature=self.temperature,
+                axis=-1
+            )
+        else:
+            # Greedy selection during inference
+            actions = jax.nn.one_hot(
+                jnp.argmax(action_logits, axis=-1),
+                self.num_experts
+            )
+            
+        # Expert computation
+        experts = []
+        for i in range(self.num_experts):
+            expert = TPUGEMMLinear(
+                features=self.features,
+                dtype=self.dtype
+            )(x)
+            experts.append(expert)
+            
+        experts = jnp.stack(experts, axis=1)
+        output = jnp.sum(experts * actions[..., None], axis=1)
+        
+        # Compute auxiliary outputs for training
+        aux = {
+            'actions': actions,
+            'action_logits': action_logits
+        }
+        
+        if prev_rewards is not None:
+            # Update policy based on previous rewards
+            policy_loss = -jnp.mean(
+                prev_rewards * jnp.log(actions + 1e-10)
+            )
+            aux['policy_loss'] = policy_loss
+            
+        return output, aux
+
 def create_layer_factory(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -320,5 +514,29 @@ def create_layer_factory(
             dtype=config["model"].get("dtype", jnp.float32),
             use_fp8=config["optimization"].get("use_fp8", True),
             block_size=config["optimization"].get("block_size", 128)
+        )
+    }
+
+def create_conditional_layer_factory(
+    config: Dict[str, Any]
+) -> Dict[str, Callable]:
+    """Create factory for conditional computation layers."""
+    return {
+        "dynamic_gating": lambda: DynamicChannelGating(
+            channels=config["model"]["hidden_dim"],
+            dtype=config["model"].get("dtype", jnp.float32)
+        ),
+        "cign": lambda: ConditionalInfoGainNode(
+            hidden_dim=config["model"]["hidden_dim"],
+            output_dim=config["model"]["hidden_dim"],
+            dtype=config["model"].get("dtype", jnp.float32)
+        ),
+        "cigt": lambda: CIGTLayer(
+            features=config["model"]["hidden_dim"],
+            dtype=config["model"].get("dtype", jnp.float32)
+        ),
+        "rl_conditional": lambda: RLBasedConditionalLayer(
+            features=config["model"]["hidden_dim"],
+            dtype=config["model"].get("dtype", jnp.float32)
         )
     }

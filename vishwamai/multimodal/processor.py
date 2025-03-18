@@ -5,6 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 from .image_processor import ImageProcessor
 from .audio_processor import AudioProcessor
+from .sonar import SonarEncoder
+from .config import MultimodalConfig, create_default_multimodal_config
 
 class MultimodalProcessor:
     """Unified processor for handling multiple input modalities."""
@@ -14,12 +16,23 @@ class MultimodalProcessor:
         image_processor: Optional[ImageProcessor] = None,
         audio_processor: Optional[AudioProcessor] = None,
         tokenizer: Optional[Any] = None,
+        config: Optional[MultimodalConfig] = None,
+        sonar_model_path: Optional[str] = None,
         max_length: int = 2048
     ):
         self.image_processor = image_processor or ImageProcessor()
         self.audio_processor = audio_processor or AudioProcessor()
         self.tokenizer = tokenizer
+        self.config = config or create_default_multimodal_config()
         self.max_length = max_length
+        
+        # Initialize SONAR if config is provided
+        if self.config.sonar_config:
+            self.sonar_encoder = SonarEncoder({
+                "fairseq2_model_path": sonar_model_path or self.config.sonar_config.fairseq2_model_path,
+            })
+        else:
+            self.sonar_encoder = None
 
     def __call__(
         self,
@@ -27,6 +40,8 @@ class MultimodalProcessor:
         images: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
         audio: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
         sampling_rate: Optional[int] = None,
+        src_lang: Optional[str] = None,
+        tgt_lang: Optional[str] = None,
         return_tensors: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
@@ -37,6 +52,8 @@ class MultimodalProcessor:
             images: Optional image input
             audio: Optional audio input
             sampling_rate: Optional audio sampling rate
+            src_lang: Source language code for SONAR
+            tgt_lang: Target language code for SONAR translation
             return_tensors: Whether to return jax tensors
             **kwargs: Additional keyword arguments
             
@@ -46,15 +63,26 @@ class MultimodalProcessor:
         outputs = {}
         
         # Process text if provided
-        if text is not None and self.tokenizer is not None:
-            text_features = self.tokenizer(
-                text,
-                max_length=self.max_length,
-                padding=True,
-                truncation=True,
-                return_tensors="jax" if return_tensors else "np"
-            )
-            outputs.update(text_features)
+        if text is not None:
+            if self.sonar_encoder and src_lang:
+                # Use SONAR for multilingual text processing
+                text_outputs = self.sonar_encoder.embed_text(
+                    text if isinstance(text, list) else [text],
+                    src_lang=src_lang
+                )
+                outputs.update({
+                    f"text_{k}": v for k, v in text_outputs.items()
+                })
+            elif self.tokenizer:
+                # Default tokenizer processing
+                text_features = self.tokenizer(
+                    text,
+                    max_length=self.max_length,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="jax" if return_tensors else "np"
+                )
+                outputs.update(text_features)
         
         # Process images if provided
         if images is not None:
@@ -69,18 +97,38 @@ class MultimodalProcessor:
         
         # Process audio if provided
         if audio is not None:
-            audio_features = self.audio_processor(
-                audio,
-                sampling_rate=sampling_rate,
-                return_tensors=return_tensors
+            if self.sonar_encoder and src_lang:
+                # Use SONAR for speech processing
+                audio_outputs = self.sonar_encoder.embed_speech(
+                    audio,
+                    src_lang=src_lang,
+                    sampling_rate=sampling_rate or 16000
+                )
+                outputs.update({
+                    f"audio_{k}": v for k, v in audio_outputs.items()
+                })
+            else:
+                # Default audio processing
+                audio_features = self.audio_processor(
+                    audio,
+                    sampling_rate=sampling_rate,
+                    return_tensors=return_tensors
+                )
+                outputs.update({
+                    f"audio_{k}": v 
+                    for k, v in audio_features.items()
+                })
+        
+        # Handle translation if target language is specified
+        if tgt_lang and self.sonar_encoder and "embeddings" in outputs:
+            decoded_text = self.sonar_encoder.decode_text(
+                outputs["embeddings"],
+                tgt_lang=tgt_lang
             )
-            outputs.update({
-                f"audio_{k}": v 
-                for k, v in audio_features.items()
-            })
+            outputs["translated_text"] = decoded_text
         
         return outputs
-    
+
     def batch_process(
         self,
         batch: Dict[str, Any],
@@ -173,5 +221,36 @@ class MultimodalProcessor:
         return self(
             audio=audio,
             sampling_rate=sampling_rate,
+            **kwargs
+        )
+
+    def prepare_multilingual_inputs(
+        self,
+        text: Optional[Union[str, List[str]]] = None,
+        speech: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
+        src_lang: str = "eng",
+        tgt_lang: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Prepare inputs specifically for multilingual processing.
+        
+        Args:
+            text: Text input in source language
+            speech: Speech input in source language
+            src_lang: Source language code
+            tgt_lang: Optional target language for translation
+            **kwargs: Additional arguments
+            
+        Returns:
+            Dictionary with processed multilingual inputs
+        """
+        if not self.sonar_encoder:
+            raise ValueError("SONAR encoder not initialized. Please provide sonar_config.")
+            
+        return self(
+            text=text,
+            audio=speech,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
             **kwargs
         )

@@ -19,7 +19,7 @@ optax = "^0.1.8"
 transformers = "^4.36.0"
 datasets = "^2.15.0"
 torch = "^2.2.0"  # Required for DataLoader and other utilities
-hydra-core = "^1.3.3"
+hydra-core = ">=1.1.0,<1.4.0"  # More flexible version range
 wandb = "^0.15.13"
 tensorboard = "^2.15.0"
 optuna = "^3.5.0"

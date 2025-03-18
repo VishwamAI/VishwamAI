@@ -19,7 +19,7 @@ tokenizers>=0.15.0
 huggingface-hub==0.29.2
 
 # Training Utilities
-wandb==1.39.2
+wandb==0.15.10
 duckdb==1.2.1
 tqdm==4.67.1
 pyarrow==16.1.0

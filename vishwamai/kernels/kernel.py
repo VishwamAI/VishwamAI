@@ -45,7 +45,9 @@ def act_quant(
     x: jnp.ndarray,
     num_bits: int = 8,
     axis: Optional[int] = None,
-    block_size: int = 128
+    block_size: int = 128,
+    use_stochastic_rounding: bool = True,
+    rng_key: Optional[jnp.ndarray] = None
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Quantize activations to reduced precision with automatic scale determination.
@@ -55,9 +57,15 @@ def act_quant(
         num_bits: Number of bits for quantization
         axis: Axis along which to compute scaling factors
         block_size: Block size for tiling
+        use_stochastic_rounding: Whether to use stochastic rounding to reduce quantization bias
+        rng_key: Optional PRNG key for stochastic rounding
     """
     if axis is None:
         axis = tuple(range(x.ndim))
+    
+    # Create rng_key if using stochastic rounding but none provided
+    if use_stochastic_rounding and rng_key is None:
+        rng_key = jax.random.PRNGKey(0)
     
     # Process in blocks for better TPU utilization
     def _process_block(block):
@@ -65,8 +73,21 @@ def act_quant(
         abs_max = jnp.max(jnp.abs(block), axis=axis, keepdims=True)
         scale = (2 ** (num_bits - 1) - 1) / (abs_max + 1e-5)
         
-        # Quantize and dequantize
-        x_quant = jnp.clip(jnp.round(block * scale), -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1)
+        # Scale the input
+        scaled = block * scale
+        
+        # Apply stochastic rounding if enabled
+        if use_stochastic_rounding:
+            # Generate noise in [-0.5, 0.5)
+            noise_key, rng_key = jax.random.split(rng_key)
+            noise = jax.random.uniform(noise_key, block.shape, minval=-0.5, maxval=0.5)
+            # Add noise before rounding for stochastic rounding
+            x_quant = jnp.clip(jnp.floor(scaled + noise + 0.5), -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1)
+        else:
+            # Standard deterministic rounding
+            x_quant = jnp.clip(jnp.round(scaled), -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1)
+        
+        # Dequantize
         x_dequant = x_quant / scale
         
         return x_dequant, scale

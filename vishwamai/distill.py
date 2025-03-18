@@ -3,9 +3,9 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Dict, Optional, Tuple
-from .kernels.kernel import fp8_gemm_optimized, act_quant
-from .layers.layers import TPUGEMMLinear, RMSNorm
-
+from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant
+from vishwamai.layers.layers import TPUGEMMLinear, TPURMSNorm
+from vishwamai.transformer import EnhancedTransformerModel
 class LinearPathDistillation(nn.Module):
     """Linear path embedding distillation layer"""
     hidden_dim: int
@@ -13,7 +13,7 @@ class LinearPathDistillation(nn.Module):
     
     def setup(self):
         self.linear_projection = TPUGEMMLinear(features=self.hidden_dim)
-        self.layer_norm = RMSNorm()
+        self.layer_norm = TPURMSNorm()
     
     def __call__(self, x, training=False):
         x = self.linear_projection(x)
@@ -198,8 +198,8 @@ class IntermediateLayerDistillation(nn.Module):
             student_proj = student_hidden
             
         # Normalize representations
-        teacher_norm = RMSNorm(dtype=teacher_hidden.dtype)(teacher_hidden)
-        student_norm = RMSNorm(dtype=student_hidden.dtype)(student_proj)
+        teacher_norm = TPURMSNorm(dtype=teacher_hidden.dtype)(teacher_hidden)
+        student_norm = TPURMSNorm(dtype=student_hidden.dtype)(student_proj)
         
         # Compute cosine similarity loss
         if self.temperature != 1.0:

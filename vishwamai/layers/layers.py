@@ -624,9 +624,96 @@ def create_conditional_layer_factory(
 # Alias TPUMoELayer as MoELayer for compatibility
 MoELayer = TPUMoELayer
 
+
+class TPURMSNorm(nn.Module):
+    """TPU-optimized RMS Normalization layer."""
+    epsilon: float = 1e-6
+    dtype: Any = jnp.float32
+    scale_init: Any = nn.initializers.ones
+    bias_init: Any = nn.initializers.zeros
+    use_scale: bool = True
+    use_bias: bool = True
+    axis: int = -1
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Apply RMS normalization to the input tensor.
+        
+        Args:
+            x: Input tensor of shape [..., features]
+            
+        Returns:
+            Normalized tensor of the same shape as input
+        """
+        # Compute RMS along the specified axis
+        rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=self.axis, keepdims=True) + self.epsilon)
+        
+        # Normalize
+        y = x / rms
+        
+        # Apply learnable scale
+        if self.use_scale:
+            scale = self.param('scale', 
+                             self.scale_init, 
+                             (x.shape[self.axis],), 
+                             self.dtype)
+            y = y * scale
+            
+        # Apply learnable bias
+        if self.use_bias:
+            bias = self.param('bias',
+                            self.bias_init,
+                            (x.shape[self.axis],),
+                            self.dtype)
+            y = y + bias
+            
+        return y.astype(self.dtype)
+
+# Add to layer factory
+def create_layer_factory(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Updated layer factory including RMSNorm."""
+    layers = {
+        "linear": lambda features: TPUGEMMLinear(
+            features=features,
+            dtype=config["model"].get("dtype", jnp.float32),
+            use_fp8=config["optimization"].get("use_fp8", True),
+            block_size=config["optimization"].get("block_size", 128)
+        ),
+        "layer_norm": lambda: TPULayerNorm(
+            dtype=config["model"].get("dtype", jnp.float32)
+        ),
+        "rms_norm": lambda: TPURMSNorm(
+            dtype=config["model"].get("dtype", jnp.float32),
+            epsilon=config["model"].get("epsilon", 1e-6),
+            use_scale=config["model"].get("use_scale", True),
+            use_bias=config["model"].get("use_bias", True)
+        ),
+        "attention": lambda: TPUMultiHeadAttention(
+            num_heads=config["model"]["num_heads"],
+            head_dim=config["model"]["head_dim"],
+            dropout_rate=config["model"].get("attention_dropout_rate", 0.0),
+            dtype=config["model"].get("dtype", jnp.float32),
+            use_flash_attn=config["optimization"].get("use_flash_attention", True),
+            use_fp8=config["optimization"].get("use_fp8", True),
+            block_size=config["optimization"].get("block_size", 128)
+        ),
+        "moe": lambda: TPUMoELayer(
+            num_experts=config["model"].get("num_experts", 8),
+            expert_dim=config["model"]["hidden_dim"],
+            dropout_rate=config["model"].get("dropout_rate", 0.0),
+            dtype=config["model"].get("dtype", jnp.float32),
+            use_fp8=config["optimization"].get("use_fp8", True),
+            block_size=config["optimization"].get("block_size", 128)
+        )
+    }
+    return layers
+
+# Update __all__
 __all__ = [
     'TPUGEMMLinear',
-    'TPULayerNorm', 
+    'TPULayerNorm',
+    'TPURMSNorm',  # Added RMSNorm
     'TPUMultiHeadAttention',
     'TPUMoELayer',
     'MoELayer',

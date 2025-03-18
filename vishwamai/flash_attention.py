@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from jax import lax
 from typing import Optional, Tuple, Dict, Any
 import numpy as np
+from functools import partial
 
 def flash_attention(
     q: jnp.ndarray,  # shape: [batch, q_len, num_heads, head_dim]
@@ -28,104 +29,137 @@ def flash_attention(
         dropout_rng: Optional RNG for dropout
         dropout_rate: Dropout probability
         causal: Whether to apply causal masking
-        block_size: Size of blocks for chunked attention computation
-        tpu_block_multiple: Multiple of block size optimized for TPU
-        precision: Numerical precision to use
+        block_size: Size of blocks for tiling (should be tuned for TPU architecture)
+        tpu_block_multiple: Block multiple for TPU memory alignment
+        precision: Precision to use for intermediate calculations
         
     Returns:
-        Tuple of (output, attention probs)
+        Output tensor and attention weights
     """
+    # Ensure block_size is a multiple of tpu_block_multiple
+    block_size = (block_size + tpu_block_multiple - 1) // tpu_block_multiple * tpu_block_multiple
+    
+    # Extract dimensions
     batch_size, q_len, num_heads, head_dim = q.shape
     _, kv_len, _, _ = k.shape
     
-    # Adjust block size to TPU-friendly multiple
-    block_size = (block_size + tpu_block_multiple - 1) // tpu_block_multiple * tpu_block_multiple
-    
-    # Cast to specified precision
+    # Cast to preferred precision for computation
     dtype = precision
     q = q.astype(dtype)
     k = k.astype(dtype)
     v = v.astype(dtype)
     
-    # Scale query
-    scaling = jnp.sqrt(head_dim).astype(dtype)
-    q = q / scaling
-    
-    # Initialize output accumulators
+    # Initialize output and normalization terms
+    # o will accumulate the weighted values
     o = jnp.zeros((batch_size, q_len, num_heads, head_dim), dtype=dtype)
+    # l will accumulate the softmax normalization denominator
     l = jnp.zeros((batch_size, q_len, num_heads, 1), dtype=dtype)
+    # m will track the max value for numerical stability
     m = jnp.ones((batch_size, q_len, num_heads, 1), dtype=dtype) * -jnp.inf
     
-    # Process attention in blocks
-    for block_start in range(0, kv_len, block_size):
-        block_end = min(block_start + block_size, kv_len)
+    # Constant scaling factor for Q*K
+    scale = jnp.sqrt(head_dim).astype(dtype)
+    
+    # Perform Flash Attention with tiled processing
+    # Process KV sequence in blocks to maintain O(1) memory complexity
+    def scan_fn(carry, block_idx):
+        o_partial, l_partial, m_partial = carry
         
-        # Get key/value block
-        k_block = jax.lax.dynamic_slice(
-            k,
-            (0, block_start, 0, 0),
-            (batch_size, block_end - block_start, num_heads, head_dim)
+        # Calculate start/end indices for this block
+        block_start = block_idx * block_size
+        block_end = jnp.minimum(block_start + block_size, kv_len)
+        block_len = block_end - block_start
+        
+        # Extract key/value blocks - shape optimization for TPU memory layout
+        k_block = lax.dynamic_slice(
+            k, 
+            (0, block_start, 0, 0), 
+            (batch_size, block_len, num_heads, head_dim)
         )
-        v_block = jax.lax.dynamic_slice(
-            v,
-            (0, block_start, 0, 0),
-            (batch_size, block_end - block_start, num_heads, head_dim)
+        v_block = lax.dynamic_slice(
+            v, 
+            (0, block_start, 0, 0), 
+            (batch_size, block_len, num_heads, head_dim)
         )
         
-        # Compute attention scores for block
-        s = jnp.einsum('bqhd,bkhd->bqhk', q, k_block)
+        # Compute attention scores for this block
+        # Reshape to [batch, num_heads, q_len, block_len] for efficient matmul on TPU
+        # Note: This transposed layout matches TPU's preferred memory access pattern
+        s = jnp.einsum('bqhd,bkhd->bhqk', q, k_block, precision=lax.Precision.HIGHEST) / scale
         
-        # Apply masking
+        # Apply causal masking if needed
         if causal:
-            causal_mask = jnp.triu(
-                jnp.ones((q_len, block_end - block_start), dtype=bool),
-                k=block_start + 1
+            causal_mask = jnp.greater_equal(
+                jnp.arange(q_len)[:, None], 
+                jnp.arange(block_start, block_end)[None, :]
             )
-            s = jnp.where(causal_mask[:, None, :], -jnp.inf, s)
+            causal_mask = causal_mask.reshape(1, 1, q_len, block_len)
+            s = jnp.where(causal_mask, s, -1e10)
         
+        # Apply attention mask if provided
         if mask is not None:
             mask_block = jax.lax.dynamic_slice(
-                mask,
-                (0, 0, block_start),
-                (batch_size, q_len, block_end - block_start)
+                mask, 
+                (0, 0, 0, block_start) if mask.ndim == 4 else (0, 0, block_start),
+                (batch_size, num_heads, q_len, block_len) if mask.ndim == 4 else (batch_size, q_len, block_len)
             )
-            s = jnp.where(mask_block[..., None, :], -jnp.inf, s)
+            if mask.ndim == 3:
+                mask_block = mask_block.reshape(batch_size, 1, q_len, block_len)
+            s = jnp.where(mask_block, s, -1e10)
         
-        # Update running maximum
+        # Find max for numerical stability within this block
         m_block = jnp.max(s, axis=-1, keepdims=True)
-        m_new = jnp.maximum(m, m_block)
         
-        # Update output with re-normalized contributions
-        exp_scale = jnp.exp(m - m_new)
+        # Compute new running max combining current block and previous blocks
+        m_new = jnp.maximum(m_partial, m_block)
+        
+        # Update exponential terms with numerical stability
+        exp_scale = jnp.exp(m_partial - m_new)
         exp_s = jnp.exp(s - m_block)
         
         # Apply dropout if specified
         if dropout_rate > 0.0 and dropout_rng is not None:
-            dropout_mask = jax.random.bernoulli(
-                dropout_rng,
-                p=1.0 - dropout_rate,
-                shape=exp_s.shape
+            dropout_shape = (batch_size, num_heads, q_len, block_len)
+            keep_prob = 1.0 - dropout_rate
+            keep_mask = jax.random.bernoulli(dropout_rng, keep_prob, shape=dropout_shape)
+            keep_mask = keep_mask / keep_prob  # Scale to preserve expectation
+            exp_s = exp_s * keep_mask
+        
+        # Update normalization term l
+        l_new = l_partial * exp_scale + jnp.sum(exp_s, axis=-1, keepdims=True)
+        
+        # Update output accumulation - efficient fused matmul pattern for TPU
+        o_new = o_partial * exp_scale + jnp.einsum('bhqk,bkhd->bqhd', exp_s, v_block, precision=lax.Precision.HIGHEST)
+        
+        return (o_new, l_new, m_new), None
+    
+    # Number of blocks to process
+    num_blocks = (kv_len + block_size - 1) // block_size
+    
+    # Scan over blocks
+    (o, l, m), _ = lax.scan(
+        scan_fn,
+        init=(o, l, m),
+        xs=jnp.arange(num_blocks)
+    )
+    
+    # Final normalization
+    out = o / l
+    
+    # Compute attention weights for visualization/analysis (optional)
+    # This can be removed in production as it requires O(N²) memory
+    if dropout_rate > 0 and dropout_rng is not None:
+        attn_weights = None  # Don't compute weights when using dropout for memory efficiency
+    else:
+        qk = jnp.einsum('bqhd,bkhd->bhqk', q, k) / scale
+        if causal:
+            causal_mask = jnp.greater_equal(
+                jnp.arange(q_len)[:, None], jnp.arange(kv_len)[None, :]
             )
-            exp_s = exp_s * dropout_mask / (1.0 - dropout_rate)
-        
-        # Accumulate weighted values
-        l_new = l * exp_scale + jnp.sum(exp_s, axis=-1, keepdims=True)
-        o_new = o * exp_scale + jnp.einsum('bqhk,bkhd->bqhd', exp_s, v_block)
-        
-        # Update accumulators
-        l = l_new
-        o = o_new
-        m = m_new
+            qk = jnp.where(causal_mask.reshape(1, 1, q_len, kv_len), qk, -1e10)
+        attn_weights = jax.nn.softmax(qk, axis=-1)
     
-    # Compute final output
-    o = o / l
-    
-    # Compute attention probabilities (optional)
-    p = None
-    if not jnp.isnan(o).any():  # Only compute if numerically stable
-        p = jnp.exp(s - m) / l
-    
-    return o, p
+    return out, attn_weights
 
 def mha_with_flash_attention(
     qkv: jnp.ndarray,
@@ -282,6 +316,7 @@ class FlashAttention:
         """Factory method to create FlashAttention instance."""
         return FlashAttention(config)
 
+@partial(jax.jit, static_argnums=(5, 6, 7, 8))
 def flash_attention_inference(
     q: jnp.ndarray,
     k: jnp.ndarray, 
@@ -320,24 +355,126 @@ def flash_attention_inference(
     # Initialize output
     batch_size = q.shape[0]
     seq_len = q.shape[2]
+    kv_len = k.shape[2]
     
-    # Compute attention scores in blocks
-    scale = 1.0 / jnp.sqrt(head_dim)
-    scores = jnp.einsum('bhsd,bhtd->bhst', q, k) * scale
+    # For autoregressive generation, fast path when q is just the last token
+    is_single_token = seq_len == 1
     
-    if mask is not None:
-        scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
-    
-    # Apply softmax    
-    probs = jax.nn.softmax(scores, axis=-1)
-    
-    # Compute weighted values
-    output = jnp.einsum('bhst,bhtd->bhsd', probs, v)
+    # Fast path for single-token generation: direct attention calculation without tiling
+    if is_single_token:
+        # Compute attention scores
+        scale = 1.0 / jnp.sqrt(head_dim)
+        
+        # Efficient matmul for single-token q
+        scores = jnp.einsum('bhsd,bhtd->bhst', q, k) * scale
+        
+        # Apply mask if needed
+        if mask is not None:
+            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+        
+        # Apply softmax
+        probs = jax.nn.softmax(scores, axis=-1)
+        
+        # Weighted sum of values
+        output = jnp.einsum('bhst,bhtd->bhsd', probs, v)
+    else:
+        # Multi-token case: use tiled flash attention
+        output = jnp.zeros((batch_size, num_heads, seq_len, head_dim), dtype=q.dtype)
+        l = jnp.zeros((batch_size, num_heads, seq_len, 1), dtype=q.dtype)
+        m = jnp.ones((batch_size, num_heads, seq_len, 1), dtype=q.dtype) * -jnp.inf
+        scale = 1.0 / jnp.sqrt(head_dim)
+        
+        # Process blocks of keys/values
+        for block_start in range(0, kv_len, block_size):
+            block_end = min(block_start + block_size, kv_len)
+            k_block = k[:, :, block_start:block_end]
+            v_block = v[:, :, block_start:block_end]
+            
+            # Compute scores for this block - optimized for TPU memory layout
+            s = jnp.einsum('bhsd,bhtd->bhst', q, k_block) * scale
+            
+            # Apply mask if needed
+            if mask is not None:
+                mask_block = mask[:, :, :, block_start:block_end]
+                s = jnp.where(mask_block, s, jnp.finfo(s.dtype).min)
+            
+            # Update running max
+            m_block = jnp.max(s, axis=-1, keepdims=True)
+            m_new = jnp.maximum(m, m_block)
+            
+            # Numerically stable update
+            exp_scale = jnp.exp(m - m_new)
+            exp_s = jnp.exp(s - m_block)
+            
+            # Update accumulators
+            l_new = l * exp_scale + jnp.sum(exp_s, axis=-1, keepdims=True)
+            output = (output * exp_scale + jnp.einsum('bhst,bhtd->bhsd', exp_s, v_block)) / l_new * l_new
+            
+            # Update running values
+            l = l_new
+            m = m_new
+        
+        # Final normalization
+        output = output / l
     
     # Cache key/values for next forward pass
     present = (k, v) if past_key_values is not None else None
     
     return output, present
+
+def create_fused_attention(config: Dict[str, Any]):
+    """Create optimized TPU-specific fused attention functions."""
+    
+    @partial(jax.jit, static_argnums=(4, 5, 6))
+    def fused_qkv_attention(
+        qkv_proj: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        dropout_rng: Optional[jnp.ndarray] = None,
+        dropout_rate: float = 0.0,
+        num_heads: int = 8,
+        head_dim: int = 64,
+        block_size: int = 128,
+    ):
+        """Fused QKV attention for better TPU utilization.
+        
+        Args:
+            qkv_proj: Combined QKV projection [batch, seq_len, 3 * num_heads * head_dim]
+            mask: Optional attention mask
+            dropout_rng: Optional RNG for dropout
+            dropout_rate: Dropout probability
+            num_heads: Number of attention heads
+            head_dim: Size of attention head dimension
+            block_size: Block size for tiled attention
+            
+        Returns:
+            Output tensor and attention weights
+        """
+        # Split qkv_proj into q, k, v components
+        batch_size, seq_len, _ = qkv_proj.shape
+        qkv = qkv_proj.reshape(batch_size, seq_len, 3, num_heads, head_dim)
+        q, k, v = [qkv[:, :, i] for i in range(3)]
+        
+        # Run flash attention
+        output, weights = flash_attention(
+            q, k, v, 
+            mask=mask,
+            dropout_rng=dropout_rng,
+            dropout_rate=dropout_rate,
+            causal=config.get("causal_mask", True),
+            block_size=block_size,
+            tpu_block_multiple=config.get("tpu_block_multiple", 128),
+            precision=config.get("compute_dtype", jnp.bfloat16)
+        )
+        
+        # Reshape output
+        output = output.reshape(batch_size, seq_len, -1)
+        return output, weights
+    
+    return {
+        "flash_attention": flash_attention,
+        "flash_attention_inference": flash_attention_inference,
+        "fused_qkv_attention": fused_qkv_attention
+    }
 
 # For backwards compatibility
 create_flash_attention = FlashAttention.create

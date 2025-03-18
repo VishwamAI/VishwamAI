@@ -133,7 +133,7 @@ def test_multimodal_functionality():
         print("\nTesting multimodal functionality:")
         print("1. Testing image processing...")
         try:
-            from vishwamai.multimodal.processor import ImageProcessor
+            from vishwamai.multimodal.image_processor import ImageProcessor
             processor = ImageProcessor(image_size=224)
             dummy_image = np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8)
             processed = processor(dummy_image)
@@ -145,6 +145,7 @@ def test_multimodal_functionality():
         print("2. Testing vision encoder...")
         try:
             from vishwamai.multimodal.vision import ViTEncoder
+            from vishwamai.layers.attention import FlashAttention
             
             rng = jax.random.PRNGKey(0)
             encoder = ViTEncoder(
@@ -153,7 +154,16 @@ def test_multimodal_functionality():
                 num_heads=12,
                 mlp_dim=3072,
                 patch_size=16,
-                image_size=224
+                image_size=224,
+                attention_cls=lambda: FlashAttention(
+                    hidden_dim=768,
+                    num_heads=12,
+                    dropout_rate=0.0,
+                    causal=False,
+                    block_size=128,
+                    tpu_block_multiple=128,
+                    dtype=jnp.float32
+                )
             )
             
             dummy_image = jnp.ones((1, 224, 224, 3))
@@ -197,9 +207,10 @@ def test_kernel_performance():
         # Test GEMM performance
         print("1. Testing GEMM performance...")
         try:
-            # Stable deterministic values for testing
-            x = jnp.ones((1024, 1024), dtype=jnp.float32)
-            y = jnp.ones((1024, 1024), dtype=jnp.float32)
+            # Use smaller matrices compatible with quantization
+            batch_size = 32
+            x = jnp.ones((batch_size, 64), dtype=jnp.float32)
+            y = jnp.ones((64, batch_size), dtype=jnp.float32)
             
             # Warmup
             _ = jnp.matmul(x, y)
@@ -214,20 +225,16 @@ def test_kernel_performance():
             
             # Try optimized GEMM if available
             try:
-                from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant
-                
-                # Prepare input for optimized GEMM
-                x_quant, x_scale = act_quant(x)
-                y_quant, y_scale = act_quant(y)
+                from vishwamai.kernels.kernel import fp8_gemm_optimized
                 
                 # Warmup
-                _ = fp8_gemm_optimized(x_quant, y_quant)
+                _ = fp8_gemm_optimized(x, y)
                 jax.tree_util.tree_map(lambda x: x.block_until_ready(), _)
                 
                 # Measure optimized GEMM
                 start = time.time()
                 for _ in range(10):
-                    result = fp8_gemm_optimized(x_quant, y_quant)
+                    result = fp8_gemm_optimized(x, y)
                     jax.tree_util.tree_map(lambda x: x.block_until_ready(), result)
                 opt_time = (time.time() - start) / 10
                 
@@ -241,7 +248,7 @@ def test_kernel_performance():
         # Test activation functions
         print("2. Testing activation functions...")
         try:
-            x = jnp.ones((4096, 4096), dtype=jnp.float32)
+            x = jnp.ones((1024, 1024), dtype=jnp.float32)
             
             # Standard GELU
             start = time.time()

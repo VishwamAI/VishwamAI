@@ -7,7 +7,7 @@ from PIL import Image
 from typing import Any, Dict, List, Optional, Union, Tuple
 import albumentations as A
 from albumentations.core.composition import Compose
-from audio_processor import AudioProcessor  # Assuming this is in a separate file
+from vishwamai.multimodal.audio_processor import AudioProcessor
 
 class ImageProcessor:
     """Process images for vision models."""

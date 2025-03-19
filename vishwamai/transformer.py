@@ -444,91 +444,83 @@ class FlashAttention(nn.Module):
         block_q = min(32, seq_len_q)  # Reduced for TPU v2
         block_k = min(32, seq_len_k)  # Keep blocks small for TPU v2
         
-        # Pad sequences if needed
-        def pad_to_multiple(x, block_size):
-            pad_len = (block_size - x.shape[2] % block_size) % block_size
-            return jnp.pad(x, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
-        
-        query = pad_to_multiple(query, block_q)
-        key = pad_to_multiple(key, block_k)
-        value = pad_to_multiple(value, block_k)
-        
         # Initialize accumulators with proper types for TPU
         acc_dtype = jnp.float32  # Use float32 for accumulation
         O = jnp.zeros((batch_size, self.num_heads, seq_len_q, self.head_dim), dtype=acc_dtype)
         L = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=acc_dtype) * -1e4
         m = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=acc_dtype) * -1e4
         
-        # Scale factor for better numerical stability on TPU
+        # Scale factor for better numerical stability
         scale = 1.0 / jnp.sqrt(self.head_dim)
         
         # Process attention in blocks
         def process_block(carry, block_idx):
             O, L, m = carry
             start_idx = block_idx * block_k
-            end_idx = min(start_idx + block_k, seq_len_k)
             
-            # Get current key/value block
-            k_block = lax.dynamic_slice(
+            # Use safe indexing for blocks
+            safe_size = jnp.minimum(block_k, seq_len_k - start_idx)
+            actual_size = lax.select(start_idx < seq_len_k, safe_size, 0)
+            
+            # Get current key/value block with safe dynamic slice
+            k_block = lax.dynamic_slice_in_dim(
                 key,
-                (0, 0, start_idx, 0),
-                (batch_size, self.num_heads, block_k, self.head_dim)
+                start_idx,
+                block_k,
+                axis=2,
+                slice_size=None
             )
-            v_block = lax.dynamic_slice(
+            v_block = lax.dynamic_slice_in_dim(
                 value,
-                (0, 0, start_idx, 0),
-                (batch_size, self.num_heads, block_k, self.head_dim)
+                start_idx,
+                block_k,
+                axis=2,
+                slice_size=None
             )
             
-            # Compute attention scores with TPU optimization
-            q_scaled = query * scale
-            k_block_scaled = k_block * scale
+            # Apply attention masking
+            query_scaled = query * scale
+            key_block_scaled = k_block * scale
             
-            # Use FP8 GEMM for attention computation
-            S = fp8_gemm_optimized(
-                q_scaled, jnp.ones_like(scale),
-                k_block_scaled.transpose(0, 1, 3, 2), jnp.ones_like(scale)
-            )
+            # Compute scores
+            S = jnp.einsum('bhqd,bhkd->bhqk', query_scaled, k_block)
             
             if mask is not None:
-                mask_block = lax.dynamic_slice(
+                # Safe mask slicing
+                mask_block = lax.dynamic_slice_in_dim(
                     mask,
-                    (0, 0, 0, start_idx),
-                    (batch_size, 1, seq_len_q, block_k)
+                    start_idx,
+                    block_k,
+                    axis=-1,
+                    slice_size=None
                 )
-                S = jnp.where(mask_block, S, -1e4)
+                S = jnp.where(mask_block, S, -1e10)
             
-            # Update running maximum (TPU optimized)
+            # Update running maximum
             m_block = jnp.max(S, axis=-1, keepdims=True)
             m_new = jnp.maximum(m, m_block)
             
-            # Compute attention weights with stable softmax
-            exp_S = jnp.exp(S - m_new)
+            # Compute attention weights
+            exp_S = jnp.exp(S - m_new[..., None])
+            
+            # Update normalization term
             L_new = L * jnp.exp(m - m_new) + jnp.sum(exp_S, axis=-1, keepdims=True)
             
-            # Update output with optimized GEMM
+            # Update output 
             O_new = (O * jnp.exp(m - m_new) + 
-                    fp8_gemm_optimized(
-                        exp_S, jnp.ones_like(scale),
-                        v_block, jnp.ones_like(scale)
-                    )) / L_new
+                    jnp.einsum('bhqk,bhkd->bhqd', exp_S, v_block)) / L_new
             
             return (O_new, L_new, m_new), None
         
-        # Run blocked attention
+        # Scan over blocks
         num_blocks = (seq_len_k + block_k - 1) // block_k
-        init_carry = (O, L, m)
         (O_final, _, _), _ = lax.scan(
             process_block,
-            init_carry,
+            (O, L, m),
             jnp.arange(num_blocks)
         )
         
-        # Remove padding if needed
-        if seq_len_q < O_final.shape[2]:
-            O_final = O_final[:, :, :seq_len_q, :]
-        
-        # Cast back to original dtype
+        # Cast output to desired dtype
         return O_final.astype(self.dtype)
 
 class RMSNorm(nn.Module):

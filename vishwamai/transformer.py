@@ -427,7 +427,7 @@ class FlashAttention(nn.Module):
     num_heads: int
     head_dim: int
     dropout_rate: float = 0.0
-    dtype: Any = jnp.float32
+    dtype: Any = jnp.bfloat16  # Change default to bfloat16
 
     @nn.compact
     def __call__(
@@ -438,13 +438,18 @@ class FlashAttention(nn.Module):
         mask: Optional[jnp.ndarray] = None,
         deterministic: bool = True
     ) -> jnp.ndarray:
+        # Cast inputs to correct dtype at the start
+        query = query.astype(self.dtype)
+        key = key.astype(self.dtype)
+        value = value.astype(self.dtype)
+        
         batch_size, seq_len_q = query.shape[0], query.shape[2]
         _, _, seq_len_k, _ = key.shape
         
-        # TPU-optimized block sizes
-        block_k = min(128, seq_len_k)  # Keep blocks reasonable for TPU
+        # TPU-optimized block sizes 
+        block_k = min(128, seq_len_k)
         
-        # Initialize accumulators
+        # Initialize accumulators with correct dtype
         O = jnp.zeros((batch_size, self.num_heads, seq_len_q, self.head_dim), dtype=self.dtype)
         L = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=self.dtype) * -1e4
         m = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=self.dtype) * -1e4
@@ -453,7 +458,6 @@ class FlashAttention(nn.Module):
             O, L, m = carry
             start_idx = block_idx * block_k
             
-            # Get current key/value block using pure dynamic_slice
             k_block = jax.lax.dynamic_slice(
                 key,
                 (0, 0, start_idx, 0),
@@ -465,30 +469,30 @@ class FlashAttention(nn.Module):
                 (batch_size, self.num_heads, block_k, self.head_dim)
             )
             
-            # Compute attention scores for this block
-            S = jnp.einsum('bhqd,bhkd->bhqk', query, k_block) / jnp.sqrt(self.head_dim)
+            # Compute attention scores
+            S = jnp.einsum('bhqd,bhkd->bhqk', query, k_block).astype(self.dtype)
+            S = S / jnp.sqrt(self.head_dim).astype(self.dtype)
             
-            # Apply mask if provided
             if mask is not None:
                 mask_block = jax.lax.dynamic_slice(
                     mask,
                     (0, 0, 0, start_idx),
                     (batch_size, self.num_heads, seq_len_q, block_k)
                 )
-                S = jnp.where(mask_block, S, -1e10)
+                S = jnp.where(mask_block, S, jnp.full_like(S, -1e10, dtype=self.dtype))
             
-            # Update running maximum
+            # Update max scores and ensure dtype consistency
             m_block = jnp.max(S, axis=-1, keepdims=True)
-            m_new = jnp.maximum(m, m_block)
+            m_new = jnp.maximum(m, m_block).astype(self.dtype)
             
-            # Compute attention weights
-            exp_S = jnp.exp(S - m_new)
+            # Compute exp(S) with proper scaling
+            exp_S = jnp.exp(S - m_new).astype(self.dtype)
             
             # Update normalization term
-            L_new = L * jnp.exp(m - m_new) + jnp.sum(exp_S, axis=-1, keepdims=True)
+            L_new = (L * jnp.exp(m - m_new) + jnp.sum(exp_S, axis=-1, keepdims=True)).astype(self.dtype)
             
-            # Update output
-            O_new = O * jnp.exp(m - m_new) + jnp.einsum('bhqk,bhkd->bhqd', exp_S, v_block)
+            # Update output accumulator
+            O_new = (O * jnp.exp(m - m_new) + jnp.einsum('bhqk,bhkd->bhqd', exp_S, v_block)).astype(self.dtype)
             
             return (O_new, L_new, m_new), None
         
@@ -501,9 +505,9 @@ class FlashAttention(nn.Module):
         )
         
         # Final rescaling
-        output = O_final / L_final
+        output = (O_final / L_final).astype(self.dtype)
         
-        return output.astype(self.dtype)
+        return output
 
 class RMSNorm(nn.Module):
     """TPU-optimized RMSNorm for better performance than LayerNorm"""
@@ -762,48 +766,28 @@ DTYPE_CONFIG = {
     'embedding_dtype': jnp.int32
 }
 
-# Function to create model with appropriate configuration
-def create_vishwamai_transformer(config: Dict[str, Any]):
+def create_vishwamai_transformer(config):
     """Create a VishwamAI transformer model with TPU v2 optimized configuration."""
-    # Set TPU v2 optimized defaults if not specified
-    config.setdefault('use_enhanced', True)
-    config.setdefault('use_rotary', True)
-    config.setdefault('use_flash_attn', True)
-    config.setdefault('use_rms_norm', False)  # LayerNorm more stable on TPU v2
-    config.setdefault('dtype', jnp.float32)  # Better performance on TPU v2
-    config.setdefault('max_grad_norm', 0.5)  # Adjusted for stability
-    config.setdefault('beta1', 0.9)
-    config.setdefault('beta2', 0.95)  # Slightly reduced for TPU v2
-    config.setdefault('weight_decay', 0.01)
-    config.setdefault('dropout_rate', 0.1)
-
-    if config['use_enhanced']:
-        return EnhancedTransformerModel(
-            vocab_size=config['vocab_size'],
-            num_layers=config['num_layers'],
-            num_heads=config['num_heads'],
-            head_dim=config['head_dim'],
-            hidden_dim=config['hidden_dim'],
-            mlp_dim=config['mlp_dim'],
-            max_seq_len=config['max_seq_len'],
-            dropout_rate=config['dropout_rate'],
-            use_rotary=config['use_rotary'],
-            use_flash_attn=config['use_flash_attn'],
-            use_rms_norm=config['use_rms_norm'],
-            dtype=config['dtype']
-        )
+    # Handle TPUTrainingConfig object
+    if hasattr(config, 'model_config'):
+        model_config = config.model_config
     else:
-        return TransformerModel(
-            vocab_size=config['vocab_size'],
-            num_layers=config['num_layers'],
-            num_heads=config['num_heads'],
-            head_dim=config['head_dim'],
-            hidden_dim=config['hidden_dim'],
-            mlp_dim=config['mlp_dim'],
-            max_seq_len=config['max_seq_len'],
-            dropout_rate=config['dropout_rate'],
-            dtype=config['dtype']
-        )
+        model_config = config
+        
+    return EnhancedTransformerModel(
+        vocab_size=model_config['vocab_size'],
+        num_layers=model_config['num_layers'],
+        num_heads=model_config['num_heads'],
+        head_dim=model_config['head_dim'],
+        hidden_dim=model_config['hidden_dim'],
+        mlp_dim=model_config['mlp_dim'],
+        max_seq_len=model_config['max_seq_len'],
+        dropout_rate=model_config.get('dropout_rate', 0.1),
+        use_flash_attn=model_config.get('use_flash_attn', True),
+        use_rotary=model_config.get('use_rotary', True),
+        use_rms_norm=model_config.get('use_rms_norm', False),
+        dtype=getattr(config, 'dtype', jnp.bfloat16)
+    )
 
 # Training utilities
 def create_learning_rate_schedule(

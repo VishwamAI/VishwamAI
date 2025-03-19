@@ -33,7 +33,10 @@ class TPUProfiler:
             self.xla_profiler = trace
         except:
             pass
-    
+
+        # Get dtype from config
+        self.dtype = getattr(config, 'dtype', jnp.float32)
+        
     @contextmanager
     def profile_region(self, name: str):
         """Profile a specific code region."""
@@ -75,6 +78,12 @@ class TPUProfiler:
         # Save to disk periodically
         if self.current_step % 100 == 0:
             self.save_metrics()
+
+    def _ensure_dtype(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Ensure array has correct dtype."""
+        if x.dtype != self.dtype:
+            return x.astype(self.dtype)
+        return x
     
     def record_flops(
         self,

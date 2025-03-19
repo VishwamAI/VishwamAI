@@ -19,38 +19,24 @@ from flax.training import train_state
 
 from vishwamai.transformer import EnhancedTransformerModel
 from vishwamai.distill import DistillationTrainer
+from dataclasses import dataclass
 
+@dataclass
 class TPUTrainingConfig:
-    """Configuration for TPU-optimized training"""
-    def __init__(
-        self,
-        model_config: Dict[str, Any],
-        batch_size: int = 32,
-        grad_accum_steps: int = 4,  # Effective batch size = batch_size * grad_accum_steps * num_devices
-        learning_rate: float = 1e-4,
-        warmup_steps: int = 2000,
-        max_steps: int = 100000,
-        weight_decay: float = 0.01,
-        max_grad_norm: float = 1.0,
-        dtype: str = 'bfloat16',
-        enable_pjit: bool = True,
-        block_size: int = 128,  # Optimal for TPU v2
-        use_flash_attn: bool = True,
-        mixed_precision: bool = True
-    ):
-        self.model_config = model_config
-        self.batch_size = batch_size
-        self.grad_accum_steps = grad_accum_steps
-        self.learning_rate = learning_rate
-        self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
-        self.weight_decay = weight_decay
-        self.max_grad_norm = max_grad_norm
-        self.dtype = getattr(jnp, dtype)
-        self.enable_pjit = enable_pjit
-        self.block_size = block_size
-        self.use_flash_attn = use_flash_attn
-        self.mixed_precision = mixed_precision
+    """Configuration for TPU-optimized training."""
+    model_config: Dict[str, Any]
+    batch_size: int
+    grad_accum_steps: int
+    learning_rate: float
+    warmup_steps: int
+    max_steps: int
+    weight_decay: float
+    max_grad_norm: float
+    dtype: str = 'bfloat16'
+    enable_pjit: bool = True
+    block_size: int = 128
+    use_flash_attn: bool = True
+    mixed_precision: bool = True
 
 class MultimodalTrainingConfig(TPUTrainingConfig):
     """Configuration for multimodal training"""

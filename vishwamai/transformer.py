@@ -423,76 +423,57 @@ class TransformerComputeLayerTPU(nn.Module):
 # Enhanced components for VishwamAI
 
 class FlashAttention(nn.Module):
-    """TPU v2-optimized Flash Attention implementation"""
+    """TPU-optimized Flash Attention implementation."""
     num_heads: int
     head_dim: int
     dropout_rate: float = 0.0
     dtype: Any = jnp.float32
-    
+
     @nn.compact
-    def __call__(self,
-                query: jnp.ndarray,
-                key: jnp.ndarray,
-                value: jnp.ndarray,
-                mask: Optional[jnp.ndarray] = None,
-                deterministic: bool = True) -> jnp.ndarray:
-        
+    def __call__(
+        self,
+        query: jnp.ndarray,
+        key: jnp.ndarray,
+        value: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> jnp.ndarray:
         batch_size, seq_len_q = query.shape[0], query.shape[2]
         _, _, seq_len_k, _ = key.shape
         
-        # TPU v2 optimal block sizes
-        block_q = min(32, seq_len_q)  # Reduced for TPU v2
-        block_k = min(32, seq_len_k)  # Keep blocks small for TPU v2
+        # TPU-optimized block sizes
+        block_k = min(128, seq_len_k)  # Keep blocks reasonable for TPU
         
-        # Initialize accumulators with proper types for TPU
-        acc_dtype = jnp.float32  # Use float32 for accumulation
-        O = jnp.zeros((batch_size, self.num_heads, seq_len_q, self.head_dim), dtype=acc_dtype)
-        L = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=acc_dtype) * -1e4
-        m = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=acc_dtype) * -1e4
+        # Initialize accumulators
+        O = jnp.zeros((batch_size, self.num_heads, seq_len_q, self.head_dim), dtype=self.dtype)
+        L = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=self.dtype) * -1e4
+        m = jnp.ones((batch_size, self.num_heads, seq_len_q, 1), dtype=self.dtype) * -1e4
         
-        # Scale factor for better numerical stability
-        scale = 1.0 / jnp.sqrt(self.head_dim)
-        
-        # Process attention in blocks
         def process_block(carry, block_idx):
             O, L, m = carry
             start_idx = block_idx * block_k
             
-            # Use safe indexing for blocks
-            safe_size = jnp.minimum(block_k, seq_len_k - start_idx)
-            actual_size = lax.select(start_idx < seq_len_k, safe_size, 0)
-            
-            # Get current key/value block with safe dynamic slice
-            k_block = lax.dynamic_slice_in_dim(
+            # Get current key/value block using pure dynamic_slice
+            k_block = jax.lax.dynamic_slice(
                 key,
-                start_idx,
-                block_k,
-                axis=2,
-                slice_size=None
+                (0, 0, start_idx, 0),
+                (batch_size, self.num_heads, block_k, self.head_dim)
             )
-            v_block = lax.dynamic_slice_in_dim(
+            v_block = jax.lax.dynamic_slice(
                 value,
-                start_idx,
-                block_k,
-                axis=2,
-                slice_size=None
+                (0, 0, start_idx, 0),
+                (batch_size, self.num_heads, block_k, self.head_dim)
             )
             
-            # Apply attention masking
-            query_scaled = query * scale
-            key_block_scaled = k_block * scale
+            # Compute attention scores for this block
+            S = jnp.einsum('bhqd,bhkd->bhqk', query, k_block) / jnp.sqrt(self.head_dim)
             
-            # Compute scores
-            S = jnp.einsum('bhqd,bhkd->bhqk', query_scaled, k_block)
-            
+            # Apply mask if provided
             if mask is not None:
-                # Safe mask slicing
-                mask_block = lax.dynamic_slice_in_dim(
+                mask_block = jax.lax.dynamic_slice(
                     mask,
-                    start_idx,
-                    block_k,
-                    axis=-1,
-                    slice_size=None
+                    (0, 0, 0, start_idx),
+                    (batch_size, self.num_heads, seq_len_q, block_k)
                 )
                 S = jnp.where(mask_block, S, -1e10)
             
@@ -501,27 +482,28 @@ class FlashAttention(nn.Module):
             m_new = jnp.maximum(m, m_block)
             
             # Compute attention weights
-            exp_S = jnp.exp(S - m_new[..., None])
+            exp_S = jnp.exp(S - m_new)
             
             # Update normalization term
             L_new = L * jnp.exp(m - m_new) + jnp.sum(exp_S, axis=-1, keepdims=True)
             
-            # Update output 
-            O_new = (O * jnp.exp(m - m_new) + 
-                    jnp.einsum('bhqk,bhkd->bhqd', exp_S, v_block)) / L_new
+            # Update output
+            O_new = O * jnp.exp(m - m_new) + jnp.einsum('bhqk,bhkd->bhqd', exp_S, v_block)
             
             return (O_new, L_new, m_new), None
         
         # Scan over blocks
         num_blocks = (seq_len_k + block_k - 1) // block_k
-        (O_final, _, _), _ = lax.scan(
+        (O_final, L_final, _), _ = jax.lax.scan(
             process_block,
             (O, L, m),
             jnp.arange(num_blocks)
         )
         
-        # Cast output to desired dtype
-        return O_final.astype(self.dtype)
+        # Final rescaling
+        output = O_final / L_final
+        
+        return output.astype(self.dtype)
 
 class RMSNorm(nn.Module):
     """TPU-optimized RMSNorm for better performance than LayerNorm"""

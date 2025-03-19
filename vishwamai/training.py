@@ -1,15 +1,15 @@
-"""
-Training module for VishwamAI transformer.
-"""
+"""Training module for VishwamAI transformer with enhanced TPU support."""
 
 import jax
 import jax.numpy as jnp
 import optax
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Callable, Iterator
 from jax.sharding import PartitionSpec as P
 from tqdm.auto import tqdm
 from vishwamai.pipeline import VishwamAIPipeline
+from vishwamai.profiler import TPUProfiler
 from vishwamai.transformer import create_learning_rate_schedule
 from vishwamai.logger import DuckDBLogger
 
@@ -20,11 +20,10 @@ from flax.training import train_state
 
 from vishwamai.transformer import EnhancedTransformerModel
 from vishwamai.distill import DistillationTrainer
-from dataclasses import dataclass
 
 @dataclass
 class TPUTrainingConfig:
-    """Configuration for TPU-optimized training."""
+    """Enhanced configuration for TPU-optimized training."""
     model_config: Dict[str, Any]
     batch_size: int
     grad_accum_steps: int
@@ -41,8 +40,12 @@ class TPUTrainingConfig:
     data_parallel: bool = True
     model_parallel: bool = True
     pipeline_parallel: bool = False
-    pipeline_stages: int = 2  # For 2x2x2 topology
-    model_parallel_size: int = 2  # For 2x2x2 topology
+    pipeline_stages: int = 2
+    model_parallel_size: int = 2
+    profile_steps: int = 100
+    profile_memory: bool = True
+    save_profile: bool = True
+    profile_dir: str = "tpu_profiles"
 
 class MultimodalTrainingConfig(TPUTrainingConfig):
     """Configuration for multimodal training"""
@@ -62,61 +65,64 @@ class MultimodalTrainingConfig(TPUTrainingConfig):
 def create_train_state_tpu(
     config: TPUTrainingConfig,
     rng: Any,
-    mesh: Optional[Any] = None
+    mesh: Optional[Any] = None,
+    profiler: Optional[TPUProfiler] = None
 ) -> Any:
-    """
-    Create training state optimized for TPU execution.
+    """Create training state optimized for TPU execution."""
     
-    Args:
-        config: Training configuration
-        rng: PRNG key
-        mesh: Optional device mesh for model parallelism
-    """
     # Create learning rate schedule
-    warmup_fn = optax.linear_schedule(
+    lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
-        end_value=config.learning_rate,
-        transition_steps=config.warmup_steps
-    )
-    decay_fn = optax.cosine_decay_schedule(
-        init_value=config.learning_rate,
-        decay_steps=config.max_steps - config.warmup_steps
-    )
-    lr_schedule = optax.join_schedules(
-        schedules=[warmup_fn, decay_fn],
-        boundaries=[config.warmup_steps]
+        peak_value=config.learning_rate,
+        warmup_steps=config.warmup_steps,
+        decay_steps=config.max_steps,
+        end_value=0.0
     )
     
-    # Create optimizer with TPU-optimized gradient transforms
+    # Configure optimizer with TPU optimizations
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(
             learning_rate=lr_schedule,
             b1=0.9,
-            b2=0.95,  # Increased for better TPU stability
+            b2=0.95,
             eps=1e-8,
             weight_decay=config.weight_decay
         )
     )
-
-    # Create model with TPU optimizations
-    model = EnhancedTransformerModel(
-        vocab_size=config.model_config['vocab_size'],
-        num_layers=config.model_config['num_layers'],
-        num_heads=config.model_config['num_heads'],
-        head_dim=config.model_config['head_dim'],
-        hidden_dim=config.model_config['hidden_dim'],
-        mlp_dim=config.model_config['mlp_dim'],
-        max_seq_len=config.model_config['max_seq_len'],
-        dropout_rate=config.model_config.get('dropout_rate', 0.1),
-        use_flash_attn=config.use_flash_attn,
-        use_rms_norm=True,
-        dtype=config.dtype
-    )
     
-    # Initialize parameters with optimal TPU layout
-    dummy_input = jnp.ones((2, config.model_config['max_seq_len']), dtype=jnp.int32)
-    variables = model.init(rng, dummy_input, deterministic=False)
+    # Profile model initialization if profiler is available
+    if profiler:
+        with profiler.profile_region("model_init"):
+            model = EnhancedTransformerModel(
+                vocab_size=config.model_config['vocab_size'],
+                num_layers=config.model_config['num_layers'],
+                num_heads=config.model_config['num_heads'],
+                head_dim=config.model_config['head_dim'],
+                hidden_dim=config.model_config['hidden_dim'],
+                mlp_dim=config.model_config['mlp_dim'],
+                max_seq_len=config.model_config['max_seq_len'],
+                dropout_rate=config.model_config.get('dropout_rate', 0.1),
+                use_flash_attn=config.use_flash_attn,
+                use_rms_norm=True,
+                dtype=config.dtype
+            )
+            variables = model.init(rng, jnp.ones((2, config.block_size), dtype=jnp.int32))
+    else:
+        model = EnhancedTransformerModel(
+            vocab_size=config.model_config['vocab_size'],
+            num_layers=config.model_config['num_layers'],
+            num_heads=config.model_config['num_heads'],
+            head_dim=config.model_config['head_dim'],
+            hidden_dim=config.model_config['hidden_dim'],
+            mlp_dim=config.model_config['mlp_dim'],
+            max_seq_len=config.model_config['max_seq_len'],
+            dropout_rate=config.model_config.get('dropout_rate', 0.1),
+            use_flash_attn=config.use_flash_attn,
+            use_rms_norm=True,
+            dtype=config.dtype
+        )
+        variables = model.init(rng, jnp.ones((2, config.block_size), dtype=jnp.int32))
     
     return train_state.TrainState.create(
         apply_fn=model.apply,
@@ -193,96 +199,54 @@ def create_multimodal_train_state(
 def create_train_step_tpu(
     config: TPUTrainingConfig,
     state: Any,
-    trainer: Optional[DistillationTrainer] = None
+    profiler: Optional[TPUProfiler] = None
 ) -> Callable:
-    """Create TPU-optimized training step function."""
+    """Create TPU-optimized training step function with profiling."""
+    
     def train_step(
         state: Any,
         batch: Dict[str, jnp.ndarray],
         dropout_rng: Any
     ) -> Tuple[Any, Dict[str, float]]:
-        # Split batch for pipeline stages
-        micro_batch_size = batch['input_ids'].shape[0] // (config.grad_accum_steps * 2)  # 2 pipeline stages
         
-        def compute_loss(params, chunk):
-            outputs = state.apply_fn(
+        def loss_fn(params):
+            logits = state.apply_fn(
                 {'params': params},
-                chunk['input_ids'],
+                batch['input_ids'],
                 deterministic=False,
                 rngs={'dropout': dropout_rng}
             )
-            
-            if trainer is not None:
-                return trainer.compute_distillation_loss(
-                    outputs,
-                    chunk['teacher_logits'],
-                    chunk['labels'],
-                    chunk.get('attention_mask')
-                )
-            else:
-                return optax.softmax_cross_entropy_with_integer_labels(
-                    logits=outputs,
-                    labels=chunk['labels']
-                ).mean()
+            return optax.softmax_cross_entropy_with_integer_labels(
+                logits=logits,
+                labels=batch['labels']
+            ).mean()
         
-        # Gradient function with automatic device sharding
-        grad_fn = jax.value_and_grad(compute_loss)
+        if profiler:
+            with profiler.profile_region("forward_backward"):
+                grad_fn = jax.value_and_grad(loss_fn)
+                loss, grads = grad_fn(state.params)
+        else:
+            grad_fn = jax.value_and_grad(loss_fn)
+            loss, grads = grad_fn(state.params)
         
-        # Initialize accumulators
-        total_loss = 0.0
-        total_grads = None
+        # Update state
+        new_state = state.apply_gradients(grads=grads)
+        metrics = {'loss': loss}
         
-        # Accumulate gradients across micro-batches
-        for i in range(config.grad_accum_steps):
-            for j in range(2):  # Pipeline stages
-                start_idx = (i * 2 + j) * micro_batch_size
-                end_idx = start_idx + micro_batch_size
-                
-                chunk = {
-                    k: v[start_idx:end_idx]
-                    for k, v in batch.items()
-                }
-                
-                # Compute gradients
-                loss, grads = grad_fn(state.params, chunk)
-                total_loss += loss
-                
-                if total_grads is None:
-                    total_grads = grads
-                else:
-                    total_grads = jax.tree_map(
-                        lambda x, y: x + y,
-                        total_grads,
-                        grads
-                    )
-        
-        # Average gradients
-        total_grads = jax.tree_map(
-            lambda x: x / (config.grad_accum_steps * 2),
-            total_grads
-        )
-        
-        # Update state with synchronized gradients
-        new_state = state.apply_gradients(grads=total_grads)
-        metrics = {'loss': total_loss / (config.grad_accum_steps * 2)}
+        # Record metrics if profiling
+        if profiler:
+            profiler.record_memory(loss_fn)
+            profiler.record_flops(loss_fn)
         
         return new_state, metrics
     
-    # Enable pjit with mesh sharding
+    # Enable pjit with mesh sharding if configured
     if config.enable_pjit:
-        mesh_axis_names = ('data', 'model', 'pipe') if config.pipeline_parallel else ('data', 'model')
         train_step = jax.pjit(
             train_step,
-            in_shardings=(
-                None,  # state
-                P('data', None),  # batch
-                None,  # dropout_rng
-            ),
-            out_shardings=(
-                None,  # new_state
-                None,  # metrics
-            ),
-            donate_argnums=(0,)  # Allow state buffer reuse
+            in_axis_resources=(None, P('data'), None),
+            out_axis_resources=(None, None),
+            donate_argnums=(0,)
         )
     else:
         train_step = jax.jit(train_step)
@@ -455,40 +419,27 @@ def create_eval_step_tpu(
 
 def setup_tpu_training(
     config: TPUTrainingConfig,
-    seed: int = 42
-) -> Tuple[Any, Any, Callable, Callable]:
-    """
-    Set up complete TPU training pipeline.
+    seed: int = 42,
+    enable_profiling: bool = True
+) -> Tuple[Any, Any, Callable, TPUProfiler]:
+    """Set up TPU training with integrated profiling."""
     
-    Args:
-        config: Training configuration
-        seed: Random seed
+    # Initialize profiler if enabled
+    profiler = TPUProfiler(config.model_config) if enable_profiling else None
     
-    Returns:
-        Tuple containing:
-        - Training state
-        - Device mesh
-        - Training step function
-        - Evaluation step function
-    """
-    # Set up device mesh for TPU
-    devices = jax.devices()
-    mesh_shape = (len(devices),)
-    device_mesh = jax.sharding.Mesh(devices, ('batch',))
+    # Set up TPU device mesh
+    device_mesh = None
+    if config.enable_pjit:
+        devices = jax.devices()
+        mesh_shape = (len(devices),)
+        device_mesh = jax.sharding.Mesh(devices, ('data',))
     
-    # Initialize random keys
+    # Initialize training state
     rng = jax.random.PRNGKey(seed)
-    rng, init_rng = jax.random.split(rng)
+    state = create_train_state_tpu(config, rng, device_mesh, profiler)
+    train_step = create_train_step_tpu(config, state, profiler)
     
-    # Create training state
-    with device_mesh:
-        state = create_train_state_tpu(config, init_rng, device_mesh)
-        
-    # Create step functions
-    train_step_fn = create_train_step_tpu(config, state)
-    eval_step_fn = create_eval_step_tpu(config, state)
-    
-    return state, device_mesh, train_step_fn, eval_step_fn
+    return state, device_mesh, train_step, profiler
 
 def get_tpu_compile_options(
     config: TPUTrainingConfig

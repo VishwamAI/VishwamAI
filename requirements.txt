@@ -31,6 +31,8 @@ orbax-checkpoint==0.11.8
 ipython==8.20.0
 jupyter==1.0.0
 notebook==6.4.12
+matplotlib>=3.8.0
+psutil>=5.9.0
 
 # Additional Libraries
 scipy==1.11.4

@@ -29,23 +29,35 @@ class TPUGEMMLinear(nn.Module):
         kernel = self.param('kernel',
                           self.kernel_init,
                           (inputs.shape[-1], self.features))
+
+        # TPU v2 optimized quantization with proper axis handling
+        inputs_quant, input_scale = act_quant(
+            inputs, 
+            num_bits=8,
+            axis=None  # Let act_quant determine proper axes based on input shape
+        )
+        kernel_quant, kernel_scale = act_quant(
+            kernel, 
+            num_bits=8,
+            axis=None
+        )
         
-        # TPU v2 optimized quantization
-        inputs_quant, input_scale = act_quant(inputs, num_bits=8)
-        kernel_quant, kernel_scale = act_quant(kernel, num_bits=8)
-        
+        # Optimize memory layout for TPU
+        inputs_quant = optimize_kernel_layout(inputs_quant)
+        kernel_quant = optimize_kernel_layout(kernel_quant)
+
         # Process in chunks for TPU v2 memory efficiency
         chunk_size = 32  # Optimal for TPU v2
         num_chunks = max(1, inputs.shape[0] // chunk_size)
         outputs = []
-        
+
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, inputs.shape[0])
             
             # Get current chunk
             chunk_inputs = lax.dynamic_slice(
-                inputs_quant, 
+                inputs_quant,
                 (start_idx,) + (0,) * (inputs_quant.ndim - 1),
                 (end_idx - start_idx,) + inputs_quant.shape[1:]
             )
@@ -57,15 +69,16 @@ class TPUGEMMLinear(nn.Module):
             
             # Perform FP8 matrix multiplication for chunk
             chunk_output = fp8_gemm_optimized(
-                chunk_inputs, chunk_scale,
-                kernel_quant, kernel_scale
+                chunk_inputs, 
+                kernel_quant,
+                dtype=self.dtype
             )
             outputs.append(chunk_output)
         
         y = jnp.concatenate(outputs, axis=0) if num_chunks > 1 else outputs[0]
         
         if self.use_bias:
-            bias = self.param('bias', self.bias_init, (self.features,))
+            bias = self.param('bias', self.bias_init, (self.features,), self.dtype)
             y = y + bias
             
         return y

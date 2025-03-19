@@ -55,31 +55,32 @@ def act_quant(
     Args:
         x: Input tensor
         num_bits: Number of bits for quantization
-        axis: Axis along which to compute scaling factors
+        axis: Axis along which to compute scaling factors. If None, compute globally.
         block_size: Block size for tiling
-        use_stochastic_rounding: Whether to use stochastic rounding to reduce quantization bias
+        use_stochastic_rounding: Whether to use stochastic rounding
         rng_key: Optional PRNG key for stochastic rounding
         
     Returns:
         Tuple of (quantized_tensor, scale_factor)
     """
-    if axis is None:
-        axis = tuple(range(x.ndim))
-    
     # Create rng_key if using stochastic rounding but none provided
     if use_stochastic_rounding and rng_key is None:
         rng_key = jax.random.PRNGKey(0)
-    
-    # Process in blocks for better TPU utilization
+        
     def _process_block(block, local_rng_key):
-        # Compute scale factor
-        abs_max = jnp.max(jnp.abs(block), axis=axis, keepdims=True)
+        # Determine reduction axes based on input dimensionality
+        if axis is None:
+            reduce_axes = tuple(range(block.ndim))
+        else:
+            reduce_axes = (axis,) if isinstance(axis, int) else tuple(axis)
+            
+        # Compute scale factor per specified axes
+        abs_max = jnp.max(jnp.abs(block), axis=reduce_axes, keepdims=True)
         scale = (2 ** (num_bits - 1) - 1) / (abs_max + 1e-5)
         
         # Scale the input
         scaled = block * scale
         
-        # Apply stochastic rounding if enabled
         if use_stochastic_rounding:
             # Generate noise in [-0.5, 0.5)
             noise = jax.random.uniform(
@@ -107,13 +108,14 @@ def act_quant(
         
         return x_dequant, scale
     
-    # Split into blocks
+    # Process in blocks for better TPU utilization
     orig_shape = x.shape
-    reshaped = x.reshape(-1, block_size)
+    reshaped = x.reshape(-1, block_size) if x.size > block_size else x
     
-    # Process each block with a unique RNG key
+    # Process each block
     results = []
     scales = []
+    
     for i in range(0, reshaped.shape[0], block_size):
         if use_stochastic_rounding:
             block_key = jax.random.fold_in(rng_key, i)
@@ -123,17 +125,28 @@ def act_quant(
         block = jax.lax.dynamic_slice(
             reshaped,
             (i, 0),
-            (min(block_size, reshaped.shape[0] - i), block_size)
+            (min(block_size, reshaped.shape[0] - i), reshaped.shape[-1])
         )
+        
         block_dequant, block_scale = _process_block(block, block_key)
         results.append(block_dequant)
         scales.append(block_scale)
     
     # Concatenate results and reshape
     x_dequant = jnp.concatenate(results, axis=0).reshape(orig_shape)
-    scale = jnp.concatenate(scales, axis=0).reshape(orig_shape[0], 1, 1, 1)
+    scales = jnp.concatenate(scales, axis=0)
     
-    return x_dequant, scale
+    # Reshape scales to match reduction dimensions
+    if axis is not None:
+        scales_shape = [1] * x.ndim
+        if isinstance(axis, int):
+            scales_shape[axis] = x.shape[axis]
+        else:
+            for ax in axis:
+                scales_shape[ax] = x.shape[ax]
+        scales = scales.reshape(scales_shape)
+    
+    return x_dequant, scales
 
 def block_tpu_matmul(
     A: jnp.ndarray,

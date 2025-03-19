@@ -41,61 +41,78 @@ class TPUMeshContext:
     def _compute_mesh_shape(self) -> Tuple[int, ...]:
         """Compute optimal device mesh shape."""
         if self.pipeline_parallel:
-            # Use 3D mesh for pipeline parallelism
-            num_pipeline_stages = self.config["training"].get("pipeline_stages", 1)
-            model_parallel_size = self.config["training"].get("model_parallel_size", 1)
-            data_parallel_size = self.num_devices // (num_pipeline_stages * model_parallel_size)
-            
-            return (data_parallel_size, model_parallel_size, num_pipeline_stages)
+            # 2x2x2 topology for pipeline parallelism
+            return (2, 2, 2)  # (data, model, pipe)
         elif self.model_parallel and self.data_parallel:
-            # Use 2D mesh for data and model parallelism
-            model_parallel_size = min(
-                self.config["training"].get("model_parallel_size", 1),
-                int(np.sqrt(self.num_devices))
-            )
-            data_parallel_size = self.num_devices // model_parallel_size
-            
-            return (data_parallel_size, model_parallel_size)
+            # 4x2 topology for data and model parallelism
+            return (4, 2)  # (data, model)
         else:
-            # Use 1D mesh for data parallelism only
+            # Use all devices for data parallelism
             return (self.num_devices,)
     
     def _create_device_mesh(self) -> Mesh:
-        """Create TPU device mesh."""
-        devices = mesh_utils.create_device_mesh(self.mesh_shape)
-        
+        """Create TPU device mesh with optimal topology mapping."""
         if self.pipeline_parallel:
-            return Mesh(devices, ("data", "model", "pipe"))
+            # For 2x2x2 topology, create physical device mapping
+            devices = np.array(self.devices).reshape(2, 2, 2)  # Reshape to match physical topology
+            mesh = jax.sharding.Mesh(devices, ("data", "model", "pipe"))
         elif self.model_parallel and self.data_parallel:
-            return Mesh(devices, ("data", "model"))
+            # For 4x2 topology (data parallel x model parallel)
+            devices = np.array(self.devices).reshape(4, 2)
+            mesh = jax.sharding.Mesh(devices, ("data", "model"))
         else:
-            return Mesh(devices, ("data",))
+            # Single dimension for pure data parallelism
+            devices = np.array(self.devices).reshape(-1)
+            mesh = jax.sharding.Mesh(devices, ("data",))
+        
+        return mesh
     
     def _create_sharding_rules(self) -> Dict[str, Any]:
         """Create sharding rules for different tensor types."""
         if self.pipeline_parallel:
+            # Optimal sharding for 2x2x2 topology
             return {
-                "weights": P("model", "pipe", None),
+                "weights": P("model", "pipe", None),  # Shard across model and pipeline dimensions
                 "biases": P("model", "pipe"),
-                "activations": P("data", None, "pipe"),
-                "gradients": P("data", "model", "pipe"),
-                "optimizer_state": P("model", "pipe", None)
+                "activations": P("data", None, "pipe"),  # Shard activations across data parallel and pipeline dimensions
+                "gradients": P("data", "model", "pipe"),  # Shard gradients across all dimensions
+                "optimizer_state": P("model", "pipe", None),
+                "attention": {
+                    "query": P("data", "model", None),
+                    "key": P("data", "model", None),
+                    "value": P("data", "model", None),
+                    "output": P("data", "model", None)
+                }
             }
         elif self.model_parallel and self.data_parallel:
+            # 4x2 topology for data and model parallelism
             return {
                 "weights": P("model", None),
                 "biases": P("model"),
                 "activations": P("data", None),
                 "gradients": P("data", "model"),
-                "optimizer_state": P("model", None)
+                "optimizer_state": P("model", None),
+                "attention": {
+                    "query": P("data", None),
+                    "key": P("data", None),
+                    "value": P("data", None),
+                    "output": P("data", None)
+                }
             }
         else:
+            # Simple data parallel only
             return {
                 "weights": P(None),
                 "biases": P(None),
                 "activations": P("data", None),
                 "gradients": P("data", None),
-                "optimizer_state": P(None)
+                "optimizer_state": P(None),
+                "attention": {
+                    "query": P("data", None),
+                    "key": P("data", None),
+                    "value": P("data", None),
+                    "output": P("data", None)
+                }
             }
     
     def shard_params(

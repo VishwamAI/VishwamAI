@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import optax
 import time
 from typing import Any, Dict, Optional, Tuple, Callable, Iterator
+from jax.sharding import PartitionSpec as P
 from tqdm.auto import tqdm
 from vishwamai.pipeline import VishwamAIPipeline
 from vishwamai.transformer import create_learning_rate_schedule
@@ -37,6 +38,11 @@ class TPUTrainingConfig:
     block_size: int = 128
     use_flash_attn: bool = True
     mixed_precision: bool = True
+    data_parallel: bool = True
+    model_parallel: bool = True
+    pipeline_parallel: bool = False
+    pipeline_stages: int = 2  # For 2x2x2 topology
+    model_parallel_size: int = 2  # For 2x2x2 topology
 
 class MultimodalTrainingConfig(TPUTrainingConfig):
     """Configuration for multimodal training"""
@@ -189,95 +195,98 @@ def create_train_step_tpu(
     state: Any,
     trainer: Optional[DistillationTrainer] = None
 ) -> Callable:
-    """
-    Create TPU-optimized training step function.
-    
-    Args:
-        config: Training configuration
-        state: Training state
-        trainer: Optional distillation trainer
-    """
+    """Create TPU-optimized training step function."""
     def train_step(
         state: Any,
         batch: Dict[str, jnp.ndarray],
         dropout_rng: Any
     ) -> Tuple[Any, Dict[str, float]]:
-        # Split batch into chunks for gradient accumulation
-        chunk_size = batch['input_ids'].shape[0] // config.grad_accum_steps
+        # Split batch for pipeline stages
+        micro_batch_size = batch['input_ids'].shape[0] // (config.grad_accum_steps * 2)  # 2 pipeline stages
         
         def compute_loss(params, chunk):
+            outputs = state.apply_fn(
+                {'params': params},
+                chunk['input_ids'],
+                deterministic=False,
+                rngs={'dropout': dropout_rng}
+            )
+            
             if trainer is not None:
-                # Distillation training
                 return trainer.compute_distillation_loss(
-                    state.apply_fn(
-                        {'params': params},
-                        chunk['input_ids'],
-                        deterministic=False,
-                        rngs={'dropout': dropout_rng}
-                    ),
+                    outputs,
                     chunk['teacher_logits'],
                     chunk['labels'],
                     chunk.get('attention_mask')
                 )
             else:
-                # Standard training
-                logits = state.apply_fn(
-                    {'params': params},
-                    chunk['input_ids'],
-                    deterministic=False,
-                    rngs={'dropout': dropout_rng}
-                )
                 return optax.softmax_cross_entropy_with_integer_labels(
-                    logits=logits,
+                    logits=outputs,
                     labels=chunk['labels']
                 ).mean()
         
-        # Accumulate gradients across chunks
+        # Gradient function with automatic device sharding
         grad_fn = jax.value_and_grad(compute_loss)
+        
+        # Initialize accumulators
         total_loss = 0.0
         total_grads = None
         
+        # Accumulate gradients across micro-batches
         for i in range(config.grad_accum_steps):
-            start_idx = i * chunk_size
-            end_idx = start_idx + chunk_size
-            chunk = {
-                k: v[start_idx:end_idx] 
-                for k, v in batch.items()
-            }
-            
-            loss, grads = grad_fn(state.params, chunk)
-            total_loss += loss
-            
-            if total_grads is None:
-                total_grads = grads
-            else:
-                total_grads = jax.tree_map(
-                    lambda x, y: x + y,
-                    total_grads,
-                    grads
-                )
+            for j in range(2):  # Pipeline stages
+                start_idx = (i * 2 + j) * micro_batch_size
+                end_idx = start_idx + micro_batch_size
+                
+                chunk = {
+                    k: v[start_idx:end_idx]
+                    for k, v in batch.items()
+                }
+                
+                # Compute gradients
+                loss, grads = grad_fn(state.params, chunk)
+                total_loss += loss
+                
+                if total_grads is None:
+                    total_grads = grads
+                else:
+                    total_grads = jax.tree_map(
+                        lambda x, y: x + y,
+                        total_grads,
+                        grads
+                    )
         
-        # Average gradients and update
+        # Average gradients
         total_grads = jax.tree_map(
-            lambda x: x / config.grad_accum_steps,
+            lambda x: x / (config.grad_accum_steps * 2),
             total_grads
         )
         
+        # Update state with synchronized gradients
         new_state = state.apply_gradients(grads=total_grads)
-        metrics = {'loss': total_loss / config.grad_accum_steps}
+        metrics = {'loss': total_loss / (config.grad_accum_steps * 2)}
         
         return new_state, metrics
     
-    # Enable pjit for TPU if configured
+    # Enable pjit with mesh sharding
     if config.enable_pjit:
+        mesh_axis_names = ('data', 'model', 'pipe') if config.pipeline_parallel else ('data', 'model')
         train_step = jax.pjit(
             train_step,
-            in_axis_resources=None,
-            out_axis_resources=None
+            in_shardings=(
+                None,  # state
+                P('data', None),  # batch
+                None,  # dropout_rng
+            ),
+            out_shardings=(
+                None,  # new_state
+                None,  # metrics
+            ),
+            donate_argnums=(0,)  # Allow state buffer reuse
         )
     else:
         train_step = jax.jit(train_step)
-        
+    
     return train_step
 
 def create_multimodal_train_step(

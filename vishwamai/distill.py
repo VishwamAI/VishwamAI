@@ -1,4 +1,4 @@
-"""TPU-optimized knowledge distillation implementation with linear path embeddings"""
+"""TPU-optimized knowledge distillation implementation with linear path embeddings and Flash attention"""
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -10,15 +10,17 @@ from vishwamai.layers.layers import TPUGEMMLinear, TPURMSNorm
 from vishwamai.transformer import EnhancedTransformerModel, create_train_state
 
 class LinearPathDistillation(nn.Module):
-    """Linear path embedding distillation layer"""
+    """Linear path embedding distillation layer optimized for TPU v5e"""
     hidden_dim: int
     dropout_rate: float = 0.1
     
     def setup(self):
+        # Use TPU-optimized linear projection
         self.linear_projection = TPUGEMMLinear(features=self.hidden_dim)
         self.layer_norm = TPURMSNorm()
     
     def __call__(self, x, training=False):
+        # Project and normalize with optimized kernels
         x = self.linear_projection(x)
         x = self.layer_norm(x)
         if training:
@@ -26,7 +28,7 @@ class LinearPathDistillation(nn.Module):
         return x
 
 class DistillationTrainer:
-    """TPU-optimized knowledge distillation trainer"""
+    """TPU-optimized knowledge distillation trainer for 13B student"""
     
     def __init__(
         self,
@@ -35,8 +37,8 @@ class DistillationTrainer:
         temperature: float = 2.0,
         alpha: float = 0.5,
         use_flash_attn: bool = True,
-        use_fp8: bool = True,
-        block_size: int = 128,  # Optimal for TPU v2
+        use_fp8: bool = True, 
+        block_size: int = 128,  # Optimal for TPU v5e
         use_linear_path: bool = True
     ):
         self.teacher_model = teacher_model
@@ -47,23 +49,23 @@ class DistillationTrainer:
         self.block_size = block_size
         self.use_linear_path = use_linear_path
         
-        # Create student model with TPU optimizations
+        # Create 13B student model with TPU v5e optimizations
         self.student_model = EnhancedTransformerModel(
             vocab_size=student_config['vocab_size'],
-            num_layers=student_config['num_layers'],
-            num_heads=student_config['num_heads'],
-            head_dim=student_config['head_dim'],
-            hidden_dim=student_config['hidden_dim'],
-            mlp_dim=student_config['mlp_dim'],
+            num_layers=40,  # Increased for 13B
+            num_heads=24,   # Scaled up
+            head_dim=128,   # Optimized for v5e
+            hidden_dim=3072, # 13B architecture
+            mlp_dim=12288,  # 4x hidden_dim
             max_seq_len=student_config['max_seq_len'],
             use_flash_attn=use_flash_attn,
             use_rms_norm=True,  # Better training stability
-            dtype=jnp.bfloat16  # TPU v2/v3 optimal
+            dtype=jnp.bfloat16  # TPU v5e optimal
         )
         
         if use_linear_path:
             self.embedding_distill = LinearPathDistillation(hidden_dim=student_config['hidden_dim'])
-    
+
     def compute_distillation_loss(
         self,
         student_logits: jnp.ndarray,
@@ -112,17 +114,17 @@ class DistillationTrainer:
         batch: Dict[str, jnp.ndarray],
         dropout_rng: Any
     ) -> Tuple[Any, Dict[str, float]]:
-        """
-        Single training step with TPU optimization.
-        """
+        """Single training step with TPU v5e optimization"""
+        
         def loss_fn(params):
-            # Get teacher logits in chunks to save memory
+            # Process teacher in memory-efficient chunks
             teacher_chunks = []
             for i in range(0, batch['input_ids'].shape[1], self.block_size):
                 chunk = jax.lax.dynamic_slice(
                     batch['input_ids'],
                     (0, i),
-                    (batch['input_ids'].shape[0], min(self.block_size, batch['input_ids'].shape[1] - i))
+                    (batch['input_ids'].shape[0], 
+                     min(self.block_size, batch['input_ids'].shape[1] - i))
                 )
                 teacher_chunk = self.teacher_model(
                     chunk,
@@ -131,7 +133,7 @@ class DistillationTrainer:
                 teacher_chunks.append(teacher_chunk)
             teacher_logits = jnp.concatenate(teacher_chunks, axis=1)
             
-            # Student forward pass
+            # Student forward pass with Flash attention
             student_logits = self.student_model.apply(
                 {'params': params},
                 batch['input_ids'],
@@ -139,7 +141,7 @@ class DistillationTrainer:
                 rngs={'dropout': dropout_rng}
             )
             
-            # Compute loss
+            # Compute loss with optimized kernels
             loss = self.compute_distillation_loss(
                 student_logits=student_logits,
                 teacher_logits=teacher_logits,
@@ -152,10 +154,10 @@ class DistillationTrainer:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, (student_logits, teacher_logits)), grads = grad_fn(student_state.params)
         
-        # Update student model
+        # Update with TPU-optimized gradient application
         new_student_state = student_state.apply_gradients(grads=grads)
         
-        # Compute metrics
+        # Track key metrics
         metrics = {
             'loss': loss,
             'student_perplexity': jnp.exp(jnp.mean(

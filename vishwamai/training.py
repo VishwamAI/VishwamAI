@@ -12,7 +12,7 @@ from vishwamai.pipeline import VishwamAIPipeline
 from vishwamai.profiler import TPUProfiler
 from vishwamai.transformer import create_learning_rate_schedule
 from vishwamai.logger import DuckDBLogger
-from jax import pjit  # Import pjit directly from jax
+from jax.experimental import pjit  # Updated import path for pjit
 
 """Training configuration and initialization"""
 
@@ -23,7 +23,7 @@ from vishwamai.transformer import EnhancedTransformerModel
 from vishwamai.distill import DistillationTrainer
 
 @dataclass
-class TrainingConfig:
+class TPUTrainingConfig:  # Renamed from TrainingConfig to TPUTrainingConfig
     """Training configuration with proper typing"""
     model_config: Dict[str, Any]
     batch_size: int
@@ -39,40 +39,40 @@ class TrainingConfig:
     use_flash_attn: bool
     mixed_precision: bool
 
-def create_training_config() -> TrainingConfig:
-    """Create TPU-optimized training configuration"""
+def create_training_config() -> TPUTrainingConfig:
+    """Create TPU-optimized training configuration for 13B distillation"""
     model_config = {
         'vocab_size': 32000,
-        'num_layers': 12,
-        'num_heads': 12,
-        'head_dim': 64,
-        'hidden_dim': 768,
-        'mlp_dim': 3072,
+        'num_layers': 40,     # Scaled up for 13B
+        'num_heads': 24,      # Increased head count
+        'head_dim': 128,      # Optimized for v5e
+        'hidden_dim': 3072,   # 13B architecture
+        'mlp_dim': 12288,     # 4x hidden_dim
         'max_seq_len': 2048,
         'dropout_rate': 0.1,
         'use_flash_attn': True,
         'use_rotary': True,
-        'use_rms_norm': False
+        'use_rms_norm': True  # Better stability
     }
     
-    return TrainingConfig(
+    return TPUTrainingConfig(
         model_config=model_config,
-        batch_size=32,
-        grad_accum_steps=4,
+        batch_size=64,        # Increased for v5e
+        grad_accum_steps=8,   # Accumulate for effective 512 batch
         learning_rate=1e-4,
         warmup_steps=2000,
-        max_steps=100000,
+        max_steps=150000,     # Longer training for 13B
         weight_decay=0.01,
         max_grad_norm=1.0,
-        dtype='bfloat16',
+        dtype='bfloat16',     # TPU v5e optimal
         enable_pjit=True,
-        block_size=128,
+        block_size=128,       # Optimal chunk size
         use_flash_attn=True,
-        mixed_precision=True
+        mixed_precision=True  # Enable mixed precision
     )
 
 def create_train_state_tpu(
-    config: TrainingConfig,
+    config: TPUTrainingConfig,
     rng: Any,
     mesh: Optional[Any] = None,
     profiler: Optional[TPUProfiler] = None
@@ -140,7 +140,7 @@ def create_train_state_tpu(
     )
 
 def create_train_step_tpu(
-    config: TrainingConfig,
+    config: TPUTrainingConfig,
     state: Any,
     profiler: Optional[TPUProfiler] = None
 ) -> Callable:
@@ -197,7 +197,7 @@ def create_train_step_tpu(
     return train_step
 
 def create_eval_step_tpu(
-    config: TrainingConfig,
+    config: TPUTrainingConfig,
     state: Any
 ) -> Callable:
     """Create TPU-optimized evaluation step function."""
@@ -252,7 +252,7 @@ def create_eval_step_tpu(
     return eval_step
 
 def setup_tpu_training(
-    config: TrainingConfig,
+    config: TPUTrainingConfig,
     seed: int = 42,
     enable_profiling: bool = True
 ) -> Tuple[Any, Any, Callable, TPUProfiler]:
@@ -276,7 +276,7 @@ def setup_tpu_training(
     return state, device_mesh, train_step, profiler
 
 def get_tpu_compile_options(
-    config: TrainingConfig
+    config: TPUTrainingConfig
 ) -> Dict[str, Any]:
     """Get XLA compilation options optimized for TPU."""
     return {

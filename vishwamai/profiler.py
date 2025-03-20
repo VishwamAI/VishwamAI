@@ -23,6 +23,7 @@ class TPUProfiler:
         os.makedirs(self.log_dir, exist_ok=True)
         
         self.metrics = defaultdict(list)
+        self.step_metrics = {}  # Added missing attribute
         self.current_step = 0
         self.start_time = time.time()
         self.last_trace_time = time.time()
@@ -96,9 +97,10 @@ class TPUProfiler:
             except:
                 pass
         
-        avg_util = total_util / len(devices)
+        avg_util = total_util / len(devices) if devices else 0.0
         self.step_metrics["tpu_utilization"] = avg_util
         self.metrics["detailed_utilization"].append(detailed_utils)
+        self.metrics["tpu_utilization"].append(avg_util)  # Track in metrics history
         
     def record_flops(self, computation: Any):
         """Record FLOPs for a JAX computation."""

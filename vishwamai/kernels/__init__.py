@@ -1,118 +1,87 @@
-"""DeepGEMM kernel module."""
+"""VishwamAI optimized kernels module."""
 
-# Import core components
-from .jit_manager import (
-    # Core functionality
-    get_kernel,
+# Core kernel functionality
+from .core import (
+    KernelManager,
     register_kernel,
-    get_manager,
+    get_kernel,
+    KernelType,
+    HardwareType
+)
+
+# Platform-specific implementations
+from .cuda import (
+    FlashMLACUDA,
+    FlashKVCache,
+    FP8GEMM
+)
+
+from .tpu import (
+    TPUGEMMKernel,
+    TPUAttentionKernel,
+    TPULayerNormKernel
+)
+
+# JIT compilation
+from .jit import (
     JITManager,
-    
-    # Platform detection
-    KernelPlatform,
-    
-    # Kernel decorators
-    tpu_kernel,
-    gpu_kernel,
-    triton_kernel,
-    cpu_kernel,
-    no_jit,
-    
-    # Common kernel functions
+    compile_kernel,
+    KernelTemplate
+)
+
+# Common operations
+from .ops import (
     matmul,
     layer_norm,
     gelu,
     flash_attention,
+    sparse_matmul
 )
 
-# Import optimized kernels
-from .kernel import (
-    fp8_gemm_optimized,
-    act_quant,
-    optimize_kernel_layout,
-    block_tpu_matmul,
-)
-
-from .sparse import (
-    sparse_gemm,
-    sparse_attention,
-    block_sparse_attention,
-    sparse_block_gemm,
-    create_sparse_mask,
-)
-
-from .flash_kv import (
-    FlashKVCache,
-    KVCache,
-)
-
-from .tree_matmul import (
-    TreeMatMul,
-    create_adaptive_depth_mask,
-)
-
-from .hybrid_matmul import (
-    HybridMatMul,
-)
-
-from .fp8_cast_bf16 import (
-    fp8_cast_to_bf16,
-    bf16_cast_to_fp8,
-    FP8CastManager,
-    DynamicFP8Scaler,
+# Optimizations
+from .optimizers import (
+    quantize,
+    prune,
+    distill,
+    tensor_parallel
 )
 
 # Version
 __version__ = "0.1.0"
 
 __all__ = [
-    # Core functionality
-    'get_kernel',
-    'register_kernel',
-    'get_manager',
-    'JITManager',
-    'KernelPlatform',
-    
-    # Kernel decorators
-    'tpu_kernel',
-    'gpu_kernel',
-    'triton_kernel',
-    'cpu_kernel',
-    'no_jit',
-    
-    # Common kernel functions
-    'matmul',
-    'layer_norm',
-    'gelu',
-    'flash_attention',
-    
-    # Optimized kernels
-    'fp8_gemm_optimized',
-    'act_quant',
-    'optimize_kernel_layout',
-    'block_tpu_matmul',
-    
-    # Sparse operations
-    'sparse_gemm',
-    'sparse_attention', 
-    'block_sparse_attention',
-    'sparse_block_gemm',
-    'create_sparse_mask',
-    
-    # KV cache
-    'FlashKVCache',
-    'KVCache',
-    
-    # Tree computation
-    'TreeMatMul',
-    'create_adaptive_depth_mask',
-    
-    # Hybrid execution
-    'HybridMatMul',
-    
-    # FP8 casting
-    'fp8_cast_to_bf16',
-    'bf16_cast_to_fp8',
-    'FP8CastManager',
-    'DynamicFP8Scaler',
+    # Core
+    "KernelManager",
+    "register_kernel", 
+    "get_kernel",
+    "KernelType",
+    "HardwareType",
+
+    # CUDA kernels
+    "FlashMLACUDA",
+    "FlashKVCache",
+    "FP8GEMM",
+
+    # TPU kernels
+    "TPUGEMMKernel",
+    "TPUAttentionKernel", 
+    "TPULayerNormKernel",
+
+    # JIT
+    "JITManager",
+    "compile_kernel",
+    "KernelTemplate",
+
+    # Operations
+    "matmul",
+    "layer_norm",
+    "gelu",
+    "flash_attention",
+    "sparse_matmul",
+
+    # Optimizations
+    "quantize",
+    "prune",
+    "distill",
+    "tensor_parallel"
 ]

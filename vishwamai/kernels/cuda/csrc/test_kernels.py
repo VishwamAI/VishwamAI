@@ -7,7 +7,7 @@ import numpy as np
 from typing import Tuple
 import pytest
 
-from flash_mla_cuda import (
+from vishwamai.kernels.cuda.flashmla_cuda import (
     get_mla_metadata,
     flash_mla_forward
 )

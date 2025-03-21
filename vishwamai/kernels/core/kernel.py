@@ -8,7 +8,7 @@ from jax import lax
 from typing import Tuple, Optional, Any
 import numpy as np
 from functools import partial
-from .fp8_cast_bf16 import fp8_cast, optimize_kernel_layout
+from vishwamai.kernels.cuda.fp8_cast_bf16 import fp8_cast, optimize_kernel_layout
 
 def fp8_cast_transpose(x: jnp.ndarray) -> jnp.ndarray:
     """Transpose with FP8 casting for TPU optimization."""

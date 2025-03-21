@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Callable, Optional, Dict
 
-from vishwamai.kernels.activation import gelu_approx, silu_optimized, quick_gelu
+from vishwamai.kernels.ops.activation import gelu_approx, silu_optimized, quick_gelu
 
 # Flash GELU Function (Optimized for TPU)
 def flash_gelu(x: jnp.ndarray) -> jnp.ndarray:

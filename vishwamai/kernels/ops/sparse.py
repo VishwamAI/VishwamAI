@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 from typing import Tuple, Optional, Dict, Any
-from .kernel import optimize_kernel_layout, act_quant
+from vishwamai.kernels.core.kernel import optimize_kernel_layout, act_quant
 
 def sparse_gemm(
     a: jnp.ndarray, 

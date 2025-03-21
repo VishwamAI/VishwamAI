@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Optional, Tuple, Dict, List, Callable
 from vishwamai.layers.attention import FlashAttention, flash_attention_inference
-from vishwamai.kernels.kernel import fp8_gemm_optimized, act_quant, optimize_kernel_layout
+from vishwamai.kernels.core.kernel import fp8_gemm_optimized, act_quant, optimize_kernel_layout
 
 class TPUGEMMLinear(nn.Module):
     """Linear layer with TPU-optimized GEMM operations."""

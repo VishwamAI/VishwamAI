@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 from typing import Tuple, Optional, Dict, Any, List
-from .kernel import optimize_kernel_layout, act_quant
+from vishwamai.kernels.core.kernel import optimize_kernel_layout, act_quant
 
 class TreeMatMul:
     """Implements recursive matrix multiplication for adaptive-depth transformers."""

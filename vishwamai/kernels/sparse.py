@@ -1,9 +1,10 @@
-"""TPU-optimized sparse computation kernels."""
+"""TPU-optimized sparse operations for VishwamAI."""
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from typing import Tuple, Dict, Any, Optional
+from functools import partial
+from typing import Tuple, Optional, Dict, Any
+from .kernel import optimize_kernel_layout, act_quant
 
 def sparse_gemm(
     a: jnp.ndarray, 
@@ -228,3 +229,214 @@ def block_sparse_attention(
         output = output[:, :, :seq_len, :]
         
     return output
+
+def sparse_block_gemm(
+    values: jnp.ndarray,
+    indices: jnp.ndarray,
+    weights: jnp.ndarray,
+    num_total_experts: int,
+    block_size: int = 128,
+    use_fp8: bool = True
+) -> jnp.ndarray:
+    """
+    Block-sparse matrix multiplication optimized for MoE routing on TPU.
+    Only computes expert blocks that are selected by the router.
+    
+    Args:
+        values: Input values [batch, seq_len, hidden_dim]
+        indices: Expert assignment indices [batch, seq_len, top_k]
+        weights: Expert weights [batch, seq_len, top_k]
+        num_total_experts: Total number of experts
+        block_size: Block size for chunked computation
+        use_fp8: Whether to use FP8 precision
+    
+    Returns:
+        Output tensor [batch, seq_len, hidden_dim]
+    """
+    batch_size, seq_len, hidden_dim = values.shape
+    _, _, top_k = indices.shape
+    
+    # Cast to optimal precision
+    if use_fp8:
+        values, values_scale = act_quant(values, block_size=block_size)
+    
+    # Handle each expert block separately
+    def process_expert(expert_idx):
+        # Find tokens routed to this expert
+        expert_mask = indices == expert_idx
+        expert_weights = jnp.where(expert_mask, weights, 0.)
+        
+        # Only process if any tokens use this expert
+        any_selected = jnp.any(expert_mask)
+        
+        def compute_expert():
+            # Get tokens for this expert
+            selected_values = values * expert_weights[..., None]
+            
+            # Optimize memory layout
+            selected_values = optimize_kernel_layout(selected_values)
+            
+            # Process in blocks
+            def process_block(block_idx):
+                start_idx = block_idx * block_size
+                end_idx = min(start_idx + block_size, seq_len)
+                
+                block_values = jax.lax.dynamic_slice(
+                    selected_values,
+                    (0, start_idx, 0),
+                    (batch_size, end_idx - start_idx, hidden_dim)
+                )
+                
+                # Expert computation
+                result = expert_ffn(block_values, expert_idx)
+                
+                # Scale back if using FP8
+                if use_fp8:
+                    result = result * values_scale
+                    
+                return result
+                
+            num_blocks = (seq_len + block_size - 1) // block_size
+            results = [process_block(i) for i in range(num_blocks)]
+            return jnp.concatenate(results, axis=1)
+            
+        # Only compute if expert is used
+        return jax.lax.cond(
+            any_selected,
+            compute_expert,
+            lambda: jnp.zeros((batch_size, seq_len, hidden_dim))
+        )
+    
+    # Process all experts
+    expert_outputs = [process_expert(i) for i in range(num_total_experts)]
+    
+    # Sum expert outputs
+    output = sum(expert_outputs)
+    return output
+
+def expert_ffn(x: jnp.ndarray, expert_idx: int) -> jnp.ndarray:
+    """Mock expert FFN computation - replace with actual expert parameters."""
+    return x  # Placeholder - would use actual expert weights
+
+@partial(jax.jit, static_argnums=(1,))
+def block_sparse_attention(
+    qkv: jnp.ndarray,
+    num_heads: int,
+    sparsity_mask: Optional[jnp.ndarray] = None,
+    block_size: int = 64,
+    use_fp8: bool = True
+) -> jnp.ndarray:
+    """
+    Block-sparse attention implementation optimized for TPU.
+    Only computes attention for non-zero blocks in the sparsity mask.
+    
+    Args:
+        qkv: Combined QKV tensor [batch, seq_len, 3 * num_heads * head_dim]
+        num_heads: Number of attention heads
+        sparsity_mask: Optional binary mask indicating which blocks to compute
+        block_size: Size of attention blocks
+        use_fp8: Whether to use FP8 precision
+    
+    Returns:
+        Output tensor [batch, seq_len, num_heads * head_dim]
+    """
+    batch_size, seq_len, _ = qkv.shape
+    head_dim = qkv.shape[-1] // (3 * num_heads)
+    
+    # Split QKV
+    qkv = qkv.reshape(batch_size, seq_len, 3, num_heads, head_dim)
+    q, k, v = [qkv[:, :, i] for i in range(3)]
+    
+    # Cast to FP8 if requested
+    if use_fp8:
+        q, q_scale = act_quant(q)
+        k, k_scale = act_quant(k)
+        v, v_scale = act_quant(v)
+    
+    # Process attention in blocks
+    num_blocks = (seq_len + block_size - 1) // block_size
+    
+    def process_block(query_idx, key_idx):
+        # Extract block ranges
+        q_start = query_idx * block_size
+        k_start = key_idx * block_size
+        q_end = min(q_start + block_size, seq_len)
+        k_end = min(k_start + block_size, seq_len)
+        
+        # Get query/key/value blocks
+        q_block = q[:, q_start:q_end]
+        k_block = k[:, k_start:k_end]
+        v_block = v[:, k_start:k_end]
+        
+        # Skip if masked
+        if sparsity_mask is not None:
+            mask_block = sparsity_mask[
+                :, :,
+                q_start:q_end,
+                k_start:k_end
+            ]
+            block_active = jnp.any(mask_block)
+        else:
+            block_active = True
+            mask_block = None
+            
+        def compute_attention():
+            # Compute attention scores
+            scores = jnp.einsum('bthd,bshd->btsh', q_block, k_block)
+            scores = scores / jnp.sqrt(head_dim)
+            
+            # Apply mask if provided
+            if mask_block is not None:
+                scores = jnp.where(mask_block, scores, -1e10)
+                
+            # Apply softmax
+            scores = jax.nn.softmax(scores, axis=-1)
+            
+            # Compute attention output
+            output = jnp.einsum('btsh,bshd->bthd', scores, v_block)
+            
+            # Scale back if using FP8
+            if use_fp8:
+                output = output * (q_scale * v_scale)
+                
+            return output
+            
+        return jax.lax.cond(
+            block_active,
+            compute_attention,
+            lambda: jnp.zeros_like(q_block)
+        )
+    
+    # Process all block pairs
+    outputs = []
+    for i in range(num_blocks):
+        block_outputs = []
+        for j in range(num_blocks):
+            block_output = process_block(i, j)
+            block_outputs.append(block_output)
+        outputs.append(jnp.concatenate(block_outputs, axis=1))
+    
+    output = jnp.concatenate(outputs, axis=1)
+    return output.reshape(batch_size, seq_len, -1)
+
+def create_sparse_mask(
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    block_size: int = 64,
+    sparsity: float = 0.9
+) -> jnp.ndarray:
+    """Create sparsity mask for block-sparse attention."""
+    num_blocks = (seq_len + block_size - 1) // block_size
+    rng = jax.random.PRNGKey(0)
+    
+    mask = jax.random.uniform(
+        rng,
+        (batch_size, num_heads, num_blocks, num_blocks)
+    ) > sparsity
+    
+    # Expand mask to full sequence length
+    mask = jnp.repeat(jnp.repeat(mask, block_size, axis=2), block_size, axis=3)
+    mask = mask[:, :, :seq_len, :seq_len]
+    
+    return mask

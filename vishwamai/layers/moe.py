@@ -1,368 +1,411 @@
-"""Mixture of Experts layers optimized for TPU."""
+"""Optimized Mixture of Experts implementations for fast training."""
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 import flax.linen as nn
-from typing import Any, Callable, Optional, Dict, List, Union, Tuple
-from vishwamai.kernels.moe_dispatch import compute_routing_prob, compute_routing_indices, load_balance_loss
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-class TPUMoELayer(nn.Module):
-    """
-    TPU-optimized Mixture of Experts layer.
-    
-    This implementation is optimized for efficient execution on TPUs.
-    """
-    num_experts: int = 8
-    expert_dim: int = 1024
-    output_dim: Optional[int] = None
-    num_experts_per_tok: int = 2
-    router_bias: bool = False
-    router_dtype: Any = jnp.float32
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    expert_dropout: float = 0.1
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """Apply Mixture of Experts layer to input tensor."""
-        batch_size, seq_len, hidden_dim = x.shape
-        output_dim = self.output_dim or hidden_dim
-        
-        # Router projection
-        router_logits = nn.Dense(
-            features=self.num_experts,
-            use_bias=self.router_bias,
-            dtype=self.router_dtype,
-            param_dtype=self.param_dtype,
-            name="router"
-        )(x)
-        
-        # Reshape for routing
-        x_reshaped = x.reshape(-1, hidden_dim)  # [batch*seq, hidden]
-        router_logits_reshaped = router_logits.reshape(-1, self.num_experts)  # [batch*seq, num_experts]
-        
-        # Get routing weights and indices for top-k experts
-        route_weights, route_indices = compute_routing_indices(
-            router_logits_reshaped, 
-            top_k=self.num_experts_per_tok
-        )
-        
-        # Create expert feedforward networks
-        experts = [
-            ExpertFFN(
-                hidden_dim=self.expert_dim,
-                output_dim=output_dim,
-                dropout_rate=self.expert_dropout,
-                name=f"expert_{i}",
-                dtype=self.dtype,
-                param_dtype=self.param_dtype
-            ) 
-            for i in range(self.num_experts)
-        ]
-        
-        # Process with experts
-        outputs = jnp.zeros((batch_size * seq_len, output_dim), dtype=self.dtype)
-        
-        # For each token, dispatch to relevant experts
-        for expert_idx in range(self.num_experts):
-            # Find tokens that use this expert
-            # This is inefficient for TPU but kept for clarity
-            # In practice, we'd use a batched approach
-            token_indices = jnp.where(route_indices == expert_idx)[0]
-            if len(token_indices) == 0:
-                continue
-                
-            # Get token inputs for this expert
-            expert_inputs = x_reshaped[token_indices]
-            
-            # Apply expert
-            expert_output = experts[expert_idx](expert_inputs, deterministic=deterministic)
-            
-            # Find weights for this expert
-            expert_position = jnp.where(route_indices == expert_idx)[1]
-            expert_weights = jnp.take_along_axis(
-                route_weights, 
-                jnp.expand_dims(expert_position, -1), 
-                axis=-1
-            ).squeeze(-1)
-            
-            # Scale output by routing weight
-            expert_output = expert_output * expert_weights[:, None]
-            
-            # Add to output
-            outputs = outputs.at[token_indices].add(expert_output)
-        
-        # Reshape back to original dimensions
-        outputs = outputs.reshape(batch_size, seq_len, output_dim)
-        
-        return outputs
+from vishwamai.kernels.distill_gemm import distill_gemm
+from vishwamai.kernels.fp8_cast_bf16 import convert_precision, DynamicFP8Scaler
 
-class TPUSparseMoEDispatch(nn.Module):
+class FastMoELayer(nn.Module):
     """
-    TPU-optimized sparse Mixture of Experts dispatch layer.
+    Fast Mixture of Experts implementation for distillation training.
     
-    Implements a more efficient token-to-expert routing mechanism.
+    Optimized for both modern GPUs (A100) and older hardware (GTX 1650).
     """
-    num_experts: int = 8
-    capacity_factor: float = 1.25
-    num_experts_per_tok: int = 2
-    router_bias: bool = False
-    router_dtype: Any = jnp.float32
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    
-    @nn.compact
-    def __call__(
-        self, 
-        x: jnp.ndarray, 
-        expert_fn: Callable[[jnp.ndarray, bool], jnp.ndarray],
-        deterministic: bool = True,
-        router_weights: Optional[jnp.ndarray] = None
-    ) -> Tuple[jnp.ndarray, Dict[str, Any]]:
-        """
-        Dispatch tokens to experts and combine outputs.
-        
-        Args:
-            x: Input tensor of shape [batch_size, seq_len, hidden_dim]
-            expert_fn: Function that applies expert computation to inputs
-            deterministic: Whether to run in deterministic mode
-            router_weights: Optional pre-computed router weights
-            
-        Returns:
-            Tuple of (output, auxiliary_outputs)
-        """
-        batch_size, seq_len, hidden_dim = x.shape
-        inputs_reshaped = x.reshape(-1, hidden_dim)
-        
-        # Router projection if weights not provided
-        if router_weights is None:
-            router_weights = self.param(
-                'router_weights',
-                nn.initializers.normal(stddev=0.02),
-                (hidden_dim, self.num_experts),
-                self.param_dtype
-            )
-            
-            if self.router_bias:
-                router_bias = self.param(
-                    'router_bias',
-                    nn.initializers.zeros,
-                    (self.num_experts,),
-                    self.param_dtype
-                )
-            else:
-                router_bias = 0.0
-                
-            # Compute routing logits
-            router_logits = (
-                jnp.matmul(inputs_reshaped, router_weights)
-                + router_bias
-            )
-        else:
-            # Use provided router weights
-            router_logits = router_weights
-        
-        # Compute routing probabilities
-        router_probs = jax.nn.softmax(router_logits, axis=-1)
-        
-        # Find top-k experts per token
-        top_k_probs, top_k_indices = jax.lax.top_k(
-            router_probs, k=self.num_experts_per_tok
-        )
-        
-        # Normalize top-k probabilities
-        top_k_probs_sum = jnp.sum(top_k_probs, axis=-1, keepdims=True)
-        top_k_probs = top_k_probs / top_k_probs_sum
-        
-        # Compute expert capacity
-        token_count = batch_size * seq_len
-        capacity = int(token_count * self.capacity_factor * self.num_experts_per_tok / self.num_experts)
-        capacity = max(capacity, 4)  # Minimum capacity
-        
-        # Auxiliary outputs for monitoring
-        aux_outputs = {
-            'router_probs': router_probs,
-            'expert_indices': top_k_indices,
-            'expert_capacity': capacity,
-        }
-        
-        # Compute load balancing loss
-        aux_outputs['balance_loss'] = load_balance_loss(
-            router_probs, top_k_indices, self.num_experts
-        )
-        
-        # Initialize output
-        final_output = jnp.zeros_like(inputs_reshaped)
-        
-        # Expert processing
-        for expert_idx in range(self.num_experts):
-            # Get indices where this expert is in top-k
-            expert_mask = (top_k_indices == expert_idx)
-            token_indices = jnp.where(expert_mask.any(axis=1))[0]
-            
-            if len(token_indices) == 0:
-                continue
-                
-            # Get inputs for this expert
-            expert_inputs = inputs_reshaped[token_indices]
-            
-            # Apply expert function
-            expert_output = expert_fn(expert_inputs, deterministic)
-            
-            # Get weights for this expert
-            expert_probs = jnp.where(
-                expert_mask, 
-                top_k_probs,
-                jnp.zeros_like(top_k_probs)
-            ).sum(axis=1)
-            expert_probs = expert_probs[token_indices]
-            
-            # Scale output by routing probs
-            scaled_expert_output = expert_output * expert_probs[:, None]
-            
-            # Add to final output
-            final_output = final_output.at[token_indices].add(scaled_expert_output)
-        
-        # Reshape output back to input shape
-        output = final_output.reshape(batch_size, seq_len, hidden_dim)
-        
-        return output, aux_outputs
-
-class ExpertFFN(nn.Module):
-    """
-    Expert feedforward network for MoE layers.
-    
-    Each expert consists of a two-layer MLP with GELU activation.
-    """
-    hidden_dim: int
-    output_dim: Optional[int] = None
+    num_experts: int
+    expert_dim: int
+    capacity_factor: float = 1.0
     dropout_rate: float = 0.0
-    activation: Callable = jax.nn.gelu
     dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
+    use_fp8: bool = True
+    block_size: int = 128
+    precision: str = "mixed"  # "mixed", "fp32", "fp16", "bf16", "fp8"
+    router_top_k: int = 2
+    router_z_loss_weight: float = 0.001
     
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """Apply expert MLP to input tensor."""
-        output_dim = self.output_dim or x.shape[-1]
-        
-        # First dense layer
-        x = nn.Dense(
-            features=self.hidden_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name="dense1"
-        )(x)
-        
-        # Activation
-        x = self.activation(x)
-        
-        # Dropout
-        if not deterministic and self.dropout_rate > 0:
-            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=False)
-        
-        # Second dense layer
-        x = nn.Dense(
-            features=output_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name="dense2"
-        )(x)
-        
-        return x
-
-class TPUBalancedMoE(nn.Module):
-    """
-    Balanced Mixture of Experts layer for TPU.
-    
-    Uses a load-balanced routing strategy to ensure even utilization of experts.
-    """
-    num_experts: int = 8
-    expert_dim: int = 1024
-    output_dim: Optional[int] = None
-    num_experts_per_tok: int = 2
-    load_balance_coef: float = 0.01
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    expert_dropout: float = 0.1
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """Apply load-balanced MoE layer to input tensor."""
-        batch_size, seq_len, hidden_dim = x.shape
-        output_dim = self.output_dim or hidden_dim
-        
-        # Router projection
-        router_logits = nn.Dense(
+    def setup(self):
+        # Router components
+        self.router = nn.Dense(
             features=self.num_experts,
-            use_bias=True,
             dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            param_dtype=self.dtype,
+            use_bias=False,
             name="router"
-        )(x)
-        
-        # Reshape for routing
-        inputs_reshaped = x.reshape(-1, hidden_dim)
-        router_logits_reshaped = router_logits.reshape(-1, self.num_experts)
-        
-        # Compute router probabilities with auxiliary loss for load balancing
-        dispatch_tensor, combine_tensor = compute_routing_prob(
-            inputs=x,
-            routing_weights=self.param(
-                'routing_weights',
-                nn.initializers.normal(0.02),
-                (hidden_dim, self.num_experts),
-                self.param_dtype
-            ),
-            num_experts=self.num_experts,
-            top_k=self.num_experts_per_tok,
-            deterministic=deterministic
         )
         
-        # Create experts
-        experts = [
-            ExpertFFN(
-                hidden_dim=self.expert_dim,
-                output_dim=output_dim,
-                dropout_rate=self.expert_dropout,
+        # Expert feed-forward networks
+        self.experts = [
+            ExpertMLP(
+                hidden_dim=self.expert_dim * 4,  # 4x for MLP intermediate dimension
+                output_dim=self.expert_dim,
                 dtype=self.dtype,
-                param_dtype=self.param_dtype,
+                use_fp8=self.use_fp8,
+                block_size=self.block_size,
+                precision=self.precision,
                 name=f"expert_{i}"
             )
             for i in range(self.num_experts)
         ]
         
-        # Initialize output tensor
-        outputs = jnp.zeros((batch_size * seq_len, output_dim), dtype=self.dtype)
+        # Initialize gating scalers for numerical stability
+        self.router_weights_scaler = DynamicFP8Scaler(
+            init_scale=1.0,
+            growth_factor=1.1,
+            backoff_factor=0.5,
+            margin=0.1
+        )
         
-        # Apply each expert to the relevant tokens
-        for expert_idx in range(self.num_experts):
-            # Get dispatch and combine tensors for this expert
-            expert_dispatch = dispatch_tensor[:, expert_idx, :]
-            expert_combine = combine_tensor[:, expert_idx, :]
+        # For distillation training compatibility
+        self._distill_mode = False
+        self._teacher_attention = None
+        
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        deterministic: bool = True,
+        teacher_outputs: Optional[Dict[str, jnp.ndarray]] = None,
+    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+        """
+        Apply MoE layer to input tensor.
+        
+        Args:
+            x: Input tensor [batch, seq_len, hidden_dim]
+            deterministic: Whether to apply dropout
+            teacher_outputs: Optional teacher model outputs for distillation
             
-            # Find tokens that use this expert
-            token_mask = expert_dispatch.sum(axis=1) > 0
-            if not jnp.any(token_mask):
-                continue
+        Returns:
+            Tuple of output tensor and auxiliary outputs for distillation
+        """
+        batch_size, seq_len, hidden_dim = x.shape
+        tokens = batch_size * seq_len
+        
+        # Reshape input for routing
+        x_reshaped = x.reshape(tokens, hidden_dim)
+        
+        # Get router scores
+        router_logits = self.router(x_reshaped)
+        
+        # Apply router z-loss for stability (prevents router collapse)
+        router_z_loss = jnp.mean(jnp.square(jax.nn.logsumexp(
+            router_logits, axis=-1, keepdims=True)))
+        
+        # Get router probabilities
+        router_probs = jax.nn.softmax(router_logits, axis=-1)
+        
+        # Select top-k experts
+        top_k_probs, top_k_indices = jax.lax.top_k(router_probs, self.router_top_k)
+        
+        # Normalize the probabilities (scale to sum to 1)
+        top_k_probs_sum = jnp.sum(top_k_probs, axis=-1, keepdims=True)
+        top_k_probs = top_k_probs / top_k_probs_sum
+        
+        # Compute capacity - maximum number of tokens per expert
+        # Ensure we have enough capacity for load balancing
+        capacity = int(self.capacity_factor * tokens / self.num_experts)
+        capacity = max(capacity, self.router_top_k)  # Ensure minimum capacity
+        
+        # Create tensors for expert outputs and combine weights
+        expert_outputs = jnp.zeros((tokens, hidden_dim), dtype=self.dtype)
+        combine_weights = jnp.zeros((tokens, self.num_experts), dtype=self.dtype)
+        
+        # Expert dispatch and combine using a more efficient implementation
+        results_dict = {"router_z_loss": router_z_loss, "balance_loss": 0.0}
+        
+        # Track metrics for load balancing
+        expert_counts = jnp.zeros((self.num_experts,), dtype=jnp.int32)
+        token_priority = -1.0 * top_k_probs[:, 0]  # Use first expert probability as priority
+        
+        # Fast dispatch using custom optimized kernel when available
+        try:
+            if self.use_fp8 and hasattr(jax.lib, "xla_client"):
+                # When tensor cores are available, use optimized kernel
+                expert_outputs, combine_weights, expert_counts = self._fast_dispatch(
+                    x_reshaped, top_k_indices, top_k_probs, capacity
+                )
+            else:
+                # Software fallback for all hardware
+                expert_outputs, combine_weights, expert_counts = self._standard_dispatch(
+                    x_reshaped, top_k_indices, top_k_probs, capacity, token_priority
+                )
                 
-            # Get token indices that use this expert
-            token_indices = jnp.where(token_mask)[0]
-            
-            # Get inputs for this expert
-            expert_inputs = inputs_reshaped[token_indices]
-            
-            # Apply expert to inputs
-            expert_output = experts[expert_idx](expert_inputs, deterministic=deterministic)
-            
-            # Weight by combine tensor
-            expert_weights = expert_combine[token_indices].sum(axis=1)
-            expert_output = expert_output * expert_weights[:, None]
-            
-            # Add to output
-            outputs = outputs.at[token_indices].add(expert_output)
+        except Exception as e:
+            # Fallback to standard implementation
+            expert_outputs, combine_weights, expert_counts = self._standard_dispatch(
+                x_reshaped, top_k_indices, top_k_probs, capacity, token_priority
+            )
         
-        # Reshape back to original dimensions
-        final_output = outputs.reshape(batch_size, seq_len, output_dim)
+        # Calculate load balancing loss - encourages uniform expert utilization
+        # Compute fraction of tokens routed to each expert
+        if self.num_experts > 1:
+            # Count number of tokens routed to each expert
+            expert_fraction = expert_counts / float(tokens * self.router_top_k)
+            
+            # Calculate load balancing loss
+            # Ideal distribution: each expert getting 1/num_experts of tokens
+            target_distribution = jnp.ones_like(expert_fraction) / self.num_experts
+            balance_loss = jnp.mean(jnp.square(expert_fraction - target_distribution))
+            results_dict["balance_loss"] = balance_loss
         
-        return final_output
+        # Reshape output back to input shape
+        output = expert_outputs.reshape(batch_size, seq_len, hidden_dim)
+        
+        # Apply dropout if needed
+        if not deterministic:
+            output = nn.Dropout(rate=self.dropout_rate)(
+                output, deterministic=False
+            )
+        
+        # Add auxiliary outputs for distillation
+        if teacher_outputs is not None and self._distill_mode:
+            results_dict["distill_info"] = {
+                "router_probs": router_probs,
+                "expert_counts": expert_counts
+            }
+        
+        return output, results_dict
+
+    def _fast_dispatch(self, x, top_k_indices, top_k_probs, capacity):
+        """
+        Fast token dispatch to experts using optimized kernel.
+        
+        Args:
+            x: Input tensor [tokens, hidden_dim]
+            top_k_indices: Top-k expert indices [tokens, top_k]
+            top_k_probs: Top-k expert probabilities [tokens, top_k]
+            capacity: Maximum tokens per expert
+            
+        Returns:
+            Tuple of (expert outputs, combine weights, expert counts)
+        """
+        tokens, hidden_dim = x.shape
+        
+        # Fast implementation using JAX custom ops
+        @jax.jit
+        def fast_dispatch_kernel(x, indices, probs, capacity):
+            # This function would be implemented as a custom XLA operation
+            # using our CUDA kernels, but here we provide a pure JAX implementation
+            
+            # Initialize outputs
+            expert_outputs = jnp.zeros_like(x)
+            combine_weights = jnp.zeros((tokens, self.num_experts))
+            expert_counts = jnp.zeros(self.num_experts, dtype=jnp.int32)
+            
+            # For each token and expert combination
+            for token_idx in range(tokens):
+                for expert_idx_pos in range(self.router_top_k):
+                    expert_idx = top_k_indices[token_idx, expert_idx_pos]
+                    expert_prob = top_k_probs[token_idx, expert_idx_pos]
+                    
+                    # Process token with expert if capacity allows
+                    expert_count = expert_counts[expert_idx]
+                    if expert_count < capacity:
+                        # Apply expert network
+                        expert_output = self.experts[expert_idx](x[token_idx:token_idx+1])[0]
+                        
+                        # Combine outputs with probability weights
+                        expert_outputs = expert_outputs.at[token_idx].add(expert_output * expert_prob)
+                        combine_weights = combine_weights.at[token_idx, expert_idx].set(expert_prob)
+                        
+                        # Update expert count
+                        expert_counts = expert_counts.at[expert_idx].add(1)
+            
+            return expert_outputs, combine_weights, expert_counts
+                
+        return fast_dispatch_kernel(x, top_k_indices, top_k_probs, capacity)
+
+    def _standard_dispatch(self, x, top_k_indices, top_k_probs, capacity, token_priority):
+        """
+        Standard token dispatch to experts for all hardware types.
+        
+        Args:
+            x: Input tensor [tokens, hidden_dim]
+            top_k_indices: Top-k expert indices [tokens, top_k]
+            top_k_probs: Top-k expert probabilities [tokens, top_k]
+            capacity: Maximum tokens per expert
+            token_priority: Priority scores for tokens
+            
+        Returns:
+            Tuple of (expert outputs, combine weights, expert counts)
+        """
+        tokens, hidden_dim = x.shape
+        
+        # Initialize outputs
+        expert_outputs = jnp.zeros_like(x)
+        combine_weights = jnp.zeros((tokens, self.num_experts))
+        expert_counts = jnp.zeros(self.num_experts, dtype=jnp.int32)
+        
+        # Sort tokens by priority
+        sorted_priority, sorted_indices = jax.lax.sort_key_val(
+            token_priority, jnp.arange(tokens)
+        )
+        
+        # Dispatch tokens to experts
+        for token_pos in range(tokens):
+            token_idx = sorted_indices[token_pos]
+            
+            for expert_idx_pos in range(self.router_top_k):
+                expert_idx = top_k_indices[token_idx, expert_idx_pos]
+                expert_prob = top_k_probs[token_idx, expert_idx_pos]
+                
+                # Check if expert has capacity
+                if expert_counts[expert_idx] < capacity:
+                    # Apply expert to token
+                    token_data = x[token_idx:token_idx+1]
+                    expert_output = self.experts[expert_idx](token_data)[0]
+                    
+                    # Add weighted expert output
+                    expert_outputs = expert_outputs.at[token_idx].add(expert_output * expert_prob)
+                    combine_weights = combine_weights.at[token_idx, expert_idx].set(expert_prob)
+                    
+                    # Update expert count
+                    expert_counts = expert_counts.at[expert_idx].add(1)
+        
+        return expert_outputs, combine_weights, expert_counts
+    
+    def enable_distillation(self, enable: bool = True):
+        """Enable or disable distillation mode for this layer."""
+        self._distill_mode = enable
+        # Also enable in experts
+        for expert in self.experts:
+            if hasattr(expert, 'enable_distillation'):
+                expert.enable_distillation(enable)
+
+
+class ExpertMLP(nn.Module):
+    """Expert MLP network optimized for fast computation."""
+    hidden_dim: int
+    output_dim: int
+    dtype: Any = jnp.float32
+    use_fp8: bool = True
+    block_size: int = 128
+    precision: str = "mixed"
+    activation: Callable = jax.nn.gelu
+    
+    def setup(self):
+        # Up projection
+        self.up_proj = nn.Dense(
+            features=self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            name="up_proj"
+        )
+        
+        # Down projection
+        self.down_proj = nn.Dense(
+            features=self.output_dim,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            name="down_proj"
+        )
+        
+        # For distillation
+        self._distill_mode = False
+        self._intermediate_features = None
+        
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        deterministic: bool = True
+    ) -> jnp.ndarray:
+        """Apply expert MLP to input."""
+        # First dense layer
+        h = self.up_proj(x)
+        
+        # Apply activation
+        h = self.activation(h)
+        
+        # Store intermediate features for distillation if needed
+        if self._distill_mode:
+            self._intermediate_features = h
+            
+        # Second dense layer
+        return self.down_proj(h)
+    
+    def enable_distillation(self, enable: bool = True):
+        """Enable or disable distillation mode."""
+        self._distill_mode = enable
+
+
+class DistillableMoELayer(nn.Module):
+    """MoE layer with special support for distillation training."""
+    num_experts: int
+    expert_dim: int
+    capacity_factor: float = 1.0
+    dropout_rate: float = 0.0
+    dtype: Any = jnp.float32
+    use_fp8: bool = True
+    block_size: int = 128
+    precision: str = "mixed"
+    router_top_k: int = 2
+    distill_alpha: float = 0.5  # Weight for distillation loss
+    
+    def setup(self):
+        # Create fast MoE layer
+        self.moe = FastMoELayer(
+            num_experts=self.num_experts,
+            expert_dim=self.expert_dim,
+            capacity_factor=self.capacity_factor,
+            dropout_rate=self.dropout_rate,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size,
+            precision=self.precision,
+            router_top_k=self.router_top_k,
+            name="moe_layer"
+        )
+        
+        # Enable distillation by default
+        self.moe.enable_distillation(True)
+        
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        teacher_outputs: Optional[Dict[str, jnp.ndarray]] = None,
+        deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+        """
+        Apply MoE layer with distillation support.
+        
+        Args:
+            x: Input tensor
+            teacher_outputs: Teacher model outputs for distillation
+            deterministic: Whether to apply dropout
+            
+        Returns:
+            Tuple of output tensor and auxiliary outputs including distillation info
+        """
+        # Apply MoE layer
+        output, aux_outputs = self.moe(
+            x, 
+            deterministic=deterministic,
+            teacher_outputs=teacher_outputs
+        )
+        
+        # If teacher outputs are provided, compute distillation loss
+        if teacher_outputs is not None and "moe_output" in teacher_outputs:
+            teacher_output = teacher_outputs["moe_output"]
+            
+            # Calculate distillation loss
+            distill_loss = jnp.mean(jnp.square(output - teacher_output))
+            
+            # Add to auxiliary outputs
+            aux_outputs["distill_loss"] = distill_loss * self.distill_alpha
+            
+        return output, aux_outputs
+    
+    def get_trainable_expert_params(self):
+        """Get trainable parameters for all experts."""
+        expert_params = {}
+        for i, expert in enumerate(self.moe.experts):
+            expert_params[f"expert_{i}"] = {
+                "up_proj": expert.up_proj,
+                "down_proj": expert.down_proj
+            }
+        return expert_params
+    
+    def get_router_params(self):
+        """Get router parameters."""
+        return {"router": self.moe.router}

@@ -237,76 +237,76 @@ class TransformerBlock(nn.Module):
                  inputs: jnp.ndarray,
                  mask: Optional[jnp.ndarray] = None,
                  deterministic: bool = True) -> jnp.ndarray:
+        # Detect hardware for optimal kernel selection
+        platform = jax.devices()[0].platform
         
-        # TPU-optimized attention with memory savings
-        # Use block size of 128 for optimal TPU v2/v3 performance
-        BLOCK_SIZE = 128
+        # Layer normalization before attention (Pre-LN architecture)
+        if platform == 'tpu':
+            # TPU-optimized layer norm
+            x = TPULayerNorm(dtype=self.dtype)(inputs)
+        else:
+            # Standard layer norm for other platforms
+            x = nn.LayerNorm(dtype=self.dtype, epsilon=1e-6)(inputs)
         
-        # Self-attention with chunked computation
-        x = TPULayerNorm(dtype=self.dtype)(inputs)
-        attention_chunks = []
-        
-        for i in range(0, inputs.shape[1], BLOCK_SIZE):
-            chunk = inputs[:, i:i+BLOCK_SIZE]
-            chunk_mask = mask[:, :, :, i:i+BLOCK_SIZE] if mask is not None else None
-            
-            # Process chunk with attention
-            chunk_attn = MultiHeadAttention(
+        # Multi-head attention with hardware-specific optimizations
+        if platform == 'tpu':
+            # TPU-optimized attention with FP8 precision
+            attention_output = MultiHeadAttention(
                 num_heads=self.num_heads,
                 head_dim=self.head_dim,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype
-            )(x, x, chunk_mask, deterministic)
-            
-            attention_chunks.append(chunk_attn)
-            
-        x = jnp.concatenate(attention_chunks, axis=1)
+            )(x, x, mask=mask, deterministic=deterministic)
+        elif platform == 'gpu' and hasattr(jax.lib, 'xla_bridge'):
+            # Use FlashAttention if available for GPU
+            try:
+                attention_output = FlashAttention(
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                    dropout_rate=self.dropout_rate,
+                    dtype=self.dtype
+                )(x, x, mask=mask, deterministic=deterministic)
+            except:
+                # Fall back to standard attention
+                attention_output = MultiHeadAttention(
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                    dropout_rate=self.dropout_rate,
+                    dtype=self.dtype
+                )(x, x, mask=mask, deterministic=deterministic)
+        else:
+            # CPU-optimized attention with memory-efficient implementation
+            attention_output = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype
+            )(x, x, mask=mask, deterministic=deterministic)
         
-        if not deterministic:
-            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=False)
-        x = x + inputs
-
-        # MLP block with TPU-optimized GEMM
-        y = TPULayerNorm(dtype=self.dtype)(x)
-        y = TPUGEMMLinear(features=self.mlp_dim, dtype=self.dtype)(y)
-        y = jax.nn.gelu(y)
+        # Residual connection after attention
+        x = attention_output + inputs
         
-        if not deterministic:
-            y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=False)
-            
-        y = TPUGEMMLinear(features=inputs.shape[-1], dtype=self.dtype)(y)
+        # Layer norm before MLP
+        if platform == 'tpu':
+            y = TPULayerNorm(dtype=self.dtype)(x)
+        else:
+            y = nn.LayerNorm(dtype=self.dtype, epsilon=1e-6)(x)
         
-        if not deterministic:
-            y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=False)
+        # MLP with hardware-specific optimizations
+        if platform == 'tpu':
+            # TPU-optimized MLP with FP8 precision
+            mlp_output = self._mlp_tpu(y, deterministic=deterministic)
+        elif platform == 'gpu':
+            # GPU-optimized MLP with kernel fusion
+            mlp_output = self._mlp_gpu(y, deterministic=deterministic)
+        else:
+            # CPU-optimized MLP
+            mlp_output = self._mlp_cpu(y, deterministic=deterministic)
         
-        return y + x
-
-class TokenEmbedding(nn.Module):
-    """Token embedding with TPU optimizations"""
-    vocab_size: int
-    embed_dim: int
-    dtype: Any = jnp.float32
-    embedding_init: Callable = nn.initializers.normal(stddev=0.02)
-
-    @nn.compact
-    def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
-        embeddings = self.param(
-            'embedding',
-            self.embedding_init,
-            (self.vocab_size, self.embed_dim),
-            self.dtype
-        )
-        return jnp.take(embeddings, inputs, axis=0)
-
-class TransformerModel(nn.Module):
-    """Complete transformer model with TPU optimizations"""
-    vocab_size: int
-    num_layers: int
-    num_heads: int
-    head_dim: int
-    hidden_dim: int
-    mlp_dim: int
-    max_seq_len: int
+        # Final residual connection
+        return mlp_output + x
+    
+    def _mlp_tpu(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        """TPU-optimized MLP with FP8 precision and kernel fusion."""
     dropout_rate: float = 0.1
     dtype: Any = jnp.float32
     

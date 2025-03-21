@@ -3,59 +3,47 @@ import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# Check CUDA version
-cuda_version = torch.version.cuda.split('.')
-cuda_major = int(cuda_version[0])
-cuda_minor = int(cuda_version[1])
-
-# Define source files
-sources = [
-    'flash_mla.cu',
-    'flash_mla_cuda.cpp',
-]
-
-# Define include directories
-include_dirs = []
-
-# Define NVCC arguments
-nvcc_args = [
-    '-O3',
-    '--use_fast_math',
-    '-std=c++14',
-    f'-gencode=arch=compute_70,code=sm_70',
-    f'-gencode=arch=compute_75,code=sm_75',
-    f'-gencode=arch=compute_80,code=sm_80',
-    '-U__CUDA_NO_HALF_OPERATORS__',
-    '-U__CUDA_NO_HALF_CONVERSIONS__',
-    '-U__CUDA_NO_HALF2_OPERATORS__',
-]
-
-# If CUDA version >= 11, add Ampere support
-if cuda_major >= 11:
-    nvcc_args.extend([
-        f'-gencode=arch=compute_86,code=sm_86',
-    ])
-
-# Support for advanced hardware if available
-if cuda_major >= 12:
-    nvcc_args.extend([
-        f'-gencode=arch=compute_90,code=sm_90',
-    ])
+def get_cuda_arch_flags():
+    """Get CUDA architecture flags for compilation."""
+    # Default architectures if not specified
+    DEFAULT_CUDA_ARCHS = [
+        "7.0",  # Volta: V100
+        "7.5",  # Turing: T4, RTX 2080
+        "8.0",  # Ampere: A100
+        "8.6",  # Ampere: RTX 3090
+        "8.9",  # Hopper: H100
+    ]
+    
+    # Use environment variable if set
+    if "TORCH_CUDA_ARCH_LIST" in os.environ:
+        return os.environ["TORCH_CUDA_ARCH_LIST"]
+        
+    return ";".join([f"sm_{arch.replace('.', '')}" for arch in DEFAULT_CUDA_ARCHS])
 
 setup(
-    name='flash_mla_cuda',
+    name="flash_mla_cuda",
     ext_modules=[
         CUDAExtension(
-            name='flash_mla_cuda',
-            sources=sources,
-            include_dirs=include_dirs,
+            name="flash_mla_cuda",
+            sources=[
+                "flash_mla_cuda.cpp",
+                "flash_mla.cu",
+            ],
             extra_compile_args={
-                'cxx': ['-O3', '-std=c++14'],
-                'nvcc': nvcc_args,
+                "cxx": ["-O3", "-std=c++17"],
+                "nvcc": [
+                    "-O3",
+                    "--use_fast_math",
+                    "-std=c++17",
+                    f"-arch={get_cuda_arch_flags()}",
+                    "--ptxas-options=-v",
+                    "-lineinfo",
+                    "--extended-lambda",
+                    "--expt-relaxed-constexpr",
+                ]
             },
-        ),
+            include_dirs=["."],
+        )
     ],
-    cmdclass={
-        'build_ext': BuildExtension
-    },
+    cmdclass={"build_ext": BuildExtension},
 )

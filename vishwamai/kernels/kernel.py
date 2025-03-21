@@ -155,49 +155,50 @@ def block_tpu_matmul(
     transpose_b: bool = False,
     precision: Optional[lax.Precision] = None
 ) -> jnp.ndarray:
-    """
-    Blocked matrix multiplication optimized for TPU memory hierarchy.
+    """TPU-optimized blocked matrix multiplication.
     
-    Args:
-        A: First input matrix
-        B: Second input matrix
-        block_size: Size of blocks for tiling
-        transpose_b: Whether to transpose B
-        precision: XLA precision setting
+    Features:
+    - Efficient memory access patterns for TPU HBM
+    - Block-level fusion of operations
+    - Dynamic padding for optimal TPU utilization
     """
     M, K = A.shape
-    K, N = B.shape if not transpose_b else B.shape[::-1]
-    
-    # Pad dimensions to multiples of block_size
+    K_, N = B.shape if not transpose_b else B.shape[::-1]
+    assert K == K_, f"Incompatible dimensions: {K} != {K_}"
+
+    # Pad dimensions to block_size for TPU efficiency
     M_pad = (block_size - M % block_size) % block_size
-    K_pad = (block_size - K % block_size) % block_size
     N_pad = (block_size - N % block_size) % block_size
+    K_pad = (block_size - K % block_size) % block_size
     
+    # Pad inputs while maintaining dtype
     A_padded = jnp.pad(A, ((0, M_pad), (0, K_pad)))
     B_padded = jnp.pad(B, ((0, K_pad), (0, N_pad)) if not transpose_b else ((0, N_pad), (0, K_pad)))
     
     if transpose_b:
         B_padded = B_padded.T
     
-    # Reshape into blocks
+    # Reshape into blocks for TPU-efficient processing
     A_blocks = A_padded.reshape(-1, block_size, A_padded.shape[1] // block_size, block_size)
     B_blocks = B_padded.reshape(-1, block_size, B_padded.shape[1] // block_size, block_size)
     
-    # Optimize block layout for TPU
+    # Optimize layout for TPU memory access
     A_blocks = optimize_kernel_layout(A_blocks)
     B_blocks = optimize_kernel_layout(B_blocks)
     
-    # Perform blocked matrix multiplication
+    # Perform blocked matmul with high precision
     C_blocks = jax.lax.dot_general(
         A_blocks,
-        B_blocks.transpose(0, 2, 1, 3),
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-        precision=precision
+        B_blocks,
+        (((2, 3), (2, 3)), ((0, 1), (0, 1))),
+        precision=precision or lax.Precision.HIGHEST
     )
     
-    # Reshape result back
-    C_padded = C_blocks.reshape(M + M_pad, N + N_pad)
-    return C_padded[:M, :N]
+    # Reshape result and remove padding
+    C = C_blocks.reshape(M + M_pad, N + N_pad)
+    C = C[:M, :N]
+    
+    return C
 
 def multi_head_attention_kernel(
     Q: jnp.ndarray,

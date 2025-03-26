@@ -1,11 +1,29 @@
-"""TPU-optimized JAX kernel implementations."""
+"""TPU-optimized kernels for VishwamAI."""
 
-from .pjit import pjit_kernel, get_mesh_context
-from .tpu_custom_call import tpu_kernel_call, lower_to_custom_call
+from .tpu_custom_call import (
+    tpu_custom_call,
+    compile_tpu_kernel,
+    optimize_tpu_layout,
+    pad_to_tpu_multiple,
+    get_optimal_tpu_layout
+)
+
+from .gemm import TPUGEMMKernel
+from .attention import TPUAttentionKernel
+from .layer_norm import TPULayerNormKernel
+from .flash_attention import TPUFlashAttention
 
 __all__ = [
-    "pjit_kernel",
-    "get_mesh_context",
-    "tpu_kernel_call",
-    "lower_to_custom_call"
+    # TPU custom call functions
+    "tpu_custom_call",
+    "compile_tpu_kernel",
+    "optimize_tpu_layout",
+    "pad_to_tpu_multiple",
+    "get_optimal_tpu_layout",
+    
+    # TPU kernels
+    "TPUGEMMKernel",
+    "TPUAttentionKernel",
+    "TPULayerNormKernel",
+    "TPUFlashAttention",
 ]

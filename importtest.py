@@ -218,7 +218,7 @@ def test_kernel_performance():
             
             # Try optimized GEMM if available
             try:
-                from vishwamai.kernels.kernel import fp8_gemm_optimized
+                from vishwamai.layers.layers import fp8_gemm_optimized
                 
                 # Warmup
                 _ = fp8_gemm_optimized(x, y)
@@ -251,7 +251,7 @@ def test_kernel_performance():
             
             # Try optimized activation if available
             try:
-                from vishwamai.kernels.activation import gelu_approx
+                from vishwamai.kernels.ops.activation import gelu_approx
                 
                 start = time.time()
                 _ = gelu_approx(x)
@@ -269,7 +269,246 @@ def test_kernel_performance():
     except Exception as e:
         print(f"\nKernel performance tests failed with error: {str(e)}")
 
+def test_tpu_kernels():
+    """Test the newly implemented TPU kernel capabilities."""
+    try:
+        import jax
+        import jax.numpy as jnp
+        import time
+        import numpy as np
+        
+        print("\nTesting TPU Kernel Implementations:")
+        
+        # Test TPUGEMMKernel
+        print("1. Testing TPUGEMMKernel...")
+        try:
+            from vishwamai.kernels.tpu import TPUGEMMKernel
+            
+            # Create test data
+            batch_size = 32
+            m, n, k = 128, 128, 128
+            x = jnp.ones((batch_size, m, k), dtype=jnp.float32)
+            y = jnp.ones((batch_size, k, n), dtype=jnp.float32)
+            
+            # Initialize TPU GEMM kernel
+            tpu_gemm = TPUGEMMKernel(block_size=128, use_bfloat16=True)
+            
+            # Warmup
+            _ = tpu_gemm(x, y)
+            jax.block_until_ready(_)
+            
+            # Benchmark
+            start = time.time()
+            result = tpu_gemm(x, y)
+            jax.block_until_ready(result)
+            elapsed = time.time() - start
+            
+            print(f"✓ TPUGEMMKernel - Execution time: {elapsed:.4f}s, Output shape: {result.shape}")
+            
+            # Compare with standard matmul
+            std_result = jnp.matmul(x, y)
+            accuracy = jnp.allclose(result, std_result, rtol=1e-2, atol=1e-2)
+            print(f"  Accuracy check: {'Passed' if accuracy else 'Failed'}")
+            
+        except ImportError as e:
+            print(f"✗ TPUGEMMKernel import failed: {str(e)}")
+        except Exception as e:
+            print(f"✗ TPUGEMMKernel test failed: {str(e)}")
+            
+        # Test TPULayerNormKernel
+        print("2. Testing TPULayerNormKernel...")
+        try:
+            from vishwamai.kernels.tpu import TPULayerNormKernel
+            
+            # Create test data
+            batch_size = 32
+            seq_len = 128
+            hidden_dim = 768
+            x = jnp.ones((batch_size, seq_len, hidden_dim), dtype=jnp.float32)
+            weight = jnp.ones(hidden_dim, dtype=jnp.float32)
+            bias = jnp.zeros(hidden_dim, dtype=jnp.float32)
+            
+            # Initialize TPU LayerNorm kernel
+            layernorm = TPULayerNormKernel(dim=hidden_dim, use_bfloat16=True)
+            
+            # Warmup
+            _ = layernorm(x, weight, bias)
+            jax.block_until_ready(_)
+            
+            # Benchmark
+            start = time.time()
+            result = layernorm(x, weight, bias)
+            jax.block_until_ready(result)
+            elapsed = time.time() - start
+            
+            print(f"✓ TPULayerNormKernel - Execution time: {elapsed:.4f}s, Output shape: {result.shape}")
+            
+            # Compare with standard layernorm
+            def standard_layernorm(x, weight, bias, eps=1e-5):
+                mean = jnp.mean(x, axis=-1, keepdims=True)
+                var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+                x_norm = (x - mean) / jnp.sqrt(var + eps)
+                return x_norm * weight + bias
+                
+            std_result = standard_layernorm(x, weight, bias)
+            accuracy = jnp.allclose(result, std_result, rtol=1e-2, atol=1e-2)
+            print(f"  Accuracy check: {'Passed' if accuracy else 'Failed'}")
+            
+        except ImportError as e:
+            print(f"✗ TPULayerNormKernel import failed: {str(e)}")
+        except Exception as e:
+            print(f"✗ TPULayerNormKernel test failed: {str(e)}")
+            
+        # Test TPUAttentionKernel
+        print("3. Testing TPUAttentionKernel...")
+        try:
+            from vishwamai.kernels.tpu import TPUAttentionKernel
+            
+            # Create test data
+            batch_size = 2
+            num_heads = 12
+            seq_len = 128
+            head_dim = 64
+            
+            query = jnp.ones((batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+            key = jnp.ones((batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+            value = jnp.ones((batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+            
+            # Initialize TPU Attention kernel
+            attention = TPUAttentionKernel(use_flash=False, use_bfloat16=True)
+            
+            # Warmup
+            _ = attention(query, key, value)
+            jax.block_until_ready(_)
+            
+            # Benchmark
+            start = time.time()
+            result = attention(query, key, value)
+            jax.block_until_ready(result)
+            elapsed = time.time() - start
+            
+            print(f"✓ TPUAttentionKernel - Execution time: {elapsed:.4f}s, Output shape: {result.shape}")
+            
+        except ImportError as e:
+            print(f"✗ TPUAttentionKernel import failed: {str(e)}")
+        except Exception as e:
+            print(f"✗ TPUAttentionKernel test failed: {str(e)}")
+            
+        # Test TPUFlashAttention
+        print("4. Testing TPUFlashAttention...")
+        try:
+            from vishwamai.kernels.tpu import TPUFlashAttention
+            
+            # Create test data
+            batch_size = 2
+            num_heads = 12
+            seq_len = 128
+            head_dim = 64
+            
+            query = jnp.ones((batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+            key = jnp.ones((batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+            value = jnp.ones((batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+            
+            # Initialize TPU Flash Attention
+            flash_attention = TPUFlashAttention(block_size=128, use_bfloat16=True)
+            
+            # Warmup
+            _ = flash_attention(query, key, value)
+            jax.block_until_ready(_)
+            
+            # Benchmark
+            start = time.time()
+            result = flash_attention(query, key, value)
+            jax.block_until_ready(result)
+            elapsed = time.time() - start
+            
+            print(f"✓ TPUFlashAttention - Execution time: {elapsed:.4f}s, Output shape: {result.shape}")
+            
+            # Compare with standard attention for small sequence
+            def standard_attention(q, k, v, scale=None):
+                if scale is None:
+                    scale = 1.0 / jnp.sqrt(q.shape[-1])
+                scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+                attention_weights = jax.nn.softmax(scores, axis=-1)
+                return jnp.einsum('bhqk,bhkd->bhqd', attention_weights, v)
+                
+            std_result = standard_attention(query, key, value)
+            accuracy = jnp.allclose(result, std_result, rtol=1e-2, atol=1e-2)
+            print(f"  Accuracy check: {'Passed' if accuracy else 'Failed'}")
+            
+            # Memory efficiency test with longer sequence
+            try:
+                long_seq_len = 2048
+                query_long = jnp.ones((batch_size, num_heads, long_seq_len, head_dim), dtype=jnp.float32)
+                key_long = jnp.ones((batch_size, num_heads, long_seq_len, head_dim), dtype=jnp.float32)
+                value_long = jnp.ones((batch_size, num_heads, long_seq_len, head_dim), dtype=jnp.float32)
+                
+                result_long = flash_attention(query_long, key_long, value_long)
+                jax.block_until_ready(result_long)
+                print(f"  Long sequence test (length={long_seq_len}): Passed")
+            except Exception as e:
+                print(f"  Long sequence test (length={long_seq_len}): Failed - {str(e)}")
+            
+        except ImportError as e:
+            print(f"✗ TPUFlashAttention import failed: {str(e)}")
+        except Exception as e:
+            print(f"✗ TPUFlashAttention test failed: {str(e)}")
+            
+        # Test layout optimization functions
+        print("5. Testing TPU layout optimization utilities...")
+        try:
+            from vishwamai.kernels.tpu import optimize_tpu_layout, pad_to_tpu_multiple
+            
+            # Test optimize_tpu_layout
+            x = jnp.ones((batch_size, seq_len, hidden_dim), dtype=jnp.float32)
+            opt_x = optimize_tpu_layout(x)
+            print(f"✓ optimize_tpu_layout - Input shape: {x.shape}, Output shape: {opt_x.shape}")
+            
+            # Test pad_to_tpu_multiple
+            x_padded = pad_to_tpu_multiple(x, multiple=128)
+            print(f"✓ pad_to_tpu_multiple - Input shape: {x.shape}, Output shape: {x_padded.shape}")
+            
+        except ImportError as e:
+            print(f"✗ TPU layout optimization utilities import failed: {str(e)}")
+        except Exception as e:
+            print(f"✗ TPU layout optimization utilities test failed: {str(e)}")
+            
+        print("\nTPU kernel tests completed")
+    except Exception as e:
+        print(f"\nTPU kernel tests failed with error: {str(e)}")
+
+def test_tpu_kernel_imports():
+    """Add specific tests for TPU kernel imports."""
+    print("\nTesting TPU Kernel Imports:")
+    imports = [
+        "from vishwamai.kernels.tpu import TPUGEMMKernel",
+        "from vishwamai.kernels.tpu import TPUAttentionKernel",
+        "from vishwamai.kernels.tpu import TPULayerNormKernel",
+        "from vishwamai.kernels.tpu import TPUFlashAttention",
+        "from vishwamai.kernels.tpu import optimize_tpu_layout",
+        "from vishwamai.kernels.tpu import pad_to_tpu_multiple",
+        "from vishwamai.kernels.tpu import get_optimal_tpu_layout",
+        "from vishwamai.kernels.tpu import tpu_custom_call",
+        "from vishwamai.kernels.tpu import compile_tpu_kernel",
+        "from vishwamai.kernels.tpu.tpu_custom_call import tpu_custom_call_lowering",
+    ]
+    
+    successful = 0
+    for import_stmt in imports:
+        try:
+            exec(import_stmt)
+            print(f"✓ {import_stmt}")
+            successful += 1
+        except ImportError as e:
+            print(f"✗ {import_stmt} - Error: {str(e)}")
+        except Exception as e:
+            print(f"! {import_stmt} - Unexpected error: {str(e)}")
+    
+    print(f"\nTPU Kernel Import Summary: {successful}/{len(imports)} successful")
+
 if __name__ == "__main__":
     test_imports()
     test_multimodal_functionality()
     test_kernel_performance()
+    test_tpu_kernel_imports()
+    test_tpu_kernels()

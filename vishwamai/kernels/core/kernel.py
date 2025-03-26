@@ -8,7 +8,45 @@ from jax import lax
 from typing import Tuple, Optional, Any
 import numpy as np
 from functools import partial
-from vishwamai.kernels.cuda.fp8_cast_bf16 import fp8_cast, optimize_kernel_layout
+
+# Define optimize_kernel_layout directly here to avoid circular imports
+def optimize_kernel_layout(x: jnp.ndarray) -> jnp.ndarray:
+    """Optimize tensor layout for TPU memory access patterns.
+    
+    Args:
+        x: Input tensor
+        
+    Returns:
+        Tensor with optimized memory layout
+    """
+    # For TPU, we want to ensure data is arranged in blocks to utilize hardware
+    # This is a simplified version - actual TPU optimization would involve:
+    # - Changing memory layout for efficient tile access
+    # - Ensuring optimal tensor padding and alignment
+    # - Arranging computation to maximize TPU utilization
+    
+    # Transpose for memory access efficiency if 4D
+    if x.ndim == 4:
+        return jnp.transpose(x, (0, 2, 1, 3))
+    
+    # For 2D matrices, ensure dimensions are multiples of 8 for TPU efficiency
+    if x.ndim == 2:
+        pad_r = (8 - (x.shape[0] % 8)) % 8
+        pad_c = (8 - (x.shape[1] % 8)) % 8
+        return jnp.pad(x, ((0, pad_r), (0, pad_c)))
+    
+    return x
+
+# Now continue with the rest of the imports
+try:
+    from vishwamai.kernels.cuda.fp8_cast_bf16 import fp8_cast
+except ImportError:
+    # Define fallback if import fails
+    def fp8_cast(x: jnp.ndarray, block_size: int = 128) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Fallback implementation of fp8_cast."""
+        scale = jnp.max(jnp.abs(x), keepdims=True) / 127.0
+        x_fp8 = jnp.clip(jnp.round(x / scale), -127, 127)
+        return x_fp8, scale
 
 def fp8_cast_transpose(x: jnp.ndarray) -> jnp.ndarray:
     """Transpose with FP8 casting for TPU optimization."""

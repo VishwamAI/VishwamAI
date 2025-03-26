@@ -4,9 +4,9 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 from typing import Tuple, Optional, Dict, Any, Union, Literal, List
-from .kernel import optimize_kernel_layout, act_quant
-from .flash_kv import FlashKVCache
-from .tree_matmul import TreeMatMul
+from vishwamai.kernels.core.kernel import optimize_kernel_layout, act_quant
+from vishwamai.kernels.cuda.flash_kv import FlashKVCache
+from vishwamai.kernels.ops.tree_matmul import TreeMatMul
 
 DeviceType = Literal["tpu", "gpu"]
 

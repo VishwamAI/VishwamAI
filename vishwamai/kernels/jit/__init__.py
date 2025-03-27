@@ -22,6 +22,14 @@ from .decorators import (
     no_jit
 )
 
+from .templates import (
+    get_template,
+    TEMPLATES,
+    MATMUL_TEMPLATE,
+    ELEMENTWISE_TEMPLATE,
+    REDUCTION_TEMPLATE
+)
+
 __all__ = [
     # Core JIT functionality
     "JITManager",
@@ -40,5 +48,12 @@ __all__ = [
     "gpu_kernel", 
     "triton_kernel",
     "cpu_kernel",
-    "no_jit"
+    "no_jit",
+    
+    # Templates
+    "get_template",
+    "TEMPLATES",
+    "MATMUL_TEMPLATE",
+    "ELEMENTWISE_TEMPLATE",
+    "REDUCTION_TEMPLATE"
 ]

@@ -1,3 +1,125 @@
+"""Efficient parallel operations library optimized for TPU/GPU."""
+
+import jax
+import jax.numpy as jnp
+from typing import Optional, Tuple, List, Union
+from functools import partial
+
+class EfficientParallelOps:
+    """Collection of efficient parallel operations."""
+    
+    @staticmethod
+    @partial(jax.jit, static_argnums=(2,))
+    def batch_matmul(
+        matrices_a: jnp.ndarray,
+        matrices_b: jnp.ndarray,
+        chunk_size: int = 32
+    ) -> jnp.ndarray:
+        """
+        Efficient batched matrix multiplication.
+        
+        Args:
+            matrices_a: First batch of matrices [batch, M, K]
+            matrices_b: Second batch of matrices [batch, K, N]
+            chunk_size: Size of chunks for parallel processing
+            
+        Returns:
+            Batched matrix multiplication result [batch, M, N]
+        """
+        return jax.vmap(jnp.matmul)(matrices_a, matrices_b)
+
+    @staticmethod
+    @partial(jax.jit, static_argnums=(1,))
+    def parallel_scan(
+        sequence: jnp.ndarray,
+        chunk_size: int = 1024
+    ) -> jnp.ndarray:
+        """
+        Parallel scan (prefix sum) implementation.
+        
+        Args:
+            sequence: Input sequence
+            chunk_size: Size of chunks for parallel processing
+            
+        Returns:
+            Cumulative sum array
+        """
+        # Split into chunks
+        chunks = jnp.array_split(sequence, max(1, len(sequence) // chunk_size))
+        
+        # Compute chunk sums
+        chunk_sums = jnp.array([chunk.sum() for chunk in chunks])
+        prefix_sums = jnp.cumsum(chunk_sums)
+        
+        # Compute parallel scan within chunks
+        def scan_chunk(chunk, offset):
+            return jnp.cumsum(chunk) + offset
+            
+        results = []
+        offset = 0
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                offset = prefix_sums[i-1]
+            results.append(scan_chunk(chunk, offset))
+            
+        return jnp.concatenate(results)
+
+    @staticmethod
+    @jax.jit
+    def parallel_sort(
+        values: jnp.ndarray,
+        keys: Optional[jnp.ndarray] = None
+    ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
+        """
+        Parallel sorting implementation.
+        
+        Args:
+            values: Values to sort
+            keys: Optional keys to sort by
+            
+        Returns:
+            Sorted array or tuple of (sorted_values, sorted_keys)
+        """
+        if keys is None:
+            return jnp.sort(values)
+        else:
+            indices = jnp.argsort(keys)
+            return values[indices], keys[indices]
+
+    @staticmethod
+    @partial(jax.jit, static_argnums=(1,))
+    def strided_reduction(
+        array: jnp.ndarray,
+        reduction_size: int,
+        op: str = 'sum'
+    ) -> jnp.ndarray:
+        """
+        Parallel strided reduction.
+        
+        Args:
+            array: Input array
+            reduction_size: Size of reduction window
+            op: Reduction operation ('sum', 'max', 'min', 'mean')
+            
+        Returns:
+            Reduced array
+        """
+        ops = {
+            'sum': jnp.sum,
+            'max': jnp.max,
+            'min': jnp.min,
+            'mean': jnp.mean
+        }
+        
+        if op not in ops:
+            raise ValueError(f"Unsupported reduction op: {op}")
+            
+        reduce_fn = ops[op]
+        return reduce_fn(array.reshape(-1, reduction_size), axis=1)
+
+# Create singleton instance
+efficient_parallel_ops = EfficientParallelOps()
+
 from typing import Tuple, Dict, Any
 
 import jax

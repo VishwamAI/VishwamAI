@@ -45,6 +45,43 @@ def get_cache_dir() -> str:
     return cache_dir
 
 
+class KernelTemplate:
+    """Template for generating CUDA kernel code."""
+    
+    def __init__(self, template: str):
+        self.template = template
+        
+    def instantiate(self, **kwargs) -> str:
+        """Instantiate the template with given parameters."""
+        return self.template.format(**kwargs)
+
+
+def compile_kernel(
+    name: str,
+    arg_defs: tuple,
+    template: Union[str, KernelTemplate],
+    template_args: Optional[Dict[str, Any]] = None
+):
+    """
+    Compile a kernel from a template.
+    
+    Args:
+        name: Name of the kernel
+        arg_defs: Tuple of argument types
+        template: Kernel code template or KernelTemplate instance
+        template_args: Arguments to instantiate template
+        
+    Returns:
+        Compiled kernel function
+    """
+    if isinstance(template, KernelTemplate):
+        code = template.instantiate(**(template_args or {}))
+    else:
+        code = template
+        
+    return build_jax(name, arg_defs, code)
+
+
 def build_jax(name: str, arg_defs: tuple, code: str):
     """
     Build a custom CUDA kernel and return a JAX-compatible callable.

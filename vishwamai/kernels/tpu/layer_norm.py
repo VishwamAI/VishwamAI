@@ -9,7 +9,7 @@ from functools import partial
 
 from vishwamai.kernels.core.kernel import Kernel, KernelConfig
 from vishwamai.kernels.core.kernel_manager import HardwareType
-from .tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
+from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
 
 class LayerNormOutput(NamedTuple):
     """Output from layer normalization."""

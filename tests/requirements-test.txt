@@ -1,0 +1,47 @@
+# Test Dependencies for VishwamAI Kernels
+
+# Core testing frameworks
+pytest>=7.0.0
+pytest-xdist>=3.0.0  # For parallel test execution
+pytest-benchmark>=4.0.0  # For performance benchmarking
+pytest-cov>=4.0.0  # For coverage reporting
+pytest-timeout>=2.1.0  # For test timeouts
+pytest-instafail>=0.4.2  # For immediate failure reporting
+
+# TPU dependencies
+jax[tpu]>=0.4.1  # JAX with TPU support
+jaxlib>=0.4.1  # JAX low-level bindings
+libtpu-nightly  # TPU support library
+
+# GPU dependencies
+torch>=2.0.0  # PyTorch for GPU operations
+torchvision>=0.15.0  # Additional PyTorch utilities
+cuda-python>=11.8  # CUDA Python bindings
+cupy-cuda11x>=12.0.0  # CuPy for GPU operations
+
+# CPU dependencies
+numpy>=1.20.0  # Core numerical operations
+scipy>=1.8.0  # Scientific computing utilities
+numba>=0.56.0  # JIT compilation for CPU
+
+# Development tools
+black>=22.0.0  # Code formatting
+flake8>=4.0.0  # Code linting
+mypy>=0.900  # Type checking
+isort>=5.10.0  # Import sorting
+pytest-mock>=3.10.0  # Mocking support
+pytest-asyncio>=0.20.0  # Async test support
+
+# Documentation
+sphinx>=4.5.0  # Documentation generation
+sphinx-rtd-theme>=1.0.0  # Documentation theme
+nbsphinx>=0.8.9  # Notebook support in docs
+pytest-html>=3.1.1  # HTML test reports
+
+# Performance monitoring
+memory-profiler>=0.60.0  # Memory profiling
+line-profiler>=3.5.1  # Line-by-line profiling
+scalene>=1.5.19  # CPU/GPU/memory profiling
+
+# Platform-specific requirements
+--find-links https://storage.googleapis.com/jax-releases/jax_releases.html  # TPU wheels

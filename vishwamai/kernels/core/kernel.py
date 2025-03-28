@@ -1,190 +1,128 @@
-"""
-TPU-optimized kernel operations for VishwamAI transformer.
-"""
+"""TPU-optimized kernel operations for VishwamAI transformer."""
 
 import jax
 import jax.numpy as jnp
 from jax import lax
-from typing import Tuple, Optional, Any
+from typing import Tuple, Optional, Any, NamedTuple, Dict, Union
 import numpy as np
 from functools import partial
 
-# Define optimize_kernel_layout directly here to avoid circular imports
-def optimize_kernel_layout(x: jnp.ndarray) -> jnp.ndarray:
-    """Optimize tensor layout for TPU memory access patterns.
+from jax.experimental import pjit
+from jax.sharding import PartitionSpec as P
+from vishwamai.kernels.cuda.fp8_cast_bf16 import fp8_cast
+
+def create_mesh_and_sharding(
+    num_devices: int,
+    sharding_mode: str,
+    batch_sharding: bool = True
+) -> Tuple[jax.sharding.Mesh, Dict[str, P]]:
+    """
+    Create device mesh and sharding specs for TPU pods.
+    
+    Args:
+        num_devices: Number of TPU devices
+        sharding_mode: Sharding strategy ("1d", "2d", "3d")
+        batch_sharding: Whether to shard batch dimension
+        
+    Returns:
+        Tuple of (device mesh, sharding specs dictionary)
+    """
+    if sharding_mode == "1d":
+        devices = jax.devices()[:num_devices]
+        mesh = jax.sharding.Mesh(np.array(devices), ["dp"])
+        specs = {
+            "hidden": P("dp"),
+            "mlp": P("dp"),
+            "heads": P(None),
+            "batch": P("dp") if batch_sharding else P(None)
+        }
+    elif sharding_mode == "2d":
+        dp = int(np.sqrt(num_devices))
+        mp = num_devices // dp
+        devices = np.array(jax.devices()[:num_devices]).reshape(dp, mp)
+        mesh = jax.sharding.Mesh(devices, ["dp", "mp"])
+        specs = {
+            "hidden": P("mp"),
+            "mlp": P("mp"),
+            "heads": P("dp"),
+            "batch": P("dp") if batch_sharding else P(None)
+        }
+    else:  # 3d
+        assert num_devices >= 8, "3D sharding requires at least 8 devices"
+        dp = 2
+        tp = 2
+        pp = num_devices // (dp * tp)
+        devices = np.array(jax.devices()[:num_devices]).reshape(dp, tp, pp)
+        mesh = jax.sharding.Mesh(devices, ["dp", "tp", "pp"])
+        specs = {
+            "hidden": P("tp"),
+            "mlp": P(("tp", "pp")),
+            "heads": P("dp"),
+            "batch": P("dp") if batch_sharding else P(None)
+        }
+    
+    return mesh, specs
+
+def optimize_kernel_layout(x: jnp.ndarray, block_size: int = 128) -> jnp.ndarray:
+    """
+    Optimize tensor layout for TPU memory access patterns.
     
     Args:
         x: Input tensor
+        block_size: Block size for memory alignment
         
     Returns:
         Tensor with optimized memory layout
     """
-    # For TPU, we want to ensure data is arranged in blocks to utilize hardware
-    # This is a simplified version - actual TPU optimization would involve:
-    # - Changing memory layout for efficient tile access
-    # - Ensuring optimal tensor padding and alignment
-    # - Arranging computation to maximize TPU utilization
-    
-    # Transpose for memory access efficiency if 4D
-    if x.ndim == 4:
-        return jnp.transpose(x, (0, 2, 1, 3))
-    
-    # For 2D matrices, ensure dimensions are multiples of 8 for TPU efficiency
-    if x.ndim == 2:
-        pad_r = (8 - (x.shape[0] % 8)) % 8
-        pad_c = (8 - (x.shape[1] % 8)) % 8
-        return jnp.pad(x, ((0, pad_r), (0, pad_c)))
+    # Handle different tensor dimensions
+    if x.ndim == 4:  # BHQK format for attention
+        # Reshape to optimize for TPU memory layout
+        B, H, Q, K = x.shape
+        padded_q = (Q + block_size - 1) // block_size * block_size
+        padded_k = (K + block_size - 1) // block_size * block_size
+        
+        # Pad if needed
+        if padded_q > Q or padded_k > K:
+            x = jnp.pad(x, ((0, 0), (0, 0), 
+                           (0, padded_q - Q), 
+                           (0, padded_k - K)))
+        
+        # Reshape for TPU efficiency
+        x = x.reshape(B, H, padded_q // block_size, block_size,
+                     padded_k // block_size, block_size)
+        x = jnp.transpose(x, (0, 1, 2, 4, 3, 5))
+        return x.reshape(B, H, padded_q, padded_k)
+        
+    elif x.ndim == 3:  # BLD format
+        B, L, D = x.shape
+        padded_l = (L + block_size - 1) // block_size * block_size
+        padded_d = (D + block_size - 1) // block_size * block_size
+        
+        if padded_l > L or padded_d > D:
+            x = jnp.pad(x, ((0, 0), 
+                           (0, padded_l - L),
+                           (0, padded_d - D)))
+            
+        x = x.reshape(B, padded_l // block_size, block_size,
+                     padded_d // block_size, block_size)
+        x = jnp.transpose(x, (0, 1, 3, 2, 4))
+        return x.reshape(B, padded_l, padded_d)
+        
+    elif x.ndim == 2:  # MK format
+        M, K = x.shape
+        padded_m = (M + block_size - 1) // block_size * block_size
+        padded_k = (K + block_size - 1) // block_size * block_size
+        
+        if padded_m > M or padded_k > K:
+            x = jnp.pad(x, ((0, padded_m - M),
+                           (0, padded_k - K)))
+            
+        x = x.reshape(padded_m // block_size, block_size,
+                     padded_k // block_size, block_size)
+        x = jnp.transpose(x, (0, 2, 1, 3))
+        return x.reshape(padded_m, padded_k)
     
     return x
-
-# Now continue with the rest of the imports
-try:
-    from vishwamai.kernels.cuda.fp8_cast_bf16 import fp8_cast
-except ImportError:
-    # Define fallback if import fails
-    def fp8_cast(x: jnp.ndarray, block_size: int = 128) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Fallback implementation of fp8_cast."""
-        scale = jnp.max(jnp.abs(x), keepdims=True) / 127.0
-        x_fp8 = jnp.clip(jnp.round(x / scale), -127, 127)
-        return x_fp8, scale
-
-def fp8_cast_transpose(x: jnp.ndarray) -> jnp.ndarray:
-    """Transpose with FP8 casting for TPU optimization."""
-    return lax.transpose(x, (0, 2, 1, 3)) if x.ndim == 4 else x.T
-
-def fp8_gemm_optimized(
-    a: jnp.ndarray,
-    b: jnp.ndarray,
-    transpose_a: bool = False,
-    transpose_b: bool = False,
-    dtype: Any = jnp.float32
-) -> jnp.ndarray:
-    """Optimized FP8 GEMM implementation.
-    
-    Args:
-        a: First input matrix
-        b: Second input matrix
-        transpose_a: Whether to transpose first matrix
-        transpose_b: Whether to transpose second matrix
-        dtype: Output data type
-        
-    Returns:
-        Matrix multiplication result
-    """
-    # For now, use standard matmul as placeholder
-    # TODO: Implement actual FP8 optimization
-    return jnp.matmul(
-        jnp.asarray(a, dtype),
-        jnp.asarray(b, dtype),
-        precision=jax.lax.Precision.HIGHEST
-    )
-
-def act_quant(
-    x: jnp.ndarray,
-    num_bits: int = 8,
-    axis: Optional[int] = None,
-    block_size: int = 128,
-    use_stochastic_rounding: bool = True,
-    rng_key: Optional[jnp.ndarray] = None
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Quantize activations to reduced precision with automatic scale determination.
-    
-    Args:
-        x: Input tensor
-        num_bits: Number of bits for quantization
-        axis: Axis along which to compute scaling factors. If None, compute globally.
-        block_size: Block size for tiling
-        use_stochastic_rounding: Whether to use stochastic rounding
-        rng_key: Optional PRNG key for stochastic rounding
-        
-    Returns:
-        Tuple of (quantized_tensor, scale_factor)
-    """
-    # Create rng_key if using stochastic rounding but none provided
-    if use_stochastic_rounding and rng_key is None:
-        rng_key = jax.random.PRNGKey(0)
-        
-    def _process_block(block, local_rng_key):
-        # Determine reduction axes based on input dimensionality
-        if axis is None:
-            reduce_axes = tuple(range(block.ndim))
-        else:
-            reduce_axes = (axis,) if isinstance(axis, int) else tuple(axis)
-            
-        # Compute scale factor per specified axes
-        abs_max = jnp.max(jnp.abs(block), axis=reduce_axes, keepdims=True)
-        scale = (2 ** (num_bits - 1) - 1) / (abs_max + 1e-5)
-        
-        # Scale the input
-        scaled = block * scale
-        
-        if use_stochastic_rounding:
-            # Generate noise in [-0.5, 0.5)
-            noise = jax.random.uniform(
-                local_rng_key,
-                block.shape,
-                minval=-0.5,
-                maxval=0.5
-            )
-            # Add noise before rounding for stochastic rounding
-            x_quant = jnp.clip(
-                jnp.floor(scaled + noise + 0.5),
-                -2 ** (num_bits - 1),
-                2 ** (num_bits - 1) - 1
-            )
-        else:
-            # Standard deterministic rounding
-            x_quant = jnp.clip(
-                jnp.round(scaled),
-                -2 ** (num_bits - 1),
-                2 ** (num_bits - 1) - 1
-            )
-        
-        # Dequantize
-        x_dequant = x_quant / scale
-        
-        return x_dequant, scale
-    
-    # Process in blocks for better TPU utilization
-    orig_shape = x.shape
-    reshaped = x.reshape(-1, block_size) if x.size > block_size else x
-    
-    # Process each block
-    results = []
-    scales = []
-    
-    for i in range(0, reshaped.shape[0], block_size):
-        if use_stochastic_rounding:
-            block_key = jax.random.fold_in(rng_key, i)
-        else:
-            block_key = None
-            
-        block = jax.lax.dynamic_slice(
-            reshaped,
-            (i, 0),
-            (min(block_size, reshaped.shape[0] - i), reshaped.shape[-1])
-        )
-        
-        block_dequant, block_scale = _process_block(block, block_key)
-        results.append(block_dequant)
-        scales.append(block_scale)
-    
-    # Concatenate results and reshape
-    x_dequant = jnp.concatenate(results, axis=0).reshape(orig_shape)
-    scales = jnp.concatenate(scales, axis=0)
-    
-    # Reshape scales to match reduction dimensions
-    if axis is not None:
-        scales_shape = [1] * x.ndim
-        if isinstance(axis, int):
-            scales_shape[axis] = x.shape[axis]
-        else:
-            for ax in axis:
-                scales_shape[ax] = x.shape[ax]
-        scales = scales.reshape(scales_shape)
-    
-    return x_dequant, scales
 
 def block_tpu_matmul(
     A: jnp.ndarray,
@@ -193,50 +131,78 @@ def block_tpu_matmul(
     transpose_b: bool = False,
     precision: Optional[lax.Precision] = None
 ) -> jnp.ndarray:
-    """TPU-optimized blocked matrix multiplication.
+    """
+    TPU-optimized blocked matrix multiplication.
     
     Features:
     - Efficient memory access patterns for TPU HBM
     - Block-level fusion of operations
     - Dynamic padding for optimal TPU utilization
+    - Support for SPMD with pjit
+    
+    Args:
+        A: First input matrix
+        B: Second input matrix
+        block_size: Block size for tiling (must be multiple of 128 for TPU)
+        transpose_b: Whether to transpose second matrix
+        precision: JAX precision setting
     """
     M, K = A.shape
     K_, N = B.shape if not transpose_b else B.shape[::-1]
     assert K == K_, f"Incompatible dimensions: {K} != {K_}"
-
-    # Pad dimensions to block_size for TPU efficiency
-    M_pad = (block_size - M % block_size) % block_size
-    N_pad = (block_size - N % block_size) % block_size
-    K_pad = (block_size - K % block_size) % block_size
     
-    # Pad inputs while maintaining dtype
-    A_padded = jnp.pad(A, ((0, M_pad), (0, K_pad)))
-    B_padded = jnp.pad(B, ((0, K_pad), (0, N_pad)) if not transpose_b else ((0, N_pad), (0, K_pad)))
-    
-    if transpose_b:
-        B_padded = B_padded.T
-    
-    # Reshape into blocks for TPU-efficient processing
-    A_blocks = A_padded.reshape(-1, block_size, A_padded.shape[1] // block_size, block_size)
-    B_blocks = B_padded.reshape(-1, block_size, B_padded.shape[1] // block_size, block_size)
-    
-    # Optimize layout for TPU memory access
-    A_blocks = optimize_kernel_layout(A_blocks)
-    B_blocks = optimize_kernel_layout(B_blocks)
-    
-    # Perform blocked matmul with high precision
-    C_blocks = jax.lax.dot_general(
-        A_blocks,
-        B_blocks,
-        (((2, 3), (2, 3)), ((0, 1), (0, 1))),
-        precision=precision or lax.Precision.HIGHEST
+    # Create sharding for SPMD
+    mesh, specs = create_mesh_and_sharding(
+        jax.device_count(),
+        "2d",  # Use 2D sharding by default
+        batch_sharding=False
     )
     
-    # Reshape result and remove padding
-    C = C_blocks.reshape(M + M_pad, N + N_pad)
-    C = C[:M, :N]
+    def shard_matmul(A_shard, B_shard):
+        # Pad dimensions to block_size for TPU efficiency
+        M_pad = (block_size - M % block_size) % block_size
+        N_pad = (block_size - N % block_size) % block_size
+        K_pad = (block_size - K % block_size) % block_size
+        
+        # Pad inputs while maintaining dtype
+        A_padded = jnp.pad(A_shard, ((0, M_pad), (0, K_pad)))
+        B_padded = jnp.pad(B_shard, ((0, K_pad), (0, N_pad)) if not transpose_b
+                          else ((0, N_pad), (0, K_pad)))
+        
+        if transpose_b:
+            B_padded = B_padded.T
+        
+        # Reshape into blocks
+        A_blocks = A_padded.reshape(-1, block_size, 
+                                  A_padded.shape[1] // block_size, block_size)
+        B_blocks = B_padded.reshape(-1, block_size,
+                                  B_padded.shape[1] // block_size, block_size)
+        
+        # Optimize layout
+        A_blocks = optimize_kernel_layout(A_blocks, block_size)
+        B_blocks = optimize_kernel_layout(B_blocks, block_size)
+        
+        # Perform blocked matmul
+        C_blocks = jax.lax.dot_general(
+            A_blocks,
+            B_blocks,
+            (((2, 3), (2, 3)), ((0, 1), (0, 1))),
+            precision=precision or lax.Precision.HIGHEST
+        )
+        
+        # Reshape and remove padding
+        C = C_blocks.reshape(M + M_pad, N + N_pad)
+        return C[:M, :N]
     
-    return C
+    # Use pjit for SPMD
+    sharded_matmul = pjit.pjit(
+        shard_matmul,
+        in_axis_resources=(specs["mlp"], specs["mlp"]),
+        out_axis_resources=specs["mlp"]
+    )
+    
+    with mesh:
+        return sharded_matmul(A, B)
 
 def multi_head_attention_kernel(
     Q: jnp.ndarray,
@@ -248,10 +214,13 @@ def multi_head_attention_kernel(
     deterministic: bool = False,
     precision: Optional[lax.Precision] = None,
     block_size: int = 128,
-    use_fp8: bool = True
+    use_fp8: bool = True,
+    causal: bool = False,
+    use_flash: bool = True,  # Added flash attention support
+    window_size: Optional[int] = None  # Added sliding window support
 ) -> jnp.ndarray:
     """
-    TPU-optimized multi-head attention kernel.
+    TPU-optimized multi-head attention kernel with flash attention support.
     
     Args:
         Q, K, V: Query, Key, and Value tensors
@@ -262,8 +231,33 @@ def multi_head_attention_kernel(
         precision: XLA precision setting
         block_size: Block size for tiling
         use_fp8: Whether to use FP8 precision
+        causal: Whether to use causal attention
+        use_flash: Whether to use flash attention optimization
+        window_size: Optional sliding window size for local attention
     """
-    # Convert to optimal precision
+    # Get dimensions
+    B, H, L, D = Q.shape
+    S = K.shape[2]
+    
+    # Choose implementation based on sequence length and settings
+    if use_flash and L >= 1024:
+        # Use flash attention for long sequences
+        return flash_attention(Q, K, V, mask=mask, block_size=block_size)
+    
+    if window_size is not None:
+        # Use sliding window attention
+        return sliding_window_attention(
+            Q, K, V,
+            window_size=window_size,
+            mask=mask,
+            dropout_rng=dropout_rng,
+            dropout_rate=dropout_rate,
+            deterministic=deterministic,
+            precision=precision,
+            block_size=block_size
+        )
+    
+    # Standard attention with optimizations
     if use_fp8:
         Q_fp8, Q_scale = fp8_cast(Q, block_size=block_size)
         K_fp8, K_scale = fp8_cast(K, block_size=block_size)
@@ -272,7 +266,7 @@ def multi_head_attention_kernel(
         Q_fp8, K_fp8, V_fp8 = Q, K, V
         Q_scale = K_scale = V_scale = 1.0
     
-    # Compute attention scores
+    # Compute attention scores with TPU optimizations
     scores = block_tpu_matmul(
         Q_fp8,
         K_fp8,
@@ -281,19 +275,28 @@ def multi_head_attention_kernel(
         precision=precision
     )
     
-    # Apply mask if provided
+    # Apply causal mask if needed
+    if causal:
+        causal_mask = jnp.triu(
+            jnp.ones((L, S), dtype=bool),
+            k=1
+        )
+        scores = jnp.where(causal_mask, -1e9, scores)
+    
+    # Apply attention mask
     if mask is not None:
-        scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+        scores = jnp.where(mask, scores, -1e9)
     
     # Apply softmax
-    scores = jax.nn.softmax(scores / jnp.sqrt(Q.shape[-1]), axis=-1)
+    scores = jax.nn.softmax(scores / jnp.sqrt(D), axis=-1)
     
     # Apply dropout
     if dropout_rate > 0.0 and not deterministic:
-        dropout_shape = list(scores.shape)
-        keep_prob = 1.0 - dropout_rate
-        keep = jax.random.bernoulli(dropout_rng, keep_prob, dropout_shape)
-        scores = jnp.where(keep, scores / keep_prob, 0.0)
+        scores = jax.random.bernoulli(
+            dropout_rng,
+            p=1.0 - dropout_rate,
+            shape=scores.shape
+        ) * scores / (1.0 - dropout_rate)
     
     # Compute attention output
     output = block_tpu_matmul(
@@ -305,6 +308,47 @@ def multi_head_attention_kernel(
     
     return output if not use_fp8 else output * (Q_scale * V_scale)
 
+def sliding_window_attention(
+    Q: jnp.ndarray,
+    K: jnp.ndarray,
+    V: jnp.ndarray,
+    window_size: int,
+    **kwargs
+) -> jnp.ndarray:
+    """
+    Sliding window attention for efficient long sequence processing.
+    
+    Args:
+        Q, K, V: Query, Key, and Value tensors
+        window_size: Size of the attention window
+        **kwargs: Additional arguments passed to attention kernel
+    """
+    B, H, L, D = Q.shape
+    
+    # Pad sequences for window attention
+    pad_size = window_size // 2
+    K_padded = jnp.pad(K, ((0, 0), (0, 0), (pad_size, pad_size), (0, 0)))
+    V_padded = jnp.pad(V, ((0, 0), (0, 0), (pad_size, pad_size), (0, 0)))
+    
+    # Create rolling windows
+    K_windows = jax.lax.slice(K_padded, (0, 0, 0, 0),
+                             (B, H, L + window_size, D))
+    V_windows = jax.lax.slice(V_padded, (0, 0, 0, 0),
+                             (B, H, L + window_size, D))
+    
+    # Compute attention within windows
+    return multi_head_attention_kernel(
+        Q, K_windows, V_windows,
+        mask=create_window_mask(L, window_size),
+        **kwargs
+    )
+
+def create_window_mask(length: int, window_size: int) -> jnp.ndarray:
+    """Create attention mask for sliding window."""
+    indices = jnp.arange(length)
+    mask = jnp.abs(indices[:, None] - indices[None, :]) <= window_size // 2
+    return mask
+
 def flash_attention(
     Q: jnp.ndarray,
     K: jnp.ndarray,
@@ -313,241 +357,139 @@ def flash_attention(
     block_size: int = 128
 ) -> jnp.ndarray:
     """
-    Flash attention implementation optimized for TPU.
-    Implements attention with O(1) memory complexity.
+    Flash attention implementation with O(1) memory complexity.
     
     Args:
-        Q: Query tensor [batch, num_heads, seq_len_q, head_dim]
-        K: Key tensor [batch, num_heads, seq_len_k, head_dim] 
-        V: Value tensor [batch, num_heads, seq_len_k, head_dim]
+        Q, K, V: Query, Key, and Value tensors
         mask: Optional attention mask
-        block_size: Size of blocks for tiling
+        block_size: Block size for tiling
     """
-    batch_size, num_heads, seq_len_q, head_dim = Q.shape
-    _, _, seq_len_k, _ = K.shape
+    B, H, L, D = Q.shape
+    S = K.shape[2]
     
-    # Scaling factor for better numerical stability
-    scale = 1. / jnp.sqrt(head_dim)
+    # Scaling factor
+    scale = 1. / jnp.sqrt(D)
     
     # Initialize accumulators
-    O = jnp.zeros((batch_size, num_heads, seq_len_q, head_dim))
-    L = jnp.ones((batch_size, num_heads, seq_len_q, 1)) * -jnp.inf
-    m = jnp.ones((batch_size, num_heads, seq_len_q, 1)) * -jnp.inf
+    O = jnp.zeros_like(Q)
+    L_acc = jnp.ones((B, H, L, 1)) * -jnp.inf
+    m_acc = jnp.ones((B, H, L, 1)) * -jnp.inf
     
-    # Process blocks of keys and values
-    for block_start in range(0, seq_len_k, block_size):
-        block_end = min(block_start + block_size, seq_len_k)
+    # Process blocks of K/V
+    def process_kv_block(carry, block_start):
+        O, L_acc, m_acc = carry
+        block_end = jnp.minimum(block_start + block_size, S)
         
         # Get current blocks
-        K_block = K[:, :, block_start:block_end]
-        V_block = V[:, :, block_start:block_end]
+        K_block = jax.lax.dynamic_slice(
+            K,
+            (0, 0, block_start, 0),
+            (B, H, block_end - block_start, D)
+        )
+        V_block = jax.lax.dynamic_slice(
+            V,
+            (0, 0, block_start, 0),
+            (B, H, block_end - block_start, D)
+        )
         
-        # Compute attention scores for current block
-        S_block = jnp.einsum('bhqd,bhkd->bhqk', Q, K_block) * scale
+        # Compute attention scores
+        S_block = jnp.einsum('bhld,bhkd->bhlk', Q, K_block) * scale
         
         # Apply mask if provided
         if mask is not None:
-            mask_block = mask[:, :, :, block_start:block_end]
+            mask_block = jax.lax.dynamic_slice(
+                mask,
+                (0, 0, 0, block_start),
+                (B, H, L, block_end - block_start)
+            )
             S_block = jnp.where(mask_block, S_block, -jnp.inf)
         
         # Update running maximum
         m_block = jnp.max(S_block, axis=-1, keepdims=True)
-        m_new = jnp.maximum(m, m_block)
+        m_new = jnp.maximum(m_acc, m_block)
         
-        # Update output and normalization factor
+        # Update output
         exp_block = jnp.exp(S_block - m_new)
-        L_new = L * jnp.exp(m - m_new) + jnp.sum(exp_block, axis=-1, keepdims=True)
+        L_new = L_acc * jnp.exp(m_acc - m_new) + jnp.sum(exp_block, axis=-1, keepdims=True)
         
-        O = (O * jnp.exp(m - m_new) + 
-             jnp.einsum('bhqk,bhkd->bhqd', exp_block, V_block)) / L_new
+        O_new = (O * jnp.exp(m_acc - m_new) +
+                jnp.einsum('bhlk,bhkd->bhld', exp_block, V_block)) / L_new
         
-        # Update running statistics
-        L = L_new
-        m = m_new
+        return (O_new, L_new, m_new), None
+    
+    # Process all blocks
+    (O, _, _), _ = jax.lax.scan(
+        process_kv_block,
+        (O, L_acc, m_acc),
+        jnp.arange(0, S, block_size)
+    )
     
     return O
 
+# TPU-optimized RoPE implementation with precomputed tables
+class RoPEConfig(NamedTuple):
+    """RoPE configuration."""
+    dim: int
+    base: int = 10000
+    scale: float = 1.0
+    max_position: int = 32768
+    use_precomputed: bool = True
+    dtype: Any = jnp.float32
+
+def create_rope_cache(config: RoPEConfig) -> Dict[str, jnp.ndarray]:
+    """Create cached RoPE tables."""
+    freqs = config.scale * jnp.arange(0, config.dim, 2) / config.dim
+    freqs = 1.0 / (config.base ** freqs)
+    
+    pos = jnp.arange(config.max_position, dtype=config.dtype)
+    theta = pos[:, None] * freqs[None, :]
+    
+    return {
+        "cos": jnp.cos(theta).astype(config.dtype),
+        "sin": jnp.sin(theta).astype(config.dtype)
+    }
+
 def rope_embedding(
     x: jnp.ndarray,
-    dim: int,
-    base: int = 10000,
-    scale: float = 1.0
+    config: RoPEConfig,
+    cache: Optional[Dict[str, jnp.ndarray]] = None
 ) -> jnp.ndarray:
     """
     Rotary Position Embedding optimized for TPU.
     
     Args:
         x: Input tensor [batch, seq_len, num_heads, head_dim]
-        dim: Dimension of the embedding
-        base: Base for the angle computation
-        scale: Scale factor for the embedding
+        config: RoPE configuration
+        cache: Optional precomputed tables
     """
-    # Generate position indices
-    position = jnp.arange(x.shape[1], dtype=jnp.float32)
+    B, L, H, D = x.shape
+    assert D == config.dim, f"Dimension mismatch: {D} != {config.dim}"
     
-    # Generate frequency bands
-    freq = scale * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim
-    freq = 1.0 / (base ** freq)
+    if cache is None and config.use_precomputed:
+        cache = create_rope_cache(config)
     
-    # Compute angles
-    angles = position[:, None] * freq[None, :]
-    
-    # Generate rotation matrices
-    sin = jnp.sin(angles)
-    cos = jnp.cos(angles)
+    if cache is not None:
+        cos = cache["cos"][:L]  # [L, D//2]
+        sin = cache["sin"][:L]
+    else:
+        freqs = config.scale * jnp.arange(0, D, 2) / D
+        freqs = 1.0 / (config.base ** freqs)
+        theta = jnp.arange(L)[:, None] * freqs[None, :]
+        cos = jnp.cos(theta)
+        sin = jnp.sin(theta)
     
     # Reshape for broadcasting
-    sin = sin[None, :, None, :].repeat(x.shape[2], axis=2)
-    cos = cos[None, :, None, :].repeat(x.shape[2], axis=2)
+    cos = cos[None, :, None, :]  # [1, L, 1, D//2]
+    sin = sin[None, :, None, :]
     
-    # Apply rotations
+    # Split input
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
+    
+    # Apply rotation
     rotated = jnp.stack([
         x1 * cos - x2 * sin,
         x1 * sin + x2 * cos
     ], axis=-1)
     
     return rotated.reshape(x.shape)
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    """Apply rotary position embeddings to queries and keys."""
-    # Rotate queries and keys
-    q_rot = rotate_half(q)
-    k_rot = rotate_half(k)
-    
-    # Apply rotary embeddings
-    q_out = q * cos + q_rot * sin
-    k_out = k * cos + k_rot * sin
-    
-    return q_out, k_out
-
-# TPU performance utilities
-def auto_sharding(x: jnp.ndarray, num_devices: int) -> jnp.ndarray:
-    """Automatically shard tensor across TPU devices."""
-    return jax.device_put_sharded(
-        list(np.array_split(x, num_devices)), 
-        jax.devices()[:num_devices]
-    )
-
-def batch_norm_tpu(
-    x: jnp.ndarray,
-    mean: jnp.ndarray,
-    var: jnp.ndarray,
-    scale: Optional[jnp.ndarray] = None,
-    bias: Optional[jnp.ndarray] = None,
-    epsilon: float = 1e-5
-) -> jnp.ndarray:
-    """TPU-optimized batch normalization."""
-    inv = lax.rsqrt(var + epsilon)
-    if scale is not None:
-        inv = inv * scale
-    x = (x - mean) * inv
-    if bias is not None:
-        x = x + bias
-    return x
-
-def weight_dequant(x: jnp.ndarray, s: jnp.ndarray) -> jnp.ndarray:
-    """
-    Dequantizes the given weight tensor using the provided scale tensor.
-    
-    Args:
-        x (jnp.ndarray): The quantized weight tensor of shape (M, N).
-        s (jnp.ndarray): The scale tensor.
-        
-    Returns:
-        jnp.ndarray: The dequantized weight tensor of the same shape as `x`.
-    """
-    # Ensure inputs are 2D
-    assert x.ndim == 2 and s.ndim == 2, 'Input tensors must have 2 dimensions'
-    
-    # Dequantize by multiplying with scale
-    # For TPU, we would use a custom dequantization operator here
-    # but for this example, we'll just multiply
-    return x * s
-
-def block_matmul(a_block, b_block, a_scale_block, b_scale_block):
-    """Perform scaled matrix multiplication for a single block."""
-    # Convert to higher precision for accumulation
-    a_block = a_block.astype(jnp.float32)
-    b_block = b_block.astype(jnp.float32)
-    
-    # Apply scales
-    result = jnp.matmul(a_block, b_block) * a_scale_block * b_scale_block
-    return result
-
-@partial(jax.jit, static_argnums=(4, 5, 6))
-def fp8_gemm(a: jnp.ndarray, a_s: jnp.ndarray, b: jnp.ndarray, b_s: jnp.ndarray, 
-             block_size_m: int = 32, block_size_n: int = 64, block_size_k: int = 128) -> jnp.ndarray:
-    """
-    Perform a matrix multiplication using FP8 precision for TPU.
-    
-    Args:
-        a (jnp.ndarray): The first input matrix.
-        a_s (jnp.ndarray): The scaling factor for the first input matrix.
-        b (jnp.ndarray): The second input matrix.
-        b_s (jnp.ndarray): The scaling factor for the second input matrix.
-        block_size_m (int): Block size for the M dimension. Default is 32.
-        block_size_n (int): Block size for the N dimension. Default is 64.
-        block_size_k (int): Block size for the K dimension. Default is 128.
-        
-    Returns:
-        jnp.ndarray: The result of the matrix multiplication.
-    """
-    M, K = a.shape
-    N = b.shape[0]
-    
-    # Initialize output
-    c = jnp.zeros((M, N), dtype=jnp.float32)
-    
-    # For a true TPU implementation, we would use TPU's native GEMM with scaling
-    # Here we demonstrate the block-wise approach as a reference
-    
-    # Define a scan function to process blocks
-    def process_block(i, j, k, result):
-        a_block = lax.dynamic_slice(a, (i, k), (min(block_size_m, M-i), min(block_size_k, K-k)))
-        b_block = lax.dynamic_slice(b, (j, k), (min(block_size_n, N-j), min(block_size_k, K-k)))
-        
-        # Get corresponding scale factors
-        a_scale_block = lax.dynamic_slice(a_s, (i, k//block_size_k), 
-                                         (min(block_size_m, M-i), 1))
-        b_scale_block = lax.dynamic_slice(b_s, (j//block_size_k, k//block_size_k), 
-                                         (1, 1))
-        
-        # Perform scaled matrix multiplication for this block
-        block_result = block_matmul(a_block, b_block, a_scale_block, b_scale_block)
-        
-        # Update result
-        result_slice = lax.dynamic_slice(result, (i, j), (min(block_size_m, M-i), min(block_size_n, N-j)))
-        result_slice = result_slice + block_result
-        result = lax.dynamic_update_slice(result, result_slice, (i, j))
-        return result
-    
-    # For demonstration, we'll use a simple loop - in practice
-    # you would use JAX's scan or other optimized operations
-    for i in range(0, M, block_size_m):
-        for j in range(0, N, block_size_n):
-            for k in range(0, K, block_size_k):
-                c = process_block(i, j, k, c)
-    
-    return c
-
-# Example usage:
-def example_usage():
-    # Create sample data
-    a = jnp.ones((1024, 1024), dtype=jnp.float32)
-    b = jnp.ones((1024, 1024), dtype=jnp.float32)
-    
-    # Quantize the inputs
-    a_quant, a_scale = act_quant(a)
-    b_quant, b_scale = act_quant(b)
-    
-    # Perform FP8 matrix multiplication
-    result = fp8_gemm_optimized(a_quant, a_scale, b_quant, b_scale)
-    return result

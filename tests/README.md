@@ -1,235 +1,202 @@
 # VishwamAI Kernel Tests
 
-This directory contains the test suite for VishwamAI kernels across different hardware platforms (TPU, GPU, CPU).
+Test suite for VishwamAI kernels across different hardware platforms (TPU, GPU, CPU).
 
-## Setup
+## Quick Start
 
 1. Install test dependencies:
 ```bash
-pip install -r requirements-test.txt
+# For CPU-only testing
+pip install -e "tests/.[dev]"
+
+# For GPU testing
+pip install -e "tests/.[gpu,dev]"
+
+# For TPU testing
+pip install -e "tests/.[tpu,dev]"
+
+# For all features (including benchmarks)
+pip install -e "tests/.[all]"
 ```
 
-2. Platform-specific setup:
-
-### TPU Setup
+2. Run tests:
 ```bash
-# Install TPU support
-pip install "jax[tpu]>=0.4.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# Using test runner (recommended)
+./tests/run_tests.py                   # All available platforms
+./tests/run_tests.py --platform cpu    # CPU only
+./tests/run_tests.py --platform gpu    # GPU only
+./tests/run_tests.py --platform tpu    # TPU only
 
-# Configure TPU access
-export TPU_NAME="local"
-export XRT_TPU_CONFIG="localservice;0;localhost:51011"
-```
-
-### GPU Setup
-```bash
-# Install CUDA support
-pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118
-
-# Set CUDA device (optional)
-export CUDA_VISIBLE_DEVICES="0"
-```
-
-## Running Tests
-
-### Using the Test Runner
-
-```bash
-# Run all tests
-python tests/run_tests.py
-
-# Run platform-specific tests
-python tests/run_tests.py --platform tpu
-python tests/run_tests.py --platform gpu
-python tests/run_tests.py --platform cpu
-
-# Run with benchmarks
-python tests/run_tests.py --benchmark
-
-# Run specific test types
-python tests/run_tests.py --test-type unit
-python tests/run_tests.py --test-type integration
-
-# Run with verbose output
-python tests/run_tests.py -v
-```
-
-### Using pytest Directly
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run specific test file
-pytest tests/test_kernels.py
-
-# Run tests with specific marker
-pytest -m tpu tests/
-pytest -m gpu tests/
-
-# Run tests in parallel
-pytest -n auto tests/
-
-# Generate coverage report
-pytest --cov=vishwamai.kernels tests/
+# Using pytest directly
+pytest tests/                          # Run all tests
+pytest -m gpu tests/                   # Run GPU tests only
+pytest -m tpu tests/                   # Run TPU tests only
 ```
 
 ## Test Organization
 
-### Directory Structure
 ```
 tests/
 ├── __init__.py          # Test package initialization
 ├── conftest.py          # pytest configuration and fixtures
 ├── requirements-test.txt # Test dependencies
 ├── run_tests.py         # Test runner script
+├── setup.py            # Test package setup
 └── test_kernels.py      # Main test suite
 ```
 
-### Test Categories
+## Platform Support
 
-1. Matrix Operations
-- Basic matrix multiplication
-- Hybrid matrix operations
-- Sparse matrix operations
+### CPU
+- Always available
+- Vectorized operations with NumPy
+- Multi-threading support
+- SIMD optimizations
 
-2. Attention Mechanisms
-- Flash attention
-- Multi-head attention
-- Sliding window attention
+### GPU
+- Requires CUDA-capable GPU
+- PyTorch backend
+- Tensor core optimizations
+- Automatic mixed precision
 
-3. Layer Operations
-- Layer normalization
-- Expert parallelism
-- Fusion patterns
+### TPU
+- Requires TPU access
+- JAX/XLA backend
+- SPMD support
+- BFloat16 optimization
 
-4. Integration Tests
-- End-to-end kernel pipelines
-- Cross-platform operations
-- Memory management
+## Running Benchmarks
 
-## Performance Benchmarks
-
-Run benchmarks with:
 ```bash
-python tests/run_tests.py --benchmark
+# Run all benchmarks
+./tests/run_tests.py --benchmark
+
+# Platform-specific benchmarks
+./tests/run_tests.py --platform gpu --benchmark
+./tests/run_tests.py --platform tpu --benchmark
+
+# Generate benchmark report
+pytest --benchmark-only --benchmark-json=report.json tests/
 ```
 
-### Benchmark Categories
+## Test Types
 
-1. Speed Tests
-- Operation latency
-- Throughput measurements
-- Scaling behavior
-
-2. Memory Tests
-- Memory usage patterns
-- Peak memory consumption
-- Memory bandwidth
-
-3. Platform-Specific Tests
-- TPU MXU utilization
-- GPU SM occupancy
-- CPU cache performance
-
-## Test Coverage
-
-Generate coverage report:
+### Unit Tests
 ```bash
-pytest --cov=vishwamai.kernels --cov-report=html tests/
+./tests/run_tests.py --test-type unit
 ```
 
-Expected coverage areas:
-- Core kernel operations
-- Platform-specific optimizations
-- Memory management
-- Error handling
+### Integration Tests
+```bash
+./tests/run_tests.py --test-type integration
+```
 
-## Adding New Tests
+### Performance Tests
+```bash
+# Run benchmarks with detailed profiling
+./tests/run_tests.py --benchmark --verbose
+```
 
-1. Test Structure:
+## Common Issues
+
+### TPU Not Found
+```
+Error: TPU platform not available
+```
+Solution:
+1. Check TPU environment variables
+2. Verify JAX TPU installation
+3. Check TPU connectivity
+
+### CUDA Not Available
+```
+Error: GPU platform not available
+```
+Solution:
+1. Check CUDA installation
+2. Verify GPU drivers
+3. Check PyTorch CUDA support
+
+### Memory Issues
+```
+CUDA out of memory
+```
+Solution:
+1. Reduce batch size
+2. Clear GPU cache
+3. Use gradient checkpointing
+
+## Development
+
+### Adding New Tests
+
+1. Create test function:
 ```python
 @pytest.mark.platform  # tpu, gpu, or cpu
 def test_new_feature():
-    """Test docstring describing purpose."""
-    # Test setup
-    data = prepare_test_data()
-    
-    # Test execution
-    result = run_operation(data)
-    
-    # Test validation
-    validate_result(result)
+    """Test docstring."""
+    # Test implementation
 ```
 
-2. Performance Test:
+2. Add to test suite:
 ```python
-@pytest.mark.benchmark
-def test_performance(benchmark):
-    """Benchmark docstring."""
-    benchmark(operation_to_test, test_data)
+# In test_kernels.py
+class TestNewFeature:
+    def test_operation(self):
+        pass
 ```
 
-## Debugging Tests
+### Running Tests in Development
 
-### Common Issues
+```bash
+# Run with verbose output
+./tests/run_tests.py -v
 
-1. Platform Availability
-```python
-# Check platform availability
-if not jax.devices('tpu'):
-    pytest.skip("No TPU available")
+# Run specific test
+pytest tests/test_kernels.py::TestClass::test_function
+
+# Run with debugger
+pytest --pdb tests/
 ```
 
-2. Memory Management
-```python
-# Clear device memory
-@pytest.fixture(autouse=True)
-def clear_memory():
-    yield
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+### Code Style
+
+```bash
+# Format code
+black tests/
+
+# Check types
+mypy tests/
+
+# Sort imports
+isort tests/
 ```
 
-3. Device Placement
-```python
-# Ensure correct device placement
-data = place_on_device(data, platform)
+## CI/CD Integration
+
+The test suite is designed to work with CI/CD pipelines:
+
+```yaml
+# Example GitHub Actions workflow
+test:
+  runs-on: ubuntu-latest
+  strategy:
+    matrix:
+      platform: [cpu, gpu]
+  steps:
+    - uses: actions/checkout@v2
+    - name: Run tests
+      run: |
+        pip install -e ".[${matrix.platform},dev]"
+        ./tests/run_tests.py --platform ${{ matrix.platform }}
 ```
-
-### Troubleshooting
-
-1. Memory Issues:
-- Use `--memprof` flag for memory profiling
-- Check for memory leaks with `pytest-leaks`
-- Monitor device memory usage
-
-2. Performance Issues:
-- Use `--benchmark-only` for focused testing
-- Profile with `--benchmark-histogram`
-- Check operation fusion with XLA debug flags
-
-3. Platform Issues:
-- Verify platform availability
-- Check device configurations
-- Validate environment variables
 
 ## Contributing
 
-1. Adding Tests:
-- Follow existing test structure
-- Include docstrings and type hints
-- Add appropriate markers
-- Update test documentation
+1. Follow test structure
+2. Add appropriate markers
+3. Include performance tests
+4. Update documentation
+5. Run full test suite
 
-2. Running CI:
-- Ensure all tests pass
-- Check coverage requirements
-- Verify cross-platform compatibility
-- Run performance benchmarks
-
-3. Code Review:
-- Follow style guide
-- Include test cases
-- Document changes
-- Update requirements if needed
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for more details.

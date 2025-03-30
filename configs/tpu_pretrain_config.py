@@ -1,34 +1,55 @@
 """TPU-optimized pre-training configuration."""
 
 def get_pretrain_config():
-    """Get TPU-optimized pre-training configuration."""
+    """Get TPU-optimized pre-training configuration for Gemma distillation."""
     return {
         "model": {
-            "vocab_size": 32000,
-            "num_layers": 24,
-            "num_heads": 16,
-            "head_dim": 64,
-            "hidden_dim": 1024,  # Multiple of 128 for TPU efficiency
-            "mlp_dim": 4096,
-            "max_seq_len": 2048,
-            "dropout_rate": 0.1,
+            "vocab_size": 256000,  # Gemma vocabulary size
+            "num_layers": 32,      # 7B model size
+            "num_heads": 32,
+            "head_dim": 128,
+            "hidden_dim": 4096,
+            "mlp_dim": 14336,
+            "max_seq_len": 32768,
+            "dropout_rate": 0.0,
             "use_flash_attn": True,
-            "use_rotary": True,
+            "use_rope": True,
             "use_rms_norm": True
         },
+        "thinking": {
+            "num_steps": 5,         # Increased thinking steps
+            "max_branches": 4,      # More thought branches
+            "beam_width": 3,        # Beam search width
+            "temperature": 0.7,     # Higher temperature for more diversity
+            "use_value_network": True,
+            "use_temporal_integration": True,
+            "thought_refinement_iterations": 2
+        },
+        "distillation": {
+            "teacher_model": "gemma-27b",
+            "student_model": "gemma-7b",
+            "temperature": 2.0,
+            "alpha": 0.5,
+            "use_intermediate_distillation": True,
+            "layer_mapping_strategy": "uniform_span"
+        },
         "training": {
-            "batch_size": 16,  # Per device batch size
-            "grad_accum_steps": 4,  # Global batch size = 16 * 4 * 8 = 512
-            "learning_rate": 1e-4,
-            "warmup_steps": 2000,
-            "max_steps": 100000,
-            "weight_decay": 0.01,
+            "batch_size": 16,
+            "grad_accum_steps": 8,
+            "learning_rate": 5e-5,
+            "warmup_steps": 4000,
+            "max_steps": 500000,
+            "weight_decay": 0.1,
             "max_grad_norm": 1.0,
+            "checkpoint_steps": 5000
         },
         "optimization": {
-            "dtype": "bfloat16",  # TPU native format
+            "dtype": "bfloat16",
             "mixed_precision": True,
-            "block_size": 128,  # Optimal for TPU
+            "block_size": 128,
+            "use_fp8_gemm": True,
+            "gradient_checkpointing": True,
+            "teacher_load_dtype": "bfloat16"
         },
         "tpu": {
             "num_devices": 8,

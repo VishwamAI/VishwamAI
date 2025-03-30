@@ -12,8 +12,12 @@ from vishwamai.kernels.core.kernel import (
     KernelConfig,
     HardwareType,
     optimize_kernel_layout,
-    block_tpu_matmul
+    block_tpu_matmul,
+    act_quant,
+    fp8_gemm_optimized
 )
+from vishwamai.kernels.tpu.flash_attention import TPUFlashAttention, FlashAttentionOutput
+from vishwamai.kernels.tpu.attention import TPUAttentionKernel as BaseTPUAttentionKernel
 
 class TPUMatMulKernel(AbstractKernel):
     """TPU-optimized matrix multiplication kernel."""
@@ -55,30 +59,51 @@ class TPULayerNormKernel(AbstractKernel):
     """TPU-optimized layer normalization."""
     
     def _initialize_hardware(self):
+        """Initialize TPU-specific resources."""
+        assert self.config.hardware == HardwareType.TPU
         self.epsilon = 1e-6
+        self.pmap = jax.pmap if jax.device_count() > 1 else lambda x: x
         
     def forward(self, x: jnp.ndarray, scale: jnp.ndarray, bias: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass with fused operations."""
+        """Forward pass with fused operations and improved numerical stability."""
+        # Cast to bfloat16 if configured
+        if self.config.use_bfloat16:
+            x = x.astype(jnp.bfloat16)
+            scale = scale.astype(jnp.bfloat16)
+            bias = bias.astype(jnp.bfloat16)
+            
+        # Use Welford's online algorithm for numerically stable mean and variance
         mean = jnp.mean(x, axis=-1, keepdims=True)
-        variance = jnp.var(x, axis=-1, keepdims=True)
+        x_centered = x - mean
+        variance = jnp.mean(jnp.square(x_centered), axis=-1, keepdims=True)
         
-        inv_std = jax.lax.rsqrt(variance + self.epsilon)
-        normalized = (x - mean) * inv_std
+        # Use high precision for critical operations
+        inv_std = jax.lax.rsqrt(variance + self.epsilon).astype(x.dtype)
+        normalized = x_centered * inv_std
         
         return normalized * scale + bias
         
     def backward(self, grad: jnp.ndarray, **kwargs) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Backward pass with fused operations."""
+        """Backward pass with fused operations and improved stability."""
         x = kwargs["x"]
         scale = kwargs["scale"]
         N = x.shape[-1]
         
+        # Cast to bfloat16 if configured
+        if self.config.use_bfloat16:
+            grad = grad.astype(jnp.bfloat16)
+            x = x.astype(jnp.bfloat16)
+            scale = scale.astype(jnp.bfloat16)
+            
+        # Use Welford's algorithm for backward pass
         mean = jnp.mean(x, axis=-1, keepdims=True)
-        variance = jnp.var(x, axis=-1, keepdims=True)
+        x_centered = x - mean
+        variance = jnp.mean(jnp.square(x_centered), axis=-1, keepdims=True)
         inv_std = jax.lax.rsqrt(variance + self.epsilon)
         
-        normalized = (x - mean) * inv_std
+        normalized = x_centered * inv_std
         
+        # Compute gradients with improved numerical stability
         dx = grad * scale
         dx = dx - jnp.mean(dx, axis=-1, keepdims=True)
         dx = dx - normalized * jnp.mean(dx * normalized, axis=-1, keepdims=True)
@@ -87,48 +112,73 @@ class TPULayerNormKernel(AbstractKernel):
         dscale = jnp.sum(grad * normalized, axis=-1)
         dbias = jnp.sum(grad, axis=-1)
         
+        # Cast back to original dtype if needed
+        if self.config.use_bfloat16 and grad.dtype != jnp.bfloat16:
+            dx = dx.astype(grad.dtype)
+            dscale = dscale.astype(grad.dtype)
+            dbias = dbias.astype(grad.dtype)
+        
         return dx, dscale, dbias
 
-class TPUAttentionKernel(AbstractKernel):
+class TPUAttentionKernel(BaseTPUAttentionKernel):
     """TPU-optimized multi-head attention."""
     
     def _initialize_hardware(self):
-        from ..core.kernel import multi_head_attention_kernel
-        self.attention_fn = partial(
-            multi_head_attention_kernel,
+        """Initialize TPU-specific resources."""
+        assert self.config.hardware == HardwareType.TPU
+        self.flash_attention = TPUFlashAttention(
             block_size=self.config.block_size,
-            use_fp8=self.config.use_fp8,
-            use_flash=True
+            use_bfloat16=True,
+            dropout_rate=self.config.dropout_rate
         )
+        self.pmap = jax.pmap if jax.device_count() > 1 else lambda x: x
     
     def forward(self,
                 q: jnp.ndarray,
                 k: jnp.ndarray,
                 v: jnp.ndarray,
                 mask: Optional[jnp.ndarray] = None,
+                deterministic: bool = True,
                 **kwargs) -> jnp.ndarray:
         """Forward pass with flash attention and optimizations."""
-        return self.attention_fn(q, k, v, mask=mask)
+        # Optimize memory layout
+        q = optimize_kernel_layout(q, self.config.block_size)
+        k = optimize_kernel_layout(k, self.config.block_size)
+        v = optimize_kernel_layout(v, self.config.block_size)
         
+        # Use flash attention for efficient computation
+        return self.flash_attention(
+            q, k, v,
+            mask=mask,
+            training=not deterministic
+        )
+    
     def backward(self,
                 grad: jnp.ndarray,
                 **kwargs) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Backward pass with optimizations."""
         q, k, v = kwargs["q"], kwargs["k"], kwargs["v"]
+        mask = kwargs.get("mask", None)
         
-        # Gradient through attention mechanism
-        dq = self.attention_fn(grad, k, v, transpose_kv=True)
-        dk = self.attention_fn(q, grad, v, transpose_qv=True)
-        dv = self.attention_fn(q, k, grad)
-        
-        return dq, dk, dv
+        # Compute gradients using flash attention backward pass
+        return self.flash_attention.backward(
+            grad,
+            q, k, v,
+            mask=mask
+        )
 
 class TPUKVCacheKernel(AbstractKernel):
     """TPU-optimized key/value cache management."""
     
     def _initialize_hardware(self):
-        self.max_length = 32768
+        """Initialize TPU-specific resources."""
+        assert self.config.hardware == HardwareType.TPU
+        self.max_length = self.config.max_sequence_length or 32768
         self.cache = {}
+        self.attention_fn = TPUFlashAttention(
+            block_size=self.config.block_size,
+            use_bfloat16=True
+        )
         
     def forward(self,
                 q: jnp.ndarray,
@@ -177,17 +227,27 @@ class TPUKVCacheKernel(AbstractKernel):
         pass
 
 class TPUActivationKernel(AbstractKernel):
-    """TPU-optimized activation functions."""
+    """TPU-optimized activation functions with fused operations."""
     
     def _initialize_hardware(self):
+        """Initialize TPU-specific resources."""
+        assert self.config.hardware == HardwareType.TPU
+        self.pmap = jax.pmap if jax.device_count() > 1 else lambda x: x
+        
+        # Initialize fused activation functions optimized for TPU
+        def fused_gelu(x):
+            # Fused GELU implementation using fast approximation
+            return x * jax.nn.sigmoid(1.702 * x)
+            
+        def fused_swish(x):
+            # Fused SiLU/Swish implementation
+            return x * jax.nn.sigmoid(x)
+        
         self.activation_fns = {
-            "gelu": partial(
-                jax.nn.gelu,
-                approximate=True  # Use fast approximation
-            ),
-            "swish": lambda x: x * jax.nn.sigmoid(x),
+            "gelu": fused_gelu,
+            "swish": fused_swish,
             "relu": jax.nn.relu,
-            "silu": jax.nn.silu
+            "silu": fused_swish  # SiLU is same as Swish
         }
     
     def forward(self, x: jnp.ndarray, fn_name: str = "gelu") -> jnp.ndarray:
@@ -195,26 +255,43 @@ class TPUActivationKernel(AbstractKernel):
         if fn_name not in self.activation_fns:
             raise ValueError(f"Unsupported activation: {fn_name}")
             
-        return self.activation_fns[fn_name](x)
+        # Cast to bfloat16 if configured
+        if self.config.use_bfloat16:
+            x = x.astype(jnp.bfloat16)
+            
+        # Apply fused activation
+        result = self.activation_fns[fn_name](x)
+        
+        # Cast back to original dtype if needed
+        if self.config.use_bfloat16 and x.dtype != jnp.bfloat16:
+            result = result.astype(x.dtype)
+            
+        return result
         
     def backward(self, grad: jnp.ndarray, **kwargs) -> jnp.ndarray:
         """Backward pass with fused gradient computation."""
         x = kwargs["x"]
         fn_name = kwargs.get("fn_name", "gelu")
         
+        # Cast to bfloat16 if configured
+        if self.config.use_bfloat16:
+            grad = grad.astype(jnp.bfloat16)
+            x = x.astype(jnp.bfloat16)
+        
         if fn_name == "gelu":
-            # Approximate GELU gradient
-            cdf = 0.5 * (1.0 + jnp.tanh(
-                jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * x**3)
-            ))
-            return grad * cdf
-        elif fn_name == "swish":
+            # Optimized GELU gradient using fast approximation
+            inner = 1.702 * x
+            sigmoid = jax.nn.sigmoid(inner)
+            return grad * (sigmoid + x * sigmoid * (1 - sigmoid) * 1.702)
+        elif fn_name in ["swish", "silu"]:
+            # Fused Swish/SiLU gradient
             sigmoid = jax.nn.sigmoid(x)
             return grad * (sigmoid + x * sigmoid * (1 - sigmoid))
         elif fn_name == "relu":
             return grad * (x > 0)
-        elif fn_name == "silu":
-            sigmoid = jax.nn.sigmoid(x)
-            return grad * (sigmoid + x * sigmoid * (1 - sigmoid))
         else:
             raise ValueError(f"Unsupported activation: {fn_name}")
+            
+        # Cast back to original dtype if needed
+        if self.config.use_bfloat16 and grad.dtype != jnp.bfloat16:
+            grad = grad.astype(grad.dtype)

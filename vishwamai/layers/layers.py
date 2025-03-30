@@ -626,49 +626,29 @@ MoELayer = TPUMoELayer
 
 
 class TPURMSNorm(nn.Module):
-    """TPU-optimized RMS Normalization layer."""
+    """TPU-optimized Root Mean Square normalization layer."""
     epsilon: float = 1e-6
-    dtype: Any = jnp.float32
+    dtype: Any = jnp.bfloat16
     scale_init: Any = nn.initializers.ones
-    bias_init: Any = nn.initializers.zeros
-    use_scale: bool = True
-    use_bias: bool = True
-    axis: int = -1
-    
+
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Apply RMS normalization to the input tensor.
+        # Cast input to compute type for better numerical stability
+        x = x.astype(jnp.float32)
         
-        Args:
-            x: Input tensor of shape [..., features]
-            
-        Returns:
-            Normalized tensor of the same shape as input
-        """
-        # Compute RMS along the specified axis
-        rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=self.axis, keepdims=True) + self.epsilon)
+        # Get feature shape for scale parameter
+        feature_shape = (x.shape[-1],)
         
-        # Normalize
-        y = x / rms
+        # Initialize scale parameter
+        scale = self.param('scale', self.scale_init, feature_shape)
+        scale = scale.astype(self.dtype)
         
-        # Apply learnable scale
-        if self.use_scale:
-            scale = self.param('scale', 
-                             self.scale_init, 
-                             (x.shape[self.axis],), 
-                             self.dtype)
-            y = y * scale
-            
-        # Apply learnable bias
-        if self.use_bias:
-            bias = self.param('bias',
-                            self.bias_init,
-                            (x.shape[self.axis],),
-                            self.dtype)
-            y = y + bias
-            
-        return y.astype(self.dtype)
+        # Compute RMS normalization
+        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+        x_normalized = x * jax.lax.rsqrt(variance + self.epsilon)
+        
+        # Apply scale and cast back to working precision
+        return (x_normalized * scale).astype(self.dtype)
 
 # Add to layer factory
 def create_layer_factory(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -952,7 +932,6 @@ class TPUGroupedQueryAttention(nn.Module):
                     present = None
         else:
             # Standard scaled dot-product attention
-            # ... (similar to TPUMultiQueryAttention implementation)
             scale = 1.0 / jnp.sqrt(self.head_dim)
             attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
             

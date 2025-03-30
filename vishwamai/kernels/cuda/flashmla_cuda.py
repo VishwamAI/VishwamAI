@@ -8,9 +8,18 @@ import numpy as np
 import os
 import sys
 import warnings
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
+from jax.sharding import PositionalSharding
 
-# Flag to track if we're using the CUDA extension or fallback
+# Initialize TPU device mesh
+devices = jax.devices()
+device_mesh = mesh_utils.create_device_mesh((2, 4))  # 2x4 mesh for 8 TPU cores
+mesh = Mesh(devices, ('batch', 'model'))
+
+# Flag to track execution mode
 USING_CUDA_EXTENSION = False
+USING_TPU = True if 'TPU' in str(jax.devices()[0]) else False
 
 # Try to import CUDA extension
 try:

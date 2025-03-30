@@ -14,8 +14,7 @@ USING_CUDA_EXTENSION = False
 
 # Try to import CUDA extension
 try:
-    import flash_mla_cuda
-    USING_CUDA_EXTENSION = True
+    pass
 except ImportError:
     # Provide helpful warning message
     csrc_path = os.path.join(os.path.dirname(__file__), 'csrc')

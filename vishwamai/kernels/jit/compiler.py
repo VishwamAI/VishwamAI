@@ -1,334 +1,156 @@
-"""JIT compilation system for CUDA and TPU kernels."""
-import hashlib
-import functools
+"""JIT compilation system for kernel optimization."""
+
 import os
-import re
-import subprocess
-import uuid
-from pathlib import Path
-from typing import Tuple, Dict, Any, List, Optional, Union, Callable
+import hashlib
+from typing import Dict, Any, Optional, Callable, Union
 import jax
 import jax.numpy as jnp
-from jax import lax
-from jaxlib.xla_extension import compile_custom_call
+from jax.experimental import maps
+import torch
+from functools import partial, lru_cache
 
-from vishwamai.kernels.core.kernel import KernelConfig
+from ..core.kernel import KernelConfig, HardwareType
 
-class KernelPlatform:
-    """Supported platforms for kernel compilation."""
-    TPU = "tpu"
-    GPU = "gpu"
-    CPU = "cpu"
-
-class KernelTemplate:
-    """Enhanced template for generating kernel code."""
-    
-    def __init__(
-        self,
-        template: str,
-        platform: str = KernelPlatform.TPU,
-        config: Optional[Dict[str, Any]] = None
-    ):
-        self.template = template
-        self.platform = platform
-        self.config = config or {}
-        
-    def instantiate(self, **kwargs) -> str:
-        """
-        Instantiate the template with given parameters.
-        
-        Args:
-            **kwargs: Template parameters
-            
-        Returns:
-            Instantiated kernel code
-        """
-        template_args = {**self.config, **kwargs}
-        
-        # Add platform-specific optimizations
-        if self.platform == KernelPlatform.TPU:
-            template_args.update({
-                "block_size": 128,
-                "use_bfloat16": True,
-                "tpu_layout_opt": True
-            })
-        elif self.platform == KernelPlatform.GPU:
-            template_args.update({
-                "block_size": 64,
-                "use_fp16": True,
-                "use_tensor_cores": True
-            })
-            
-        return self.template.format(**template_args)
-
-@functools.lru_cache(maxsize=None)
-def get_jit_include_dir() -> str:
-    """Return the include directory for JIT kernels."""
-    return f'{os.path.dirname(os.path.abspath(__file__))}/../include'
-
-@functools.lru_cache(maxsize=None)
-def get_compiler_info(platform: str) -> Tuple[str, str]:
-    """
-    Get compiler information for the specified platform.
-    
-    Args:
-        platform: Target platform (tpu/gpu/cpu)
-        
-    Returns:
-        Tuple of (compiler_path, version)
-    """
-    if platform == KernelPlatform.GPU:
-        paths = [f'{os.getenv("CUDA_HOME", "/usr/local/cuda")}/bin/nvcc']
-        version_pattern = re.compile(r'release (\d+\.\d+)')
-        
-        for path in paths:
-            if os.path.exists(path):
-                try:
-                    version_output = subprocess.check_output([path, '--version']).decode('utf-8')
-                    match = version_pattern.search(version_output)
-                    if match:
-                        return path, match.group(1)
-                except (subprocess.SubprocessError, OSError):
-                    continue
-        raise RuntimeError('Cannot find NVCC compiler')
-        
-    elif platform == KernelPlatform.TPU:
-        # For TPU, we use JAX's built-in XLA compiler
-        return "xla", jax.__version__
-    else:
-        return "gcc", "latest"  # Fallback for CPU
-
-class KernelCache:
+class JITCache:
     """Cache for compiled kernels."""
     
-    def __init__(self, platform: str):
-        self.platform = platform
-        self.cache_dir = self._get_cache_dir()
-        self.kernels: Dict[str, Callable] = {}
+    def __init__(self, cache_dir: Optional[str] = None):
+        self.cache_dir = cache_dir or os.path.expanduser("~/.cache/vishwamai/kernels")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.memory_cache = {}
         
-    def _get_cache_dir(self) -> str:
-        """Get platform-specific cache directory."""
-        base_dir = os.path.expanduser('~/.vishwamai_cache')
-        platform_dir = os.path.join(base_dir, self.platform)
-        os.makedirs(platform_dir, exist_ok=True)
-        return platform_dir
+    def get_cache_key(self, code: str, config: Dict[str, Any]) -> str:
+        """Generate cache key from code and config."""
+        config_str = str(sorted(config.items()))
+        content = f"{code}{config_str}".encode()
+        return hashlib.sha256(content).hexdigest()
         
-    def get_kernel(self, name: str, code_hash: str) -> Optional[Callable]:
-        """Get cached kernel if it exists."""
-        key = f"{name}_{code_hash}"
-        
-        if key in self.kernels:
-            return self.kernels[key]
+    def get(self, key: str) -> Optional[Callable]:
+        """Get cached kernel if available."""
+        if key in self.memory_cache:
+            return self.memory_cache[key]
             
-        so_path = os.path.join(self.cache_dir, f"kernel_{key}.so")
-        if os.path.exists(so_path):
-            kernel = compile_custom_call(so_path)
-            self.kernels[key] = kernel
-            return kernel
-            
+        cache_path = os.path.join(self.cache_dir, f"{key}.pkl")
+        if os.path.exists(cache_path):
+            import pickle
+            with open(cache_path, "rb") as f:
+                self.memory_cache[key] = pickle.load(f)
+            return self.memory_cache[key]
         return None
         
-    def cache_kernel(self, name: str, code_hash: str, so_path: str, kernel: Callable):
-        """Cache a compiled kernel."""
-        key = f"{name}_{code_hash}"
-        cached_path = os.path.join(self.cache_dir, f"kernel_{key}.so")
+    def put(self, key: str, kernel: Callable):
+        """Cache compiled kernel."""
+        self.memory_cache[key] = kernel
         
-        if not os.path.exists(cached_path):
-            os.replace(so_path, cached_path)
+        cache_path = os.path.join(self.cache_dir, f"{key}.pkl")
+        import pickle
+        with open(cache_path, "wb") as f:
+            pickle.dump(kernel, f)
+
+class KernelCompiler:
+    """Compile kernels for different hardware targets."""
+    
+    def __init__(self):
+        self.cache = JITCache()
+        
+    def compile_for_tpu(self,
+                       kernel_fn: Callable,
+                       static_argnums: Optional[tuple] = None,
+                       **jit_options) -> Callable:
+        """Compile kernel for TPU execution."""
+        
+        # Create optimized TPU version
+        @partial(jax.jit,
+                static_argnums=static_argnums,
+                backend="tpu",
+                **jit_options)
+        def tpu_kernel(*args, **kwargs):
+            return kernel_fn(*args, **kwargs)
             
-        self.kernels[key] = kernel
-
-# Global kernel caches
-_kernel_caches: Dict[str, KernelCache] = {}
-
-def get_kernel_cache(platform: str) -> KernelCache:
-    """Get or create kernel cache for platform."""
-    if platform not in _kernel_caches:
-        _kernel_caches[platform] = KernelCache(platform)
-    return _kernel_caches[platform]
-
-def compile_kernel(
-    name: str,
-    arg_defs: tuple,
-    template: Union[str, KernelTemplate],
-    platform: str = KernelPlatform.TPU,
-    template_args: Optional[Dict[str, Any]] = None,
-    config: Optional[KernelConfig] = None
-) -> Callable:
-    """
-    Compile a kernel from a template.
-    
-    Args:
-        name: Name of the kernel
-        arg_defs: Tuple of argument types
-        template: Kernel code template or KernelTemplate instance
-        platform: Target platform
-        template_args: Arguments to instantiate template
-        config: Optional kernel configuration
+        # Add optional SPMD compilation
+        def wrapped_kernel(*args, **kwargs):
+            if maps.thread_resources.env.physical_mesh.size > 1:
+                return maps.xmap(
+                    tpu_kernel,
+                    in_axes=("batch", "hidden"),
+                    out_axes=("batch", "hidden"),
+                    axis_resources={"batch": "x", "hidden": "y"}
+                )(*args, **kwargs)
+            return tpu_kernel(*args, **kwargs)
+            
+        return wrapped_kernel
         
-    Returns:
-        Compiled kernel function
-    """
-    if isinstance(template, str):
-        template = KernelTemplate(template, platform, config)
+    def compile_for_gpu(self,
+                       kernel_fn: Callable,
+                       input_spec: Optional[Dict[str, torch.dtype]] = None,
+                       **compile_options) -> Callable:
+        """Compile kernel for GPU execution."""
         
-    code = template.instantiate(**(template_args or {}))
-    return build_kernel(name, arg_defs, code, platform)
-
-def build_kernel(
-    name: str,
-    arg_defs: tuple,
-    code: str,
-    platform: str = KernelPlatform.TPU
-) -> Callable:
-    """
-    Build a custom kernel for the specified platform.
-    
-    Args:
-        name: The kernel name
-        arg_defs: Tuple of argument types
-        code: Kernel code as string
-        platform: Target platform
+        # Create TorchScript version
+        def gpu_kernel(*args, **kwargs):
+            # Convert inputs to correct device/dtype
+            if input_spec:
+                args = [arg.to(dtype=input_spec[f"arg_{i}"]) 
+                       for i, arg in enumerate(args)]
+                for k, v in kwargs.items():
+                    if k in input_spec:
+                        kwargs[k] = v.to(dtype=input_spec[k])
+                        
+            with torch.cuda.amp.autocast():
+                return kernel_fn(*args, **kwargs)
+                
+        # JIT compile with TorchScript
+        return torch.jit.script(gpu_kernel, **compile_options)
         
-    Returns:
-        A compiled kernel that can be called from JAX
-    """
-    code_hash = hashlib.md5(code.encode()).hexdigest()
-    cache = get_kernel_cache(platform)
-    
-    # Check cache first
-    cached_kernel = cache.get_kernel(name, code_hash)
-    if cached_kernel:
-        return cached_kernel
-    
-    # Compile based on platform
-    if platform == KernelPlatform.TPU:
-        kernel = _build_tpu_kernel(name, arg_defs, code)
-    elif platform == KernelPlatform.GPU:
-        kernel = _build_gpu_kernel(name, arg_defs, code)
-    else:
-        kernel = _build_cpu_kernel(name, arg_defs, code)
+    @lru_cache(maxsize=1024)
+    def get_or_compile(self,
+                      kernel_fn: Callable,
+                      config: KernelConfig,
+                      kernel_name: str,
+                      static_argnums: Optional[tuple] = None,
+                      input_spec: Optional[Dict[str, Any]] = None,
+                      **compile_options) -> Callable:
+        """Get cached kernel or compile new one."""
         
-    # Cache the result
-    cache.cache_kernel(name, code_hash, f"{cache.cache_dir}/tmp_{uuid.uuid4()}.so", kernel)
-    
-    return kernel
-
-def _build_tpu_kernel(name: str, arg_defs: tuple, code: str) -> Callable:
-    """Build TPU kernel using JAX/XLA."""
-    # For TPU, we use JAX's primitives and XLA
-    def kernel_impl(*args):
-        # Convert code to XLA HLO operations
-        # This is a simplified example - actual implementation would parse the code
-        # and generate appropriate JAX operations
-        if "matmul" in name.lower():
-            return jax.lax.dot_general(args[0], args[1], dimension_numbers=(((1,), (0,)), ((), ())))
-        elif "reduce" in name.lower():
-            return jax.lax.reduce(args[0], 0., jax.lax.add, dimensions=(0,))
+        # Generate cache key
+        key = self.cache.get_cache_key(
+            kernel_name,
+            {
+                "config": config.__dict__,
+                "static_argnums": static_argnums,
+                "input_spec": input_spec,
+                "compile_options": compile_options
+            }
+        )
+        
+        # Check cache first
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+            
+        # Compile for target hardware
+        if config.hardware == HardwareType.TPU:
+            kernel = self.compile_for_tpu(
+                kernel_fn,
+                static_argnums=static_argnums,
+                **compile_options
+            )
+        elif config.hardware == HardwareType.GPU:
+            kernel = self.compile_for_gpu(
+                kernel_fn,
+                input_spec=input_spec,
+                **compile_options
+            )
         else:
-            raise NotImplementedError(f"TPU kernel type not implemented: {name}")
+            kernel = kernel_fn # CPU fallback
             
-    return jax.jit(kernel_impl)
+        # Cache compiled kernel
+        self.cache.put(key, kernel)
+        return kernel
 
-def _build_gpu_kernel(name: str, arg_defs: tuple, code: str) -> Callable:
-    """Build CUDA kernel for GPU."""
-    nvcc_flags = [
-        '-std=c++17', '-shared', '-O3',
-        '--expt-relaxed-constexpr',
-        '--expt-extended-lambda',
-        '--use_fast_math'
-    ]
-    cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations']
-    flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
-    include_dirs = [get_jit_include_dir()]
-    
-    # Get temporary paths
-    cache_dir = get_kernel_cache(KernelPlatform.GPU).cache_dir
-    tmp_id = uuid.uuid4()
-    so_path = f'{cache_dir}/nvcc.tmp.{tmp_id}.so'
-    cuda_path = f'{cache_dir}/kernel_{tmp_id}.cu'
-    
-    # Generate and compile CUDA code
-    with open(cuda_path, 'w') as f:
-        f.write(generate_cuda_kernel(name, arg_defs, code))
-        
-    try:
-        nvcc_path = get_compiler_info(KernelPlatform.GPU)[0]
-        command = [
-            nvcc_path, '-o', so_path, cuda_path,
-            *flags, *[f'-I{d}' for d in include_dirs]
-        ]
-        subprocess.check_call(command)
-        return compile_custom_call(so_path)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"CUDA kernel compilation failed: {e}")
-    finally:
-        # Cleanup temporary files
-        if os.path.exists(cuda_path):
-            os.unlink(cuda_path)
+# Global compiler instance
+_compiler = KernelCompiler()
 
-def _build_cpu_kernel(name: str, arg_defs: tuple, code: str) -> Callable:
-    """Build CPU kernel (fallback implementation)."""
-    # For CPU, we use a simple numpy/JAX implementation
-    def cpu_kernel(*args):
-        if "matmul" in name.lower():
-            return jnp.matmul(args[0], args[1])
-        elif "reduce" in name.lower():
-            return jnp.sum(args[0], axis=0)
-        else:
-            raise NotImplementedError(f"CPU kernel not implemented: {name}")
-            
-    return cpu_kernel
-
-def generate_cuda_kernel(name: str, arg_defs: tuple, code: str) -> str:
-    """
-    Generate CUDA kernel code with appropriate includes and function signatures.
-    
-    Args:
-        name: The kernel name
-        arg_defs: Tuple of argument types
-        code: Core kernel code
-    
-    Returns:
-        Complete CUDA kernel code as a string
-    """
-    cuda_code = f"""
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <mma.h>
-
-// Include VishwamAI headers
-#include "deepgemm/utils.cuh"
-#include "deepgemm/mma_utils.cuh"
-#include "deepgemm/tensor_utils.cuh"
-#include "deepgemm/memory_utils.cuh"
-
-extern "C" __global__ void {name}_kernel(
-    {', '.join([f'{arg_type} *in{i}' for i, arg_type in enumerate(arg_defs)])}
-) {{
-    // Get global thread index
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Kernel implementation
-    {code}
-}}
-
-// XLA custom call interface
-extern "C" void {name}(
-    {', '.join([f'{arg_type} *in{i}' for i, arg_type in enumerate(arg_defs)])}
-) {{
-    // Configure grid and block dimensions
-    const int block_size = 256;
-    const int grid_size = (1024 + block_size - 1) / block_size;
-    
-    dim3 grid(grid_size, 1, 1);
-    dim3 block(block_size, 1, 1);
-    
-    // Launch kernel
-    {name}_kernel<<<grid, block>>>(
-        {', '.join([f'in{i}' for i in range(len(arg_defs))])}
-    );
-}}
-"""
-    return cuda_code
+def get_compiler() -> KernelCompiler:
+    """Get global kernel compiler instance."""
+    return _compiler

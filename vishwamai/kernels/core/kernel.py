@@ -3,30 +3,89 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
-from typing import Tuple, Optional, Any, NamedTuple, Dict, Union
+from typing import Tuple, Optional, Any, NamedTuple, Dict, Union, Type
 import numpy as np
+from enum import Enum
 from functools import partial
+from abc import ABC, abstractmethod
+import dataclasses
 
 from jax.experimental import pjit
 from jax.sharding import PartitionSpec as P
 from vishwamai.kernels.cuda.fp8_cast_bf16 import fp8_cast
+
+class KernelType(Enum):
+    """Available kernel types."""
+    MATMUL = "matmul"
+    ATTENTION = "attention" 
+    SPARSE = "sparse"
+    TREE = "tree"
+    FLASH = "flash"
+    HYBRID = "hybrid"
+    LAYER_NORM = "layer_norm"
+    ACTIVATION = "activation"
+    EMBEDDING = "embedding"
+
+class HardwareType(Enum):
+    """Supported hardware platforms."""
+    TPU = "tpu"
+    GPU = "gpu"
+    CPU = "cpu"
+
+@dataclasses.dataclass
+class KernelConfig:
+    """Configuration for kernel execution."""
+    hardware: HardwareType
+    precision: str = "fp32"
+    block_size: int = 128
+    use_fp8: bool = False
+    use_flash_attn: bool = False
+    dynamic_scale: bool = True
+    num_warps: int = 8
+    profile: bool = False
+    mesh_mode: str = "2d"
+    batch_parallel: bool = True
+    expert_parallel: bool = False
+    num_experts: int = 1
+
+class AbstractKernel(ABC):
+    """Abstract base class for all kernels."""
+    
+    def __init__(self, config: KernelConfig):
+        self.config = config
+        self._validate_config()
+        self._initialize_hardware()
+        
+    @abstractmethod
+    def forward(self, *args, **kwargs):
+        """Forward pass implementation."""
+        pass
+        
+    @abstractmethod
+    def backward(self, *args, **kwargs):
+        """Backward pass implementation."""
+        pass
+
+    @abstractmethod
+    def _initialize_hardware(self):
+        """Initialize hardware-specific resources."""
+        pass
+        
+    def _validate_config(self):
+        """Validate kernel configuration."""
+        if self.config.hardware == HardwareType.TPU:
+            if self.config.block_size % 128 != 0:
+                raise ValueError("TPU block size must be multiple of 128")
+        elif self.config.hardware == HardwareType.GPU:
+            if self.config.block_size % 32 != 0:
+                raise ValueError("GPU block size must be multiple of 32")
 
 def create_mesh_and_sharding(
     num_devices: int,
     sharding_mode: str,
     batch_sharding: bool = True
 ) -> Tuple[jax.sharding.Mesh, Dict[str, P]]:
-    """
-    Create device mesh and sharding specs for TPU pods.
-    
-    Args:
-        num_devices: Number of TPU devices
-        sharding_mode: Sharding strategy ("1d", "2d", "3d")
-        batch_sharding: Whether to shard batch dimension
-        
-    Returns:
-        Tuple of (device mesh, sharding specs dictionary)
-    """
+    """Create device mesh and sharding specs for TPU pods."""
     if sharding_mode == "1d":
         devices = jax.devices()[:num_devices]
         mesh = jax.sharding.Mesh(np.array(devices), ["dp"])

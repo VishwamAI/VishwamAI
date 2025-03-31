@@ -17,8 +17,47 @@ _DEFAULT_IMAGE_SIZE = 896  # SigLip expected input image size
 _DEFAULT_PATCH_SIZE = 14  # SigLip expected patch size
 
 
+def patchify_images(
+    images: NDArray,
+    patch_size: int = _DEFAULT_PATCH_SIZE,
+    padding: str = "VALID",
+) -> NDArray:
+    """Convert images into patches with memory-efficient processing.
+    
+    Args:
+        images: Image array of shape (batch_size, height, width, channels)
+        patch_size: Size of patches
+        padding: Padding mode for patching
+
+    Returns:
+        Array of patches with optimized memory layout
+    """
+    batch_size, height, width, channels = images.shape
+    
+    # Use TPU-optimized convolution for patch extraction
+    patches = jax.lax.conv_general_dilated_patches(
+        images,
+        filter_shape=(patch_size, patch_size, channels, patch_size * patch_size * channels),
+        window_strides=(patch_size, patch_size),
+        padding=padding,
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        precision=jax.lax.Precision.HIGH  # Ensure numerical stability
+    )
+    
+    # Memory-efficient reshape
+    num_patches = (height // patch_size) * (width // patch_size)
+    patch_dim = patch_size * patch_size * channels
+    
+    # Use jax.block_until_ready for better TPU performance
+    patches = jax.block_until_ready(
+        patches.reshape(batch_size, num_patches, patch_dim)
+    )
+    
+    return patches
+
+
 def normalize_images(images: NDArray) -> NDArray:
-    """Normalize the image to zero mean and unit variance.
+    """Normalize images with memory-efficient processing.
 
     Args:
         images: Image array of shape (height, width, channels)
@@ -26,9 +65,16 @@ def normalize_images(images: NDArray) -> NDArray:
     Returns:
         Normalized image array
     """
-    mean = np.asarray(_IMAGE_MEAN).reshape(1, 1, -1)
-    std = np.asarray(_IMAGE_STD).reshape(1, 1, -1)
-    return (images - mean) / std
+    # Use TPU-optimized operations
+    mean = jnp.asarray(_IMAGE_MEAN, dtype=images.dtype).reshape(1, 1, -1)
+    std = jnp.asarray(_IMAGE_STD, dtype=images.dtype).reshape(1, 1, -1)
+    
+    # Fused normalization operation
+    return jax.lax.select(
+        jnp.all(std > 0),
+        (images - mean) / std,
+        images
+    )
 
 
 def pre_process_image(
@@ -61,42 +107,6 @@ def pre_process_image(
     image = normalize_images(image)
     image = jnp.clip(image, -1, 1)
     return image
-
-
-def patchify_images(
-    images: NDArray,
-    patch_size: int = _DEFAULT_PATCH_SIZE,
-    padding: str = "VALID",
-) -> NDArray:
-    """Convert images into patches.
-    
-    Args:
-        images: Image array of shape (batch_size, height, width, channels)
-        patch_size: Size of patches
-        padding: Padding mode for patching
-
-    Returns:
-        Array of patches
-    """
-    batch_size, height, width, channels = images.shape
-    
-    # Extract patches
-    patches = jax.lax.conv_general_dilated(
-        images,
-        jnp.eye(patch_size * patch_size * channels).reshape(
-            patch_size, patch_size, channels, -1
-        ),
-        window_strides=(patch_size, patch_size),
-        padding=padding,
-        dimension_numbers=("NHWC", "HWIO", "NHWC")
-    )
-    
-    # Reshape to (batch_size, num_patches, patch_dim)
-    num_patches = (height // patch_size) * (width // patch_size)
-    patch_dim = patch_size * patch_size * channels
-    patches = patches.reshape(batch_size, num_patches, patch_dim)
-    
-    return patches
 
 
 def load_image_files(

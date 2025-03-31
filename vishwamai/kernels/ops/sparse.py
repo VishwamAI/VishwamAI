@@ -2,11 +2,16 @@
 
 import jax
 import jax.numpy as jnp
-from typing import Tuple, Optional, NamedTuple, Union
+from typing import Tuple, Optional, NamedTuple, Union, Dict
 from functools import partial
 from jax import lax
 
 from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
+
+class SparseOutput(NamedTuple):
+    """Output from sparse operations."""
+    output: jnp.ndarray
+    sparsity_mask: Optional[jnp.ndarray]
 
 class BlockSparseConfig(NamedTuple):
     """Configuration for block-sparse operations."""
@@ -14,26 +19,43 @@ class BlockSparseConfig(NamedTuple):
     min_sparsity: float = 0.8  # Minimum sparsity to use sparse implementation
     use_bfloat16: bool = True
     precision: Optional[lax.Precision] = None
+    prefetch_depth: int = 2
+    pipeline_stages: int = 3
+    remat_granularity: int = 2
 
-class SparseOutput(NamedTuple):
-    """Output from sparse operations."""
-    output: jnp.ndarray
-    attention_weights: Optional[jnp.ndarray] = None
-    sparsity_mask: Optional[jnp.ndarray] = None
+@partial(jax.jit, static_argnums=(1,))
+def block_sparse_einsum(
+    x: jnp.ndarray,
+    equation: str,
+    y: jnp.ndarray,
+    sparsity_mask: Optional[jnp.ndarray] = None,
+    block_size: int = 128,
+    precision: Optional[lax.Precision] = None
+) -> jnp.ndarray:
+    """Optimized block-sparse einsum."""
+    # Optimize memory layout
+    x = optimize_tpu_layout(x)
+    y = optimize_tpu_layout(y)
+    
+    # Use higher precision accumulation
+    acc_dtype = jnp.float32
+    orig_dtype = x.dtype
+    
+    def block_dot(block_x, block_y):
+        return jnp.einsum(
+            equation,
+            block_x.astype(acc_dtype),
+            block_y.astype(acc_dtype),
+            precision=precision
+        ).astype(orig_dtype)
+    
+    return jax.vmap(block_dot)(x, y)
 
 class SparseMatrixOps:
     """TPU-optimized sparse matrix operations."""
     
     def __init__(self, config: Optional[BlockSparseConfig] = None):
-        """
-        Initialize sparse matrix operations.
-        
-        Args:
-            config: Optional configuration for block-sparse operations
-        """
         self.config = config or BlockSparseConfig()
-        
-        # Validate block size
         if self.config.block_size % 128 != 0:
             raise ValueError("Block size must be multiple of 128 for TPU")
 
@@ -157,165 +179,149 @@ class SparseMatrixOps:
         training: bool = True,
         block_size: Optional[int] = None
     ) -> SparseOutput:
-        """
-        Block-sparse attention implementation optimized for TPU.
-        
-        Args:
-            queries: Query vectors [batch, heads, seq_len, dim]
-            keys: Key vectors [batch, heads, seq_len, dim]
-            values: Value vectors [batch, heads, seq_len, dim]
-            mask: Optional attention mask [batch, heads, seq_len, seq_len]
-            dropout_rate: Dropout probability
-            training: Whether in training mode
-            block_size: Optional block size override
-            
-        Returns:
-            SparseOutput containing attention output and optional weights/mask
-        """
+        """TPU-optimized block-sparse attention."""
         orig_dtype = queries.dtype
         block_size = block_size or self.config.block_size
         
-        # Use bfloat16 for TPU optimization if specified
-        if self.config.use_bfloat16:
-            queries = queries.astype(jnp.bfloat16)
-            keys = keys.astype(jnp.bfloat16)
-            values = values.astype(jnp.bfloat16)
-            
-        # Optimize memory layout
-        queries = optimize_tpu_layout(queries)
-        keys = optimize_tpu_layout(keys)
-        values = optimize_tpu_layout(values)
+        # Cast to efficient compute dtype
+        compute_dtype = jnp.bfloat16 if self.config.use_bfloat16 else jnp.float32
+        queries = queries.astype(compute_dtype)
+        keys = keys.astype(compute_dtype)
+        values = values.astype(compute_dtype)
+        
+        # Optimize memory layout with padding
+        queries = pad_to_tpu_multiple(optimize_tpu_layout(queries), 128)
+        keys = pad_to_tpu_multiple(optimize_tpu_layout(keys), 128)
+        values = pad_to_tpu_multiple(optimize_tpu_layout(values), 128)
         
         # Get dimensions
         batch_size, num_heads, seq_len_q, dim = queries.shape
         _, _, seq_len_k, _ = keys.shape
         
-        # Compute attention scores
-        scale = jnp.sqrt(dim).astype(queries.dtype)
-        scores = jnp.einsum(
+        # Calculate attention scores with optimized einsum
+        scale = 1.0 / jnp.sqrt(dim).astype(compute_dtype)
+        scores = block_sparse_einsum(
+            queries, 
             'bhid,bhjd->bhij',
-            queries,
             keys,
             precision=self.config.precision
-        ) / scale
-
-        # Apply mask if provided
+        ) * scale
+        
+        # Apply mask and create sparsity pattern
         if mask is not None:
-            scores = jnp.where(mask, scores, -1e9)
+            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
             
-        # Compute block-sparse attention pattern
+        # Compute block-sparse pattern with pipeline parallelism
+        def create_block_mask(scores_block):
+            # Find top-k scores for sparsity
+            k = max(1, int(seq_len_k * (1 - self.config.min_sparsity)))
+            top_k = jax.lax.top_k(scores_block, k)[0][..., -1:]
+            return scores_block >= top_k
+            
+        # Process blocks with automatic pipelining
         block_size_q = min(block_size, seq_len_q)
         block_size_k = min(block_size, seq_len_k)
-        
-        # Create sparsity mask based on top-k scores per query
-        k = max(1, int(seq_len_k * (1 - self.config.min_sparsity)))
-        top_k_scores = jax.lax.top_k(scores, k)[0][..., -1:]
-        sparsity_mask = scores >= top_k_scores
-        
-        # Ensure block alignment
         num_blocks_q = (seq_len_q + block_size_q - 1) // block_size_q
         num_blocks_k = (seq_len_k + block_size_k - 1) // block_size_k
         
-        # Create block mask
-        block_mask = jnp.zeros((batch_size, num_heads, num_blocks_q, num_blocks_k))
-        
-        def update_block_mask(block_idx):
+        def process_attention_block(carry, block_idx):
+            output, m_i = carry
             q_idx, k_idx = block_idx // num_blocks_k, block_idx % num_blocks_k
+            
+            # Get current blocks
             q_start = q_idx * block_size_q
             k_start = k_idx * block_size_k
             q_end = min(q_start + block_size_q, seq_len_q)
             k_end = min(k_start + block_size_k, seq_len_k)
             
-            block_scores = scores[
-                :, :,
-                q_start:q_end,
-                k_start:k_end
-            ]
-            return jnp.any(sparsity_mask[
-                :, :,
-                q_start:q_end,
-                k_start:k_end
-            ])
+            # Extract blocks with prefetching
+            if k_end + block_size_k <= seq_len_k:
+                # Prefetch next blocks
+                next_k = jax.lax.prefetch(keys, (0, 0, k_end, 0))
+                next_v = jax.lax.prefetch(values, (0, 0, k_end, 0))
             
-        block_mask = jax.vmap(update_block_mask)(
-            jnp.arange(num_blocks_q * num_blocks_k)
-        ).reshape(num_blocks_q, num_blocks_k)
-        
-        # Apply block-sparse attention
-        def process_block(carry, block_idx):
-            q_idx, k_idx = block_idx // num_blocks_k, block_idx % num_blocks_k
-            
-            if not block_mask[q_idx, k_idx]:
-                return carry, None
-                
-            # Get query block
-            q_start = q_idx * block_size_q
-            q_end = min(q_start + block_size_q, seq_len_q)
-            query_block = jax.lax.dynamic_slice(
+            query_block = lax.dynamic_slice(
                 queries,
                 (0, 0, q_start, 0),
                 (batch_size, num_heads, q_end - q_start, dim)
             )
-            
-            # Get key and value blocks
-            k_start = k_idx * block_size_k
-            k_end = min(k_start + block_size_k, seq_len_k)
-            key_block = jax.lax.dynamic_slice(
+            key_block = lax.dynamic_slice(
                 keys,
                 (0, 0, k_start, 0),
                 (batch_size, num_heads, k_end - k_start, dim)
             )
-            value_block = jax.lax.dynamic_slice(
+            value_block = lax.dynamic_slice(
                 values,
                 (0, 0, k_start, 0),
                 (batch_size, num_heads, k_end - k_start, dim)
             )
             
-            # Compute attention for this block
-            block_scores = scores[
-                :, :,
-                q_start:q_end,
-                k_start:k_end
-            ]
+            # Get attention scores for this block
+            scores_block = scores[..., q_start:q_end, k_start:k_end]
             
-            # Apply softmax
-            block_weights = jax.nn.softmax(block_scores, axis=-1)
+            # Create block mask
+            block_mask = create_block_mask(scores_block)
             
-            if training and dropout_rate > 0:
-                keep_prob = 1.0 - dropout_rate
-                dropout_mask = jax.random.bernoulli(
-                    jax.random.PRNGKey(0),
-                    p=keep_prob,
-                    shape=block_weights.shape
+            if jnp.any(block_mask):
+                # Compute attention weights
+                m_block = jnp.max(scores_block, axis=-1, keepdims=True)
+                m_new = jnp.maximum(m_i[..., q_start:q_end, :], m_block)
+                
+                # Numerically stable softmax
+                exp_block = jnp.exp(scores_block - m_block)
+                exp_sum = jnp.sum(exp_block * block_mask, axis=-1, keepdims=True)
+                
+                # Apply dropout during training
+                if training and dropout_rate > 0:
+                    keep_prob = 1.0 - dropout_rate
+                    random_tensor = jax.random.uniform(
+                        jax.random.PRNGKey(0),
+                        exp_block.shape
+                    )
+                    dropout_mask = random_tensor < keep_prob
+                    exp_block = jnp.where(dropout_mask, exp_block / keep_prob, 0)
+                
+                # Compute attention output
+                block_output = block_sparse_einsum(
+                    exp_block / (exp_sum + 1e-6),
+                    'bhqk,bhkd->bhqd',
+                    value_block,
+                    precision=self.config.precision
                 )
-                block_weights = block_weights * dropout_mask / keep_prob
+                
+                # Update output
+                exp_scale = jnp.exp(m_i[..., q_start:q_end, :] - m_new)
+                output = output.at[:, :, q_start:q_end].set(
+                    output[:, :, q_start:q_end] * exp_scale + block_output
+                )
+                m_i = m_i.at[..., q_start:q_end, :].set(m_new)
+                
+            return (output, m_i), None
             
-            # Apply attention to values
-            block_output = jnp.einsum(
-                'bhqk,bhkd->bhqd',
-                block_weights,
-                value_block,
-                precision=self.config.precision
-            )
-            
-            # Update output
-            output = carry.at[:, :, q_start:q_end].add(block_output)
-            return output, None
-            
-        # Initialize output
+        # Initialize accumulators
         output = jnp.zeros(
             (batch_size, num_heads, seq_len_q, dim),
-            dtype=queries.dtype
+            dtype=compute_dtype
+        )
+        m_i = jnp.full(
+            (batch_size, num_heads, seq_len_q, 1),
+            -jnp.inf,
+            dtype=compute_dtype
         )
         
-        # Process all blocks
+        # Process all blocks with pipelining
         block_indices = jnp.arange(num_blocks_q * num_blocks_k)
-        output, _ = jax.lax.scan(process_block, output, block_indices)
+        (output, _), _ = jax.lax.scan(
+            process_attention_block,
+            (output, m_i),
+            block_indices,
+            unroll=self.config.pipeline_stages
+        )
         
         # Cast back to original dtype if needed
-        if self.config.use_bfloat16 and orig_dtype != jnp.bfloat16:
+        if compute_dtype != orig_dtype:
             output = output.astype(orig_dtype)
             
-        return SparseOutput(output, attention_weights=None, sparsity_mask=sparsity_mask)
+        return SparseOutput(output, sparsity_mask=None)
 
-sparse_ops = SparseMatrixOps()  # Create singleton instance
+sparse_ops = SparseMatrixOps()

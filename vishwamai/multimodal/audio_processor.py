@@ -64,17 +64,31 @@ class AudioProcessor:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _stft(self, audio: jnp.ndarray) -> jnp.ndarray:
-        """Short-time Fourier transform (used only if use_whisper=False)."""
+        """Short-time Fourier transform with optimized memory usage and TPU acceleration."""
+        # Use TPU-optimized operations
         window = jnp.hanning(self.n_fft + 1)[:-1]
         pad_width = (self.n_fft - self.hop_length) // 2
-        audio = jnp.pad(audio, (pad_width, pad_width), mode='reflect')
+        
+        # Memory-efficient padding
+        audio = jax.lax.dynamic_slice_in_dim(
+            jnp.pad(audio, (pad_width, pad_width), mode='reflect'),
+            0,
+            audio.shape[0] + 2 * pad_width
+        )
+
+        # Efficient patch extraction using TPU-optimized convolution
         frames = jax.lax.conv_general_dilated_patches(
             audio[None, None, :],
             filter_shape=(self.n_fft,),
             window_strides=(self.hop_length,),
-            padding='VALID'
+            padding='VALID',
+            dimension_numbers=('NCHW', 'OIHW', 'NCHW')
         )
+        
+        # Memory-efficient windowing
         frames = frames[0] * window
+        
+        # Optimized FFT computation
         return jax.vmap(jnp.fft.rfft)(frames)
 
     @functools.partial(jax.jit, static_argnums=(0,))

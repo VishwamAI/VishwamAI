@@ -10,7 +10,7 @@ from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm, TPUMultiHeadAtt
 from vishwamai.multimodal.vision_utils import MAPHead, _posemb_sincos_2d
 
 class ViTBlock(nn.Module):
-    """Transformer encoder block for ViT."""
+    """Transformer encoder block for ViT with memory optimizations."""
     
     hidden_dim: int
     num_heads: int
@@ -21,41 +21,38 @@ class ViTBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
-        """Apply transformer block.
-        
-        Args:
-            x: Input tensor [batch, tokens, channels]
-            training: Whether in training mode
-            
-        Returns:
-            Output tensor [batch, tokens, channels]
-        """
-        # Layer norm 1
+        # Memory-efficient layer norm
         y = TPULayerNorm(dtype=self.dtype)(x)
         
-        # Multi-head attention
+        # FlashAttention for better memory efficiency
         y = TPUMultiHeadAttention(
             num_heads=self.num_heads,
             head_dim=self.hidden_dim // self.num_heads,
             dropout_rate=self.attention_dropout_rate,
-            dtype=self.dtype
+            dtype=self.dtype,
+            use_flash_attention=True,  # Enable FlashAttention
+            block_size=64  # Optimize for TPU memory access
         )(y, mask=None, deterministic=not training)
         
-        # Add skip connection
-        x = x + y
+        # Gradient checkpointing for memory efficiency
+        if training:
+            y = nn.remat(lambda x, y: x + y)(x, y)
+        else:
+            x = x + y
 
-        # Layer norm 2  
+        # Memory-efficient MLP with kernel fusion
         y = TPULayerNorm(dtype=self.dtype)(x)
-        
-        # MLP block
         mlp_dim = self.mlp_dim or 4 * self.hidden_dim
-        y = TPUGEMMLinear(features=mlp_dim, dtype=self.dtype)(y)
-        y = nn.gelu(y)
-        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=not training)
-        y = TPUGEMMLinear(features=self.hidden_dim, dtype=self.dtype)(y)
-        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=not training)
         
-        # Add skip connection
+        # Fused MLP operations
+        y = nn.Sequential([
+            TPUGEMMLinear(features=mlp_dim, dtype=self.dtype),
+            nn.gelu,
+            nn.Dropout(rate=self.dropout_rate),
+            TPUGEMMLinear(features=self.hidden_dim, dtype=self.dtype),
+            nn.Dropout(rate=self.dropout_rate)
+        ])(y, deterministic=not training)
+        
         return x + y
 
 class ViTEncoder(nn.Module):

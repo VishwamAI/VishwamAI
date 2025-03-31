@@ -64,20 +64,32 @@ def generate_sequence(
     temperature: float,
     key: jax.random.PRNGKey
 ) -> List[int]:
-    """
-    Generate a sequence of tokens autoregressively using the model.
-
+    """Generates a sequence of tokens autoregressively using a JAX/Flax transformer model.
+    
+    This function performs token generation by:
+    1. Taking the current sequence of tokens
+    2. Computing logits from the model
+    3. Applying temperature scaling
+    4. Sampling the next token
+    5. Appending it to the sequence
+    6. Repeating until max length or EOS token is reached
+    
     Args:
-        model: The Flax transformer model.
-        params: Model parameters.
-        tokenizer: Tokenizer with encode and decode methods.
-        input_ids: Initial input token IDs.
-        max_length: Maximum sequence length.
-        temperature: Sampling temperature.
-        key: JAX random key for sampling.
+        model: The Flax transformer model for text generation.
+        params: Dictionary of model parameters/weights.
+        tokenizer: Tokenizer instance for encoding/decoding text.
+        input_ids: List of integer token IDs to start generation from.
+        max_length: Maximum number of tokens to generate.
+        temperature: Sampling temperature - higher values increase diversity.
+        key: JAX PRNG key for random sampling.
 
     Returns:
-        A list of generated token IDs.
+        List[int]: The generated sequence of token IDs, including the input_ids.
+        
+    Note:
+        - Uses JAX's categorical sampling for token selection
+        - Stops early if the model's EOS token is generated
+        - Temperature scaling controls randomness in generation
     """
     generated = list(input_ids)
     current_key = key

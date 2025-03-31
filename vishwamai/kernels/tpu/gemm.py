@@ -12,12 +12,6 @@ from vishwamai.kernels.core.kernel_manager import HardwareType
 from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
 
 class TPUGEMMKernel:
-    """TPU-optimized matrix multiplication kernel.
-    
-    Provides efficient matrix multiplication operations optimized for TPU hardware
-    with automatic tiling, memory layout transformation, and mixed precision support.
-    """
-    
     def __init__(
         self,
         block_size: int = 128,
@@ -25,26 +19,27 @@ class TPUGEMMKernel:
         use_fp8: bool = False,
         use_bfloat16: bool = True,
         reuse_workspace: bool = True,
+        pipeline_depth: int = 3,  # Added pipeline depth for throughput
+        prefetch_distance: int = 2,  # Added prefetch distance
     ):
-        """Initialize TPU GEMM kernel.
-        
-        Args:
-            block_size: Size of blocks for tiling (should be multiple of 128 for TPU)
-            precision: JAX precision setting for computation
-            use_fp8: Whether to use FP8 precision for weights
-            use_bfloat16: Whether to use bfloat16 for computation
-            reuse_workspace: Whether to reuse workspace memory between operations
-        """
         self.block_size = block_size
         self.precision = precision or lax.Precision.HIGHEST
         self.use_fp8 = use_fp8
         self.use_bfloat16 = use_bfloat16
         self.reuse_workspace = reuse_workspace
+        self.pipeline_depth = pipeline_depth
+        self.prefetch_distance = prefetch_distance
         
         # Ensure block_size is appropriate for TPU
         if block_size % 128 != 0:
             raise ValueError("Block size must be a multiple of 128 for TPU")
-    
+        
+        # Initialize TPU-optimized parameters
+        self.tile_m = 128  # TPU MXU tile size
+        self.tile_n = 128
+        self.tile_k = 128
+        self.vectorization_factor = 8  # TPU vector unit width
+        
     def __call__(
         self,
         a: jnp.ndarray,
@@ -52,230 +47,104 @@ class TPUGEMMKernel:
         transpose_a: bool = False,
         transpose_b: bool = False,
         scale: Optional[float] = None,
+        aggressive_fusion: bool = True
     ) -> jnp.ndarray:
-        """Perform matrix multiplication optimized for TPU.
+        # Apply advanced memory layout optimization
+        a = optimize_tpu_layout(a, self.block_size)
+        b = optimize_tpu_layout(b, self.block_size)
         
-        Args:
-            a: First input matrix
-            b: Second input matrix
-            transpose_a: Whether to transpose first matrix
-            transpose_b: Whether to transpose second matrix
-            scale: Optional scaling factor for result
+        # Cast to efficient compute dtype
+        compute_dtype = jnp.bfloat16 if self.use_bfloat16 else jnp.float32
+        a = a.astype(compute_dtype)
+        b = b.astype(compute_dtype)
+
+        # Define efficient block-wise matmul
+        @partial(jax.jit, static_argnums=(2, 3))
+        def blocked_matmul(a_block, b_block, m, n):
+            # Use high-precision accumulation
+            acc_dtype = jnp.float32
+            result = jnp.zeros((m, n), dtype=acc_dtype)
             
-        Returns:
-            Matrix multiplication result
-        """
-        return self.forward(a, b, transpose_a, transpose_b, scale)
-        
-    def forward(
-        self,
-        a: jnp.ndarray,
-        b: jnp.ndarray,
-        transpose_a: bool = False,
-        transpose_b: bool = False,
-        scale: Optional[float] = None,
-    ) -> jnp.ndarray:
-        """Forward pass computation.
-        
-        Args:
-            a: First input matrix
-            b: Second input matrix
-            transpose_a: Whether to transpose first matrix
-            transpose_b: Whether to transpose second matrix
-            scale: Optional scaling factor for result
+            def compute_tile(carry, idx):
+                i, j, k = idx
+                # Extract tiles with optimal memory access pattern
+                a_tile = lax.dynamic_slice(a_block, (i, k), (self.tile_m, self.tile_k))
+                b_tile = lax.dynamic_slice(b_block, (k, j), (self.tile_k, self.tile_n))
+                
+                # Compute tile product with maximum precision
+                tile_result = lax.dot_general(
+                    a_tile, b_tile,
+                    dimension_numbers=(((1,), (0,)), ((), ())),
+                    precision=self.precision
+                )
+                
+                # Update accumulator
+                result_slice = lax.dynamic_slice(carry, (i, j), (self.tile_m, self.tile_n))
+                result_slice = result_slice + tile_result.astype(acc_dtype)
+                carry = lax.dynamic_update_slice(carry, result_slice, (i, j))
+                return carry, None
             
-        Returns:
-            Matrix multiplication result
-        """
-        # Cast to bfloat16 if specified
-        if self.use_bfloat16:
-            a = a.astype(jnp.bfloat16)
-            b = b.astype(jnp.bfloat16)
+            # Generate efficient tile indices
+            indices = jnp.array([
+                (i, j, k) 
+                for i in range(0, m, self.tile_m)
+                for j in range(0, n, self.tile_n)
+                for k in range(0, a_block.shape[1], self.tile_k)
+            ])
             
-        # Handle transpose if needed
+            # Process tiles with pipeline parallelism
+            result, _ = lax.scan(
+                compute_tile,
+                result,
+                indices,
+                unroll=self.pipeline_depth
+            )
+            
+            return result.astype(compute_dtype)
+
+        # Get matrix dimensions
+        M, K = a.shape
         if transpose_a:
-            a = jnp.transpose(a)
+            M, K = K, M
+        _, N = b.shape
         if transpose_b:
-            b = jnp.transpose(b)
+            N = b.shape[0]
+
+        # Apply efficient blocking with overlap
+        def parallel_blocked_execution():
+            num_blocks_m = (M + self.block_size - 1) // self.block_size
+            num_blocks_n = (N + self.block_size - 1) // self.block_size
             
-        # For 2D matrices, use block_tpu_matmul
-        if a.ndim == 2 and b.ndim == 2:
-            result = self._block_tpu_matmul(a, b)
-        else:
-            # For batched matmul, use einsum with optimal layout
-            a = optimize_tpu_layout(a)
-            b = optimize_tpu_layout(b)
+            results = []
+            for i in range(0, num_blocks_m):
+                row_results = []
+                for j in range(0, num_blocks_n):
+                    m_size = min(self.block_size, M - i * self.block_size)
+                    n_size = min(self.block_size, N - j * self.block_size)
+                    
+                    a_block = lax.dynamic_slice(
+                        a, 
+                        (i * self.block_size, 0),
+                        (m_size, K)
+                    )
+                    b_block = lax.dynamic_slice(
+                        b,
+                        (0, j * self.block_size),
+                        (K, n_size)
+                    )
+                    
+                    block_result = blocked_matmul(a_block, b_block, m_size, n_size)
+                    row_results.append(block_result)
+                
+                results.append(jnp.concatenate(row_results, axis=1))
             
-            if a.ndim == 3 and b.ndim == 3:
-                # Batched matrix multiplication
-                result = jnp.einsum('bij,bjk->bik', a, b, precision=self.precision)
-            elif a.ndim == 4 and b.ndim == 4:
-                # Multi-head attention style matmul
-                result = jnp.einsum('bhij,bhjk->bhik', a, b, precision=self.precision)
-            else:
-                raise ValueError(f"Unsupported shapes for TPU GEMM: {a.shape}, {b.shape}")
+            return jnp.concatenate(results, axis=0)
+
+        # Execute with aggressive optimization
+        result = parallel_blocked_execution()
         
-        # Apply scaling if specified
+        # Apply scaling if needed
         if scale is not None:
             result = result * scale
             
-        return result
-
-    def backward(
-        self,
-        grad_output: jnp.ndarray,
-        a: jnp.ndarray,
-        b: jnp.ndarray,
-        transpose_a: bool = False,
-        transpose_b: bool = False,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Backward pass computation for gradients.
-        
-        Args:
-            grad_output: Gradient with respect to output
-            a: First input matrix from forward pass
-            b: Second input matrix from forward pass
-            transpose_a: Whether first matrix was transposed in forward pass
-            transpose_b: Whether second matrix was transposed in forward pass
-            
-        Returns:
-            Gradients for a and b
-        """
-        # Handle transpose states for gradient computation
-        if transpose_a:
-            a = jnp.transpose(a)
-        if transpose_b:
-            b = jnp.transpose(b)
-            
-        # Cast to bfloat16 if specified
-        if self.use_bfloat16:
-            grad_output = grad_output.astype(jnp.bfloat16)
-            a = a.astype(jnp.bfloat16)
-            b = b.astype(jnp.bfloat16)
-        
-        # Optimize layouts for TPU
-        grad_output = optimize_tpu_layout(grad_output)
-        a = optimize_tpu_layout(a)
-        b = optimize_tpu_layout(b)
-        
-        # Compute gradients
-        if grad_output.ndim == 2:
-            # For 2D case
-            grad_a = self._block_tpu_matmul(grad_output, jnp.transpose(b))
-            grad_b = self._block_tpu_matmul(jnp.transpose(a), grad_output)
-        elif grad_output.ndim == 3:
-            # For batched matrix multiplication
-            grad_a = jnp.einsum('bik,bjk->bij', grad_output, b, precision=self.precision)
-            grad_b = jnp.einsum('bij,bik->bjk', a, grad_output, precision=self.precision)
-        elif grad_output.ndim == 4:
-            # For multi-head attention style matmul
-            grad_a = jnp.einsum('bhik,bhjk->bhij', grad_output, b, precision=self.precision)
-            grad_b = jnp.einsum('bhij,bhik->bhjk', a, grad_output, precision=self.precision)
-        else:
-            raise ValueError(f"Unsupported shape for gradients: {grad_output.shape}")
-            
-        # Reverse any transpose operations for returning gradients
-        if transpose_a:
-            grad_a = jnp.transpose(grad_a)
-        if transpose_b:
-            grad_b = jnp.transpose(grad_b)
-            
-        return grad_a, grad_b
-    
-    def _block_tpu_matmul(
-        self,
-        A: jnp.ndarray,
-        B: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """TPU-optimized blocked matrix multiplication for 2D matrices.
-        
-        Features:
-        - Efficient memory access patterns for TPU HBM
-        - Block-level fusion of operations
-        - Dynamic padding for optimal TPU utilization
-        
-        Args:
-            A: First input matrix
-            B: Second input matrix
-            
-        Returns:
-            Matrix multiplication result
-        """
-        M, K = A.shape
-        K_, N = B.shape
-        assert K == K_, f"Incompatible dimensions: {K} != {K_}"
-
-        # Pad dimensions to block_size for TPU efficiency
-        M_pad = (self.block_size - M % self.block_size) % self.block_size
-        N_pad = (self.block_size - N % self.block_size) % self.block_size
-        K_pad = (self.block_size - K % self.block_size) % self.block_size
-        
-        # Pad inputs for optimal TPU execution
-        if M_pad > 0 or K_pad > 0:
-            A_padded = pad_to_tpu_multiple(A, self.block_size)
-        else:
-            A_padded = A
-            
-        if K_pad > 0 or N_pad > 0:
-            B_padded = pad_to_tpu_multiple(B, self.block_size)
-        else:
-            B_padded = B
-        
-        # Use TPU-optimized matmul (jax.lax.dot_general is highly optimized on TPU)
-        result = jax.lax.dot_general(
-            A_padded, 
-            B_padded,
-            (((1,), (0,)), ((), ())),
-            precision=self.precision
-        )
-        
-        # Remove padding
-        if M_pad > 0 or N_pad > 0:
-            result = result[:M, :N]
-            
-        return result
-        
-    @partial(jax.jit, static_argnums=(0,))
-    def quantized_matmul(
-        self,
-        a: jnp.ndarray,
-        b: jnp.ndarray,
-        a_scale: Optional[jnp.ndarray] = None,
-        b_scale: Optional[jnp.ndarray] = None,
-    ) -> jnp.ndarray:
-        """Perform quantized matrix multiplication for TPU.
-        
-        Uses dynamic quantization for improved performance while maintaining accuracy.
-        
-        Args:
-            a: First input matrix
-            b: Second input matrix
-            a_scale: Optional scaling factor for first matrix
-            b_scale: Optional scaling factor for second matrix
-            
-        Returns:
-            Matrix multiplication result
-        """
-        # If scales not provided, compute them dynamically
-        if a_scale is None:
-            a_abs_max = jnp.max(jnp.abs(a), axis=1, keepdims=True)
-            a_scale = jnp.ones_like(a_abs_max)
-            a_scale = jnp.where(a_abs_max > 0, 127.0 / (a_abs_max + 1e-5), a_scale)
-            
-        if b_scale is None:
-            b_abs_max = jnp.max(jnp.abs(b), axis=0, keepdims=True)
-            b_scale = jnp.ones_like(b_abs_max)
-            b_scale = jnp.where(b_abs_max > 0, 127.0 / (b_abs_max + 1e-5), b_scale)
-        
-        # Quantize inputs
-        a_quant = jnp.round(a * a_scale).astype(jnp.int8)
-        b_quant = jnp.round(b * b_scale).astype(jnp.int8)
-        
-        # Perform integer matrix multiplication
-        result_int = jnp.matmul(a_quant, b_quant)
-        
-        # Dequantize the result
-        result_scale = 1.0 / (a_scale * b_scale)
-        result = result_int.astype(jnp.float32) * result_scale
-        
         return result

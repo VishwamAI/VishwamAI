@@ -25,7 +25,7 @@ from . import thoughts
 # Core components
 from .model import VishwamAI
 from .tokenizer import VishwamAITokenizer
-from .training import TPUTrainingConfig, VishwamAITrainer
+from .training.training import TPUTrainingConfig, VishwamAITrainer
 from .transformer import EnhancedTransformerModel, create_vishwamai_transformer
 
 # Specialized layers

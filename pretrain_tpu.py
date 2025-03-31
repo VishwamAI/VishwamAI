@@ -3,7 +3,7 @@
 import jax
 import jax.numpy as jnp
 from vishwamai.transformer import EnhancedTransformerModel, create_vishwamai_transformer
-from vishwamai.training import TPUTrainingConfig, create_train_state_tpu, setup_tpu_training
+from vishwamai.training.training import TPUTrainingConfig, create_train_state_tpu, setup_tpu_training
 from vishwamai.pipeline import TPUDataPipeline, DistillationDataPipeline
 from vishwamai.device_mesh import TPUMeshContext
 from vishwamai.distill import DistillationTrainer, create_student_model, initialize_from_teacher

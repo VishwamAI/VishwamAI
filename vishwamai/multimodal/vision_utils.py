@@ -23,9 +23,10 @@ def _posemb_sincos_2d(
     w: int,
     width: int,
     temperature: float = 10000.0,
-    dtype: Any = jnp.float32
+    dtype: Any = jnp.float32,
+    scale: float = 1.0  # Added scaling factor
 ) -> jnp.ndarray:
-    """Generate 2D sinusoidal position embeddings.
+    """Generate 2D sinusoidal position embeddings with improved scaling.
     
     Args:
         h: Height (patches)
@@ -33,6 +34,7 @@ def _posemb_sincos_2d(
         width: Hidden dimension size
         temperature: Temperature for frequencies
         dtype: Data type for outputs
+        scale: Optional scaling factor for embeddings
         
     Returns:
         Position embeddings [h*w, width]
@@ -53,6 +55,9 @@ def _posemb_sincos_2d(
     x = x.reshape(-1)[:, None] * omega[None, :]
     
     pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
+    
+    # Apply scaling
+    pe = pe * scale
     
     return pe.astype(dtype)
 
@@ -414,13 +419,17 @@ def extract_patches(
     images: NDArray,
     patch_size: int,
     stride: Optional[int] = None,
+    padding: str = 'VALID',
+    normalize_patches: bool = True
 ) -> NDArray:
-    """Extract image patches.
+    """Extract image patches with improved normalization.
     
     Args:
         images: Batch of images of shape (batch_size, height, width, channels)
         patch_size: Size of patches
         stride: Optional stride for patch extraction
+        padding: Padding mode ('VALID' or 'SAME')
+        normalize_patches: Whether to normalize extracted patches
         
     Returns:
         Array of patches of shape (batch_size, num_patches, patch_dim)
@@ -441,11 +450,16 @@ def extract_patches(
         images,
         identity_filter, 
         window_strides=(stride, stride),
-        padding="VALID",
+        padding=padding,
         dimension_numbers=("NHWC", "HWIO", "NHWC")
     )
     
     # Reshape to (batch_size, num_patches, patch_dim)
     patches = patches.reshape(batch_size, -1, patch_dim)
+    
+    # Normalize patches if requested
+    if normalize_patches:
+        patches = patches - jnp.mean(patches, axis=-1, keepdims=True)
+        patches = patches / (jnp.std(patches, axis=-1, keepdims=True) + 1e-6)
     
     return patches

@@ -3,105 +3,140 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm
 from vishwamai.layers.attention import FlashAttention
 
 class CrossAttentionFuser(nn.Module):
-    """Cross-attention based fusion of multimodal features."""
+    """Cross-attention based fusion of multimodal features with optimized memory usage."""
     
     hidden_dim: int
     num_heads: int
     dropout_rate: float = 0.1
+    attention_dropout_rate: float = 0.1
+    use_flash_attention: bool = True
+    block_size: int = 64
     dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(
         self,
         vision_features: jnp.ndarray,
-        text_features: jnp.ndarray,
-        deterministic: bool = True
-    ) -> Dict[str, jnp.ndarray]:
-        """Cross attend between vision and text features.
+        audio_features: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        training: bool = False
+    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+        """
+        Fuse multimodal features using cross-attention with memory optimizations.
         
         Args:
-            vision_features: Vision features [batch, vision_seq_len, hidden_dim]
-            text_features: Text features [batch, text_seq_len, hidden_dim]
-            deterministic: Whether in inference mode (no dropout)
+            vision_features: Visual features [batch, vis_seq, hidden]
+            audio_features: Audio features [batch, audio_seq, hidden] 
+            attention_mask: Optional attention mask
+            training: Whether in training mode
             
         Returns:
-            Dictionary with processed vision and text features
+            Tuple of:
+            - Fused features [batch, vis_seq + audio_seq, hidden]
+            - Attention statistics for analysis
         """
-        # Vision attending to text
-        vision_attention = FlashAttention(
-            hidden_dim=self.hidden_dim,
+        batch_size = vision_features.shape[0]
+        
+        # Project inputs using memory-efficient GEMM
+        vision_proj = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.truncated_normal(0.02)
+        )(vision_features)
+        
+        audio_proj = TPUGEMMLinear(
+            features=self.hidden_dim, 
+            dtype=self.dtype,
+            kernel_init=nn.initializers.truncated_normal(0.02)
+        )(audio_features)
+
+        # Concatenate features efficiently
+        concat_features = jnp.concatenate([vision_proj, audio_proj], axis=1)
+        
+        # FlashAttention for better memory efficiency
+        attention = FlashAttention(
             num_heads=self.num_heads,
-            dropout_rate=self.dropout_rate,
-            causal=False,
-            dtype=self.dtype
-        )
-        text_attention = FlashAttention(
-            hidden_dim=self.hidden_dim,
-            num_heads=self.num_heads,
-            dropout_rate=self.dropout_rate,
-            causal=False,
-            dtype=self.dtype
-        )
+            head_dim=self.hidden_dim // self.num_heads,
+            dropout_rate=self.attention_dropout_rate,
+            dtype=self.dtype,
+            use_causal_mask=False,
+            block_size=self.block_size
+        )(concat_features, mask=attention_mask, deterministic=not training)
+
+        # Gradient checkpointing for memory efficiency
+        if training:
+            x = nn.remat(lambda x, y: x + y)(concat_features, attention)
+        else:
+            x = concat_features + attention
         
-        vision_x = TPULayerNorm()(vision_features)
-        vision_x = vision_attention(vision_x, deterministic=deterministic)
-        vision_x = vision_features + vision_x
-        vision_x = TPUGEMMLinear(features=self.hidden_dim)(vision_x)
+        # Memory-efficient MLP with kernel fusion
+        y = TPULayerNorm(dtype=self.dtype)(x)
+        mlp_dim = self.hidden_dim * 4
         
-        # Text attending to vision  
-        text_x = TPULayerNorm()(text_features)
-        text_x = text_attention(text_x, deterministic=deterministic)
-        text_x = text_features + text_x
-        text_x = TPUGEMMLinear(features=self.hidden_dim)(text_x)
-        
-        return {
-            'vision_output': vision_x,
-            'text_output': text_x
+        y = nn.Sequential([
+            TPUGEMMLinear(features=mlp_dim, dtype=self.dtype),
+            nn.gelu,
+            nn.Dropout(rate=self.dropout_rate),
+            TPUGEMMLinear(features=self.hidden_dim, dtype=self.dtype),
+            nn.Dropout(rate=self.dropout_rate)
+        ])(y, deterministic=not training)
+
+        # Compute attention statistics for analysis
+        attn_stats = {
+            'cross_attention_scores': jnp.mean(attention, axis=(0,1)),
+            'feature_norms': {
+                'vision': jnp.mean(jnp.linalg.norm(vision_proj, axis=-1)),
+                'audio': jnp.mean(jnp.linalg.norm(audio_proj, axis=-1)),
+                'fused': jnp.mean(jnp.linalg.norm(x, axis=-1))
+            }
         }
+        
+        return x, attn_stats
 
 class MultimodalProjector(nn.Module):
-    """Project multimodal features to joint space."""
+    """Projects fused features to task-specific outputs."""
     
-    hidden_dim: int
-    projection_dim: int
+    output_dim: int
+    hidden_dim: int = 1024
     dropout_rate: float = 0.1
     dtype: Any = jnp.float32
-
+    
     @nn.compact
     def __call__(
         self,
-        vision_features: jnp.ndarray,
-        text_features: jnp.ndarray,
-        deterministic: bool = True
-    ) -> Dict[str, jnp.ndarray]:
-        """Project features to joint embedding space.
+        features: jnp.ndarray,
+        training: bool = False
+    ) -> jnp.ndarray:
+        """
+        Project fused features to output space.
         
         Args:
-            vision_features: Vision features [batch, seq_len, hidden_dim]
-            text_features: Text features [batch, seq_len, hidden_dim]
-            deterministic: Whether in inference mode (no dropout)
+            features: Fused multimodal features [batch, seq, hidden]
+            training: Whether in training mode
             
         Returns:
-            Dictionary with projected features
+            Output projections [batch, output_dim]
         """
-        # Vision projection
-        vision_x = TPULayerNorm()(vision_features)
-        vision_x = TPUGEMMLinear(features=self.projection_dim)(vision_x)
-        if not deterministic:
-            vision_x = nn.Dropout(rate=self.dropout_rate)(vision_x, deterministic=False)
-            
-        # Text projection
-        text_x = TPULayerNorm()(text_features)
-        text_x = TPUGEMMLinear(features=self.projection_dim)(text_x)
-        if not deterministic:
-            text_x = nn.Dropout(rate=self.dropout_rate)(text_x, deterministic=False)
-            
-        return {
-            'vision_embedding': vision_x,
-            'text_embedding': text_x
-        }
+        # Memory-efficient pooling and projection
+        x = jnp.mean(features, axis=1)  # Global average pooling
+        
+        x = TPULayerNorm(dtype=self.dtype)(x)
+        x = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype
+        )(x)
+        x = nn.gelu(x)
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not training)
+        
+        x = TPUGEMMLinear(
+            features=self.output_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.truncated_normal(0.02)
+        )(x)
+        
+        return x

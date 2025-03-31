@@ -16,7 +16,8 @@ class ImageProcessor:
         self,
         image_size: int = 224,
         mean: Tuple[float, float, float] = (0.48145466, 0.4578275, 0.40821073),
-        std: Tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711)
+        std: Tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711),
+        advanced_augmentations: bool = False
     ):
         """Initialize image processor.
 
@@ -24,27 +25,43 @@ class ImageProcessor:
             image_size: Target image size.
             mean: RGB mean values for normalization.
             std: RGB standard deviation values for normalization.
+            advanced_augmentations: Enable advanced data augmentation
         """
         self.image_size = image_size
         self.mean = mean
         self.std = std
 
-        self.transform = Compose([
-            A.SmallestMaxSize(max_size=image_size),
-            A.CenterCrop(height=image_size, width=image_size),
-            A.Normalize(mean=mean, std=std)
-        ])
+        if advanced_augmentations:
+            self.transform = Compose([
+                A.SmallestMaxSize(max_size=image_size),
+                A.RandomResizedCrop(height=image_size, width=image_size),
+                A.HorizontalFlip(p=0.5),
+                A.ColorJitter(p=0.5),
+                A.OneOf([
+                    A.GaussianBlur(p=1.0),
+                    A.GaussNoise(p=1.0),
+                ], p=0.3),
+                A.Normalize(mean=mean, std=std)
+            ])
+        else:
+            self.transform = Compose([
+                A.SmallestMaxSize(max_size=image_size),
+                A.CenterCrop(height=image_size, width=image_size),
+                A.Normalize(mean=mean, std=std)
+            ])
 
     def __call__(
         self,
         images: Union[Image.Image, np.ndarray, List[Union[Image.Image, np.ndarray]]],
-        return_tensors: bool = True
+        return_tensors: bool = True,
+        memory_efficient: bool = True
     ) -> Union[np.ndarray, jnp.ndarray]:
-        """Process images.
+        """Process images with memory efficiency.
 
         Args:
             images: Single image or list of images.
             return_tensors: Whether to return JAX tensors.
+            memory_efficient: Use memory efficient processing
 
         Returns:
             Processed image(s) as NumPy array or JAX tensor.
@@ -55,17 +72,33 @@ class ImageProcessor:
         processed = []
         for image in images:
             if isinstance(image, Image.Image):
-                image = np.array(image)
+                if memory_efficient:
+                    # Convert to numpy array with uint8 to save memory
+                    image = np.array(image, dtype=np.uint8)
+                else:
+                    image = np.array(image)
 
-            # Convert grayscale to RGB if needed
+            # Convert grayscale to RGB efficiently
             if len(image.shape) == 2:
-                image = np.stack([image] * 3, axis=-1)
+                image = image[..., None]
+                image = np.repeat(image, 3, axis=-1)
             elif len(image.shape) == 3 and image.shape[-1] == 1:
-                image = np.concatenate([image] * 3, axis=-1)
+                image = np.repeat(image, 3, axis=-1)
 
-            # Apply transforms
-            transformed = self.transform(image=image)['image']
-            processed.append(transformed)
+            # Apply transforms with error handling
+            try:
+                transformed = self.transform(image=image)['image']
+                processed.append(transformed)
+            except Exception as e:
+                print(f"Warning: Error processing image: {e}")
+                # Return zeros as fallback
+                processed.append(np.zeros((self.image_size, self.image_size, 3)))
+
+            # Clear memory
+            if memory_efficient:
+                del image
+                import gc
+                gc.collect()
 
         processed = np.stack(processed)
         return jnp.array(processed) if return_tensors else processed

@@ -16,11 +16,22 @@ class ImageCaptioningPipeline:
         model: VishwamAI,
         processor: MultimodalProcessor,
         config: Optional[MultimodalConfig] = None,
+        cache_size: int = 100,
         **kwargs
     ):
         self.model = model
         self.processor = processor
         self.config = config or create_default_multimodal_config()
+        self._cache = {}
+        self._cache_size = cache_size
+    
+    def _get_cached_result(self, image_hash: str) -> Optional[str]:
+        return self._cache.get(image_hash)
+    
+    def _cache_result(self, image_hash: str, caption: str):
+        if len(self._cache) >= self._cache_size:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[image_hash] = caption
     
     def __call__(
         self,
@@ -28,31 +39,47 @@ class ImageCaptioningPipeline:
         max_new_tokens: int = 50,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        batch_size: int = 4,
         **kwargs
     ) -> Union[str, List[str]]:
-        """Generate captions for images."""
-        # Process images
-        inputs = self.processor.prepare_vision_inputs(images)
+        """Generate captions for images with batching and caching."""
+        # Handle single image case
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images]
+            single_image = True
+        else:
+            single_image = False
+            
+        all_captions = []
+        for i in range(0, len(images), batch_size):
+            batch_images = images[i:i + batch_size]
+            
+            # Process images
+            inputs = self.processor.prepare_vision_inputs(batch_images)
+            
+            # Add caption prompt
+            prompt = "Describe this image in detail:"
+            text_inputs = self.processor.tokenizer(
+                prompt,
+                return_tensors="jax",
+                add_special_tokens=False
+            )
+            inputs.update(text_inputs)
+            
+            # Generate captions
+            outputs = self.model.generate_chat(
+                [{"role": "user", "content": prompt}],
+                image_input=inputs["image_pixel_values"],
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p
+            )
+            
+            if isinstance(outputs, str):
+                outputs = [outputs]
+            all_captions.extend(outputs)
         
-        # Add caption prompt
-        prompt = "Describe this image in detail:"
-        text_inputs = self.processor.tokenizer(
-            prompt,
-            return_tensors="jax",
-            add_special_tokens=False
-        )
-        inputs.update(text_inputs)
-        
-        # Generate caption
-        outputs = self.model.generate_chat(
-            [{"role": "user", "content": prompt}],
-            image_input=inputs["image_pixel_values"],
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p
-        )
-        
-        return outputs
+        return all_captions[0] if single_image else all_captions
 
 class VisualQuestionAnswering:
     """Pipeline for visual question answering."""

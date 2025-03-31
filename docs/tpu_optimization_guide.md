@@ -322,3 +322,156 @@ As VishwamAI continues to evolve:
 - [JAX TPU Documentation](https://jax.readthedocs.io/en/latest/jax-101/06-parallelism.html)
 - [Google Cloud TPU Documentation](https://cloud.google.com/tpu/docs/intro-to-tpu)
 - [Colab TPU Tutorial](https://colab.research.google.com/notebooks/tpu.ipynb)
+
+# Advanced TPU Optimization Guide
+
+## 13. Kernel-Level Optimizations
+
+### 13.1 TPU-Specific Kernel Architecture
+
+```python
+class TPUKernelManager:
+    """
+    Core components:
+    - Matrix Multiplication Unit (MXU) optimizations
+    - High Bandwidth Memory (HBM) management
+    - Systolic array processing
+    - Tensor core utilization
+    """
+```
+
+Key optimization strategies:
+- Block size alignment: 128-byte boundaries for optimal MXU usage
+- Memory access patterns: Contiguous layouts for HBM efficiency
+- Operation fusion: Combining multiple ops for reduced memory transfers
+- Precision management: bfloat16/FP8 with FP32 accumulation
+
+### 13.2 Custom Kernel Implementations
+
+```python
+@tpu_kernel(auto_optimize=True)
+def optimized_kernel(
+    x: jnp.ndarray,
+    block_size: int = 128
+) -> jnp.ndarray:
+    """TPU-optimized kernel with auto-layout optimization"""
+```
+
+Features:
+- Automatic tensor layout optimization
+- Hardware-specific operation fusion
+- Efficient memory access patterns
+- Dynamic precision management
+
+## 14. Device Mesh Architecture
+
+### 14.1 Mesh Configuration
+
+Three-tier mesh architecture based on device count:
+- 8+ devices: 3D mesh (data, model, expert)
+- 4+ devices: 2D mesh (data, model)
+- <4 devices: 1D mesh (data)
+
+Example configuration:
+```python
+mesh_config = MeshConfig(
+    mesh_shape=(2, 2, 2),  # 8 devices in 2x2x2 configuration
+    mesh_axes=('data', 'model', 'expert'),
+    data_axes={
+        'batch': ('data',),
+        'hidden': ('model',),
+        'expert': ('expert',)
+    }
+)
+```
+
+### 14.2 Sharding Strategies
+
+Optimal sharding patterns:
+1. Data Parallelism: Batch dimension across 'data' axis
+2. Model Parallelism: Hidden states across 'model' axis
+3. Expert Parallelism: MoE experts across 'expert' axis
+
+## 15. Memory Hierarchy Optimization
+
+### 15.1 Memory Access Patterns
+
+```python
+class MemoryOptimizer:
+    """
+    Implements:
+    - Block-wise processing
+    - Pipeline buffering
+    - Cache-aware layouts
+    - Prefetch strategies
+    """
+```
+
+### 15.2 Pipeline Optimization
+
+Key techniques:
+1. Gradient accumulation with configurable steps
+2. Activation checkpointing for large models
+3. Memory-efficient attention patterns
+4. Dynamic batch size adaptation
+
+## 16. Performance Monitoring Framework
+
+### 16.1 Profiling Integration
+
+```python
+class TPUProfiler:
+    """
+    Features:
+    - HBM utilization tracking
+    - Operation timing analysis
+    - Memory bandwidth monitoring
+    - Computation/memory balance
+    """
+```
+
+### 16.2 Performance Metrics
+
+Standard benchmarks:
+| Metric | Target |
+|--------|---------|
+| HBM Utilization | >80% |
+| MXU Utilization | >85% |
+| Host-Device Transfer | <10% of compute time |
+| Pipeline Efficiency | >90% |
+
+## 17. Error Recovery and Debugging
+
+### 17.1 Common Issues and Solutions
+
+1. Out of Memory (OOM):
+   - Reduce per-device batch size
+   - Enable gradient checkpointing
+   - Use activation recomputation
+   - Implement selective precision reduction
+
+2. Performance Degradation:
+   - Check memory access patterns
+   - Validate tensor layouts
+   - Monitor cross-device communication
+   - Profile operation fusion effectiveness
+
+### 17.2 Debugging Tools
+
+```python
+# Memory tracking
+def track_memory_usage():
+    print(f"HBM Usage: {jax.accelerator_util.memory_usage()}")
+    print(f"Peak Memory: {jax.peak_memory_usage()}")
+```
+
+## 18. Future Optimizations
+
+Upcoming features:
+1. Dynamic expert routing optimization
+2. Adaptive precision scaling
+3. Automated kernel fusion
+4. Smart memory prefetching
+5. Advanced pipeline parallelism
+
+For more details, refer to the JAX TPU documentation and VishwamAI kernel specifications.

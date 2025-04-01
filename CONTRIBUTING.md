@@ -182,8 +182,77 @@ By contributing, you agree that your contributions will be licensed under the Ap
 - [Architecture Overview](docs/architecture.mermaid)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 
-## Questions?
+## Documenting Internal Mistakes
 
-Feel free to reach out to the maintainers or open an issue for any questions about contributing.
+Documenting internal mistakes is crucial for continuous improvement and knowledge sharing within the project. It helps in understanding the root causes of issues, preventing future occurrences, and fostering a culture of transparency and learning.
 
-Thank you for your contributions to make Vishwamai better! 🚀
+### Importance of Documenting Internal Mistakes
+
+- **Learning from Mistakes**: Documenting mistakes allows the team to learn from them and avoid repeating the same errors.
+- **Transparency**: It promotes a culture of openness and honesty, where team members feel comfortable sharing their mistakes.
+- **Knowledge Sharing**: It helps in building a knowledge base that can be referred to by current and future team members.
+- **Continuous Improvement**: By analyzing mistakes, the team can identify areas for improvement and implement corrective actions.
+
+### How to Document Internal Mistakes
+
+1. **Code Comments**: When a mistake is identified in the code, add a comment explaining the mistake, its impact, and the corrective action taken.
+   ```python
+   # Mistake: Incorrect variable name caused a runtime error
+   # Corrective Action: Renamed the variable to match the expected name
+   correct_variable_name = incorrect_variable_name
+   ```
+
+2. **Commit Messages**: When committing a fix for a mistake, include a detailed commit message explaining the mistake and the fix.
+   ```
+   Fix: Corrected variable name in data processing script
+
+   Mistake: Incorrect variable name caused a runtime error
+   Corrective Action: Renamed the variable to match the expected name
+   ```
+
+3. **Documentation**: Add a section in the project documentation to record significant mistakes, their causes, and the solutions implemented.
+   ```markdown
+   ## Internal Mistakes
+
+   ### Incorrect Variable Name in Data Processing Script
+   - **Mistake**: Incorrect variable name caused a runtime error
+   - **Cause**: Typographical error during variable assignment
+   - **Solution**: Renamed the variable to match the expected name
+   ```
+
+### Examples of Documenting Internal Mistakes
+
+1. **Code Comment Example**:
+   ```python
+   # Mistake: Used a deprecated function that caused compatibility issues
+   # Corrective Action: Replaced the deprecated function with the recommended alternative
+   new_function = recommended_function()
+   ```
+
+2. **Commit Message Example**:
+   ```
+   Fix: Replaced deprecated function in model training script
+
+   Mistake: Used a deprecated function that caused compatibility issues
+   Corrective Action: Replaced the deprecated function with the recommended alternative
+   ```
+
+3. **Documentation Example**:
+   ```markdown
+   ## Internal Mistakes
+
+   ### Deprecated Function in Model Training Script
+   - **Mistake**: Used a deprecated function that caused compatibility issues
+   - **Cause**: Lack of awareness about the deprecation
+   - **Solution**: Replaced the deprecated function with the recommended alternative
+   ```
+
+### Guidelines for Documenting Internal Mistakes
+
+- Be specific and detailed in your documentation.
+- Focus on the root cause of the mistake and the corrective action taken.
+- Use clear and concise language.
+- Ensure that the documentation is easily accessible to all team members.
+- Encourage team members to document their mistakes without fear of judgment.
+
+By following these guidelines, we can create a culture of continuous learning and improvement, ultimately leading to a more robust and reliable project.

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import torch
 import numpy as np
 
-from .kernel import HardwareType, KernelConfig
+from vishwamai.kernels.core.kernel import HardwareType, KernelConfig
 
 @dataclass
 class ShapeSpec:

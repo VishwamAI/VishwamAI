@@ -7,11 +7,6 @@ import jax.numpy as jnp
 import optax
 from typing import Any, Dict, Optional, Tuple, Callable, Iterator
 from functools import partial
-from vishwamai.transformer import (
-    EnhancedTransformerModel,
-    create_vishwamai_transformer,
-    create_train_state
-)
 from .distill import (
     compute_distillation_loss,
     create_student_model,

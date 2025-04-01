@@ -9,8 +9,6 @@ from fairseq2.data.text import (
     StrSplitter,
     StrToIntConverter, 
     StrToTensorConverter,
-    LineEnding,
-    read_text
 )
 from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm
 from vishwamai.layers.attention import FlashAttention

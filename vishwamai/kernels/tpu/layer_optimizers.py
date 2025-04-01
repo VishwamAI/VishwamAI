@@ -9,8 +9,7 @@ import numpy as np
 from functools import partial
 
 from vishwamai.kernels.tpu.distillation_kernels import (
-    DistillationKernelConfig,
-    LayerwiseOptimizer
+    DistillationKernelConfig
 )
 
 class LayerOptConfig(NamedTuple):
@@ -23,6 +22,29 @@ class LayerOptConfig(NamedTuple):
     attention_dropout: float = 0.1
     precision: Any = lax.Precision.HIGHEST
     dtype: Any = jnp.bfloat16
+
+class LayerwiseOptimizer:
+    """Base class for layer-wise optimization on TPU."""
+    
+    def __init__(self, kernel_config: DistillationKernelConfig, num_layers: int, dropout_rate: float = 0.1):
+        self.kernel_config = kernel_config
+        self.num_layers = num_layers
+        self.dropout_rate = dropout_rate
+        
+    def optimize_layer(self,
+                      layer_idx: int,
+                      teacher_layer: Any,
+                      student_layer: Any,
+                      inputs: Dict[str, jnp.ndarray],
+                      temperature: float = 2.0) -> Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]]:
+        """Optimize a single layer's computation."""
+        # Forward pass through teacher layer
+        teacher_outputs = teacher_layer(inputs)
+        
+        # Forward pass through student layer
+        student_outputs = student_layer(inputs)
+        
+        return teacher_outputs, student_outputs
 
 class AdaptiveLayerOptimizer:
     """

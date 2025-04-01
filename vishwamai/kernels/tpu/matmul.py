@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional, Tuple, Dict, NamedTuple
 from functools import partial
 
-from .tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
+from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
 
 class MatMulOutput(NamedTuple):
     """Output from matrix multiplication."""

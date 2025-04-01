@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from enum import Enum
 import numpy as np
 
-from .tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
-
 class MemoryLayout(Enum):
     """TPU memory layout patterns."""
     BLOCKED = "blocked"

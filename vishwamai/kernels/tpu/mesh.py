@@ -7,7 +7,7 @@ from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 import numpy as np
 
-from ..core.kernel import KernelConfig, HardwareType
+from vishwamai.kernels.core.kernel import KernelConfig, HardwareType
 
 class MeshConfig(NamedTuple):
     """Configuration for TPU mesh."""

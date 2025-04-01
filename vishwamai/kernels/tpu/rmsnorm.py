@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional, Tuple, NamedTuple
 from functools import partial
 
-from .tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
+from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
 
 class RMSNormOutput(NamedTuple):
     """Output from RMSNorm computation."""

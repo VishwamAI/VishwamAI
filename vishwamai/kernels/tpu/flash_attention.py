@@ -6,7 +6,7 @@ from jax import lax
 from typing import Optional, Tuple, NamedTuple, Dict
 import numpy as np
 
-from .tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
+from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
 
 class FlashAttentionOutput(NamedTuple):
     """Output from flash attention computation."""

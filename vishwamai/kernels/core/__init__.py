@@ -31,6 +31,9 @@ from .tuner import (
     KernelTuner
 )
 
+from vishwamai.kernels.tpu.tpu_custom_call import compile_tpu_kernel as get_compiler
+from vishwamai.kernels.tpu.kernel_profiler import TPUKernelProfiler as KernelProfiler
+
 __all__ = [
     # Hardware and Kernel Types
     "HardwareType",
@@ -59,5 +62,9 @@ __all__ = [
     "fp8_gemm_optimized",
     
     # Kernel Management
-    "get_kernel_manager"
+    "get_kernel_manager",
+    
+    # TPU Optimizations
+    "get_compiler",
+    "KernelProfiler"
 ]

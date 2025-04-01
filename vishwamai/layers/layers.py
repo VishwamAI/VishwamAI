@@ -273,6 +273,68 @@ class TPUMoELayer(nn.Module):
     
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> Tuple[jnp.ndarray, Dict[str, Any]]:
         return self.gating(x, deterministic)
-
 # Alias for backwards compatibility
+MoELayer = TPUMoELayer
+
+class TPUDense(nn.Module):
+    """TPU-optimized Dense (fully connected) layer."""
+    features: int
+    use_bias: bool = True
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
+    precision: Any = None
+    kernel_init: Callable = nn.initializers.lecun_normal()
+    bias_init: Callable = nn.initializers.zeros
+    use_fp8: bool = True
+    block_size: int = 128
+
+    @nn.compact
+    def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        """Apply the Dense layer to inputs.
+
+        Args:
+            inputs: Input array of shape (..., input_features)
+
+        Returns:
+            Output array of shape (..., features)
+        """
+        inputs = jnp.asarray(inputs, self.dtype)
+        kernel = self.param(
+            'kernel',
+            self.kernel_init,
+            (inputs.shape[-1], self.features),
+            self.param_dtype
+        )
+        kernel = jnp.asarray(kernel, self.dtype)
+
+        if self.use_fp8:
+            # Use FP8 GEMM for faster computation
+            x_quant, x_scale = act_quant(inputs, block_size=self.block_size)
+            kernel_quant, kernel_scale = act_quant(kernel, block_size=self.block_size)
+            
+            y = fp8_gemm_optimized(
+                x_quant,
+                x_scale,
+                kernel_quant,
+                kernel_scale,
+                block_size=self.block_size
+            )
+        else:
+            kernel = optimize_kernel_layout(kernel)
+            y = jnp.dot(inputs, kernel, precision=self.precision)
+
+        if self.use_bias:
+            bias = self.param(
+                'bias',
+                self.bias_init,
+                (self.features,),
+                self.param_dtype
+            )
+            bias = jnp.asarray(bias, self.dtype)
+            y = y + bias
+
+        return y
+
+# Alias for compatibility with flax.linen
+Dense = TPUDense
 MoELayer = TPUMoELayer

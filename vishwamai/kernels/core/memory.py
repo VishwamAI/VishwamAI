@@ -7,8 +7,7 @@ import torch
 import numpy as np
 from dataclasses import dataclass
 from enum import Enum
-
-from .kernel import HardwareType, KernelConfig
+from vishwamai.kernels.core.kernel import HardwareType, KernelConfig
 
 class MemoryLayout(Enum):
     """Memory layout patterns."""

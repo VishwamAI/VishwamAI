@@ -10,8 +10,8 @@ from typing import Any, Dict, Optional, Tuple
 from vishwamai.kernels.core.kernel import fp8_gemm_optimized
 from vishwamai.layers.layers import TPUGEMMLinear, TPULayerNorm
 from vishwamai.layers.attention import FlashAttention
-from vishwamai.multimodal.vision import VisionEncoder
 from vishwamai.multimodal.sonar import SonarEncoder
+from vishwamai.multimodal.vision import ViTEncoder as VisionEncoder
 
 def sinusoidal_position_embedding(
     positions: jnp.ndarray,

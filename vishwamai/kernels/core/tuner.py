@@ -8,12 +8,10 @@ import jax
 import torch
 from concurrent.futures import ThreadPoolExecutor
 
-from .kernel import KernelConfig, HardwareType
-from .memory import MemoryManager
-from .shapes import DynamicShapeOptimizer
-from ..jit.compiler import get_compiler
-from ..jit.optimizer import KernelProfiler
-
+from . import get_compiler, KernelProfiler
+from vishwamai.kernels.core.kernel import KernelConfig, HardwareType
+from vishwamai.kernels.core.memory import MemoryManager
+from vishwamai.kernels.core.shapes import DynamicShapeOptimizer
 @dataclass
 class TuningConfig:
     """Configuration for kernel tuning."""

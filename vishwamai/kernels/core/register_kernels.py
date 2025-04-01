@@ -2,21 +2,19 @@
 
 from typing import Dict, Any, Optional
 from enum import Enum, auto
+from functools import partial
 from vishwamai.kernels.core.kernel import KernelPlatform
-
+from vishwamai.kernels.core.kernel_manager import register_kernel
+from vishwamai.kernels.tpu.attention_kernels import (
+    flash_attention_inference as flash_attention,
+    TPUOptimizedAttention as multi_head_attention_kernel,
+    memory_efficient_attention as sliding_window_attention
+)
+from vishwamai.layers.rotary import TPURotaryEmbedding as rope_embedding
 from vishwamai.kernels.cuda.flashmla_cuda import (
     jax_get_mla_metadata,
-    jax_flash_mla_with_kvcache,
     flash_mla_with_kvcache,
     get_mla_metadata
-)
-from vishwamai.kernels.core.kernel import (
-    KernelConfig,
-    register_kernel,
-    multi_head_attention_kernel,
-    flash_attention,
-    sliding_window_attention,
-    rope_embedding
 )
 from vishwamai.kernels.ops.sparse import (
     SparseMatrixOps
@@ -64,24 +62,40 @@ def register_attention_kernels(platform: KernelPlatform, config: Optional[Dict[s
     cfg = {**get_default_config(platform), **(config or {})}
     
     # Standard attention kernels
+    # Initialize the attention class with config
+    attention = multi_head_attention_kernel(
+        num_heads=cfg.get('num_heads', 8),
+        head_dim=cfg.get('head_dim', 64),
+        dropout_rate=cfg.get('dropout_rate', 0.0)
+    )
     register_kernel(
         "multi_head_attention",
         platform,
-        multi_head_attention_kernel,
+        attention,
         config=cfg
     )
     
+    # Configure flash attention based on platform
+    flash_fn = flash_attention if platform == KernelPlatform.TPU else flash_mla_with_kvcache
     register_kernel(
         "flash_attention",
         platform,
-        flash_attention if platform == KernelPlatform.TPU else flash_mla_with_kvcache,
+        partial(flash_fn,
+            block_size=cfg.get('block_size', 128),
+            head_dim=cfg.get('head_dim', 64),
+            num_heads=cfg.get('num_heads', 8),
+            use_fp8=cfg.get('use_fp8', False)
+        ),
         config=cfg
     )
     
+    # Configure sliding window attention
     register_kernel(
         "sliding_window_attention",
         platform,
-        sliding_window_attention,
+        partial(sliding_window_attention,
+            num_chunks=cfg.get('sliding_chunks', 4)
+        ),
         config=cfg
     )
     
@@ -210,10 +224,16 @@ def register_embedding_kernels(platform: KernelPlatform, config: Optional[Dict[s
     """Register embedding-related kernels."""
     cfg = {**get_default_config(platform), **(config or {})}
     
+    # Initialize the rotary embedding with config
+    rope = rope_embedding(
+        dim=cfg.get('head_dim', 64),
+        max_seq_len=cfg.get('max_sequence_length', 2048),
+        base=cfg.get('rope_base', 10000)
+    )
     register_kernel(
         "rope_embedding",
         platform,
-        rope_embedding,
+        rope,
         config=cfg
     )
 

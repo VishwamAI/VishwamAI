@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 import numpy as np
 
-from .tpu_custom_call import optimize_tpu_layout
+from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout
 
 class FusionPattern(Enum):
     """Supported kernel fusion patterns."""

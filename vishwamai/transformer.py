@@ -486,20 +486,22 @@ if __name__ == "__main__":
     print("\nBenchmarking performance on TPU pod...")
     benchmark_tpu_performance(model_state)
 
+from dataclasses import dataclass
+
+@dataclass
 class EnhancedTransformerConfig:
-    def __init__(self, vocab_size, hidden_size, num_attention_heads, num_hidden_layers, intermediate_size, max_position_embeddings, dropout_rate, attention_dropout, use_flash_attention, use_fp8, use_parallel, block_size):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.num_hidden_layers = num_hidden_layers
-        self.intermediate_size = intermediate_size
-        self.max_position_embeddings = max_position_embeddings
-        self.dropout_rate = dropout_rate
-        self.attention_dropout = attention_dropout
-        self.use_flash_attention = use_flash_attention
-        self.use_fp8 = use_fp8
-        self.use_parallel = use_parallel
-        self.block_size = block_size
+    vocab_size: int
+    hidden_size: int
+    num_attention_heads: int
+    num_hidden_layers: int
+    intermediate_size: int
+    max_position_embeddings: int
+    dropout_rate: float
+    attention_dropout: float
+    use_flash_attention: bool
+    use_fp8: bool
+    use_parallel: bool
+    block_size: int
 
 class EnhancedTransformerModel(nn.Module):
     config: EnhancedTransformerConfig

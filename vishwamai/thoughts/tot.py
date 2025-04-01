@@ -4,7 +4,6 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, List, Optional, Tuple
 import random
-
 from dataclasses import dataclass
 
 @dataclass
@@ -19,6 +18,21 @@ class ThoughtNode:
     def __post_init__(self):
         if self.children is None:
             self.children = []
+            
+    def add_child(self, child: 'ThoughtNode') -> None:
+        """Add a child node."""
+        self.children.append(child)
+        child.parent = self
+        child.depth = self.depth + 1
+        
+    def get_path(self) -> List[str]:
+        """Get path from root to this node."""
+        path = []
+        current = self
+        while current:
+            path.insert(0, current.thought)
+            current = current.parent
+        return path
 
 def generate_sequence(
     model: Any,
@@ -30,43 +44,40 @@ def generate_sequence(
     key: jax.random.PRNGKey,
     num_return_sequences: int = 1
 ) -> List[List[int]]:
-    """
-    Generate sequences of tokens autoregressively using the model.
-
-    Args:
-        model: JAX/Flax model instance.
-        params: Model parameters.
-        tokenizer: Tokenizer instance.
-        input_ids: Initial input token IDs.
-        max_length: Maximum sequence length (including input).
-        temperature: Sampling temperature.
-        key: JAX random key for sampling.
-        num_return_sequences: Number of sequences to generate.
-
-    Returns:
-        A list of generated token ID sequences.
-    """
-    generated = [list(input_ids) for _ in range(num_return_sequences)]
-    current_key = key
-
-    for _ in range(max_length - len(input_ids)):
-        new_generated = []
-        for seq in generated:
-            current_key, subkey = jax.random.split(current_key)
-            input_array = jnp.array([seq])
-            logits = model.apply({'params': params}, input_array, deterministic=True)
-            last_logits = logits[:, -1, :] / temperature
-            next_token = jax.random.categorical(subkey, last_logits).item()
-            new_seq = seq + [next_token]
-            new_generated.append(new_seq)
-
-            # Stop if EOS token is generated
-            if hasattr(tokenizer, 'eos_token_id') and next_token == tokenizer.eos_token_id:
-                continue
-
-        generated = new_generated
-
-    return generated
+    """Generate sequences using the model."""
+    outputs = []
+    
+    for i in range(num_return_sequences):
+        subkey = jax.random.fold_in(key, i)
+        
+        # Initialize sequence
+        cur_ids = input_ids.copy()
+        
+        # Auto-regressive generation
+        for _ in range(max_length - len(input_ids)):
+            logits = model.apply(
+                {'params': params},
+                jnp.array(cur_ids)[None, :],
+                deterministic=True
+            )
+            
+            # Get next token probabilities
+            next_token_logits = logits[0, -1, :]
+            next_token_logits = next_token_logits / temperature
+            next_token_probs = jax.nn.softmax(next_token_logits)
+            
+            # Sample next token
+            next_token = jax.random.categorical(subkey, next_token_logits)
+            
+            # Break if EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+                
+            cur_ids.append(int(next_token))
+            
+        outputs.append(cur_ids)
+        
+    return outputs
 
 class TreeOfThoughts:
     """Implements tree-based reasoning for complex problem solving."""
@@ -82,19 +93,7 @@ class TreeOfThoughts:
         temperature: float = 0.7,
         seed: int = 0
     ):
-        """
-        Initialize the TreeOfThoughts instance.
-
-        Args:
-            model: JAX/Flax model instance.
-            params: Model parameters.
-            tokenizer: Tokenizer instance.
-            max_branches: Maximum number of child nodes per expansion.
-            max_depth: Maximum depth of the thought tree.
-            beam_width: Number of top nodes to keep during search.
-            temperature: Default sampling temperature.
-            seed: Random seed for reproducibility.
-        """
+        """Initialize TreeOfThoughts."""
         self.model = model
         self.params = params
         self.tokenizer = tokenizer
@@ -110,17 +109,7 @@ class TreeOfThoughts:
         num_thoughts: int = 3,
         temperature: Optional[float] = None
     ) -> List[str]:
-        """
-        Generate multiple potential thought branches.
-
-        Args:
-            context: Current context/prompt.
-            num_thoughts: Number of thoughts to generate.
-            temperature: Optional override for sampling temperature.
-
-        Returns:
-            List of generated thoughts.
-        """
+        """Generate multiple potential thought branches."""
         temperature = temperature or self.temperature
 
         # Prepare input
@@ -139,7 +128,7 @@ class TreeOfThoughts:
                 params=self.params,
                 tokenizer=self.tokenizer,
                 input_ids=input_ids,
-                max_length=self.model.config.max_seq_len,
+                max_length=len(input_ids) + 100,  # Generate reasonable length continuation
                 temperature=temperature,
                 key=subkey,
                 num_return_sequences=1
@@ -154,23 +143,14 @@ class TreeOfThoughts:
         thought_sequence: List[str],
         objective: str
     ) -> float:
-        """
-        Estimate the value/quality of a thought sequence.
-
-        Args:
-            thought_sequence: Sequence of thoughts to evaluate.
-            objective: Goal/objective for evaluation.
-
-        Returns:
-            Estimated value between 0 and 1.
-        """
+        """Estimate value of a thought sequence."""
+        # Prepare evaluation prompt
         eval_prompt = (
             f"Objective: {objective}\n\n"
-            f"Thought sequence:\n"
-            + "\n".join(f"{i+1}. {t}" for i, t in enumerate(thought_sequence))
-            + "\n\nOn a scale of 0 to 1, rate how well this thought sequence achieves the objective."
+            f"Reasoning steps:\n" + "\n".join(thought_sequence) + "\n\n"
+            "Rate how well this reasoning achieves the objective from 0.0 to 1.0:"
         )
-
+        
         input_ids = self.tokenizer.encode(
             eval_prompt,
             return_tensors="jax",
@@ -185,7 +165,7 @@ class TreeOfThoughts:
             tokenizer=self.tokenizer,
             input_ids=input_ids,
             max_length=len(input_ids) + 20,
-            temperature=0.1,
+            temperature=0.1,  # Lower temperature for more focused rating
             key=subkey,
             num_return_sequences=1
         )[0]
@@ -206,17 +186,7 @@ class TreeOfThoughts:
         context: str,
         objective: str
     ) -> List[ThoughtNode]:
-        """
-        Expand a node by generating child thoughts.
-
-        Args:
-            node: Node to expand.
-            context: Current context.
-            objective: Goal/objective.
-
-        Returns:
-            List of child nodes.
-        """
+        """Expand a node by generating child thoughts."""
         if node.depth >= self.max_depth:
             return []
 
@@ -233,7 +203,7 @@ class TreeOfThoughts:
 
         children = []
         for thought in new_thoughts:
-            thought_sequence = self._get_thought_sequence(node) + [thought]
+            thought_sequence = node.get_path() + [thought]
             value = self.estimate_value(thought_sequence, objective)
             child = ThoughtNode(
                 thought=thought,
@@ -243,25 +213,14 @@ class TreeOfThoughts:
             )
             children.append(child)
 
+        # Sort children by value
+        children.sort(key=lambda x: x.value, reverse=True)
+        
+        # Keep only top beam_width children
+        children = children[:self.beam_width]
         node.children = children
+        
         return children
-
-    def _get_thought_sequence(self, node: ThoughtNode) -> List[str]:
-        """
-        Get the sequence of thoughts from root to node.
-
-        Args:
-            node: Target node.
-
-        Returns:
-            List of thoughts in the sequence.
-        """
-        sequence = []
-        current = node
-        while current:
-            sequence.insert(0, current.thought)
-            current = current.parent
-        return sequence
 
     def search(
         self,
@@ -269,49 +228,51 @@ class TreeOfThoughts:
         objective: str,
         max_steps: int = 10
     ) -> List[str]:
-        """
-        Perform tree search to find solution path.
-
-        Args:
-            initial_prompt: Starting prompt/context.
-            objective: Goal/objective.
-            max_steps: Maximum search steps.
-
-        Returns:
-            Best thought sequence found.
-        """
-        thoughts = self.generate_thoughts(initial_prompt)
-
-        nodes = [
-            ThoughtNode(
-                thought=t,
-                value=self.estimate_value([t], objective),
-                parent=None,
-                depth=0
-            )
-            for t in thoughts
-        ]
-
-        best_sequence = None
+        """Perform tree search to find solution path."""
+        # Generate initial thoughts
+        initial_thoughts = self.generate_thoughts(
+            initial_prompt,
+            num_thoughts=self.max_branches
+        )
+        
+        # Create root nodes
+        nodes = []
+        for thought in initial_thoughts:
+            value = self.estimate_value([thought], objective)
+            node = ThoughtNode(thought=thought, value=value)
+            nodes.append(node)
+            
+        # Sort and prune to beam width
+        nodes.sort(key=lambda x: x.value, reverse=True)
+        nodes = nodes[:self.beam_width]
+        
+        best_sequence = []
         best_value = 0.0
-
+        
+        # Perform beam search
         for _ in range(max_steps):
-            nodes.sort(key=lambda n: n.value, reverse=True)
-            nodes = nodes[:self.beam_width]
-
-            if nodes and nodes[0].value > best_value:
+            if not nodes:
+                break
+                
+            # Track best sequence seen so far
+            if nodes[0].value > best_value:
                 best_value = nodes[0].value
-                best_sequence = self._get_thought_sequence(nodes[0])
+                best_sequence = nodes[0].get_path()
 
             new_nodes = []
             for node in nodes:
                 children = self.expand_node(node, initial_prompt, objective)
                 new_nodes.extend(children)
-
-            nodes = new_nodes
-            if not nodes:
+                
+            if not new_nodes:
                 break
-
+                
+            # Sort all new nodes by value
+            new_nodes.sort(key=lambda x: x.value, reverse=True)
+            
+            # Keep top beam_width nodes
+            nodes = new_nodes[:self.beam_width]
+            
         return best_sequence if best_sequence else []
 
 def evaluate_tot_solution(
@@ -322,27 +283,15 @@ def evaluate_tot_solution(
     objective: str,
     key: jax.random.PRNGKey
 ) -> Tuple[float, str]:
-    """
-    Evaluate a Tree of Thoughts solution.
-
-    Args:
-        model: JAX/Flax model instance.
-        params: Model parameters.
-        tokenizer: Tokenizer instance.
-        solution: Sequence of thoughts.
-        objective: Original objective.
-        key: JAX random key for generation.
-
-    Returns:
-        Tuple of (score, feedback).
-    """
+    """Evaluate a ToT solution."""
+    # Prepare evaluation prompt
     eval_prompt = (
         f"Objective: {objective}\n\n"
-        f"Solution steps:\n"
-        + "\n".join(f"{i+1}. {s}" for i, s in enumerate(solution))
-        + "\n\nProvide:\n1. A score from 0 to 1\n2. Brief feedback"
+        f"Solution:\n" + "\n".join(solution) + "\n\n"
+        "Evaluate this solution. First give a score from 0.0 to 1.0, "
+        "then explain your rating:"
     )
-
+    
     input_ids = tokenizer.encode(
         eval_prompt,
         return_tensors="jax",
@@ -356,20 +305,19 @@ def evaluate_tot_solution(
         tokenizer=tokenizer,
         input_ids=input_ids,
         max_length=len(input_ids) + 200,
-        temperature=0.3,
+        temperature=0.7,
         key=key,
         num_return_sequences=1
     )[0]
 
     response = tokenizer.decode(generated, skip_special_tokens=True)
-
+    
     try:
-        score_str = response.split("Score:")[1].split("\n")[0].strip()
-        score = float(score_str)
+        score = float(next(
+            float(s) for s in response.split() if s.replace(".", "").isdigit()
+        ))
         score = max(0.0, min(1.0, score))
-        feedback = response.split("Feedback:")[1].strip()
-    except (IndexError, ValueError):
+    except (StopIteration, ValueError):
         score = 0.0
-        feedback = "Unable to parse evaluation."
-
-    return score, feedback
+        
+    return score, response

@@ -1,36 +1,159 @@
-"""TPU-optimized Flash Attention implementation with latest optimizations"""
+"""TPU-optimized Flash Attention implementation."""
 
 import jax
-import jax.numpy as jnp
+import jax.numpy as jnp 
 from jax import lax
-import flax.linen as nn
-from typing import Optional, Tuple, Dict, Any, NamedTuple
 from functools import partial
+from typing import Optional, Tuple, Dict, Any, NamedTuple
+import flax.linen as nn
 
 class FlashAttentionConfig(NamedTuple):
-    """Configuration for Flash Attention."""
-    block_size: int = 128
-    num_heads: int = 8
+    """Configuration for TPU Flash Attention."""
+    block_size: int = 128  # Must be multiple of 128 for TPU
     head_dim: int = 64
+    num_heads: int = 8
     dropout_rate: float = 0.0
     causal: bool = False
     use_fp8: bool = True
+    num_pipeline_stages: int = 3
     prefetch_size: int = 2
-    recompute_granularity: int = 4
 
-class FlashAttentionImpl(nn.Module):
-    """Optimized Flash Attention implementation (FlashAttention-3)."""
-    config: FlashAttentionConfig
+class TPUFlashAttention(nn.Module):
+    """TPU-optimized Flash Attention with O(1) memory."""
     
     def setup(self):
-        self.block_size = self.config.block_size
-        self.head_dim = self.config.head_dim
-        self.num_heads = self.config.num_heads
-        self.dropout_rate = self.config.dropout_rate
-        self.causal = self.config.causal
-        self.use_fp8 = self.config.use_fp8
+        """Initialize Flash Attention with TPU-specific optimizations."""
         
-    @nn.compact
+        # Validate TPU requirements
+        if self.config.block_size % 128 != 0:
+            raise ValueError(f"Block size must be multiple of 128 for TPU, got {self.config.block_size}")
+            
+        self.block_size = self.config.block_size
+        self.num_pipeline_stages = self.config.num_pipeline_stages
+        self.prefetch_size = self.config.prefetch_size
+        
+        # Precision settings
+        self.epsilon = 1e-6 if self.config.use_fp8 else 1e-6
+        self.compute_dtype = jnp.bfloat16 if not self.config.use_fp8 else jnp.float32
+        self.matmul_precision = jax.lax.Precision.HIGHEST
+        
+    def _chunk_attention(
+        self,
+        q: jnp.ndarray,  # [batch, num_heads, seq_len_q, head_dim]
+        k: jnp.ndarray,  # [batch, num_heads, seq_len_k, head_dim]
+        v: jnp.ndarray,  # [batch, num_heads, seq_len_k, head_dim]
+        mask: Optional[jnp.ndarray] = None,  # [batch, num_heads, seq_len_q, seq_len_k]
+        dropout_rng: Optional[Any] = None
+    ) -> jnp.ndarray:
+        """Compute attention with chunking for O(1) memory."""
+        
+        # Get dimensions
+        batch_size, num_heads, seq_len_q, head_dim = q.shape
+        _, _, seq_len_k, _ = k.shape
+        
+        # Initialize accumulators with optimal dtype
+        o = jnp.zeros((batch_size, num_heads, seq_len_q, head_dim), dtype=self.compute_dtype)
+        l = jnp.zeros((batch_size, num_heads, seq_len_q, 1), dtype=self.compute_dtype)
+        m = jnp.ones((batch_size, num_heads, seq_len_q, 1), dtype=self.compute_dtype) * -jnp.inf
+        
+        # Process in chunks with pipeline parallelism
+        def chunk_scanner(carry, chunk_idx):
+            """Process one chunk with TPU optimizations."""
+            output, lse, m_running = carry
+            
+            # Get chunk boundaries
+            start_idx = chunk_idx * self.block_size
+            end_idx = min(start_idx + self.block_size, seq_len_k)
+            
+            # Prefetch next chunk
+            if end_idx + self.block_size <= seq_len_k:
+                lax.prefetch(k, (0, 0, end_idx, 0))
+                lax.prefetch(v, (0, 0, end_idx, 0))
+            
+            # Get current chunks
+            k_chunk = lax.dynamic_slice(
+                k,
+                (0, 0, start_idx, 0),
+                (batch_size, num_heads, end_idx - start_idx, head_dim)
+            )
+            v_chunk = lax.dynamic_slice(
+                v,
+                (0, 0, start_idx, 0),
+                (batch_size, num_heads, end_idx - start_idx, head_dim)
+            )
+            
+            # Compute attention scores with maximum precision
+            s = lax.dot_general(
+                q, k_chunk,
+                dimension_numbers=(((3,), (3,)), ((0,1), (0,1))),
+                precision=self.matmul_precision
+            ) / jnp.sqrt(head_dim)
+            
+            # Apply causal mask if needed
+            if self.config.causal and start_idx + self.block_size > seq_len_k:
+                causal_mask = jnp.greater_equal(
+                    jnp.arange(seq_len_q)[:, None],
+                    jnp.arange(start_idx, end_idx)[None, :]
+                )
+                s = jnp.where(causal_mask[None, None, :, :], s, -1e10)
+            
+            # Apply attention mask if provided
+            if mask is not None:
+                mask_chunk = lax.dynamic_slice(
+                    mask,
+                    (0, 0, 0, start_idx),
+                    (batch_size, num_heads, seq_len_q, end_idx - start_idx)
+                )
+                s = jnp.where(mask_chunk, s, -1e10)
+                
+            # Update running maximum for stability
+            m_chunk = jnp.max(s, axis=-1, keepdims=True)
+            m_new = jnp.maximum(m_running, m_chunk)
+            
+            # Compute exponentials with stable scaling
+            exp_scale = jnp.exp(m_running - m_new)
+            exp_s = jnp.exp(s - m_chunk)
+            
+            # Apply dropout if needed
+            if dropout_rng is not None and self.config.dropout_rate > 0 and not self.is_initializing():
+                keep_prob = 1.0 - self.config.dropout_rate
+                dropout_mask = jax.random.bernoulli(
+                    dropout_rng,
+                    p=keep_prob,
+                    shape=exp_s.shape
+                )
+                exp_s = jnp.where(dropout_mask, exp_s / keep_prob, 0)
+            
+            # Update normalizer
+            l_new = lse * exp_scale + jnp.sum(exp_s, axis=-1, keepdims=True)
+            
+            # Update output accumulator
+            output_chunk = lax.dot_general(
+                exp_s, v_chunk,
+                dimension_numbers=(((3,), (2,)), ((0,1), (0,1))),
+                precision=self.matmul_precision
+            )
+            output_new = output * exp_scale + output_chunk
+            
+            return (output_new, l_new, m_new), None
+            
+        # Process chunks with pipeline parallelism
+        num_chunks = (seq_len_k + self.block_size - 1) // self.block_size
+        init_state = (o, l, m)
+        
+        # Run chunked computation
+        (o, l, _), _ = lax.scan(
+            chunk_scanner,
+            init_state,
+            jnp.arange(num_chunks),
+            unroll=self.num_pipeline_stages
+        )
+        
+        # Final normalization
+        o = o / (l + self.epsilon)
+        
+        return o
+        
     def __call__(
         self,
         q: jnp.ndarray,
@@ -39,145 +162,17 @@ class FlashAttentionImpl(nn.Module):
         mask: Optional[jnp.ndarray] = None,
         deterministic: bool = True
     ) -> jnp.ndarray:
-        """Forward pass with O(1) memory complexity.
+        """Apply Flash Attention with TPU optimizations."""
         
-        Args:
-            q: Query tensor [batch, heads, seq_len, head_dim]
-            k: Key tensor [batch, heads, seq_len, head_dim]
-            v: Value tensor [batch, heads, seq_len, head_dim]
-            mask: Optional attention mask
-            deterministic: Whether to use dropout
-        
-        Returns:
-            Output tensor [batch, heads, seq_len, head_dim]
-        """
-        # Get dimensions and prepare memory layout
-        batch_size, num_heads, seq_len_q, head_dim = q.shape
-        _, _, seq_len_k, _ = k.shape
-        
-        # Use efficient compute dtype
-        compute_dtype = jnp.bfloat16 if self.use_fp8 else jnp.float32
+        # Cast to compute dtype for mixed precision
         orig_dtype = q.dtype
-        q = q.astype(compute_dtype)
-        k = k.astype(compute_dtype)
-        v = v.astype(compute_dtype)
+        q = q.astype(self.compute_dtype)
+        k = k.astype(self.compute_dtype)
+        v = v.astype(self.compute_dtype)
         
-        # Initialize accumulators for tiled processing
-        output = jnp.zeros((batch_size, num_heads, seq_len_q, head_dim), dtype=compute_dtype)
-        normalizer = jnp.zeros((batch_size, num_heads, seq_len_q, 1), dtype=compute_dtype)
-        max_so_far = jnp.ones((batch_size, num_heads, seq_len_q, 1), dtype=compute_dtype) * -jnp.inf
-        
-        def block_processor(block_idx, accum):
-            o_acc, norm_acc, m_acc = accum
-            
-            # Get current block boundaries
-            start_idx = block_idx * self.block_size
-            end_idx = min(start_idx + self.block_size, seq_len_k)
-            
-            # Get key/value blocks with prefetching
-            k_block = lax.dynamic_slice(
-                k,
-                (0, 0, start_idx, 0),
-                (batch_size, num_heads, end_idx - start_idx, head_dim)
-            )
-            v_block = lax.dynamic_slice(
-                v,
-                (0, 0, start_idx, 0),
-                (batch_size, num_heads, end_idx - start_idx, head_dim)
-            )
-            
-            # Compute attention scores
-            scale = 1.0 / jnp.sqrt(head_dim)
-            scores = lax.dot_general(
-                q, k_block,
-                dimension_numbers=(((3,), (3,)), ((0,1), (0,1))),
-                precision=lax.Precision.HIGHEST
-            ) * scale
-            
-            # Apply causal masking if needed
-            if self.causal:
-                causal_mask = jnp.greater_equal(
-                    jnp.arange(seq_len_q)[:, None],
-                    jnp.arange(start_idx, end_idx)[None, :]
-                )
-                scores = jnp.where(
-                    causal_mask.reshape(1, 1, seq_len_q, end_idx - start_idx),
-                    scores,
-                    -1e10
-                )
-            
-            # Apply attention mask if provided
-            if mask is not None:
-                mask_block = lax.dynamic_slice(
-                    mask,
-                    (0, 0, 0, start_idx),
-                    (batch_size, num_heads, seq_len_q, end_idx - start_idx)
-                )
-                scores = jnp.where(mask_block, scores, -1e10)
-            
-            # Update running max for numerical stability
-            block_max = jnp.max(scores, axis=-1, keepdims=True)
-            new_max = jnp.maximum(m_acc, block_max)
-            
-            # Compute exponentials with stable numerics
-            exp_scale = jnp.exp(m_acc - new_max)
-            exp_scores = jnp.exp(scores - block_max)
-            
-            # Apply dropout during training
-            if not deterministic and self.dropout_rate > 0:
-                dropout_rng = self.make_rng('dropout')
-                keep_prob = 1.0 - self.dropout_rate
-                dropout_mask = jax.random.bernoulli(
-                    dropout_rng,
-                    p=keep_prob,
-                    shape=exp_scores.shape
-                )
-                exp_scores = exp_scores * dropout_mask / keep_prob
-            
-            # Update running sums
-            norm_new = norm_acc * exp_scale + jnp.sum(exp_scores, axis=-1, keepdims=True)
-            
-            # Compute block output with optimized matmul
-            o_new = (o_acc * exp_scale + 
-                    lax.dot_general(
-                        exp_scores, v_block,
-                        dimension_numbers=(((3,), (2,)), ((0,1), (0,1))),
-                        precision=lax.Precision.HIGHEST
-                    ))
-            
-            return (o_new, norm_new, new_max)
-        
-        # Process blocks with automatic loop unrolling
-        num_blocks = (seq_len_k + self.block_size - 1) // self.block_size
-        for block_idx in range(num_blocks):
-            output, normalizer, max_so_far = block_processor(
-                block_idx,
-                (output, normalizer, max_so_far)
-            )
-        
-        # Final normalization
-        output = output / (normalizer + 1e-6)
+        # Run attention with optimal chunking
+        dropout_rng = None if deterministic else self.make_rng('dropout')
+        output = self._chunk_attention(q, k, v, mask, dropout_rng)
         
         # Cast back to original dtype
-        output = output.astype(orig_dtype)
-        
-        return output
-
-def create_flash_attention(
-    block_size: int = 128,
-    num_heads: int = 8,
-    head_dim: int = 64,
-    dropout_rate: float = 0.0,
-    causal: bool = False,
-    use_fp8: bool = True
-) -> FlashAttentionImpl:
-    """Factory function to create Flash Attention module."""
-    config = FlashAttentionConfig(
-        block_size=block_size,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        dropout_rate=dropout_rate,
-        causal=causal,
-        use_fp8=use_fp8
-    )
-    return FlashAttentionImpl(config)
+        return output.astype(orig_dtype)

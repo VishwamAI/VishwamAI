@@ -241,3 +241,144 @@ class MultimodalBatchProcessor:
             )
 
         return outputs
+
+class MultimodalProcessor:
+    """Processor for preparing multimodal inputs for VishwamAI."""
+    
+    def __init__(
+        self,
+        tokenizer: Any,
+        image_processor: Optional[ImageProcessor] = None,
+        audio_processor: Optional[AudioProcessor] = None,
+        sonar_config: Optional[Dict[str, Any]] = None
+    ):
+        """Initialize processor.
+        
+        Args:
+            tokenizer: The tokenizer for text processing
+            image_processor: Optional custom image processor
+            audio_processor: Optional custom audio processor
+            sonar_config: Optional SONAR configuration for multilingual
+        """
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor or ImageProcessor()
+        self.audio_processor = audio_processor or AudioProcessor()
+        
+        if sonar_config:
+            from vishwamai.multimodal.sonar import SonarEncoder
+            self.sonar_encoder = SonarEncoder(sonar_config)
+            self._has_sonar = True
+        else:
+            self._has_sonar = False
+            
+    def prepare_vision_inputs(
+        self,
+        images: Union[np.ndarray, List[np.ndarray]],
+        return_tensors: bool = True
+    ) -> Dict[str, Any]:
+        """Prepare vision inputs.
+        
+        Args:
+            images: Single image or batch of images
+            return_tensors: Whether to return JAX tensors
+            
+        Returns:
+            Dict with processed image inputs
+        """
+        return self.image_processor.prepare_images(
+            images,
+            return_tensors=return_tensors
+        )
+        
+    def prepare_audio_inputs(
+        self,
+        audio: Union[np.ndarray, List[np.ndarray]],
+        sampling_rate: Optional[int] = None,
+        return_tensors: bool = True
+    ) -> Dict[str, Any]:
+        """Prepare audio inputs.
+        
+        Args:
+            audio: Single audio or batch of audio waveforms
+            sampling_rate: Sample rate(s) of audio
+            return_tensors: Whether to return JAX tensors
+            
+        Returns:
+            Dict with processed audio inputs
+        """
+        return self.audio_processor(
+            audio,
+            sampling_rate=sampling_rate,
+            return_tensors=return_tensors
+        )
+        
+    def prepare_text_inputs(
+        self,
+        texts: Union[str, List[str]],
+        padding: bool = True,
+        truncation: bool = True,
+        max_length: Optional[int] = None,
+        return_tensors: bool = True
+    ) -> Dict[str, Any]:
+        """Prepare text inputs.
+        
+        Args:
+            texts: Text or batch of texts
+            padding: Whether to pad sequences
+            truncation: Whether to truncate sequences
+            max_length: Max sequence length
+            return_tensors: Whether to return JAX tensors
+            
+        Returns:
+            Dict with processed text inputs
+        """
+        return self.tokenizer(
+            texts,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            return_tensors="jax" if return_tensors else None
+        )
+        
+    def prepare_multilingual_inputs(
+        self,
+        text: Optional[Union[str, List[str]]] = None,
+        speech: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
+        src_lang: Optional[str] = None,
+        tgt_lang: Optional[str] = None,
+        return_tensors: bool = True
+    ) -> Dict[str, Any]:
+        """Prepare multilingual inputs using SONAR.
+        
+        Args:
+            text: Optional text input
+            speech: Optional speech input
+            src_lang: Source language code
+            tgt_lang: Target language code
+            return_tensors: Whether to return JAX tensors
+            
+        Returns:
+            Dict with processed multilingual inputs
+        """
+        if not self._has_sonar:
+            raise ValueError("SONAR configuration required for multilingual processing")
+            
+        inputs = {}
+        if text is not None:
+            text_inputs = self.sonar_encoder.embed_text(
+                text if isinstance(text, list) else [text],
+                src_lang=src_lang
+            )
+            inputs.update(text_inputs)
+            
+        if speech is not None:
+            speech_inputs = self.sonar_encoder.embed_speech(
+                speech if isinstance(speech, list) else [speech],
+                src_lang=src_lang
+            )
+            inputs.update(speech_inputs)
+            
+        if tgt_lang is not None:
+            inputs["target_lang"] = tgt_lang
+            
+        return inputs

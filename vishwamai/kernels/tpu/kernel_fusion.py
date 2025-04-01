@@ -1,203 +1,351 @@
-"""TPU kernel fusion manager for optimized training."""
+"""TPU kernel fusion optimization engine."""
 
-from typing import Dict, List, Optional, Any, Tuple
 import jax
 import jax.numpy as jnp
 from jax import lax
-from functools import partial
+from typing import Dict, List, Optional, Tuple, Set, Any
+from dataclasses import dataclass
+from enum import Enum, auto
+import numpy as np
 
-from .pipeline_config import TPUPipelineConfig
-from .flash_attention import TPUFlashAttention
-from .gemm import TPUGEMMKernel
+from .tpu_custom_call import optimize_tpu_layout
 
-class TPUKernelFusionManager:
-    """Manages kernel fusion and optimization for TPU training."""
+class FusionPattern(Enum):
+    """Supported kernel fusion patterns."""
+    MATMUL_BIAS = auto()
+    MATMUL_RELU = auto()
+    MATMUL_BIAS_RELU = auto()
+    ATTENTION_DROPOUT = auto()
+    NORM_DROPOUT = auto()
+    RESIDUAL_DROPOUT = auto()
+    GELU_MATMUL = auto()
+    LAYERNORM_MATMUL = auto()
+    RMSNORM_ATTENTION = auto()
+
+@dataclass
+class FusionConfig:
+    """Configuration for kernel fusion."""
+    pattern: FusionPattern
+    block_size: int = 128
+    min_size: int = 1024
+    max_size: int = 16384
+    precision: str = "highest"
+    profile: bool = False
+
+class TPUKernelFusion:
+    """
+    Optimizes computation by fusing compatible TPU kernels.
     
-    def __init__(self, config: TPUPipelineConfig):
-        self.config = config
-        self.flash_attention = TPUFlashAttention(
-            block_size=config.block_size,
-            use_bfloat16=config.use_bfloat16,
-            use_fp8=config.use_fp8
-        )
-        self.gemm = TPUGEMMKernel(
-            block_size=config.block_size,
-            use_bfloat16=config.use_bfloat16,
-            use_fp8=config.use_fp8,
-            precision=config.matmul_precision
-        )
+    Features:
+    - Automatic pattern detection
+    - Memory access optimization
+    - Performance profiling
+    - Dynamic fusion selection
+    """
+    
+    def __init__(self, block_size: int = 128):
+        """
+        Initialize kernel fusion engine.
         
-        # Initialize fusion patterns
-        self.fusion_patterns = self._create_fusion_patterns()
+        Args:
+            block_size: Block size for TPU operations (must be multiple of 128)
+        """
+        if block_size % 128 != 0:
+            raise ValueError("Block size must be multiple of 128 for TPU")
+            
+        self.block_size = block_size
+        self.fusion_cache: Dict[str, Any] = {}
+        self._initialize_patterns()
         
-    def _create_fusion_patterns(self) -> Dict[str, Any]:
-        """Create optimized fusion patterns for common operations."""
-        patterns = {}
+    def _initialize_patterns(self):
+        """Initialize supported fusion patterns."""
+        self.patterns = {
+            FusionPattern.MATMUL_BIAS: self._fuse_matmul_bias,
+            FusionPattern.MATMUL_RELU: self._fuse_matmul_relu,
+            FusionPattern.MATMUL_BIAS_RELU: self._fuse_matmul_bias_relu,
+            FusionPattern.ATTENTION_DROPOUT: self._fuse_attention_dropout,
+            FusionPattern.NORM_DROPOUT: self._fuse_norm_dropout,
+            FusionPattern.RESIDUAL_DROPOUT: self._fuse_residual_dropout,
+            FusionPattern.GELU_MATMUL: self._fuse_gelu_matmul,
+            FusionPattern.LAYERNORM_MATMUL: self._fuse_layernorm_matmul,
+            FusionPattern.RMSNORM_ATTENTION: self._fuse_rmsnorm_attention
+        }
         
-        # Fused attention + dropout + residual
-        def fused_attention_pattern(
-            q: jnp.ndarray,
-            k: jnp.ndarray,
-            v: jnp.ndarray,
-            residual: jnp.ndarray,
-            mask: Optional[jnp.ndarray] = None,
-            dropout_rng: Optional[Any] = None
-        ) -> jnp.ndarray:
-            # Run flash attention
-            attn_output = self.flash_attention(q, k, v, mask=mask)
-            
-            # Fused dropout + residual
-            if dropout_rng is not None and self.config.dropout_rate > 0:
-                keep_prob = 1.0 - self.config.dropout_rate
-                dropout_mask = jax.random.bernoulli(
-                    dropout_rng,
-                    p=keep_prob,
-                    shape=attn_output.shape
-                )
-                attn_output = attn_output * dropout_mask / keep_prob
-            
-            return attn_output + residual
-            
-        patterns["attention_dropout_residual"] = fused_attention_pattern
-        
-        # Fused FFN + dropout + residual
-        def fused_ffn_pattern(
-            x: jnp.ndarray,
-            w1: jnp.ndarray,
-            w2: jnp.ndarray,
-            residual: jnp.ndarray,
-            dropout_rng: Optional[Any] = None,
-            activation: str = "gelu"
-        ) -> jnp.ndarray:
-            # First linear layer
-            hidden = self.gemm(x, w1)
-            
-            # Activation
-            if activation == "gelu":
-                hidden = jax.nn.gelu(hidden)
-            elif activation == "relu":
-                hidden = jax.nn.relu(hidden)
-            else:
-                raise ValueError(f"Unsupported activation: {activation}")
-                
-            # Second linear layer with fused dropout + residual
-            output = self.gemm(hidden, w2)
-            
-            if dropout_rng is not None and self.config.dropout_rate > 0:
-                keep_prob = 1.0 - self.config.dropout_rate
-                dropout_mask = jax.random.bernoulli(
-                    dropout_rng,
-                    p=keep_prob,
-                    shape=output.shape
-                )
-                output = output * dropout_mask / keep_prob
-                
-            return output + residual
-            
-        patterns["ffn_dropout_residual"] = fused_ffn_pattern
-        
-        # Fused layer norm
-        def fused_layer_norm(
-            x: jnp.ndarray,
-            weight: Optional[jnp.ndarray] = None,
-            bias: Optional[jnp.ndarray] = None,
-            eps: float = 1e-6
-        ) -> jnp.ndarray:
-            mean = jnp.mean(x, axis=-1, keepdims=True)
-            variance = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
-            x_norm = (x - mean) * jax.lax.rsqrt(variance + eps)
-            
-            if weight is not None:
-                x_norm = x_norm * weight
-            if bias is not None:
-                x_norm = x_norm + bias
-                
-            return x_norm
-            
-        patterns["layer_norm"] = fused_layer_norm
-        
-        return patterns
-        
-    def get_fused_pattern(self, pattern_name: str):
-        """Get a specific fusion pattern."""
-        if pattern_name not in self.fusion_patterns:
-            raise ValueError(f"Unknown fusion pattern: {pattern_name}")
-        return self.fusion_patterns[pattern_name]
-        
-    @partial(jax.jit, static_argnums=(0,))
-    def fused_transformer_layer(
+    def fuse_operations(
         self,
-        hidden_states: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray],
-        layer_params: Dict[str, jnp.ndarray],
-        dropout_rng: Optional[Any] = None
-    ) -> jnp.ndarray:
-        """Fused transformer layer computation."""
-        # Layer norm 1
-        ln1_out = self.fusion_patterns["layer_norm"](
-            hidden_states,
-            layer_params["ln1_weight"],
-            layer_params["ln1_bias"]
-        )
+        operations: List[Tuple[str, Dict[str, Any]]],
+        config: Optional[FusionConfig] = None
+    ) -> Any:
+        """
+        Fuse compatible operations for TPU execution.
         
-        # Self attention
-        q = self.gemm(ln1_out, layer_params["q_weight"])
-        k = self.gemm(ln1_out, layer_params["k_weight"]) 
-        v = self.gemm(ln1_out, layer_params["v_weight"])
-        
-        attn_out = self.fusion_patterns["attention_dropout_residual"](
-            q, k, v,
-            residual=hidden_states,
-            mask=attention_mask,
-            dropout_rng=dropout_rng
-        )
-        
-        # Layer norm 2
-        ln2_out = self.fusion_patterns["layer_norm"](
-            attn_out,
-            layer_params["ln2_weight"],
-            layer_params["ln2_bias"]
-        )
-        
-        # Feed forward
-        ffn_out = self.fusion_patterns["ffn_dropout_residual"](
-            ln2_out,
-            layer_params["ffn_w1"],
-            layer_params["ffn_w2"],
-            residual=attn_out,
-            dropout_rng=dropout_rng
-        )
-        
-        return ffn_out
-        
-    def create_optimized_forward(self, num_layers: int):
-        """Create optimized forward pass function."""
-        
-        @partial(jax.jit, static_argnums=(0,))
-        def optimized_forward(
-            self,
-            hidden_states: jnp.ndarray,
-            attention_mask: Optional[jnp.ndarray],
-            params: Dict[str, Dict[str, jnp.ndarray]],
-            dropout_rng: Optional[Any] = None
-        ) -> jnp.ndarray:
-            def layer_fn(state, layer_idx):
-                layer_params = params[f"layer_{layer_idx}"]
-                return self.fused_transformer_layer(
-                    state,
-                    attention_mask,
-                    layer_params,
-                    dropout_rng
-                ), None
-                
-            # Process all layers with automatic rematerialization
-            final_state, _ = jax.lax.scan(
-                layer_fn,
-                hidden_states,
-                jnp.arange(num_layers),
-                unroll=self.config.remat_granularity
+        Args:
+            operations: List of (op_name, op_args) tuples
+            config: Optional fusion configuration
+            
+        Returns:
+            Fused operation callable
+        """
+        if not operations:
+            raise ValueError("No operations provided for fusion")
+            
+        # Detect fusion pattern
+        pattern = self._detect_pattern(operations)
+        if pattern is None:
+            return None
+            
+        # Use provided config or create default
+        if config is None:
+            config = FusionConfig(
+                pattern=pattern,
+                block_size=self.block_size
             )
             
-            return final_state
+        # Check cache
+        cache_key = self._get_cache_key(operations, config)
+        if cache_key in self.fusion_cache:
+            return self.fusion_cache[cache_key]
             
-        return optimized_forward
+        # Create fused operation
+        fused_op = self.patterns[pattern](**{
+            k: v for op in operations
+            for k, v in op[1].items()
+        })
+        
+        # Cache result
+        self.fusion_cache[cache_key] = fused_op
+        return fused_op
+        
+    def _detect_pattern(
+        self,
+        operations: List[Tuple[str, Dict[str, Any]]]
+    ) -> Optional[FusionPattern]:
+        """Detect applicable fusion pattern."""
+        op_names = [op[0] for op in operations]
+        op_str = "_".join(op_names).upper()
+        
+        try:
+            return FusionPattern[op_str]
+        except KeyError:
+            return None
+            
+    def _get_cache_key(
+        self,
+        operations: List[Tuple[str, Dict[str, Any]]],
+        config: FusionConfig
+    ) -> str:
+        """Generate cache key for operation sequence."""
+        op_key = "_".join(f"{op[0]}:{sorted(op[1].keys())}" for op in operations)
+        config_key = f"{config.pattern}:{config.block_size}:{config.precision}"
+        return f"{op_key}|{config_key}"
+        
+    def _fuse_matmul_bias(
+        self,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        bias: jnp.ndarray,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse matrix multiplication with bias addition."""
+        # Optimize layouts
+        a = optimize_tpu_layout(a, self.block_size)
+        b = optimize_tpu_layout(b, self.block_size)
+        
+        # Fused computation
+        return jax.lax.dot_general(
+            a, b,
+            dimension_numbers=(((len(a.shape)-1,), (0,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        ) + bias
+        
+    def _fuse_matmul_relu(
+        self,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse matrix multiplication with ReLU activation."""
+        # Optimize layouts
+        a = optimize_tpu_layout(a, self.block_size)
+        b = optimize_tpu_layout(b, self.block_size)
+        
+        # Fused computation
+        result = jax.lax.dot_general(
+            a, b,
+            dimension_numbers=(((len(a.shape)-1,), (0,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        return jax.nn.relu(result)
+        
+    def _fuse_matmul_bias_relu(
+        self,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        bias: jnp.ndarray,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse matrix multiplication with bias and ReLU."""
+        # Optimize layouts
+        a = optimize_tpu_layout(a, self.block_size)
+        b = optimize_tpu_layout(b, self.block_size)
+        
+        # Fused computation
+        result = jax.lax.dot_general(
+            a, b,
+            dimension_numbers=(((len(a.shape)-1,), (0,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        return jax.nn.relu(result + bias)
+        
+    def _fuse_attention_dropout(
+        self,
+        query: jnp.ndarray,
+        key: jnp.ndarray,
+        value: jnp.ndarray,
+        dropout_rate: float,
+        training: bool,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse attention computation with dropout."""
+        # Compute attention scores
+        scores = jax.lax.dot_general(
+            query, key,
+            dimension_numbers=(((len(query.shape)-1,), (len(key.shape)-1,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        
+        # Fused softmax and dropout
+        if training and dropout_rate > 0:
+            scores = jax.nn.softmax(scores)
+            scores = jax.random.dropout(
+                jax.random.PRNGKey(0),
+                dropout_rate,
+                scores
+            )
+        else:
+            scores = jax.nn.softmax(scores)
+            
+        # Compute attention output
+        return jax.lax.dot_general(
+            scores, value,
+            dimension_numbers=(((len(scores.shape)-1,), (len(value.shape)-2,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        
+    def _fuse_norm_dropout(
+        self,
+        x: jnp.ndarray,
+        weight: jnp.ndarray,
+        bias: jnp.ndarray,
+        dropout_rate: float,
+        training: bool,
+        eps: float = 1e-6,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse layer normalization with dropout."""
+        # Compute statistics
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        
+        # Normalize and scale
+        x_norm = (x - mean) * jax.lax.rsqrt(var + eps)
+        x_norm = x_norm * weight + bias
+        
+        # Apply dropout if training
+        if training and dropout_rate > 0:
+            return jax.random.dropout(
+                jax.random.PRNGKey(0),
+                dropout_rate,
+                x_norm
+            )
+        return x_norm
+        
+    def _fuse_residual_dropout(
+        self,
+        x: jnp.ndarray,
+        residual: jnp.ndarray,
+        dropout_rate: float,
+        training: bool,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse residual connection with dropout."""
+        if training and dropout_rate > 0:
+            x = jax.random.dropout(
+                jax.random.PRNGKey(0),
+                dropout_rate,
+                x
+            )
+        return x + residual
+        
+    def _fuse_gelu_matmul(
+        self,
+        x: jnp.ndarray,
+        weight: jnp.ndarray,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse GELU activation with matrix multiplication."""
+        # Compute GELU
+        def gelu(x):
+            return x * 0.5 * (1.0 + jnp.tanh(
+                np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)
+            ))
+            
+        # Fused computation
+        return jax.lax.dot_general(
+            gelu(x), weight,
+            dimension_numbers=(((len(x.shape)-1,), (0,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        
+    def _fuse_layernorm_matmul(
+        self,
+        x: jnp.ndarray,
+        weight: jnp.ndarray,
+        norm_weight: jnp.ndarray,
+        norm_bias: jnp.ndarray,
+        eps: float = 1e-6,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse layer normalization with matrix multiplication."""
+        # Layer norm
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        x_norm = (x - mean) * jax.lax.rsqrt(var + eps)
+        x_norm = x_norm * norm_weight + norm_bias
+        
+        # Matrix multiplication
+        return jax.lax.dot_general(
+            x_norm, weight,
+            dimension_numbers=(((len(x_norm.shape)-1,), (0,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        
+    def _fuse_rmsnorm_attention(
+        self,
+        x: jnp.ndarray,
+        weight: jnp.ndarray,
+        query: jnp.ndarray,
+        key: jnp.ndarray,
+        value: jnp.ndarray,
+        eps: float = 1e-6,
+        **kwargs
+    ) -> jnp.ndarray:
+        """Fuse RMSNorm with attention computation."""
+        # RMSNorm
+        ms = jnp.mean(x * x, axis=-1, keepdims=True)
+        x_norm = x * jax.lax.rsqrt(ms + eps)
+        x_norm = x_norm * weight
+        
+        # Attention
+        scores = jax.lax.dot_general(
+            query, key,
+            dimension_numbers=(((len(query.shape)-1,), (len(key.shape)-1,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )
+        scores = jax.nn.softmax(scores)
+        
+        return jax.lax.dot_general(
+            scores, value,
+            dimension_numbers=(((len(scores.shape)-1,), (len(value.shape)-2,)), ((), ())),
+            precision=lax.Precision.HIGHEST
+        )

@@ -1,59 +1,77 @@
+"""Chain of Thought implementation for VishwamAI."""
+
 import jax
 import jax.numpy as jnp
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
-def format_cot_prompt(question: str, examples: Optional[List[Dict[str, str]]] = None) -> str:
-    """
-    Format a prompt for chain-of-thought reasoning.
+def extract_reasoning_steps(text: str) -> Tuple[List[str], str]:
+    """Extract reasoning steps and final answer from generated text."""
+    # Split into steps and answer
+    steps = []
+    answer = ""
+    
+    lines = text.split('\n')
+    current_step = []
+    
+    for line in lines:
+        line = line.strip()
+        if line.lower().startswith(('step', 'therefore', 'thus', 'so', 'finally')):
+            if current_step:
+                steps.append(' '.join(current_step))
+                current_step = []
+            if line.lower().startswith(('therefore', 'thus', 'so', 'finally')):
+                answer = line
+                break
+            current_step.append(line)
+        elif current_step or line:
+            current_step.append(line)
+            
+    if current_step and not answer:
+        steps.append(' '.join(current_step))
+        
+    return steps, answer
 
-    Args:
-        question: The question to reason about.
-        examples: Optional few-shot examples with 'question', 'reasoning', and 'answer' keys.
-
-    Returns:
-        A formatted prompt string.
-    """
-    prompt = ""
-
-    # Add few-shot examples if provided
-    if examples:
-        for example in examples:
-            if not all(key in example for key in ['question', 'reasoning', 'answer']):
-                raise ValueError("Each example must have 'question', 'reasoning', and 'answer' keys.")
-            prompt += f"Question: {example['question']}\n"
-            prompt += "Let's approach this step by step:\n"
-            prompt += f"{example['reasoning']}\n"
-            prompt += f"Therefore, the answer is: {example['answer']}\n\n"
-
-    # Add the actual question
-    prompt += f"Question: {question}\n"
-    prompt += "Let's approach this step by step:\n"
-
-    return prompt
-
-def extract_reasoning_steps(output: str, separator: str = "Therefore, the answer is:") -> Tuple[List[str], str]:
-    """
-    Extract reasoning steps and final answer from model output.
-
-    Args:
-        output: Raw model output text.
-        separator: String separating reasoning from answer.
-
-    Returns:
-        A tuple of (reasoning_steps, answer), where reasoning_steps is a list of steps and answer is a string.
-    """
-    # Split reasoning and answer
-    parts = output.split(separator)
-    if len(parts) != 2:
-        # If separator not found, treat entire output as answer with no steps
-        return [], output.strip()
-
-    reasoning, answer = parts
-
-    # Extract steps from reasoning part
-    steps = [step.strip() for step in reasoning.split('\n') if step.strip()]
-
-    return steps, answer.strip()
+def validate_reasoning(
+    model: Any,
+    params: Any,
+    tokenizer: Any,
+    question: str,
+    steps: List[str],
+    answer: str,
+    key: jax.random.PRNGKey
+) -> Tuple[bool, str]:
+    """Validate the reasoning steps and answer."""
+    validation_prompt = (
+        f"Question: {question}\n\n"
+        f"Reasoning steps:\n" + "\n".join(steps) + "\n\n"
+        f"Answer: {answer}\n\n"
+        "Are these reasoning steps logically valid and does the answer follow from them? "
+        "First answer YES or NO, then explain why:"
+    )
+    
+    input_ids = tokenizer.encode(
+        validation_prompt,
+        return_tensors="jax",
+        max_length=model.config.max_seq_len,
+        truncation=True
+    ).tolist()[0]
+    
+    generated = generate_sequence(
+        model=model,
+        params=params,
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        max_length=len(input_ids) + 200,
+        temperature=0.7,
+        key=key,
+        num_return_sequences=1
+    )[0]
+    
+    response = tokenizer.decode(generated, skip_special_tokens=True)
+    is_valid = response.lower().startswith('yes')
+    
+    return is_valid, response
 
 def generate_sequence(
     model: Any,
@@ -62,129 +80,43 @@ def generate_sequence(
     input_ids: List[int],
     max_length: int,
     temperature: float,
-    key: jax.random.PRNGKey
-) -> List[int]:
-    """Generates a sequence of tokens autoregressively using a JAX/Flax transformer model.
-    
-    This function performs token generation by:
-    1. Taking the current sequence of tokens
-    2. Computing logits from the model
-    3. Applying temperature scaling
-    4. Sampling the next token
-    5. Appending it to the sequence
-    6. Repeating until max length or EOS token is reached
-    
-    Args:
-        model: The Flax transformer model for text generation.
-        params: Dictionary of model parameters/weights.
-        tokenizer: Tokenizer instance for encoding/decoding text.
-        input_ids: List of integer token IDs to start generation from.
-        max_length: Maximum number of tokens to generate.
-        temperature: Sampling temperature - higher values increase diversity.
-        key: JAX PRNG key for random sampling.
-
-    Returns:
-        List[int]: The generated sequence of token IDs, including the input_ids.
-        
-    Note:
-        - Uses JAX's categorical sampling for token selection
-        - Stops early if the model's EOS token is generated
-        - Temperature scaling controls randomness in generation
-    """
-    generated = list(input_ids)
-    current_key = key
-
-    while len(generated) < max_length:
-        current_key, subkey = jax.random.split(current_key)
-        input_array = jnp.array([generated])
-        logits = model.apply({'params': params}, input_array, deterministic=True)
-        last_logits = logits[:, -1, :] / temperature
-        next_token = jax.random.categorical(subkey, last_logits).item()
-        generated.append(next_token)
-
-        # Stop if EOS token is generated
-        if hasattr(tokenizer, 'eos_token_id') and next_token == tokenizer.eos_token_id:
-            break
-
-    return generated
-
-def cot_generate(
-    model: Any,
-    params: Any,
-    tokenizer: Any,
-    question: str,
-    examples: Optional[List[Dict[str, str]]] = None,
-    max_length: int = 512,
-    temperature: float = 0.7,
-    num_return_sequences: int = 1,
-    **kwargs
-) -> List[Dict[str, Any]]:
-    """
-    Generate chain-of-thought reasoning and answer.
-
-    Args:
-        model: The Flax transformer model.
-        params: Model parameters.
-        tokenizer: Tokenizer for text encoding/decoding.
-        question: Input question.
-        examples: Optional few-shot examples.
-        max_length: Maximum sequence length.
-        temperature: Sampling temperature.
-        num_return_sequences: Number of reasoning paths to generate.
-
-    Returns:
-        A list of dictionaries containing reasoning steps, answer, and full output.
-    """
-    prompt = format_cot_prompt(question, examples)
-    input_ids = tokenizer.encode(prompt)
-
+    key: jax.random.PRNGKey,
+    num_return_sequences: int = 1
+) -> List[List[int]]:
+    """Generate sequences using the model."""
     outputs = []
-    base_key = jax.random.PRNGKey(0)
+    
     for i in range(num_return_sequences):
-        key = jax.random.fold_in(base_key, i)
-        generated = generate_sequence(model, params, tokenizer, input_ids, max_length, temperature, key)
-        decoded = tokenizer.decode(generated)
-        steps, answer = extract_reasoning_steps(decoded)
-        outputs.append({
-            'reasoning_steps': steps,
-            'answer': answer,
-            'full_output': decoded
-        })
-
+        subkey = jax.random.fold_in(key, i)
+        
+        # Initialize sequence
+        cur_ids = input_ids.copy()
+        
+        # Auto-regressive generation
+        for _ in range(max_length - len(input_ids)):
+            logits = model.apply(
+                {'params': params},
+                jnp.array(cur_ids)[None, :],
+                deterministic=True
+            )
+            
+            # Get next token probabilities
+            next_token_logits = logits[0, -1, :]
+            next_token_logits = next_token_logits / temperature
+            next_token_probs = jax.nn.softmax(next_token_logits)
+            
+            # Sample next token
+            next_token = jax.random.categorical(subkey, next_token_logits)
+            
+            # Break if EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+                
+            cur_ids.append(int(next_token))
+            
+        outputs.append(cur_ids)
+        
     return outputs
-
-def evaluate_reasoning_quality(steps: List[str], criteria: Dict[str, float]) -> float:
-    """
-    Evaluate the quality of reasoning steps.
-
-    Args:
-        steps: List of reasoning steps.
-        criteria: Dictionary of criteria names and their weights (e.g., {'num_steps': 0.4, 'logical_flow': 0.6}).
-
-    Returns:
-        A normalized quality score between 0 and 1.
-    """
-    score = 0.0
-    total_weight = sum(criteria.values()) or 1.0  # Avoid division by zero
-
-    # Criterion: Number of steps
-    if 'num_steps' in criteria:
-        optimal_steps = 3  # Adjustable heuristic
-        step_score = max(0, 1 - abs(len(steps) - optimal_steps) / optimal_steps)
-        score += criteria['num_steps'] * step_score
-
-    # Criterion: Logical flow
-    if 'logical_flow' in criteria:
-        flow_score = 0
-        if len(steps) > 1:
-            for i in range(len(steps) - 1):
-                if any(connector in steps[i + 1].lower() for connector in
-                       ['therefore', 'because', 'so', 'thus', 'hence']):
-                    flow_score += 1
-            flow_score /= (len(steps) - 1)
-        score += criteria['logical_flow'] * flow_score
-
-    return score / total_weight
 
 class ChainOfThoughtPrompting:
     """Helper class for chain-of-thought prompting."""
@@ -196,68 +128,167 @@ class ChainOfThoughtPrompting:
         tokenizer: Any,
         few_shot_examples: Optional[List[Dict[str, str]]] = None,
         temperature: float = 0.7,
-        max_length: int = 512
+        max_length: int = 512,
+        seed: int = 0
     ):
-        """
-        Initialize the CoT prompting class.
-
+        """Initialize ChainOfThoughtPrompting.
+        
         Args:
-            model: The Flax transformer model.
-            params: Model parameters.
-            tokenizer: Tokenizer with encode, decode, and optional eos_token_id.
-            few_shot_examples: Optional list of few-shot examples.
-            temperature: Sampling temperature.
-            max_length: Maximum sequence length.
+            model: The language model to use
+            params: Model parameters
+            tokenizer: Tokenizer for text processing
+            few_shot_examples: Optional examples for few-shot prompting
+            temperature: Sampling temperature
+            max_length: Maximum sequence length
+            seed: Random seed
         """
         self.model = model
         self.params = params
         self.tokenizer = tokenizer
-        self.few_shot_examples = few_shot_examples
+        self.few_shot_examples = few_shot_examples or []
         self.temperature = temperature
         self.max_length = max_length
-
-    def generate_reasoning(self, question: str, num_paths: int = 1, **kwargs) -> List[Dict[str, Any]]:
+        self.key = jax.random.PRNGKey(seed)
+        
+    def generate_reasoning(
+        self,
+        question: str,
+        num_paths: int = 1,
+        **kwargs
+    ) -> List[Dict[str, Any]]:
         """Generate multiple reasoning paths for a question."""
-        return cot_generate(
-            self.model,
-            self.params,
-            self.tokenizer,
-            question,
-            self.few_shot_examples,
-            self.max_length,
-            self.temperature,
-            num_return_sequences=num_paths,
-            **kwargs
+        # Construct prompt with examples if available
+        examples_text = ""
+        if self.few_shot_examples:
+            for ex in self.few_shot_examples:
+                examples_text += (
+                    f"Question: {ex['question']}\n"
+                    f"Let's solve this step by step:\n{ex['reasoning']}\n"
+                    f"Therefore, {ex['answer']}\n\n"
+                )
+                
+        prompt = (
+            f"{examples_text}Question: {question}\n"
+            "Let's solve this step by step:"
         )
-
+        
+        input_ids = self.tokenizer.encode(
+            prompt,
+            return_tensors="jax",
+            max_length=self.max_length,
+            truncation=True
+        ).tolist()[0]
+        
+        outputs = []
+        for _ in range(num_paths):
+            self.key, subkey = jax.random.split(self.key)
+            
+            generated = generate_sequence(
+                model=self.model,
+                params=self.params,
+                tokenizer=self.tokenizer,
+                input_ids=input_ids,
+                max_length=self.max_length,
+                temperature=self.temperature,
+                key=subkey,
+                num_return_sequences=1
+            )[0]
+            
+            text = self.tokenizer.decode(generated, skip_special_tokens=True)
+            steps, answer = extract_reasoning_steps(text)
+            
+            self.key, subkey = jax.random.split(self.key)
+            is_valid, validation = validate_reasoning(
+                self.model,
+                self.params,
+                self.tokenizer,
+                question,
+                steps,
+                answer,
+                subkey
+            )
+            
+            outputs.append({
+                'reasoning_steps': steps,
+                'answer': answer,
+                'is_valid': is_valid,
+                'validation': validation,
+                'full_output': text
+            })
+            
+        return outputs
+        
     def evaluate_reasoning(
         self,
         reasoning_outputs: List[Dict[str, Any]],
         criteria: Optional[Dict[str, float]] = None
     ) -> List[Dict[str, Any]]:
         """Evaluate and rank different reasoning paths."""
-        if criteria is None:
-            criteria = {'num_steps': 0.4, 'logical_flow': 0.6}
-
-        # Evaluate each reasoning path
+        criteria = criteria or {
+            'validity': 0.4,
+            'completeness': 0.3,
+            'clarity': 0.3
+        }
+        
         for output in reasoning_outputs:
-            quality_score = evaluate_reasoning_quality(output['reasoning_steps'], criteria)
-            output['quality_score'] = quality_score
-
-        # Sort by quality score in descending order
-        return sorted(reasoning_outputs, key=lambda x: x['quality_score'], reverse=True)
-
-    def reason(self, question: str, num_paths: int = 3, **kwargs) -> Dict[str, Any]:
-        """
-        Generate and evaluate multiple reasoning paths, returning the best one.
-
+            # Score different aspects
+            scores = {}
+            
+            # Validity score from validation
+            scores['validity'] = 1.0 if output['is_valid'] else 0.0
+            
+            # Completeness score based on number of steps
+            num_steps = len(output['reasoning_steps'])
+            scores['completeness'] = min(1.0, num_steps / 5)  # Cap at 5 steps
+            
+            # Clarity score based on average step length
+            avg_step_len = sum(len(s.split()) for s in output['reasoning_steps']) / max(1, num_steps)
+            scores['clarity'] = min(1.0, 20 / avg_step_len)  # Prefer concise steps
+            
+            # Calculate weighted score
+            output['score'] = sum(
+                scores[k] * v for k, v in criteria.items()
+            )
+            output['aspect_scores'] = scores
+            
+        # Sort by score
+        reasoning_outputs.sort(key=lambda x: x['score'], reverse=True)
+        return reasoning_outputs
+        
+    def reason(
+        self,
+        question: str,
+        num_paths: int = 3,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Generate and evaluate reasoning paths to answer a question.
+        
         Args:
-            question: The question to reason about.
-            num_paths: Number of reasoning paths to generate and evaluate.
-
+            question: The question to answer
+            num_paths: Number of reasoning paths to generate
+            **kwargs: Additional arguments for generation
+            
         Returns:
-            The highest-scored reasoning path dictionary.
+            Dictionary containing best reasoning path and metrics
         """
-        reasoning_outputs = self.generate_reasoning(question, num_paths=num_paths, **kwargs)
-        ranked_outputs = self.evaluate_reasoning(reasoning_outputs)
-        return ranked_outputs[0]
+        # Generate multiple reasoning paths
+        paths = self.generate_reasoning(
+            question,
+            num_paths=num_paths,
+            **kwargs
+        )
+        
+        # Evaluate paths
+        evaluated_paths = self.evaluate_reasoning(paths)
+        
+        # Return best path and stats
+        return {
+            'question': question,
+            'best_reasoning': evaluated_paths[0],
+            'all_paths': evaluated_paths,
+            'stats': {
+                'num_paths': len(paths),
+                'avg_score': sum(p['score'] for p in evaluated_paths) / len(evaluated_paths),
+                'max_score': evaluated_paths[0]['score']
+            }
+        }

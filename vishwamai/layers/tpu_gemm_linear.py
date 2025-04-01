@@ -25,17 +25,36 @@ class TPUGEMMLinear(nn.Module):
     use_fp8: bool = False
     block_size: int = 128
     
+    def __init__(
+        self,
+        features: int,
+        use_bias: bool = True,
+        dtype: Any = jnp.float32,
+        param_dtype: Any = jnp.float32,
+        precision: Any = None,
+        kernel_init: Callable = initializers.lecun_normal(),
+        bias_init: Callable = initializers.zeros,
+        use_fp8: bool = False,
+        block_size: int = 128
+    ):
+        # Validate TPU-specific parameters
+        if block_size % 128 != 0:
+            raise ValueError("TPU block_size must be multiple of 128")
+            
+        # Initialize parameters
+        self.features = features
+        self.use_bias = use_bias
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.kernel_init = kernel_init
+        self.bias_init = bias_init
+        self.use_fp8 = use_fp8
+        self.block_size = block_size
+        
     @nn.compact
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
-        """
-        Apply the linear transformation with optimized TPU GEMM operations.
-        
-        Args:
-            inputs: The input tensor of shape [..., input_dim]
-            
-        Returns:
-            Output tensor of shape [..., features]
-        """
+        """Apply the linear transformation with optimized TPU GEMM operations."""
         inputs = jnp.asarray(inputs, self.dtype)
         kernel_shape = (inputs.shape[-1], self.features)
         
@@ -52,32 +71,36 @@ class TPUGEMMLinear(nn.Module):
         
         # Special handling for FP8 computation
         if self.use_fp8 and hasattr(jax.lax, 'with_sharding_constraint'):
-            # Organize kernel in block_size chunks for efficient FP8 computation
-            # This dramatically improves performance on TPUs and recent GPUs
+            # Validate dimensions are TPU-friendly
             k_dim, n_dim = kernel.shape
             blocked_k = (k_dim + self.block_size - 1) // self.block_size
             blocked_n = (n_dim + self.block_size - 1) // self.block_size
+            padded_k_dim = blocked_k * self.block_size
+            padded_n_dim = blocked_n * self.block_size
             
             # Pad to block size if needed
-            if k_dim % self.block_size != 0 or n_dim % self.block_size != 0:
-                pad_k = (0, (blocked_k * self.block_size) - k_dim)
-                pad_n = (0, (blocked_n * self.block_size) - n_dim)
-                kernel = jnp.pad(kernel, (pad_k, pad_n))
+            if padded_k_dim > k_dim or padded_n_dim > n_dim:
+                kernel = jnp.pad(
+                    kernel,
+                    ((0, padded_k_dim - k_dim), (0, padded_n_dim - n_dim)),
+                    mode='constant'
+                )
             
-            # Reshape and apply TPU-specific memory layout optimization
+            # Reshape for TPU efficiency using memory-friendly layout
             kernel = kernel.reshape(blocked_k, self.block_size, blocked_n, self.block_size)
-            kernel = kernel.transpose(0, 2, 1, 3)
+            kernel = kernel.transpose(0, 2, 1, 3)  # Maximize MXU utilization
             
             # Apply sharding for multi-device computation
             kernel = jax.lax.with_sharding_constraint(
-                kernel, jax.sharding.PartitionSpec(None, None, None, None)
+                kernel,
+                jax.sharding.PartitionSpec(None, None, None, None)
             )
             
             # Restore original layout while preserving performance benefits
             kernel = kernel.transpose(0, 2, 1, 3)
             kernel = kernel.reshape(k_dim, n_dim)
             
-        # Bias creation
+        # Handle bias
         if self.use_bias:
             bias = self.param(
                 'bias',
@@ -88,6 +111,9 @@ class TPUGEMMLinear(nn.Module):
             bias = jnp.asarray(bias, self.dtype)
         else:
             bias = None
+            
+        # Optimize input layout for TPU
+        inputs = optimize_input_layout(inputs, self.block_size)
         
         # Compute optimized matrix multiplication
         y = jnp.dot(inputs, kernel, precision=self.precision)
@@ -97,6 +123,47 @@ class TPUGEMMLinear(nn.Module):
             y = y + bias
             
         return y
+
+def optimize_input_layout(x: jnp.ndarray, block_size: int) -> jnp.ndarray:
+    """Optimize input tensor memory layout for TPU."""
+    shape = x.shape
+    ndim = len(shape)
+    
+    if ndim <= 1:
+        return x
+        
+    # For 2D+ tensors, optimize the last two dimensions
+    *batch_dims, rows, cols = shape
+    blocked_rows = (rows + block_size - 1) // block_size
+    blocked_cols = (cols + block_size - 1) // block_size
+    
+    # Pad if needed
+    padded_rows = blocked_rows * block_size
+    padded_cols = blocked_cols * block_size
+    if padded_rows > rows or padded_cols > cols:
+        padding = [(0, 0)] * len(batch_dims) + [
+            (0, padded_rows - rows),
+            (0, padded_cols - cols)
+        ]
+        x = jnp.pad(x, padding, mode='constant')
+    
+    # Reshape to blocked format
+    new_shape = tuple(batch_dims) + (
+        blocked_rows, block_size,
+        blocked_cols, block_size
+    )
+    x = x.reshape(new_shape)
+    
+    # Transpose for TPU efficiency
+    perm = tuple(range(len(batch_dims))) + (
+        len(batch_dims), len(batch_dims)+2,
+        len(batch_dims)+1, len(batch_dims)+3
+    )
+    x = x.transpose(perm)
+    
+    # Reshape back while preserving layout benefits
+    final_shape = tuple(batch_dims) + (rows, cols)
+    return x.reshape(final_shape)
 
 class DistillTPUGEMMLinear(TPUGEMMLinear):
     """

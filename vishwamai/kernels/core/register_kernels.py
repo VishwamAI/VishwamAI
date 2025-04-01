@@ -2,8 +2,8 @@
 
 from typing import Dict, Any, Optional
 from enum import Enum, auto
+from vishwamai.kernels.core.kernel import KernelPlatform
 
-from vishwamai.kernels.jit.jit_manager import register_kernel, KernelPlatform
 from vishwamai.kernels.cuda.flashmla_cuda import (
     jax_get_mla_metadata,
     jax_flash_mla_with_kvcache,
@@ -12,14 +12,13 @@ from vishwamai.kernels.cuda.flashmla_cuda import (
 )
 from vishwamai.kernels.core.kernel import (
     KernelConfig,
+    register_kernel,
     multi_head_attention_kernel,
     flash_attention,
     sliding_window_attention,
     rope_embedding
 )
 from vishwamai.kernels.ops.sparse import (
-    sparse_block_gemm,
-    block_sparse_attention,
     SparseMatrixOps
 )
 from vishwamai.kernels.ops.tree_matmul import TreeMatMul

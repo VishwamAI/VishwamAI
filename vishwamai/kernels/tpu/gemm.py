@@ -19,27 +19,36 @@ class TPUGEMMKernel:
         use_fp8: bool = False,
         use_bfloat16: bool = True,
         reuse_workspace: bool = True,
-        pipeline_depth: int = 3,  # Added pipeline depth for throughput
-        prefetch_distance: int = 2,  # Added prefetch distance
+        pipeline_depth: int = 3,
+        prefetch_distance: int = 2,
     ):
+        # Validate TPU-specific requirements
+        if not isinstance(block_size, int) or block_size < 128 or block_size % 128 != 0:
+            raise ValueError(
+                f"TPU block_size must be a multiple of 128, got {block_size}"
+            )
+        
         self.block_size = block_size
         self.precision = precision or lax.Precision.HIGHEST
-        self.use_fp8 = use_fp8
+        self.use_fp8 = use_fp8 
         self.use_bfloat16 = use_bfloat16
         self.reuse_workspace = reuse_workspace
         self.pipeline_depth = pipeline_depth
         self.prefetch_distance = prefetch_distance
         
-        # Ensure block_size is appropriate for TPU
-        if block_size % 128 != 0:
-            raise ValueError("Block size must be a multiple of 128 for TPU")
-        
-        # Initialize TPU-optimized parameters
-        self.tile_m = 128  # TPU MXU tile size
+        # Initialize TPU-optimized parameters 
+        self.tile_m = 128
         self.tile_n = 128
         self.tile_k = 128
-        self.vectorization_factor = 8  # TPU vector unit width
+        self.vectorization_factor = 8
         
+        # Validate memory layout parameters
+        if self.tile_m % 128 != 0 or self.tile_n % 128 != 0 or self.tile_k % 128 != 0:
+            raise ValueError("All tile dimensions must be multiples of 128 for TPU")
+        
+        if self.vectorization_factor != 8:
+            raise ValueError("TPU vectorization factor must be 8")
+
     def __call__(
         self,
         a: jnp.ndarray,

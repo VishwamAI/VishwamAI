@@ -1,31 +1,63 @@
 """Core kernel management functionality."""
 
 from .kernel import (
-    Kernel,
-    KernelType,
     HardwareType,
     KernelConfig,
-    AbstractKernel
+    AbstractKernel,
+    act_quant,
+    optimize_kernel_layout,
+    block_tpu_matmul,
+    fp8_gemm_optimized
 )
 
 from .kernel_manager import (
+    KernelType,
     KernelManager,
-    get_kernel_manager,
-    register_kernel,
-    get_kernel
+    get_kernel_manager
+)
+
+from .memory import (
+    MemoryLayout,
+    MemoryBlock,
+    MemoryManager
+)
+
+from .shapes import *
+
+from .tuner import (
+    TuningConfig,
+    TuningResult,
+    AutotuneManager,
+    KernelTuner
 )
 
 __all__ = [
-    # Base classes and types
-    "Kernel",
-    "AbstractKernel",
-    "KernelType",
+    # Hardware and Kernel Types
     "HardwareType",
+    "KernelType",
+    
+    # Core Configurations
     "KernelConfig",
-
-    # Kernel management
+    "TuningConfig",
+    "TuningResult",
+    
+    # Core Classes
+    "AbstractKernel",
     "KernelManager",
-    "get_kernel_manager",
-    "register_kernel",
-    "get_kernel"
+    "MemoryManager",
+    "AutotuneManager",
+    "KernelTuner",
+    
+    # Memory Management
+    "MemoryLayout",
+    "MemoryBlock",
+    
+    # TPU Optimized Operations  
+    "act_quant",
+    "optimize_kernel_layout",
+    "block_tpu_matmul",
+    "fp8_gemm_optimized",
+    
+    # Kernel Management
+    "get_kernel_manager"
 ]

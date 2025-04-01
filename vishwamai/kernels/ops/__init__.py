@@ -10,7 +10,7 @@ from .activation import (
 
 from .hybrid_matmul import HybridMatMul
 from .tree_matmul import TreeMatMul, create_adaptive_depth_mask
-from .sparse import sparse_matmul, sparse_attention
+from .sparse import SparseMatrixOps
 from .eplib import efficient_parallel_ops
 
 __all__ = [
@@ -26,9 +26,8 @@ __all__ = [
     "TreeMatMul",
     "create_adaptive_depth_mask",
     
-    # Sparse operations
-    "sparse_matmul",
-    "sparse_attention",
+    # Sparse matrix operations
+    "SparseMatrixOps",
     
     # Efficient parallel operations
     "efficient_parallel_ops"

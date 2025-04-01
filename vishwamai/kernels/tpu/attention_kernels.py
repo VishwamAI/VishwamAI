@@ -19,46 +19,52 @@ def flash_attention_inference(
     num_heads: int = 8,
     use_fp8: bool = True
 ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]]:
-    """Heavily optimized Flash Attention for inference on TPU.
+    """Heavily optimized Flash Attention for inference on TPU."""
     
-    Features:
-    - Aggressive kernel fusion
-    - Cache-aware blocking
-    - Fast path for single-token inference
-    - FP8 quantization support
-    - Pipeline parallelism
-    """
+    if block_size % 128 != 0:
+        raise ValueError("Block size must be multiple of 128 for TPU")
+    
     # Add past key/values if provided
     if past_key_values is not None:
         past_k, past_v = past_key_values
         k = jnp.concatenate([past_k, k], axis=2)
         v = jnp.concatenate([past_v, v], axis=2)
     
-    # Initialize output
+    # Get dimensions
     batch_size = q.shape[0]
     seq_len = q.shape[2]
     kv_len = k.shape[2]
     
-    # Fast path optimization for single-token generation
+    # Cast to efficient compute dtype
+    compute_dtype = jnp.bfloat16 if not use_fp8 else jnp.float32
+    orig_dtype = q.dtype
+    q = q.astype(compute_dtype) 
+    k = k.astype(compute_dtype)
+    v = v.astype(compute_dtype)
+    
+    # Fast path for single token inference
     is_single_token = seq_len == 1
     
     if is_single_token:
         # Direct attention calculation without tiling
         scale = 1.0 / jnp.sqrt(head_dim)
         
-        # Fused QK computation
+        # Fused QK computation with maximum precision
         scores = lax.dot_general(
             q, k,
             dimension_numbers=(((3,), (3,)), ((0,1), (0,1))),
             precision=lax.Precision.HIGHEST
         ) * scale
         
-        # Apply mask if needed
+        # Safe masking 
         if mask is not None:
             scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
         
-        # Fused softmax + dropout
-        probs = jax.nn.softmax(scores, axis=-1)
+        # Stable softmax
+        scores_max = jnp.max(scores, axis=-1, keepdims=True)
+        scores = scores - scores_max
+        exp_scores = jnp.exp(scores)
+        probs = exp_scores / jnp.sum(exp_scores, axis=-1, keepdims=True)
         
         # Optimized value computation
         output = lax.dot_general(
@@ -68,9 +74,9 @@ def flash_attention_inference(
         )
     else:
         # Multi-token case: use tiled flash attention
-        output = jnp.zeros((batch_size, num_heads, seq_len, head_dim), dtype=q.dtype)
-        l = jnp.zeros((batch_size, num_heads, seq_len, 1), dtype=q.dtype)
-        m = jnp.ones((batch_size, num_heads, seq_len, 1), dtype=q.dtype) * -jnp.inf
+        output = jnp.zeros((batch_size, num_heads, seq_len, head_dim), dtype=compute_dtype)
+        l = jnp.zeros((batch_size, num_heads, seq_len, 1), dtype=compute_dtype)
+        m = jnp.ones((batch_size, num_heads, seq_len, 1), dtype=compute_dtype) * -jnp.inf
         scale = 1.0 / jnp.sqrt(head_dim)
         
         # Process blocks with aggressive prefetching
@@ -97,7 +103,7 @@ def flash_attention_inference(
                 mask_block = mask[:, :, :, block_start:block_end]
                 s = jnp.where(mask_block, s, jnp.finfo(s.dtype).min)
             
-            # Update running max with fused op
+            # Update running max with fused op for stability
             m_block = jnp.max(s, axis=-1, keepdims=True)
             m_new = jnp.maximum(m, m_block)
             
@@ -108,7 +114,7 @@ def flash_attention_inference(
             # Update accumulators with fused ops
             l_new = l * exp_scale + jnp.sum(exp_s, axis=-1, keepdims=True)
             
-            # Optimized matmul update
+            # Optimized matmul update with recomputation avoidance
             output = (output * exp_scale + lax.dot_general(
                 exp_s, v_block,
                 dimension_numbers=(((3,), (2,)), ((0,1), (0,1))),
@@ -121,6 +127,9 @@ def flash_attention_inference(
         
         # Final normalization (already done in loop)
         output = output / l
+    
+    # Cast back to original dtype
+    output = output.astype(orig_dtype)
     
     # Cache key/values for next forward pass
     present = (k, v) if past_key_values is not None else None

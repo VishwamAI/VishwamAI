@@ -5,18 +5,16 @@ from collections.abc import Sequence
 from flax import linen as nn
 import jax
 from jax import numpy as jnp
-from kauldron import typing
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Any, Union, TypeVar, Literal
 from numpy.typing import NDArray, ArrayLike
 
 # Define type variables for better type hinting
 B = TypeVar('B')  # Batch dimension
-M = TypeVar('M')  # Sequence length dimension
+M = TypeVar('M')  # Sequence length dimension 
 D = TypeVar('D')  # Embedding dimension
 N = TypeVar('N')  # Image height dimension
 P = TypeVar('P')  # Image width dimension
-
 
 def _posemb_sincos_2d(
     h: int,
@@ -26,440 +24,146 @@ def _posemb_sincos_2d(
     dtype: Any = jnp.float32,
     scale: float = 1.0  # Added scaling factor
 ) -> jnp.ndarray:
-    """Generate 2D sinusoidal position embeddings with improved scaling.
+    """Generate 2D sinusoidal position embeddings with TPU optimizations.
     
     Args:
-        h: Height (patches)
-        w: Width (patches)
+        h: Image height in patches
+        w: Image width in patches
         width: Hidden dimension size
-        temperature: Temperature for frequencies
-        dtype: Data type for outputs
+        temperature: Temperature for frequency scaling
+        dtype: Data type for embeddings
         scale: Optional scaling factor for embeddings
         
     Returns:
         Position embeddings [h*w, width]
     """
+    # Generate grid indices
     y, x = jnp.meshgrid(
         jnp.arange(h, dtype=jnp.float32),
         jnp.arange(w, dtype=jnp.float32),
         indexing='ij'
     )
     
-    if width % 4 != 0:
-        raise ValueError(f"Width {width} must be divisible by 4 for 2D position embeddings")
+    # Flatten grid coordinates
+    y = y.reshape(-1)
+    x = x.reshape(-1)
+    
+    # Efficient computation of frequency bands
+    omega = jnp.exp(-jnp.log(temperature) * jnp.arange(0, width // 4, dtype=jnp.float32) / (width // 4))
+    
+    # Compute embeddings efficiently using TPU-optimized operations
+    y_emb = y[:, None] * omega[None, :]
+    x_emb = x[:, None] * omega[None, :]
+    
+    # Concatenate sin/cos embeddings
+    pos_emb = jnp.concatenate([
+        jnp.sin(y_emb),
+        jnp.cos(y_emb),
+        jnp.sin(x_emb),
+        jnp.cos(x_emb)
+    ], axis=1)
+    
+    # Scale if needed
+    if scale != 1.0:
+        pos_emb = pos_emb * scale
         
-    omega = jnp.arange(width // 4, dtype=jnp.float32) / (width // 4 - 1)
-    omega = 1. / (temperature ** omega)
-    
-    y = y.reshape(-1)[:, None] * omega[None, :]
-    x = x.reshape(-1)[:, None] * omega[None, :]
-    
-    pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
-    
-    # Apply scaling
-    pe = pe * scale
-    
-    return pe.astype(dtype)
-
-
-class MlpBlock(nn.Module):
-    """Transformer MLP / feed-forward block."""
-    
-    mlp_dim: Optional[int] = None
-    dropout_rate: float = 0.0
-    dtype: Any = jnp.float32
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """Apply MLP block.
-        
-        Args:
-            x: Input tensor
-            deterministic: Whether in inference mode
-            
-        Returns:
-            Transformed tensor
-        """
-        actual_mlp_dim = self.mlp_dim or x.shape[-1] * 4
-        
-        y = nn.Dense(features=actual_mlp_dim, dtype=self.dtype)(x)
-        y = nn.gelu(y)
-        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=deterministic)
-        y = nn.Dense(features=x.shape[-1], dtype=self.dtype)(y)
-        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=deterministic)
-        
-        return y
-
+    return pos_emb.astype(dtype)
 
 class MAPHead(nn.Module):
-    """Multi-head Attention Pooling."""
+    """Multi-head Attention Pooling for global feature extraction."""
     
     block_id: int
     mlp_dim: Optional[int] = None  # Defaults to 4x input dim
     num_heads: int = 12
+    dropout_rate: float = 0.0
+    dtype: Any = jnp.float32
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """Apply multi-head attention pooling.
         
         Args:
-            x: Input tensor [batch, length, channels]
-            deterministic: Whether in inference mode
+            x: Input features [batch, seq, hidden]
+            deterministic: Whether in training mode
             
         Returns:
-            Pooled features [batch, channels]  
+            Pooled features [batch, hidden]
         """
-        n, l, d = x.shape
-        probe = self.param(
-            'probe',
-            nn.initializers.xavier_uniform(),
-            (1, 1, d)
+        hidden_dim = x.shape[-1]
+        mlp_dim = self.mlp_dim or hidden_dim * 4
+        
+        # Query token
+        query = self.param(
+            f'query_{self.block_id}',
+            nn.initializers.normal(0.02),
+            (1, 1, hidden_dim)
         )
-        probe = jnp.tile(probe, [n, 1, 1])
-
-        # Self attention
-        x = nn.MultiHeadDotProductAttention(
+        query = jnp.tile(query, [x.shape[0], 1, 1])
+        
+        # Multi-head attention
+        attn = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
-            kernel_init=nn.initializers.xavier_uniform()
-        )(probe, x)
-
-        # Layer norm and MLP
-        y = nn.LayerNorm()(x)
-        x = x + MlpBlock(mlp_dim=self.mlp_dim)(y)
+            dtype=self.dtype,
+            deterministic=deterministic,
+            name=f'attn_{self.block_id}'
+        )(query, x)
         
-        return x[:, 0]  # Return CLS token only
-
-
-class Encoder1DBlock(nn.Module):
-  """Single transformer encoder block (MHSA + MLP)."""
-
-  block_id: int
-  mlp_dim: int | None = None  # Defaults to 4x input dim
-  num_heads: int = 12
-  dropout: float = 0.0
-  dtype_mm: str = "float32"
-
-  @nn.compact
-  def __call__(
-      self, x: jax.Array, deterministic: bool = True
-  ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
-    y = nn.LayerNorm()(x)
-
-    y = nn.MultiHeadDotProductAttention(
-        num_heads=self.num_heads,
-        kernel_init=nn.initializers.xavier_uniform(),
-        deterministic=deterministic,
-        dtype=self.dtype_mm,
-    )(y, y)
-    y = nn.with_logical_constraint(y, ("act_batch", "act_len", "act_emb"))
-    y = nn.Dropout(rate=self.dropout)(y, deterministic)
-    x = x + y
-
-    y = nn.LayerNorm()(x)
-    y = MlpBlock(
-        block_id=self.block_id,
-        mlp_dim=self.mlp_dim,
-        dropout=self.dropout,
-        dtype_mm=self.dtype_mm,
-    )(y, deterministic)
-    y = nn.with_logical_constraint(y, ("act_batch", "act_len", "act_emb"))
-    y = nn.Dropout(rate=self.dropout)(y, deterministic)
-    x = x + y
-    x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
-    return x
-
-
-class Encoder(nn.Module):
-  """Transformer Model Encoder for sequence to sequence translation."""
-
-  depth: int
-  mlp_dim: int | None = None  # Defaults to 4x input dim
-  num_heads: int = 12
-  dropout: float = 0.0
-  scan: bool = False
-  remat_policy: str = "nothing_saveable"
-  dtype_mm: str = "float32"
-
-  @nn.compact
-  def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
-    if self.scan:
-      block = nn.remat(
-          Encoder1DBlock,
-          prevent_cse=False,
-          static_argnums=(2,),  # 0=self, 2=deterministic
-          policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
-      )
-      x = nn.scan(
-          block,
-          variable_axes={"params": 0},
-          split_rngs={"params": True, "dropout": True},
-          in_axes=nn.broadcast,
-          length=self.depth,
-      )(
-          block_id=0,
-          name="encoderblock",
-          dtype_mm=self.dtype_mm,
-          mlp_dim=self.mlp_dim,
-          num_heads=self.num_heads,
-          dropout=self.dropout,
-      )(
-          x, deterministic
-      )
-    else:
-      # Input Encoder
-      for lyr in range(self.depth):
-        block_cur = Encoder1DBlock(
-            block_id=lyr,
-            name=f"encoderblock_{lyr}",
-            dtype_mm=self.dtype_mm,
-            mlp_dim=self.mlp_dim,
-            num_heads=self.num_heads,
-            dropout=self.dropout,
-        )
-        x = block_cur(x, deterministic)
-    x: jax.Array = nn.LayerNorm(name="encoder_norm")(x)
-    return x
-
-
-class ViTModel(nn.Module):
-  """ViT model.
-
-  Attributes:
-    compression_type: The compression type.
-    width: The model dimension of the vision encoder.
-    mlp_dim: The hidden dimension in the ffw layers.
-    num_heads: The number of the heads.
-    depth: The number of the layers.
-    patch_size: The size to patchify images.
-    posemb: The position embedding type.
-    dropout: The dropout rate.
-    scan: Whether to scan the layers (layer stacking).
-    remat_policy: The remat policy.
-    dtype_mm: The dtype to convert the input to.
-    output_length: Number of soft tokens per image.
-  """
-
-  patch_size: Sequence[int] = (14, 14)
-  width: int = 1152
-  depth: int = 27
-  mlp_dim: int | None = 4304  # Defaults to 4x input dim
-  num_heads: int = 16
-  posemb: str = "learn"  # Can also be "sincos2d"
-  dropout: float = 0.0
-  scan: bool = False
-  # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
-  remat_policy: str = "nothing_saveable"
-  dtype_mm: str = "float32"
-
-  def _get_posemb(
-      self,
-      typ: str,
-      *,
-      seqshape: tuple[int, int],
-      width: int,
-      name: str,
-      dtype: jnp.dtype = jnp.float32,
-  ) -> jnp.ndarray:  # Changed from string literal to jnp.ndarray
-    """Returns the position embedding."""
-    if typ == "learn":
-      return self.param(
-          name,
-          nn.initializers.normal(stddev=1 / np.sqrt(width)),
-          (1, np.prod(seqshape), width),
-          dtype,
-      )
-    elif typ == "sincos2d":
-      return _posemb_sincos_2d(*seqshape, width=width, dtype=dtype)
-    else:
-      raise ValueError(f"Unknown posemb type: {typ}")
-
-  @nn.compact
-  def __call__(
-      self,
-      image: jnp.ndarray,  # Changed from string literal to jnp.ndarray
-      *,
-      train: bool = False,
-  ):
-    image = jnp.asarray(image, self.dtype_mm)
-
-    # Patch extraction
-    x = nn.Conv(
-        self.width,
-        self.patch_size,
-        strides=self.patch_size,
-        padding="VALID",
-        name="embedding",
-        dtype=self.dtype_mm,
-    )(image)
-
-    n, h, w, c = x.shape
-    x = jnp.reshape(x, [n, h * w, c])
-
-    # Add posemb before adding extra token.
-    x = x + self._get_posemb(
-        self.posemb,
-        seqshape=(h, w),
-        width=c,
-        name="pos_embedding",
-        dtype=x.dtype,
-    )
-
-    n, l, c = x.shape  # pylint: disable=unused-variable
-    x = nn.Dropout(rate=self.dropout)(x, not train)
-
-    x = Encoder(
-        depth=self.depth,
-        mlp_dim=self.mlp_dim,
-        num_heads=self.num_heads,
-        dropout=self.dropout,
-        scan=self.scan,
-        remat_policy=self.remat_policy,
-        dtype_mm=self.dtype_mm,
-        name="Transformer",
-    )(x, deterministic=not train)
-
-    return x
-
-
-def convert_to_rgb(
-    image: NDArray,
-    input_format: str = "BGR"
-) -> NDArray:
-    """Convert image to RGB format.
-    
-    Args:
-        image: Input image array of shape (height, width, 3)
-        input_format: Current color format ('BGR', 'RGB', etc)
+        # MLP
+        y = nn.LayerNorm(dtype=self.dtype)(attn)
+        y = nn.Dense(
+            mlp_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.normal(0.02),
+            name=f'mlp1_{self.block_id}'
+        )(y)
+        y = nn.gelu(y)
+        y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=deterministic)
+        y = nn.Dense(
+            hidden_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.normal(0.02),
+            name=f'mlp2_{self.block_id}'
+        )(y)
         
-    Returns:
-        RGB image array
-    """
-    if input_format == "BGR":
-        return image[..., ::-1]
-    elif input_format == "RGB":
-        return image
-    else:
-        raise ValueError(f"Unsupported input format: {input_format}")
+        # Return pooled features
+        return y[:, 0]  # Return CLS token only
 
-def center_crop(
-    image: NDArray,
-    target_height: int,
-    target_width: int
-) -> NDArray:
-    """Center crop image to target size.
-    
-    Args:
-        image: Image array of shape (height, width, channels)
-        target_height: Height to crop to
-        target_width: Width to crop to
-        
-    Returns:
-        Cropped image array
-    """
-    height, width = image.shape[:2]
-    
-    start_h = (height - target_height) // 2
-    start_w = (width - target_width) // 2
-    
-    return image[start_h:start_h + target_height,
-                start_w:start_w + target_width]
-
-def apply_image_transforms(
-    image: NDArray,
-    do_resize: bool = True,
-    do_center_crop: bool = True,
-    size: Union[int, Tuple[int, int]] = 224,
-    mean: Optional[Union[float, Tuple[float, ...]]] = None,
-    std: Optional[Union[float, Tuple[float, ...]]] = None,
-    do_normalize: bool = True,
-) -> NDArray:
-    """Apply standard image transformations.
-    
-    Args:
-        image: Input image array of shape (height, width, channels)
-        do_resize: Whether to resize image
-        do_center_crop: Whether to center crop
-        size: Target size for resize/crop
-        mean: Optional mean for normalization 
-        std: Optional std for normalization
-        do_normalize: Whether to normalize
-        
-    Returns:
-        Transformed image array
-    """
-    if isinstance(size, int):
-        size = (size, size)
-        
-    if do_resize:
-        image = jax.image.resize(
-            image,
-            shape=(*size, image.shape[-1]),
-            method="bilinear",
-            antialias=True
-        )
-        
-    if do_center_crop:
-        image = center_crop(image, size[0], size[1])
-        
-    if do_normalize:
-        if mean is None:
-            mean = (0.485, 0.456, 0.406)
-        if std is None:
-            std = (0.229, 0.224, 0.225)
-            
-        mean = jnp.array(mean).reshape(1, 1, -1)
-        std = jnp.array(std).reshape(1, 1, -1)
-        
-        image = (image - mean) / std
-        
-    return image
-
-def extract_patches(
-    images: NDArray,
+def efficient_patch_extraction(
+    images: jnp.ndarray,
     patch_size: int,
-    stride: Optional[int] = None,
-    padding: str = 'VALID',
-    normalize_patches: bool = True
-) -> NDArray:
-    """Extract image patches with improved normalization.
+    hidden_dim: int,
+    dtype: Any = jnp.float32
+) -> Tuple[jnp.ndarray, int, int]:
+    """Extract patches from images efficiently using TPU-optimized convolution.
     
     Args:
-        images: Batch of images of shape (batch_size, height, width, channels)
+        images: Input images [batch, height, width, channels]
         patch_size: Size of patches
-        stride: Optional stride for patch extraction
-        padding: Padding mode ('VALID' or 'SAME')
-        normalize_patches: Whether to normalize extracted patches
+        hidden_dim: Hidden dimension size
+        dtype: Data type for patches
         
     Returns:
-        Array of patches of shape (batch_size, num_patches, patch_dim)
+        Tuple of:
+        - Extracted patches [batch, num_patches, hidden_dim]
+        - Number of patches in height
+        - Number of patches in width
     """
-    stride = stride or patch_size
-    batch_size, height, width, channels = images.shape
-    
-    # Extract patches using convolution operation
-    patch_dim = patch_size * patch_size * channels
-    
-    # Create identity filter for patch extraction
-    identity_filter = jnp.eye(patch_dim).reshape(
-        patch_size, patch_size, channels, patch_dim
+    # Efficient patch extraction using conv
+    patch_embedder = nn.Conv(
+        features=hidden_dim,
+        kernel_size=(patch_size, patch_size),
+        strides=(patch_size, patch_size),
+        padding='VALID',
+        dtype=dtype
     )
     
-    # Extract patches with convolution
-    patches = jax.lax.conv_general_dilated(
-        images,
-        identity_filter, 
-        window_strides=(stride, stride),
-        padding=padding,
-        dimension_numbers=("NHWC", "HWIO", "NHWC")
-    )
+    x = patch_embedder(images)
     
-    # Reshape to (batch_size, num_patches, patch_dim)
-    patches = patches.reshape(batch_size, -1, patch_dim)
+    # Get shape info
+    batch_size, h, w, c = x.shape
+    num_patches = h * w
     
-    # Normalize patches if requested
-    if normalize_patches:
-        patches = patches - jnp.mean(patches, axis=-1, keepdims=True)
-        patches = patches / (jnp.std(patches, axis=-1, keepdims=True) + 1e-6)
+    # Reshape to sequence
+    x = x.reshape(batch_size, num_patches, c)
     
-    return patches
+    return x, h, w

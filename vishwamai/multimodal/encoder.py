@@ -13,6 +13,29 @@ from vishwamai.layers.attention import FlashAttention
 from vishwamai.multimodal.vision import VisionEncoder
 from vishwamai.multimodal.sonar import SonarEncoder
 
+def sinusoidal_position_embedding(
+    positions: jnp.ndarray,
+    dim: int,
+    dtype: Any = jnp.float32,
+    min_scale: float = 1.0,
+    max_scale: float = 10000.0
+) -> jnp.ndarray:
+    """Compute sinusoidal position embeddings efficiently."""
+    log_timescale_increment = jnp.log(max_scale / min_scale) / (dim // 2 - 1)
+    inv_timescales = min_scale * jnp.exp(jnp.arange(0, dim // 2) * -log_timescale_increment)
+    
+    scaled_time = jnp.expand_dims(positions, axis=1) * jnp.expand_dims(inv_timescales, axis=0)
+    
+    signal = jnp.concatenate([
+        jnp.sin(scaled_time),
+        jnp.cos(scaled_time)
+    ], axis=1)
+
+    if dim % 2 == 1:
+        signal = jnp.pad(signal, [[0, 0], [0, 1]])
+        
+    return signal.astype(dtype)
+
 class AudioEncoder(nn.Module):
     """Audio encoder for processing spectrogram inputs with memory optimizations."""
     
@@ -77,7 +100,7 @@ class AudioEncoder(nn.Module):
                 x = nn.remat(lambda x, y: x + y)(x, attention)
             else:
                 x = x + attention
-
+                
             # Memory-efficient MLP with kernel fusion
             y = TPULayerNorm(dtype=self.dtype)(x)
             y = nn.Sequential([
@@ -93,125 +116,130 @@ class AudioEncoder(nn.Module):
         # Final layer norm
         return TPULayerNorm(dtype=self.dtype)(x)
 
-def sinusoidal_position_embedding(
-    positions: jnp.ndarray,
-    dim: int,
-    dtype: Any = jnp.float32,
-    min_scale: float = 1.0,
-    max_scale: float = 10000.0,
-) -> jnp.ndarray:
-    """Compute sinusoidal position embeddings efficiently."""
-    # Efficient log space computation
-    scales = jnp.exp(
-        jnp.linspace(jnp.log(min_scale), jnp.log(max_scale), dim // 2)
-    )
-    
-    # Use jax.vmap for vectorized computation
-    scaled_positions = positions[:, :, None] / scales
-    
-    # Fused sin/cos computation
-    embeddings = jnp.concatenate([
-        jnp.sin(scaled_positions),
-        jnp.cos(scaled_positions)
-    ], axis=-1)
-    
-    return embeddings.astype(dtype)
-
-class VisionEncoder(nn.Module):
-    """Vision encoder with advanced memory optimization."""
-    hidden_dim: int
-    num_layers: int
-    num_heads: int
-    mlp_dim: int
-    patch_size: int = 14
-    image_size: int = 896
-    dropout_rate: float = 0.1
-    use_gradient_checkpointing: bool = True
-    use_flash_attention: bool = True
-    dtype: Any = jnp.float32
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        # Patch embedding with memory-efficient implementation
-        batch_size, height, width, channels = x.shape
-        num_patches = (height // self.patch_size) * (width // self.patch_size)
-        
-        # MEA-optimized patch embedding
-        patch_embed = TPUGEMMLinear(
-            features=self.hidden_dim,
-            dtype=self.dtype,
-            name='patch_embed'
-        )
-        
-        # Convert image to patches with reduced memory footprint
-        x = jnp.reshape(x, (batch_size, num_patches, -1))
-        x = patch_embed(x)
-        
-        # Position embeddings with memory-efficient initialization
-        pos_embed = self.param('pos_embed',
-                             nn.initializers.truncated_normal(stddev=0.02),
-                             (1, num_patches, self.hidden_dim))
-        x = x + pos_embed
-
-        # Apply transformer blocks with memory optimizations
-        for i in range(self.num_layers):
-            block = TransformerBlock(
-                num_heads=self.num_heads,
-                head_dim=self.hidden_dim // self.num_heads,
-                mlp_dim=self.mlp_dim,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                use_flash_attention=self.use_flash_attention
-            )
-            
-            if self.use_gradient_checkpointing:
-                block = nn.remat(block, prevent_cse=True)
-                
-            x = block(x, deterministic=deterministic)
-        
-        x = TPULayerNorm(dtype=self.dtype)(x)
-        return x
-
 class MultimodalEncoder(nn.Module):
     """Multimodal encoder that combines vision, text and audio."""
+    
     hidden_dim: int
     num_heads: int
     num_layers: int
     dropout_rate: float = 0.1
+    attention_dropout_rate: float = 0.1
+    dtype: Any = jnp.float32
+    use_flash_attention: bool = True
+    use_gradient_checkpointing: bool = True
     
     def setup(self):
+        # Modality-specific encoders
         self.vision_encoder = VisionEncoder(
             hidden_dim=self.hidden_dim,
             num_heads=self.num_heads,
             num_layers=self.num_layers,
-            dropout_rate=self.dropout_rate
+            dropout_rate=self.dropout_rate,
+            attention_dropout_rate=self.attention_dropout_rate,
+            dtype=self.dtype
         )
         
+        self.audio_encoder = AudioEncoder(
+            hidden_dim=self.hidden_dim,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            mlp_dim=self.hidden_dim * 4,
+            dropout_rate=self.dropout_rate,
+            attention_dropout_rate=self.attention_dropout_rate,
+            dtype=self.dtype,
+            use_flash_attention=self.use_flash_attention,
+            block_size=64
+        )
+        
+        # Cross-modal attention
         self.cross_attention = FlashAttention(
             num_heads=self.num_heads,
-            dropout_rate=self.dropout_rate
+            head_dim=self.hidden_dim // self.num_heads,
+            dropout_rate=self.attention_dropout_rate,
+            dtype=self.dtype,
+            use_causal_mask=False,
+            block_size=64
         )
         
-        self.ln = TPULayerNorm()
-        self.proj = TPUGEMMLinear(features=self.hidden_dim)
-        
+        # Output projection
+        self.layer_norm = TPULayerNorm(dtype=self.dtype)
+        self.output_projection = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.truncated_normal(0.02)
+        )
+    
     def __call__(
         self,
         vision_inputs: jnp.ndarray,
         text_inputs: jnp.ndarray,
+        audio_inputs: Optional[jnp.ndarray] = None,
+        attention_mask: Optional[jnp.ndarray] = None,
         training: bool = False
-    ) -> jnp.ndarray:
-        vision_embed = self.vision_encoder(vision_inputs, training=training)
+    ) -> Dict[str, jnp.ndarray]:
+        """
+        Process multimodal inputs.
         
-        # Cross attention between vision and text
-        x = self.cross_attention(
-            text_inputs,
-            k=vision_embed,
-            v=vision_embed,
+        Args:
+            vision_inputs: Visual features [batch, vis_seq, vis_dim]
+            text_inputs: Text features [batch, text_seq, text_dim]
+            audio_inputs: Optional audio features [batch, audio_seq, audio_dim]
+            attention_mask: Optional attention mask
+            training: Whether in training mode
+            
+        Returns:
+            Dictionary containing encoded features and intermediate states
+        """
+        # Encode each modality
+        vision_features = self.vision_encoder(
+            vision_inputs,
             training=training
+        )['last_hidden_state']
+        
+        # Process audio if provided
+        audio_features = None
+        if audio_inputs is not None:
+            audio_features = self.audio_encoder(
+                audio_inputs,
+                training=training
+            )
+
+        # Fuse modalities with cross attention
+        if audio_features is not None:
+            # Concatenate all modalities
+            combined_features = jnp.concatenate([
+                vision_features,
+                text_inputs,
+                audio_features
+            ], axis=1)
+        else:
+            # Just vision and text
+            combined_features = jnp.concatenate([
+                vision_features,
+                text_inputs
+            ], axis=1)
+
+        # Cross-modal attention with memory optimizations
+        attention_output = self.cross_attention(
+            combined_features,
+            mask=attention_mask,
+            deterministic=not training
         )
         
-        x = self.ln(x)
-        x = self.proj(x)
+        # Gradient checkpointing
+        if training and self.use_gradient_checkpointing:
+            x = nn.remat(lambda x, y: x + y)(combined_features, attention_output)
+        else:
+            x = combined_features + attention_output
+            
+        # Final processing
+        x = self.layer_norm(x)
+        outputs = self.output_projection(x)
         
-        return x
+        return {
+            'last_hidden_state': outputs,
+            'vision_features': vision_features,
+            'text_features': text_inputs,
+            'audio_features': audio_features,
+            'attention_output': attention_output
+        }

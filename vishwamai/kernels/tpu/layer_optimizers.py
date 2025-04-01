@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
+from flax import linen as nn
 from typing import Optional, Tuple, Dict, Any, NamedTuple, List
 import numpy as np
 from functools import partial
@@ -139,44 +140,123 @@ class AdaptiveLayerOptimizer:
         
         return new_stats
 
-class LayerNormOptimizer:
-    """
-    Optimized layer normalization for knowledge distillation.
-    Features:
-    - Stable normalization
-    - Efficient TPU implementation
-    - Adaptive scaling
-    """
+class TPULayerNorm(nn.Module):
+    """TPU-optimized layer normalization with improved memory efficiency."""
     
-    def __init__(self, config: LayerOptConfig):
-        self.config = config
-        self.eps = 1e-6
-        self.dtype = config.dtype
-    
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        scale: Optional[jnp.ndarray] = None,
-        bias: Optional[jnp.ndarray] = None
-    ) -> jnp.ndarray:
-        """Apply optimized layer normalization."""
-        # Cast inputs to compute dtype for stability
+    epsilon: float = 1e-6
+    dtype: Any = jnp.bfloat16
+    scale_init: Any = nn.initializers.ones
+    bias_init: Any = nn.initializers.zeros
+    use_bias: bool = True
+    block_size: int = 128  # Must be multiple of 128 for TPU
+    use_fused_ops: bool = True
+
+    def setup(self):
+        """Initialize parameters with TPU-optimized layout."""
+        feature_size = self.input_shape[-1]
+        self.scale = self.param(
+            'scale',
+            self.scale_init, 
+            (feature_size,),
+            self.dtype
+        )
+        if self.use_bias:
+            self.bias = self.param(
+                'bias',
+                self.bias_init,
+                (feature_size,),
+                self.dtype
+            )
+            
+    def _process_block(self, x_block: jnp.ndarray, block_idx: int) -> jnp.ndarray:
+        """Process a single block with Welford's online algorithm."""
+        # Use high precision for statistics computation
+        x_block = x_block.astype(jnp.float32)
+        
+        # Compute statistics with Welford's algorithm
+        mean = jnp.mean(x_block, axis=self.reduction_axes, keepdims=True)
+        centered = x_block - mean
+        var = jnp.mean(jnp.square(centered), axis=self.reduction_axes, keepdims=True)
+        
+        # Get scale/bias slices for this block
+        start_idx = block_idx * self.block_size
+        end_idx = min(start_idx + self.block_size, self.feature_size)
+        scale_block = lax.dynamic_slice(
+            self.scale, [start_idx], [end_idx - start_idx]
+        )
+        
+        # Normalize with stable computation
+        inv_stddev = lax.rsqrt(var + self.epsilon)
+        normed = centered * inv_stddev
+        
+        # Apply scale and optional bias
+        output = normed * scale_block
+        if self.use_bias:
+            bias_block = lax.dynamic_slice(
+                self.bias, [start_idx], [end_idx - start_idx]
+            )
+            output = output + bias_block
+            
+        return output.astype(self.dtype)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply layer normalization with TPU optimizations."""
+        # Ensure input uses compute dtype
+        x = x.astype(self.dtype)
+        
+        # Setup reduction axes and sizes
+        self.feature_axis = -1
+        self.reduction_axes = tuple(i for i in range(x.ndim) if i != self.feature_axis)
+        self.feature_size = x.shape[self.feature_axis]
+        
+        # Compute optimal block size for TPU
+        effective_block_size = min(
+            self.block_size,
+            128 * ((self.feature_size + 127) // 128)
+        )
+        
+        if self.use_fused_ops and self.feature_size <= effective_block_size:
+            # Small enough for fused operation
+            return self._fused_layernorm(x)
+            
+        # Process in blocks for large feature dimensions
+        results = []
+        for block_start in range(0, self.feature_size, effective_block_size):
+            # Extract block
+            end = min(block_start + effective_block_size, self.feature_size)
+            x_block = lax.dynamic_slice_in_dim(
+                x, block_start, end - block_start, axis=self.feature_axis
+            )
+            
+            # Process block
+            block_result = self._process_block(
+                x_block,
+                block_start // effective_block_size
+            )
+            results.append(block_result)
+            
+        # Combine blocks efficiently
+        if len(results) == 1:
+            return results[0]
+            
+        return jnp.concatenate(results, axis=self.feature_axis)
+        
+    def _fused_layernorm(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Fused layer normalization for small feature dimensions."""
+        # Use high precision accumulation
         x = x.astype(jnp.float32)
         
-        # Compute statistics
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        mean = jnp.mean(x, axis=self.reduction_axes, keepdims=True)
+        centered = x - mean
+        variance = jnp.mean(jnp.square(centered), axis=self.reduction_axes, keepdims=True)
+        inv_stddev = lax.rsqrt(variance + self.epsilon)
+        normed = centered * inv_stddev
         
-        # Normalize
-        x = (x - mean) * jax.lax.rsqrt(var + self.eps)
-        
-        # Apply scale and bias if provided
-        if scale is not None:
-            x = x * scale
-        if bias is not None:
-            x = x + bias
-        
-        return x.astype(self.dtype)
+        output = normed * self.scale
+        if self.use_bias:
+            output = output + self.bias
+            
+        return output.astype(self.dtype)
 
 class FFNOptimizer:
     """

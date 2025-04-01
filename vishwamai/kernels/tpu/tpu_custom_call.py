@@ -1,202 +1,241 @@
-"""TPU-optimized custom call operations for JAX."""
+"""TPU custom call implementations and utilities."""
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import jax
 import jax.numpy as jnp
-from jax import core
+from jax import lax
 from jax.interpreters import xla
-from jax.lib import xla_client
-from jax.interpreters import mlir
+from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
-from jax._src import abstract_arrays
-
-# Register the TPU custom call primitive
-tpu_custom_call_p = core.Primitive("tpu_custom_call")
-tpu_custom_call_p.multiple_results = True
-tpu_custom_call_p.def_impl(lambda *args, **kwargs: None)
-
-@tpu_custom_call_p.def_abstract_eval
-def _tpu_custom_call_abstract_eval(*_, out_avals, **__):
-  return out_avals
-
-
-def _avals_to_layouts(avals) -> Sequence[Sequence[int]]:
-  return [tuple(range(a.ndim - 1, -1, -1)) for a in avals]
 
 def tpu_custom_call(
-    call_target_name: str,
-    out_avals: Sequence[core.ShapedArray],
-    operands: Sequence[Any],
-    *,
-    operand_layouts: Optional[Sequence[Sequence[int]]] = None,
-    result_layouts: Optional[Sequence[Sequence[int]]] = None,
-    opaque: Optional[bytes] = None,
-    has_side_effect: bool = False,
-    schedule: Optional[int] = None,
-    backend_config: Optional[Dict[str, Any]] = None,
-):
-    """Makes a TPU custom call using TPU-optimized layouts.
-    
-    Args:
-        call_target_name: Name of the custom TPU kernel
-        out_avals: Sequence of output avals
-        operands: Sequence of JAX operands
-        operand_layouts: Optional layouts for operands
-        result_layouts: Optional layouts for results
-        opaque: Optional opaque data to pass to the custom call
-        has_side_effect: Whether the call has side effects
-        schedule: Optional scheduling priority
-        backend_config: Optional backend configuration
-        
-    Returns:
-        Result of the TPU custom call
-    """
-    operand_layouts = operand_layouts or _avals_to_layouts([core.get_aval(x) for x in operands])
-    result_layouts = result_layouts or _avals_to_layouts(out_avals)
-    backend_config = backend_config or {}
-    
-    flat_operands, in_tree = jax.tree_util.tree_flatten(operands)
-    
-    return tpu_custom_call_p.bind(
-        *flat_operands,
-        call_target_name=call_target_name,
-        out_avals=out_avals,
-        operand_layouts=operand_layouts,
-        result_layouts=result_layouts,
-        opaque=opaque,
-        has_side_effect=has_side_effect,
-        schedule=schedule,
-        backend_config=backend_config,
-    )
-
-def tpu_custom_call_lowering(ctx, *operands, call_target_name, out_avals, 
-                             operand_layouts, result_layouts, opaque, 
-                             has_side_effect, schedule, backend_config):
-    """Lowering rule for TPU custom calls."""
-    operand_shapes = [mlir.aval_to_ir_type(core.get_aval(op)) for op in operands]
-    result_shapes = [mlir.aval_to_ir_type(aval) for aval in out_avals]
-    
-    flat_operands = [mlir.ir_constants(operand) for operand in operands]
-    
-    # Convert backend config to bytes
-    if backend_config:
-        import json
-        backend_config_bytes = json.dumps(backend_config).encode('utf-8')
-    else:
-        backend_config_bytes = None
-    
-    # Create the TPU optimized custom call
-    out = mlir.xla_custom_call(
-        call_target_name,
-        result_types=result_shapes,
-        operands=flat_operands,
-        backend_config=backend_config_bytes,
-        has_side_effect=has_side_effect,
-        operand_layouts=operand_layouts,
-        result_layouts=result_layouts,
-    )
-    
-    if len(out_avals) == 1:
-        return [out]
-    else:
-        return list(out)
-
-# Register the lowering rule
-mlir.register_lowering(tpu_custom_call_p, tpu_custom_call_lowering)
-
-def compile_tpu_kernel(
     name: str,
-    fn: Callable,
-    input_shapes: Sequence[Tuple[int, ...]],
-    output_shapes: Sequence[Tuple[int, ...]],
-    input_dtypes: Sequence[np.dtype],
-    output_dtypes: Sequence[np.dtype],
-):
-    """Compile a TPU kernel with JAX.
+    inputs: List[jnp.ndarray],
+    output_shape: Tuple[int, ...],
+    opaque: bytes,
+    has_side_effect: bool = False,
+    backend_config: str = "",
+    **kwargs
+) -> jnp.ndarray:
+    """
+    Make a custom call to TPU hardware.
     
     Args:
-        name: Name of the kernel
-        fn: Function to compile
-        input_shapes: Shapes of inputs
-        output_shapes: Shapes of outputs
-        input_dtypes: Data types of inputs
-        output_dtypes: Data types of outputs
+        name: Name of custom operation
+        inputs: List of input arrays
+        output_shape: Shape of output array
+        opaque: Opaque data passed to implementation
+        has_side_effect: Whether op has side effects
+        backend_config: TPU-specific config
         
     Returns:
-        Compiled TPU kernel
+        Output array
     """
-    input_avals = [abstract_arrays.ShapedArray(shape, dtype) 
-                   for shape, dtype in zip(input_shapes, input_dtypes)]
-    output_avals = [abstract_arrays.ShapedArray(shape, dtype) 
-                    for shape, dtype in zip(output_shapes, output_dtypes)]
+    # Validate TPU platform
+    device = jax.devices()[0]
+    if device.platform != "tpu":
+        raise RuntimeError(f"TPU custom call requires TPU device, got {device.platform}")
     
-    # Create a JAX-compiled function
-    jit_fn = jax.jit(fn)
-    
-    # Create wrapper that uses custom call
-    def custom_call_wrapper(*args):
-        # Prepare backend config
-        backend_config = {
-            "kernel_name": name,
-            "input_dtypes": [str(dt) for dt in input_dtypes],
-            "output_dtypes": [str(dt) for dt in output_dtypes],
-        }
-        
-        return tpu_custom_call(
-            call_target_name=name,
-            out_avals=output_avals,
-            operands=args,
+    # Ensure shapes are TPU-friendly
+    for x in inputs:
+        if any(d % 128 != 0 for d in x.shape):
+            raise ValueError("Input shapes must be multiples of 128 for TPU")
+            
+    # Make custom call
+    return jax.custom_jvp(
+        lambda *args: lax.custom_call(
+            name,
+            args,
+            shape=output_shape, 
+            opaque=opaque,
+            has_side_effect=has_side_effect,
             backend_config=backend_config
         )
+    )(*inputs)
+
+def optimize_tpu_layout(x: jnp.ndarray, block_size: int = 128) -> jnp.ndarray:
+    """
+    Optimize tensor layout for TPU memory access.
     
-    return custom_call_wrapper
-
-# Utility functions for TPU optimization
-
-def optimize_tpu_layout(x: jnp.ndarray) -> jnp.ndarray:
-    """Optimize tensor layout for TPU memory access patterns."""
-    if x.ndim <= 1:
-        return x
-    elif x.ndim == 2:
-        # For matrix operations, TPUs prefer 128x128 tiling
-        return x
-    elif x.ndim == 3:
-        # For 3D tensors, optimize for TPU's memory hierarchy
-        return jnp.asarray(x, order='F')
-    elif x.ndim == 4:
-        # For 4D tensors (common in attention), use TPU-friendly layout
-        return jnp.transpose(x, (0, 2, 1, 3))
-    else:
-        # For higher dimensions, preserve original layout
-        return x
-
-def pad_to_tpu_multiple(x: jnp.ndarray, multiple: int = 128) -> jnp.ndarray:
-    """Pad tensor dimensions to be multiples of TPU-preferred sizes."""
+    Args:
+        x: Input tensor
+        block_size: Block size (must be multiple of 128)
+        
+    Returns:
+        Tensor with TPU-optimized layout
+    """
+    if block_size % 128 != 0:
+        raise ValueError("Block size must be multiple of 128 for TPU")
+        
     shape = x.shape
-    padded_shape = [(s + multiple - 1) // multiple * multiple for s in shape]
-    
-    if shape == tuple(padded_shape):
-        return x
-    
-    # Create padding configuration
-    pad_config = [(0, padded_shape[i] - shape[i]) for i in range(len(shape))]
-    return jnp.pad(x, pad_config, mode='constant', constant_values=0)
-
-def get_optimal_tpu_layout(shape: Tuple[int, ...]) -> Sequence[int]:
-    """Get the optimal memory layout for a given tensor shape on TPU."""
     ndim = len(shape)
     
     if ndim <= 1:
-        return tuple(range(ndim))
-    elif ndim == 2:
-        # For matrices, minor-to-major order is generally efficient
-        return (1, 0)
+        return x
+        
+    # Handle different tensor ranks
+    if ndim == 2:
+        # Matrix
+        M, N = shape
+        M_blocks = (M + block_size - 1) // block_size
+        N_blocks = (N + block_size - 1) // block_size
+        
+        # Pad if needed
+        if M % block_size != 0 or N % block_size != 0:
+            padded_m = M_blocks * block_size
+            padded_n = N_blocks * block_size
+            x = jnp.pad(x, ((0, padded_m - M), (0, padded_n - N)))
+            
+        # Reshape and transpose for TPU efficiency
+        return x.reshape(M_blocks, block_size, N_blocks, block_size).transpose(0, 2, 1, 3)
+        
     elif ndim == 3:
-        # For 3D tensors, batch dimension first in major-to-minor
-        return (0, 2, 1)
+        # 3D tensor (batch, seq_len, hidden)
+        B, S, H = shape
+        S_blocks = (S + block_size - 1) // block_size
+        H_blocks = (H + block_size - 1) // block_size
+        
+        if S % block_size != 0 or H % block_size != 0:
+            padded_s = S_blocks * block_size
+            padded_h = H_blocks * block_size
+            x = jnp.pad(x, ((0, 0), (0, padded_s - S), (0, padded_h - H)))
+            
+        return x.reshape(B, S_blocks, block_size, H_blocks, block_size).transpose(0, 1, 3, 2, 4)
+        
     elif ndim == 4:
-        # For 4D tensors used in attention computations
-        return (0, 2, 1, 3)
-    else:
-        # Default to standard minor-to-major order
-        return tuple(range(ndim - 1, -1, -1))
+        # 4D tensor (batch, heads, seq, hidden)
+        B, H, S, D = shape
+        S_blocks = (S + block_size - 1) // block_size
+        D_blocks = (D + block_size - 1) // block_size
+        
+        if S % block_size != 0 or D % block_size != 0:
+            padded_s = S_blocks * block_size
+            padded_d = D_blocks * block_size
+            x = jnp.pad(x, ((0, 0), (0, 0), (0, padded_s - S), (0, padded_d - D)))
+            
+        return x.reshape(B, H, S_blocks, block_size, D_blocks, block_size).transpose(0, 1, 2, 4, 3, 5)
+    
+    return x
+
+def pad_to_tpu_multiple(
+    x: jnp.ndarray,
+    multiple: int = 128,
+    axis: Optional[int] = None
+) -> Tuple[jnp.ndarray, List[int]]:
+    """
+    Pad tensor dimensions to TPU-efficient multiples.
+    
+    Args:
+        x: Input tensor
+        multiple: Required dimension multiple (usually 128)
+        axis: Optional specific axis to pad
+        
+    Returns:
+        Tuple of (padded tensor, padding amounts)
+    """
+    shape = list(x.shape)
+    padding = []
+    
+    axes = [axis] if axis is not None else range(len(shape))
+    
+    for i in axes:
+        remainder = shape[i] % multiple
+        if remainder != 0:
+            pad_amount = multiple - remainder
+            if i == axis:
+                padding.append(pad_amount)
+            else:
+                padding.extend([0, pad_amount])
+            shape[i] += pad_amount
+            
+    if not padding:
+        return x, []
+        
+    # Create padding tuples
+    pad_width = []
+    j = 0
+    for i in range(len(shape)):
+        if i in axes:
+            if axis is not None:
+                pad_width.append((0, padding[j]))
+            else:
+                pad_width.append((0, padding[j*2+1]))
+            j += 1
+        else:
+            pad_width.append((0, 0))
+            
+    return jnp.pad(x, pad_width), padding
+
+def compile_tpu_kernel(
+    kernel_fn,
+    input_shapes: Dict[str, Tuple[int, ...]],
+    static_argnums: Optional[Tuple[int, ...]] = None,
+    donate_argnums: Optional[Tuple[int, ...]] = None
+):
+    """
+    Compile a kernel function for TPU execution.
+    
+    Args:
+        kernel_fn: Function to compile
+        input_shapes: Expected input shapes
+        static_argnums: Tuple of static argument indices 
+        donate_argnums: Tuple of buffer donation indices
+        
+    Returns:
+        Compiled TPU function
+    """
+    # Validate TPU availability
+    if not any(d.platform == "tpu" for d in jax.devices()):
+        raise RuntimeError("No TPU devices found")
+        
+    # Create dummy inputs
+    dummy_inputs = {
+        name: jnp.zeros(shape, dtype=jnp.float32)
+        for name, shape in input_shapes.items()
+    }
+    
+    # JIT compile with TPU options
+    return jax.jit(
+        kernel_fn,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+        backend="tpu"
+    )
+
+def get_optimal_tpu_layout(
+    shape: Tuple[int, ...],
+    dtype: Any = jnp.float32
+) -> Dict[str, Any]:
+    """
+    Get optimal TPU memory layout for tensor shape.
+    
+    Args:
+        shape: Tensor shape
+        dtype: Data type
+        
+    Returns:
+        Dict with layout information
+    """
+    # Get TPU core count and memory per core
+    device = jax.devices()[0]
+    num_cores = device.num_replicas
+    memory_per_core = device.memory_per_core
+    
+    # Calculate element size
+    element_size = jnp.dtype(dtype).itemsize
+    
+    # Calculate total size and elements per core
+    total_elements = np.prod(shape)
+    elements_per_core = total_elements // num_cores
+    
+    # Determine optimal block size
+    block_size = 128  # TPU MXU optimal
+    while block_size * block_size * element_size > memory_per_core:
+        block_size //= 2
+        
+    return {
+        "block_size": block_size,
+        "elements_per_core": elements_per_core,
+        "sharding": [num_cores, 1] if len(shape) > 1 else [num_cores],
+        "memory_per_core": memory_per_core,
+        "total_memory": total_elements * element_size
+    }

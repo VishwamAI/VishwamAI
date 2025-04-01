@@ -1,256 +1,234 @@
-"""TPU-optimized kernels for Gemma 3 knowledge distillation."""
+"""TPU-optimized kernels for knowledge distillation."""
 
 import jax
 import jax.numpy as jnp
-from jax import lax
-from typing import Optional, Tuple, Dict, Any, NamedTuple
+from typing import Dict, List, Optional, Any, Tuple, Callable
+from dataclasses import dataclass
 import numpy as np
-from functools import partial
 
-from vishwamai.kernels.core.kernel import create_mesh_and_sharding, optimize_kernel_layout
-from vishwamai.kernels.tpu.flash_attention import TPUFlashAttention
-
-class DistillationKernelConfig(NamedTuple):
+@dataclass
+class DistillationKernelConfig:
     """Configuration for distillation kernels."""
-    block_size: int = 128
-    use_flash_attention: bool = True
-    use_fp8: bool = True
-    precision: Any = lax.Precision.HIGHEST
-    dtype: Any = jnp.bfloat16
-    mesh_mode: str = "2d"
+    temperature: float = 1.0
+    alpha: float = 0.5  # Weight for distillation loss
+    hidden_size: int = 768
+    intermediate_size: int = 3072
+    num_heads: int = 12
+    max_sequence_length: int = 512
+    vocab_size: int = 32000
+    
+@dataclass 
+class DistillationOutput:
+    """Output from distillation kernels."""
+    student_logits: jnp.ndarray
+    teacher_logits: jnp.ndarray
+    attention_loss: float
+    hidden_loss: float
+    prediction_loss: float
+    total_loss: float
 
-class TeacherStudentAttention:
-    """
-    Optimized attention mechanism for teacher-student knowledge distillation.
-    Features:
-    - Memory-efficient attention computation
-    - Optimized gradient flow
-    - TPU-specific optimizations
-    """
+class DistillationKernelManager:
+    """Manages TPU kernels for knowledge distillation."""
     
     def __init__(self, config: DistillationKernelConfig):
         self.config = config
-        self.flash_attention = TPUFlashAttention(
-            block_size=config.block_size,
-            precision=config.precision,
-            use_bfloat16=(config.dtype == jnp.bfloat16)
-        )
         
-    def transfer_attention_maps(
+    def create_attention_distillation_kernel(
         self,
-        teacher_q: jnp.ndarray,
-        teacher_k: jnp.ndarray,
-        teacher_v: jnp.ndarray,
-        student_q: jnp.ndarray,
-        student_k: jnp.ndarray,
-        student_v: jnp.ndarray,
-        temperature: float = 1.0,
-        mask: Optional[jnp.ndarray] = None,
-        return_intermediates: bool = False
-    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-        """
-        Compute attention with knowledge transfer from teacher to student.
+        num_heads: int,
+        head_size: int
+    ) -> Callable:
+        """Create kernel for attention map distillation."""
         
-        Args:
-            teacher_q/k/v: Teacher model attention tensors
-            student_q/k/v: Student model attention tensors
-            temperature: Temperature for attention softmax
-            mask: Optional attention mask
-            return_intermediates: Whether to return intermediate values
+        @jax.jit
+        def attention_kernel(
+            student_q: jnp.ndarray,
+            student_k: jnp.ndarray,
+            student_v: jnp.ndarray,
+            teacher_q: jnp.ndarray,
+            teacher_k: jnp.ndarray,
+            teacher_v: jnp.ndarray,
+            attention_mask: Optional[jnp.ndarray] = None
+        ) -> Tuple[jnp.ndarray, float]:
+            # Compute attention scores
+            student_scores = jnp.matmul(student_q, student_k.transpose(-2, -1))
+            teacher_scores = jnp.matmul(teacher_q, teacher_k.transpose(-2, -1))
             
-        Returns:
-            Student attention output and optional intermediate values
-        """
-        # Use flash attention for both teacher and student
-        teacher_out = self.flash_attention(
-            teacher_q,
-            teacher_k,
-            teacher_v,
-            mask=mask,
-            return_logsumexp=True
-        )
-        
-        student_out = self.flash_attention(
-            student_q,
-            student_k,
-            student_v,
-            mask=mask,
-            return_logsumexp=True
-        )
-        
-        # Scale student attention by temperature
-        student_attention = student_out.output / temperature
-        
-        # Compute attention transfer loss
-        transfer_loss = self._compute_attention_loss(
-            teacher_out.output,
-            student_attention,
-            temperature
-        )
-        
-        if return_intermediates:
-            intermediates = {
-                "teacher_output": teacher_out.output,
-                "student_output": student_out.output,
-                "transfer_loss": transfer_loss,
-                "teacher_logsumexp": teacher_out.logsumexp,
-                "student_logsumexp": student_out.logsumexp
-            }
-            return student_attention, intermediates
-        
-        return student_attention
-
-    def _compute_attention_loss(
-        self,
-        teacher_attn: jnp.ndarray,
-        student_attn: jnp.ndarray,
-        temperature: float
-    ) -> jnp.ndarray:
-        """Compute attention transfer loss between teacher and student."""
-        # Compute KL divergence between attention distributions
-        teacher_probs = jax.nn.softmax(teacher_attn / temperature, axis=-1)
-        student_log_probs = jax.nn.log_softmax(student_attn / temperature, axis=-1)
-        
-        loss = -jnp.sum(teacher_probs * student_log_probs, axis=-1)
-        return loss * (temperature ** 2)
-
-class KernelManager:
-    """
-    Manages TPU kernels for distillation operations.
-    Features:
-    - Kernel optimization
-    - Memory management
-    - Operation fusion
-    """
-    
-    def __init__(self, config: DistillationKernelConfig):
-        self.config = config
-        self.attention = TeacherStudentAttention(config)
-        self.mesh, self.sharding_specs = create_mesh_and_sharding(
-            jax.device_count(),
-            config.mesh_mode
-        )
-    
-    def optimize_kernel_layout(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Optimize tensor layout for TPU operations."""
-        return optimize_kernel_layout(x, self.config.block_size)
-    
-    def fuse_operations(
-        self,
-        ops: Dict[str, Any],
-        inputs: Dict[str, jnp.ndarray]
-    ) -> Dict[str, jnp.ndarray]:
-        """
-        Fuse multiple operations for TPU efficiency.
-        
-        Args:
-            ops: Dictionary of operations to fuse
-            inputs: Input tensors for operations
+            # Scale scores
+            scale = 1.0 / jnp.sqrt(head_size)
+            student_scores *= scale
+            teacher_scores *= scale
             
-        Returns:
-            Dictionary of operation outputs
-        """
-        with self.mesh:
-            # Apply operation fusion based on input dependencies
-            outputs = {}
-            for name, op in ops.items():
-                if isinstance(op, tuple):
-                    # Handle operation with dependencies
-                    fn, deps = op
-                    dep_inputs = {k: outputs[k] for k in deps if k in outputs}
-                    dep_inputs.update({k: v for k, v in inputs.items() if k in deps})
-                    outputs[name] = fn(**dep_inputs)
-                else:
-                    # Single operation without dependencies
-                    outputs[name] = op(inputs)
+            if attention_mask is not None:
+                student_scores += attention_mask
+                teacher_scores += attention_mask
+                
+            # Apply temperature scaling for distillation
+            student_attn = jax.nn.softmax(
+                student_scores / self.config.temperature,
+                axis=-1
+            )
+            teacher_attn = jax.nn.softmax(
+                teacher_scores / self.config.temperature,
+                axis=-1
+            )
             
-            return outputs
-
-class LayerwiseOptimizer:
-    """
-    Optimizes layer-wise operations for distillation.
-    Features:
-    - Progressive layer dropout
-    - Adaptive attention patterns
-    - Layer-wise memory management
-    """
-    
-    def __init__(
-        self,
-        config: DistillationKernelConfig,
-        num_layers: int,
-        dropout_rate: float = 0.1
-    ):
-        self.config = config
-        self.num_layers = num_layers
-        self.base_dropout = dropout_rate
-        self.kernel_manager = KernelManager(config)
-    
-    def get_layer_dropout(self, layer_idx: int) -> float:
-        """Get progressive dropout rate for layer."""
-        # Increase dropout rate for deeper layers
-        return self.base_dropout * (1 + layer_idx / (self.num_layers - 1))
-    
-    def optimize_layer(
-        self,
-        layer_idx: int,
-        teacher_layer: Any,
-        student_layer: Any,
-        inputs: Dict[str, jnp.ndarray],
-        temperature: float = 1.0
-    ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]]:
-        """
-        Optimize single layer computation for teacher-student distillation.
-        
-        Args:
-            layer_idx: Index of current layer
-            teacher_layer: Teacher model layer
-            student_layer: Student model layer
-            inputs: Input tensors
-            temperature: Temperature for attention transfer
+            # Compute attention outputs
+            student_output = jnp.matmul(student_attn, student_v)
             
-        Returns:
-            Tuple of teacher and student outputs
-        """
-        dropout_rate = self.get_layer_dropout(layer_idx)
+            # Compute attention map distillation loss
+            attention_loss = jnp.mean(
+                jax.nn.kl_divergence(
+                    jax.nn.log_softmax(teacher_scores, axis=-1),
+                    jax.nn.log_softmax(student_scores, axis=-1)
+                )
+            )
+            
+            return student_output, attention_loss
+            
+        return attention_kernel
         
-        # Define operations to fuse
-        teacher_ops = {
-            "attention": (
-                partial(
-                    self.kernel_manager.attention.transfer_attention_maps,
-                    temperature=temperature
-                ),
-                ["query", "key", "value"]
-            ),
-            "ffn": (teacher_layer.feed_forward, ["attention"]),
-            "norm": (teacher_layer.layer_norm, ["ffn"])
-        }
+    def create_hidden_distillation_kernel(
+        self,
+        hidden_size: int,
+        intermediate_size: Optional[int] = None
+    ) -> Callable:
+        """Create kernel for hidden state distillation."""
+        if intermediate_size is None:
+            intermediate_size = self.config.intermediate_size
+            
+        @jax.jit
+        def hidden_kernel(
+            student_hidden: jnp.ndarray,
+            teacher_hidden: jnp.ndarray,
+            student_intermediate: Optional[jnp.ndarray] = None,
+            teacher_intermediate: Optional[jnp.ndarray] = None
+        ) -> Tuple[jnp.ndarray, float]:
+            # Hidden state loss
+            hidden_loss = jnp.mean(
+                jnp.square(
+                    student_hidden / jnp.norm(student_hidden, axis=-1, keepdims=True) -
+                    teacher_hidden / jnp.norm(teacher_hidden, axis=-1, keepdims=True)
+                )
+            )
+            
+            # Add intermediate layer loss if provided
+            if (student_intermediate is not None and 
+                teacher_intermediate is not None):
+                intermediate_loss = jnp.mean(
+                    jnp.square(
+                        student_intermediate / jnp.norm(student_intermediate, axis=-1, keepdims=True) -
+                        teacher_intermediate / jnp.norm(teacher_intermediate, axis=-1, keepdims=True)
+                    )
+                )
+                hidden_loss = 0.5 * (hidden_loss + intermediate_loss)
+                
+            return student_hidden, hidden_loss
+            
+        return hidden_kernel
         
-        student_ops = {
-            "attention": (
-                partial(
-                    self.kernel_manager.attention.transfer_attention_maps,
-                    temperature=temperature
-                ),
-                ["query", "key", "value"]
-            ),
-            "ffn": (
-                partial(student_layer.feed_forward, dropout_rate=dropout_rate),
-                ["attention"]
-            ),
-            "norm": (student_layer.layer_norm, ["ffn"])
-        }
+    def create_prediction_distillation_kernel(
+        self,
+        vocab_size: Optional[int] = None
+    ) -> Callable:
+        """Create kernel for prediction layer distillation."""
+        if vocab_size is None:
+            vocab_size = self.config.vocab_size
+            
+        @jax.jit
+        def prediction_kernel(
+            student_logits: jnp.ndarray,
+            teacher_logits: jnp.ndarray,
+            labels: Optional[jnp.ndarray] = None
+        ) -> Tuple[jnp.ndarray, float]:
+            # Compute soft targets from teacher
+            teacher_probs = jax.nn.softmax(
+                teacher_logits / self.config.temperature,
+                axis=-1
+            )
+            
+            # Distillation loss
+            prediction_loss = -jnp.mean(
+                jnp.sum(
+                    teacher_probs * jax.nn.log_softmax(
+                        student_logits / self.config.temperature,
+                        axis=-1
+                    ),
+                    axis=-1
+                )
+            )
+            
+            # Add hard target loss if labels provided
+            if labels is not None:
+                hard_loss = jax.nn.sparse_categorical_crossentropy(
+                    labels,
+                    student_logits
+                )
+                prediction_loss = (
+                    self.config.alpha * prediction_loss +
+                    (1 - self.config.alpha) * hard_loss
+                )
+                
+            return student_logits, prediction_loss
+            
+        return prediction_kernel
         
-        # Optimize and fuse operations
-        teacher_outputs = self.kernel_manager.fuse_operations(
-            teacher_ops,
-            inputs
+    def distill_batch(
+        self,
+        student_outputs: Dict[str, jnp.ndarray],
+        teacher_outputs: Dict[str, jnp.ndarray],
+        labels: Optional[jnp.ndarray] = None,
+        attention_mask: Optional[jnp.ndarray] = None
+    ) -> DistillationOutput:
+        """Perform distillation on a batch of inputs."""
+        # Create kernels
+        attention_kernel = self.create_attention_distillation_kernel(
+            self.config.num_heads,
+            self.config.hidden_size // self.config.num_heads
+        )
+        hidden_kernel = self.create_hidden_distillation_kernel(
+            self.config.hidden_size
+        )
+        prediction_kernel = self.create_prediction_distillation_kernel()
+        
+        # Attention distillation
+        _, attention_loss = attention_kernel(
+            student_outputs["query"],
+            student_outputs["key"],  
+            student_outputs["value"],
+            teacher_outputs["query"],
+            teacher_outputs["key"],
+            teacher_outputs["value"],
+            attention_mask
         )
         
-        student_outputs = self.kernel_manager.fuse_operations(
-            student_ops,
-            inputs
+        # Hidden state distillation
+        _, hidden_loss = hidden_kernel(
+            student_outputs["hidden_states"],
+            teacher_outputs["hidden_states"],
+            student_outputs.get("intermediate"),
+            teacher_outputs.get("intermediate")
         )
         
-        return teacher_outputs, student_outputs
+        # Prediction distillation
+        student_logits, prediction_loss = prediction_kernel(
+            student_outputs["logits"],
+            teacher_outputs["logits"],
+            labels
+        )
+        
+        # Combine losses
+        total_loss = (
+            attention_loss +
+            hidden_loss +
+            prediction_loss
+        )
+        
+        return DistillationOutput(
+            student_logits=student_logits,
+            teacher_logits=teacher_outputs["logits"],
+            attention_loss=attention_loss,
+            hidden_loss=hidden_loss,
+            prediction_loss=prediction_loss,
+            total_loss=total_loss
+        )

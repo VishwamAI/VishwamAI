@@ -6,6 +6,7 @@ import flax.linen as nn
 from typing import Any, Optional, Tuple, Dict, List, Callable
 from vishwamai.layers.attention import FlashAttention, flash_attention_inference
 from vishwamai.kernels.core.kernel import fp8_gemm_optimized, act_quant, optimize_kernel_layout
+from vishwamai.layers.mode import DynamicExpertGating
 
 class TPUGEMMLinear(nn.Module):
     """Linear layer with TPU-optimized GEMM operations."""
@@ -58,24 +59,50 @@ class TPULayerNorm(nn.Module):
     use_bias: bool = True
     use_scale: bool = True
     axis: int = -1
+    block_size: int = 128  # TPU-optimal block size
     
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply layer normalization with TPU optimizations."""
+        # Ensure the input is properly aligned for TPU
+        if x.shape[self.axis] % self.block_size != 0:
+            pad_size = self.block_size - (x.shape[self.axis] % self.block_size)
+            padding = [(0, 0)] * x.ndim
+            padding[self.axis] = (0, pad_size)
+            x = jnp.pad(x, padding, mode='constant')
+            
         feature_shape = (x.shape[self.axis],)
-        mean = jnp.mean(x, axis=self.axis, keepdims=True)
-        var = jnp.var(x, axis=self.axis, keepdims=True)
         
-        # Compute normalization in FP32 for stability
-        y = (x - mean) / jnp.sqrt(var + self.epsilon)
+        # Cast to float32 for stable reduction operations
+        x_f32 = x.astype(jnp.float32)
         
+        # Compute statistics with Welford's online algorithm for stability
+        mean = jnp.mean(x_f32, axis=self.axis, keepdims=True)
+        centered = x_f32 - mean
+        var = jnp.mean(jnp.square(centered), axis=self.axis, keepdims=True)
+        
+        # Normalize with high precision
+        inv_std = jax.lax.rsqrt(var + self.epsilon)
+        y = centered * inv_std
+        
+        # Apply scale and bias if configured
         if self.use_scale:
             scale = self.param('scale', self.scale_init, feature_shape, self.dtype)
+            scale = scale.astype(jnp.float32)
             y = y * scale
             
         if self.use_bias:
             bias = self.param('bias', self.bias_init, feature_shape, self.dtype)
+            bias = bias.astype(jnp.float32)
             y = y + bias
             
+        # Remove padding if added
+        if x.shape[self.axis] != feature_shape[0]:
+            slicing = [slice(None)] * y.ndim
+            slicing[self.axis] = slice(0, feature_shape[0])
+            y = y[tuple(slicing)]
+            
+        # Cast back to working precision
         return y.astype(self.dtype)
 
 class TPUMultiHeadAttention(nn.Module):
@@ -115,7 +142,7 @@ class TPUMultiHeadAttention(nn.Module):
                 num_heads=self.num_heads,
                 dropout_rate=self.dropout_rate
             )
-    
+
     def __call__(
         self,
         x: jnp.ndarray,
@@ -126,7 +153,7 @@ class TPUMultiHeadAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
         
         # Project to Q, K, V
-        qkv = self.qkv(x)
+        qkv = self.qkv(x)  # [batch, seq, 3*heads*dim]
         qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         qkv = qkv.transpose(2, 0, 3, 1, 4)  # [3, batch, heads, seq, dim]
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -134,50 +161,48 @@ class TPUMultiHeadAttention(nn.Module):
         # Add past key/values for inference
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            k = jnp.concatenate([past_k, k], axis=2)
+            k = jnp.concatenate([past_k, k], axis=2)  # Concat on seq length
             v = jnp.concatenate([past_v, v], axis=2)
         
-        # Apply attention
+        # Apply attention with consistent dimensions
         if self.use_flash_attn:
-            if deterministic:
-                attn_output, present = flash_attention_inference(
-                    q, k, v,
-                    mask=mask,
-                    past_key_values=past_key_value,
-                    block_size=self.block_size,
-                    head_dim=self.head_dim,
-                    num_heads=self.num_heads,
-                    use_fp8=self.use_fp8
-                )
-            else:
-                attn_output = self.flash_attn(
-                    q, k, v,
-                    mask=mask,
-                    deterministic=deterministic
-                )
-                present = (k, v) if past_key_value is not None else None
+            # Flash attention expects [batch, heads, seq, dim]
+            attn_output = self.flash_attn(
+                q, k, v,
+                mask=mask,
+                deterministic=deterministic
+            )
         else:
             # Standard scaled dot-product attention
             scale = 1.0 / jnp.sqrt(self.head_dim)
+            # q, k: [batch, heads, seq, dim]
             attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
             
             if mask is not None:
-                attn_weights = jnp.where(mask, attn_weights, jnp.finfo(self.dtype).min)
+                attn_weights = jnp.where(mask, attn_weights, -1e10)
             
             attn_weights = jax.nn.softmax(attn_weights, axis=-1)
             
             if not deterministic and self.dropout_rate > 0.0:
-                attn_weights = nn.Dropout(
-                    rate=self.dropout_rate,
-                    deterministic=deterministic
-                )(attn_weights)
+                dropout_rng = self.make_rng('dropout')
+                keep_prob = 1.0 - self.dropout_rate
+                dropout_mask = jax.random.bernoulli(
+                    dropout_rng,
+                    p=keep_prob,
+                    shape=attn_weights.shape
+                )
+                attn_weights = attn_weights * dropout_mask / keep_prob
             
             attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
-            present = (k, v) if past_key_value is not None else None
         
-        # Reshape and project output
+        # Save current key/values for next step if needed
+        present = (k, v) if past_key_value is not None else None
+        
+        # Reshape output to [batch, seq, heads*dim]
         attn_output = attn_output.transpose(0, 2, 1, 3)
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        
+        # Final projection
         attn_output = self.out(attn_output)
         
         return attn_output, present
@@ -185,38 +210,69 @@ class TPUMultiHeadAttention(nn.Module):
 class TPURMSNorm(nn.Module):
     """TPU-optimized Root Mean Square normalization layer."""
     epsilon: float = 1e-6
-    dtype: Any = jnp.bfloat16
+    dtype: Any = jnp.bfloat16  # Default to bfloat16 for TPU
     scale_init: Any = nn.initializers.ones
+    block_size: int = 128  # TPU-optimal block size
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Cast input to compute type for better numerical stability
-        x = x.astype(jnp.float32)
+        # Ensure TPU-friendly dimensions
+        orig_shape = x.shape
+        if x.shape[-1] % self.block_size != 0:
+            pad_size = self.block_size - (x.shape[-1] % self.block_size)
+            x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, pad_size)])
+            
+        # Cast to float32 for reduction operations
+        x_f32 = x.astype(jnp.float32)
         
         # Get feature shape for scale parameter
         feature_shape = (x.shape[-1],)
         
         # Initialize scale parameter
         scale = self.param('scale', self.scale_init, feature_shape)
-        scale = scale.astype(self.dtype)
+        scale = scale.astype(jnp.float32)
         
-        # Compute RMS normalization
-        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        x_normalized = x * jax.lax.rsqrt(variance + self.epsilon)
+        # Fused RMS computation for TPU efficiency
+        variance = jnp.mean(
+            jnp.square(x_f32), 
+            axis=-1, 
+            keepdims=True,
+            where=None if x.shape == orig_shape else jnp.arange(orig_shape[-1]) < orig_shape[-1]
+        )
+        
+        # Use rsqrt for better TPU performance
+        x_normalized = x_f32 * jax.lax.rsqrt(variance + self.epsilon)
         
         # Apply scale and cast back to working precision
-        return (x_normalized * scale).astype(self.dtype)
+        result = (x_normalized * scale).astype(self.dtype)
+        
+        # Remove padding if added
+        if x.shape != orig_shape:
+            result = result[..., :orig_shape[-1]]
+            
+        return result
 
 class TPUMoELayer(nn.Module):
     """TPU-optimized Mixture of Experts layer."""
     num_experts: int
     expert_dim: int
+    capacity_factor: float = 1.0
     dtype: Any = jnp.float32
+    use_fp8: bool = True
+    block_size: int = 128
     
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # TODO: Implement MoE logic
-        return x
+    def setup(self):
+        self.gating = DynamicExpertGating(
+            num_experts=self.num_experts,
+            expert_dim=self.expert_dim,
+            capacity_factor=self.capacity_factor,
+            dtype=self.dtype,
+            use_fp8=self.use_fp8,
+            block_size=self.block_size
+        )
+    
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+        return self.gating(x, deterministic)
 
 # Alias for backwards compatibility
 MoELayer = TPUMoELayer

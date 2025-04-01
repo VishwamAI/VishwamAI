@@ -1,68 +1,43 @@
-"""TPU pipeline and kernel fusion configurations."""
+"""TPU pipeline configuration and scheduling utilities."""
 
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
 import jax
-from jax import lax
+import jax.numpy as jnp
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List, Tuple
 
 @dataclass
 class TPUPipelineConfig:
-    """Configuration for TPU pipeline optimization."""
+    """Configuration for TPU pipeline execution."""
+    # Memory management
+    rematerialize: bool = True
+    remat_granularity: int = 2
+    max_live_arrays: int = 4
     
-    # Pipeline stages
-    num_micro_batches: int = 8  # Number of micro-batches for pipeline parallelism
-    pipeline_stages: int = 4     # Number of pipeline stages
-    stage_placement: str = "auto" # How to place stages across TPU cores
+    # Pipeline configuration
+    pipeline_stages: int = 2
+    microbatch_size: int = 8
+    gradient_accumulation_steps: int = 4
     
-    # Memory optimizations  
-    rematerialize: bool = True   # Whether to rematerialize activations
-    remat_granularity: int = 2   # How many layers to group for rematerialization
-    preserve_rng_state: bool = True  # Preserve RNG state across pipeline stages
-    
-    # Kernel fusion settings
-    block_size: int = 128        # TPU MXU block size
-    fuse_attention: bool = True  # Fuse attention operations
-    fuse_layernorm: bool = True  # Fuse layer normalization
-    fuse_relu: bool = True       # Fuse ReLU with preceding operation
-    
-    # Precision settings
-    use_bfloat16: bool = True    # Use bfloat16 precision
-    use_fp8: bool = False        # Enable FP8 for certain operations
-    matmul_precision: Any = lax.Precision.HIGHEST
+    # TPU-specific settings
+    use_bfloat16: bool = True
+    num_partitions: int = 8
+    num_replicas: int = 1
     
     # Prefetching
-    num_prefetch: int = 2        # Number of steps to prefetch
-    prefetch_to_device: bool = True  # Prefetch directly to TPU device memory
+    prefetch_to_device: bool = True
+    num_prefetch: int = 2
     
-    # Compilation settings
-    xla_flags: Optional[Dict[str, Any]] = None  # Custom XLA flags
+    # XLA flags
+    xla_flags: Dict[str, Any] = None
     
     def __post_init__(self):
-        if self.block_size % 128 != 0:
-            raise ValueError("block_size must be multiple of 128 for TPU")
-            
-        # Set default XLA flags if not provided
         if self.xla_flags is None:
             self.xla_flags = {
-                "xla_enable_fast_math": True,
-                "xla_cpu_enable_fast_math": True,
-                "xla_gpu_enable_fast_math": True,
-                "xla_gpu_autotune_level": 4,
-                "xla_force_host_platform_device_count": "1",
+                "jax_backend_target": "tpu",
+                "jax_platform_name": "tpu",
+                "jax_xla_backend": "tpu",
+                "jax_enable_x64": False
             }
-
-def create_pipeline_mesh(num_cores: int, config: TPUPipelineConfig):
-    """Create optimal device mesh for pipeline parallelism."""
-    devices = jax.devices()
-    
-    if len(devices) < num_cores:
-        raise ValueError(f"Requested {num_cores} cores but only {len(devices)} available")
-    
-    # Create 2D mesh for data and pipeline parallelism
-    mesh_shape = (num_cores // config.pipeline_stages, config.pipeline_stages)
-    device_mesh = jax.device_mesh(devices[:num_cores], mesh_shape)
-    
-    return device_mesh
 
 def configure_tpu_pipeline(config: TPUPipelineConfig):
     """Configure JAX for optimal TPU pipeline performance."""
@@ -85,45 +60,147 @@ def configure_tpu_pipeline(config: TPUPipelineConfig):
     
     return config
 
-def get_optimal_pipeline_config(
-    model_size: str = "large",
-    num_cores: int = 8
-) -> TPUPipelineConfig:
-    """Get optimal pipeline configuration based on model size."""
+class TPUPipelineScheduler:
+    """Manages efficient pipeline scheduling for TPU computation."""
     
-    configs = {
-        "small": TPUPipelineConfig(
-            num_micro_batches=4,
-            pipeline_stages=2,
-            block_size=128,
-            use_fp8=False
-        ),
-        "medium": TPUPipelineConfig(
-            num_micro_batches=8,
-            pipeline_stages=4,
-            block_size=256,
-            use_fp8=False
-        ),
-        "large": TPUPipelineConfig(
-            num_micro_batches=16,
-            pipeline_stages=8,
-            block_size=512,
-            use_fp8=True
-        ),
-        "xl": TPUPipelineConfig(
-            num_micro_batches=32,
-            pipeline_stages=16,
-            block_size=1024,
-            use_fp8=True
-        )
-    }
-    
-    if model_size not in configs:
-        raise ValueError(f"Unknown model size: {model_size}")
+    def __init__(self, config: TPUPipelineConfig):
+        self.config = config
+        self.current_stage = 0
+        self.microbatches: List[Any] = []
         
-    config = configs[model_size]
-    
-    # Adjust pipeline stages based on available cores
-    config.pipeline_stages = min(config.pipeline_stages, num_cores)
-    
-    return config
+    def schedule_operation(
+        self,
+        operation: Any,
+        inputs: Any,
+        mesh: Optional[Any] = None
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Schedule an operation in the pipeline."""
+        if mesh is None:
+            # Create default mesh if none provided
+            devices = jax.devices()
+            mesh = jax.sharding.Mesh(
+                devices,
+                ('data', 'model')
+            )
+        
+        # Split into microbatches
+        microbatches = self._create_microbatches(inputs)
+        
+        # Process microbatches with pipeline parallelism
+        results = []
+        metadata = []
+        
+        for i, batch in enumerate(microbatches):
+            # Forward pass
+            with mesh:
+                output, meta = self._process_microbatch(
+                    operation,
+                    batch,
+                    is_forward=(i < len(microbatches) // 2)
+                )
+                results.append(output)
+                metadata.append(meta)
+        
+        # Combine results
+        combined_output = self._combine_microbatches(results)
+        combined_meta = self._aggregate_metadata(metadata)
+        
+        return combined_output, combined_meta
+        
+    def _create_microbatches(self, inputs: Any) -> List[Any]:
+        """Split inputs into microbatches."""
+        if isinstance(inputs, (tuple, list)):
+            # Handle multiple inputs
+            microbatches = []
+            batch_size = inputs[0].shape[0]
+            num_microbatches = (
+                batch_size + self.config.microbatch_size - 1
+            ) // self.config.microbatch_size
+            
+            for i in range(num_microbatches):
+                start = i * self.config.microbatch_size
+                end = min(start + self.config.microbatch_size, batch_size)
+                microbatch = [x[start:end] for x in inputs]
+                microbatches.append(microbatch)
+        else:
+            # Single input tensor
+            batch_size = inputs.shape[0]
+            num_microbatches = (
+                batch_size + self.config.microbatch_size - 1
+            ) // self.config.microbatch_size
+            
+            microbatches = []
+            for i in range(num_microbatches):
+                start = i * self.config.microbatch_size
+                end = min(start + self.config.microbatch_size, batch_size)
+                microbatches.append(inputs[start:end])
+                
+        return microbatches
+        
+    def _process_microbatch(
+        self,
+        operation: Any,
+        inputs: Any,
+        is_forward: bool
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Process a single microbatch."""
+        # Set up gradient accumulation if needed
+        if not is_forward:
+            # Use gradient accumulation for backward pass
+            grads = []
+            meta = {}
+            
+            for _ in range(self.config.gradient_accumulation_steps):
+                output, step_meta = operation(inputs)
+                grad = jax.grad(lambda x: output.sum())(inputs)
+                grads.append(grad)
+                meta.update(step_meta)
+            
+            # Average gradients
+            avg_grad = jax.tree_map(
+                lambda *x: sum(x) / len(x),
+                *grads
+            )
+            
+            return avg_grad, meta
+        else:
+            # Regular forward pass
+            return operation(inputs)
+        
+    def _combine_microbatches(self, results: List[Any]) -> Any:
+        """Combine microbatch results."""
+        if isinstance(results[0], (tuple, list)):
+            # Multiple outputs
+            num_outputs = len(results[0])
+            combined = []
+            
+            for i in range(num_outputs):
+                output_parts = [r[i] for r in results]
+                combined.append(jnp.concatenate(output_parts, axis=0))
+                
+            return tuple(combined)
+        else:
+            # Single output
+            return jnp.concatenate(results, axis=0)
+            
+    def _aggregate_metadata(
+        self,
+        metadata: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Aggregate metadata from all microbatches."""
+        if not metadata:
+            return {}
+            
+        result = {}
+        for key in metadata[0].keys():
+            if isinstance(metadata[0][key], (int, float)):
+                # Average numeric values
+                result[key] = sum(m[key] for m in metadata) / len(metadata)
+            elif isinstance(metadata[0][key], (list, tuple)):
+                # Concatenate sequences
+                result[key] = sum((m[key] for m in metadata), [])
+            else:
+                # Keep last value for other types
+                result[key] = metadata[-1][key]
+                
+        return result

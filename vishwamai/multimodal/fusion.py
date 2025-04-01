@@ -22,7 +22,8 @@ class CrossAttentionFuser(nn.Module):
     def __call__(
         self,
         vision_features: jnp.ndarray,
-        audio_features: jnp.ndarray,
+        text_features: jnp.ndarray,
+        audio_features: Optional[jnp.ndarray] = None,
         attention_mask: Optional[jnp.ndarray] = None,
         training: bool = False
     ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
@@ -31,34 +32,43 @@ class CrossAttentionFuser(nn.Module):
         
         Args:
             vision_features: Visual features [batch, vis_seq, hidden]
-            audio_features: Audio features [batch, audio_seq, hidden] 
+            text_features: Text features [batch, text_seq, hidden]
+            audio_features: Optional audio features [batch, audio_seq, hidden]
             attention_mask: Optional attention mask
             training: Whether in training mode
             
         Returns:
             Tuple of:
-            - Fused features [batch, vis_seq + audio_seq, hidden]
+            - Fused features [batch, total_seq, hidden]
             - Attention statistics for analysis
         """
-        batch_size = vision_features.shape[0]
-        
-        # Project inputs using memory-efficient GEMM
+        # Project modalities to common space using memory-efficient GEMM
         vision_proj = TPUGEMMLinear(
             features=self.hidden_dim,
             dtype=self.dtype,
             kernel_init=nn.initializers.truncated_normal(0.02)
         )(vision_features)
         
-        audio_proj = TPUGEMMLinear(
-            features=self.hidden_dim, 
+        text_proj = TPUGEMMLinear(
+            features=self.hidden_dim,
             dtype=self.dtype,
             kernel_init=nn.initializers.truncated_normal(0.02)
-        )(audio_features)
+        )(text_features)
 
-        # Concatenate features efficiently
-        concat_features = jnp.concatenate([vision_proj, audio_proj], axis=1)
+        # Handle optional audio input
+        if audio_features is not None:
+            audio_proj = TPUGEMMLinear(
+                features=self.hidden_dim,
+                dtype=self.dtype,
+                kernel_init=nn.initializers.truncated_normal(0.02)
+            )(audio_features)
+            # Concatenate all modalities
+            concat_features = jnp.concatenate([vision_proj, text_proj, audio_proj], axis=1)
+        else:
+            # Just vision and text
+            concat_features = jnp.concatenate([vision_proj, text_proj], axis=1)
         
-        # FlashAttention for better memory efficiency
+        # FlashAttention for better memory efficiency 
         attention = FlashAttention(
             num_heads=self.num_heads,
             head_dim=self.hidden_dim // self.num_heads,
@@ -77,7 +87,7 @@ class CrossAttentionFuser(nn.Module):
         # Memory-efficient MLP with kernel fusion
         y = TPULayerNorm(dtype=self.dtype)(x)
         mlp_dim = self.hidden_dim * 4
-        
+
         y = nn.Sequential([
             TPUGEMMLinear(features=mlp_dim, dtype=self.dtype),
             nn.gelu,
@@ -91,10 +101,12 @@ class CrossAttentionFuser(nn.Module):
             'cross_attention_scores': jnp.mean(attention, axis=(0,1)),
             'feature_norms': {
                 'vision': jnp.mean(jnp.linalg.norm(vision_proj, axis=-1)),
-                'audio': jnp.mean(jnp.linalg.norm(audio_proj, axis=-1)),
+                'text': jnp.mean(jnp.linalg.norm(text_proj, axis=-1)),
                 'fused': jnp.mean(jnp.linalg.norm(x, axis=-1))
             }
         }
+        if audio_features is not None:
+            attn_stats['feature_norms']['audio'] = jnp.mean(jnp.linalg.norm(audio_proj, axis=-1))
         
         return x, attn_stats
 

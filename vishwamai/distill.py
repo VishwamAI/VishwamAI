@@ -5,6 +5,8 @@ import jax.numpy as jnp
 from typing import Dict, Any, Optional, Tuple
 import optax
 from .kernels.core.kernel import fp8_gemm_optimized
+from vishwamai.transformer import EnhancedTransformerConfig, EnhancedTransformerModel
+from vishwamai.kernels.core import train_utils
 
 def create_student_config(teacher_config: Dict[str, Any], reduction_factor: float) -> EnhancedTransformerConfig:
     """Create optimal student config for TPU v3-8."""

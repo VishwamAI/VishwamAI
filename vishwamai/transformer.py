@@ -485,3 +485,83 @@ if __name__ == "__main__":
     
     print("\nBenchmarking performance on TPU pod...")
     benchmark_tpu_performance(model_state)
+
+from dataclasses import dataclass
+
+@dataclass
+class EnhancedTransformerConfig:
+    vocab_size: int
+    hidden_size: int
+    num_attention_heads: int
+    num_hidden_layers: int
+    intermediate_size: int
+    max_position_embeddings: int
+    dropout_rate: float
+    attention_dropout: float
+    use_flash_attention: bool
+    use_fp8: bool
+    use_parallel: bool
+    block_size: int
+
+class EnhancedTransformerModel(nn.Module):
+    config: EnhancedTransformerConfig
+
+    def setup(self):
+        self.embedding = nn.Embed(
+            num_embeddings=self.config.vocab_size,
+            features=self.config.hidden_size
+        )
+        self.layers = [
+            TransformerBlock(
+                hidden_size=self.config.hidden_size,
+                num_attention_heads=self.config.num_attention_heads,
+                intermediate_size=self.config.intermediate_size,
+                dropout_rate=self.config.dropout_rate,
+                attention_dropout=self.config.attention_dropout,
+                use_flash_attention=self.config.use_flash_attention,
+                use_fp8=self.config.use_fp8,
+                use_parallel=self.config.use_parallel,
+                block_size=self.config.block_size
+            ) for _ in range(self.config.num_hidden_layers)
+        ]
+        self.layer_norm = nn.LayerNorm()
+
+    def __call__(self, input_ids, deterministic=True):
+        x = self.embedding(input_ids)
+        for layer in self.layers:
+            x = layer(x, deterministic=deterministic)
+        x = self.layer_norm(x)
+        return x
+
+class TransformerBlock(nn.Module):
+    hidden_size: int
+    num_attention_heads: int
+    intermediate_size: int
+    dropout_rate: float
+    attention_dropout: float
+    use_flash_attention: bool
+    use_fp8: bool
+    use_parallel: bool
+    block_size: int
+
+    def setup(self):
+        self.attention = nn.SelfAttention(
+            num_heads=self.num_attention_heads,
+            qkv_features=self.hidden_size,
+            dropout_rate=self.attention_dropout,
+            deterministic=True
+        )
+        self.mlp = nn.Dense(
+            features=self.intermediate_size,
+            use_bias=True
+        )
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.layer_norm1 = nn.LayerNorm()
+        self.layer_norm2 = nn.LayerNorm()
+
+    def __call__(self, x, deterministic=True):
+        attn_output = self.attention(self.layer_norm1(x), deterministic=deterministic)
+        x = x + self.dropout(attn_output, deterministic=deterministic)
+        mlp_output = self.mlp(self.layer_norm2(x))
+        x = x + self.dropout(mlp_output, deterministic=deterministic)
+        return x

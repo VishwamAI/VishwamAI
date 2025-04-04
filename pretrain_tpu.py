@@ -47,7 +47,8 @@ def get_pretrain_config() -> Dict[str, Any]:
         "model": tpu_config.model_config,
         "training": {
             **tpu_config.training_config,
-            "weight_decay": 0.01  # Add weight decay parameter
+            "weight_decay": 0.01,  # Add weight decay parameter
+            "max_grad_norm": 1.0  # Add gradient clipping parameter
         },
         "tpu": tpu_config.tpu_config,
         "memory": tpu_config.memory_config,

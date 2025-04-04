@@ -74,6 +74,7 @@ def get_pretrain_config() -> Dict[str, Any]:
         "thinking": {
             "num_steps": 3,
             "max_branches": 3,
+            "max_depth": 5,
             "beam_width": 5,
             "temperature": 0.7
         },
@@ -183,8 +184,10 @@ def main():
     # Initialize Tree of Thoughts for teacher model
     teacher_tot = TreeOfThoughts(
         model=teacher_model,
-        num_steps=config["thinking"]["num_steps"],
+        params=teacher_model.params,
+        tokenizer=teacher_model.tokenizer,
         max_branches=config["thinking"]["max_branches"],
+        max_depth=config["thinking"]["max_depth"],
         beam_width=config["thinking"]["beam_width"],
         temperature=config["thinking"]["temperature"]
     )
@@ -196,11 +199,13 @@ def main():
         reduction_factor=32/80  # Ratio of student layers (32) to teacher layers (80)
     )
     
-    # Initialize Tree of Thoughts for student model
+    # Initialize Tree of Thoughts for student model 
     student_tot = TreeOfThoughts(
         model=student_model,
-        num_steps=config["thinking"]["num_steps"],
+        params=student_vars,
+        tokenizer=student_model.tokenizer,
         max_branches=config["thinking"]["max_branches"],
+        max_depth=config["thinking"]["max_depth"],
         beam_width=config["thinking"]["beam_width"],
         temperature=config["thinking"]["temperature"]
     )

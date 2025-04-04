@@ -2,13 +2,134 @@
 
 import jax
 import jax.numpy as jnp
-from vishwamai.transformer import EnhancedTransformerModel, create_vishwamai_transformer
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Tuple
+from vishwamai.model import VishwamAI, VishwamAIConfig
+from vishwamai.transformer import EnhancedTransformerModel, TPUTrainingState 
 from vishwamai.pipeline import TPUDataPipeline, DistillationDataPipeline
 from vishwamai.device_mesh import TPUMeshContext
-from vishwamai.distill import create_student_model, initialize_from_teacher
+from vishwamai.distill import (
+    create_student_model, 
+    initialize_from_teacher,
+    DistillationTrainer
+)
 from vishwamai.thoughts import TreeOfThoughts
+from vishwamai.configs.tpu_v3_config import TPUV3Config
+from vishwamai.configs.budget_model_config import BudgetModelConfig
+from vishwamai.profiler import TPUProfiler
 import time
 from tqdm.auto import tqdm
+
+@dataclass
+class TPUTrainingConfig:
+    """Training configuration for TPU."""
+    model_config: Dict[str, Any]
+    thinking_config: Dict[str, Any]
+    batch_size: int
+    grad_accum_steps: int
+    learning_rate: float
+    warmup_steps: int
+    max_steps: int
+    weight_decay: float
+    max_grad_norm: float
+    dtype: Any
+    enable_pjit: bool = True
+    block_size: int = 128
+    use_flash_attn: bool = True
+    mixed_precision: bool = True
+
+def get_pretrain_config() -> Dict[str, Any]:
+    """Get pre-training configuration."""
+    # Start with TPU v3 optimized base config
+    tpu_config = TPUV3Config()
+    
+    return {
+        "model": tpu_config.model_config,
+        "training": tpu_config.training_config,
+        "tpu": tpu_config.tpu_config,
+        "memory": tpu_config.memory_config,
+        "optimization": {
+            "dtype": "bfloat16",
+            "use_fp8_gemm": True,
+            "block_size": 128,
+            "mixed_precision": True,
+            "teacher_load_dtype": "bfloat16"
+        },
+        "thinking": {
+            "num_steps": 3,
+            "max_branches": 3,
+            "beam_width": 5,
+            "temperature": 0.7
+        },
+        "distillation": {
+            "teacher_model": "google/gemma-7b",
+            "temperature": 2.0,
+            "alpha": 0.5,
+            "layer_mapping_strategy": "uniform"
+        }
+    }
+
+def create_vishwamai_transformer(model_name: str, dtype: str = "bfloat16") -> VishwamAI:
+    """Create a VishwamAI transformer model."""
+    config = VishwamAIConfig(
+        vocab_size=32000,
+        hidden_dim=2048,
+        num_layers=24,
+        num_heads=16,
+        head_dim=128,
+        mlp_dim=8192,
+        max_seq_len=2048,
+        dropout_rate=0.1,
+        attention_dropout=0.1
+    )
+    return VishwamAI.from_pretrained(model_name, config=config, dtype=dtype)
+
+def setup_tpu_training(
+    config: TPUTrainingConfig,
+    enable_profiling: bool = True,
+    model: Optional[EnhancedTransformerModel] = None,
+    initial_params: Optional[Dict[str, Any]] = None
+) -> Tuple[TPUTrainingState, Any, Any, Optional[TPUProfiler]]:
+    """Set up TPU training state and components."""
+    
+    # Create device mesh
+    devices = jax.devices()
+    device_mesh = jax.sharding.Mesh(devices, ("data",))
+    
+    # Initialize model if not provided
+    if model is None:
+        model = create_vishwamai_transformer(config.model_config)
+    
+    # Set up training state
+    rng = jax.random.PRNGKey(42)
+    state = TPUTrainingState(
+        params=initial_params or model.init(rng, jnp.ones((1, 128), dtype=jnp.int32)),
+        opt_state=None,  # Will be initialized by optimizer
+        model_fn=model.apply,
+        tx=None  # Will be initialized by optimizer
+    )
+    
+    # Create profiler if requested
+    profiler = TPUProfiler(config) if enable_profiling else None
+    
+    # Create training step function
+    @jax.jit
+    def train_step(state: TPUTrainingState, batch: Dict[str, jnp.ndarray]):
+        """Single training step."""
+        def loss_fn(params):
+            logits = state.model_fn({"params": params}, batch["input_ids"])
+            return jax.nn.softmax_cross_entropy_with_integer_labels(
+                logits, batch["labels"]
+            ).mean()
+        
+        grad_fn = jax.value_and_grad(loss_fn)
+        loss, grads = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grads)
+        
+        metrics = {"loss": loss}
+        return new_state, metrics
+    
+    return state, device_mesh, train_step, profiler
 
 def main():
     # Load configuration

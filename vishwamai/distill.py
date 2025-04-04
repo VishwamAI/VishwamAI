@@ -2,11 +2,253 @@
 
 import jax
 import jax.numpy as jnp
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Callable
 import optax
+from dataclasses import dataclass
 from .kernels.core.kernel import fp8_gemm_optimized
-from vishwamai.transformer import EnhancedTransformerConfig, EnhancedTransformerModel
-from vishwamai.kernels.core import train_utils
+from .kernels.core import train_utils
+from vishwamai.transformer import EnhancedTransformerConfig, EnhancedTransformerModel, TPUTrainingState
+from vishwamai.thoughts.tot import TreeOfThoughts
+from vishwamai.profiler import TPUProfiler
+
+@dataclass
+class DistillationConfig:
+    """Configuration for knowledge distillation."""
+    temperature: float = 2.0
+    alpha: float = 0.5
+    use_flash_attn: bool = True
+    use_fp8: bool = True
+    block_size: int = 128
+    learning_rate: float = 1e-4
+    warmup_steps: int = 1000
+    max_steps: int = 100_000
+    gradient_accumulation_steps: int = 4
+    enable_thinking: bool = True
+    thinking_weight: float = 0.1
+
+class DistillationTrainer:
+    """Trainer for knowledge distillation with TPU optimizations."""
+    
+    def __init__(
+        self,
+        teacher_model: Any,
+        student_config: Dict[str, Any],
+        temperature: float = 2.0,
+        alpha: float = 0.5,
+        use_flash_attn: bool = True,
+        use_fp8: bool = True,
+        block_size: int = 128,
+        teacher_tot: Optional[TreeOfThoughts] = None,
+        student_tot: Optional[TreeOfThoughts] = None,
+        profiler: Optional[TPUProfiler] = None
+    ):
+        self.teacher_model = teacher_model
+        self.config = DistillationConfig(
+            temperature=temperature,
+            alpha=alpha,
+            use_flash_attn=use_flash_attn,
+            use_fp8=use_fp8,
+            block_size=block_size
+        )
+        self.teacher_tot = teacher_tot
+        self.student_tot = student_tot
+        self.profiler = profiler
+        
+        # Initialize student model
+        rng = jax.random.PRNGKey(42)
+        self.student_model, self.variables, _ = create_student_model(
+            student_config,
+            teacher_model,
+            reduction_factor=0.5,
+            rng=rng
+        )
+        
+        # Initialize training state
+        self.state = self._create_train_state(rng)
+        
+        # Compile training step
+        self.train_step = self._create_train_step()
+    
+    def _create_train_state(self, rng: jnp.ndarray) -> TPUTrainingState:
+        """Create optimized training state."""
+        schedule_fn = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=self.config.learning_rate,
+            warmup_steps=self.config.warmup_steps,
+            decay_steps=self.config.max_steps,
+            end_value=self.config.learning_rate * 0.1
+        )
+        
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(
+                learning_rate=schedule_fn,
+                b1=0.9,
+                b2=0.999,
+                eps=1e-8,
+                weight_decay=0.01
+            )
+        )
+        
+        return train_utils.create_train_state(
+            model=self.student_model,
+            optimizer=optimizer,
+            rng=rng
+        )
+    
+    def _create_train_step(self) -> Callable:
+        """Create TPU-optimized training step."""
+        
+        @jax.jit
+        def train_step(
+            state: TPUTrainingState,
+            batch: Dict[str, jnp.ndarray],
+            teacher_logits: jnp.ndarray,
+            rng: jnp.ndarray
+        ) -> Tuple[TPUTrainingState, Dict[str, Any]]:
+            
+            def loss_fn(params):
+                # Get student outputs
+                student_logits = state.apply_fn(
+                    {"params": params},
+                    batch["input_ids"],
+                    deterministic=False,
+                    rngs={"dropout": rng}
+                )
+                
+                # Compute distillation loss
+                loss, metrics = compute_distillation_loss(
+                    student_logits=student_logits,
+                    teacher_logits=teacher_logits,
+                    labels=batch.get("labels"),
+                    temperature=self.config.temperature,
+                    alpha=self.config.alpha
+                )
+                
+                # Add thinking loss if enabled
+                if self.config.enable_thinking and self.teacher_tot and self.student_tot:
+                    teacher_thoughts = self.teacher_tot.generate_thoughts(
+                        batch["input_ids"]
+                    )
+                    student_thoughts = self.student_tot.generate_thoughts(
+                        batch["input_ids"]
+                    )
+                    thinking_loss = jnp.mean(
+                        jnp.square(teacher_thoughts - student_thoughts)
+                    )
+                    loss = loss + self.config.thinking_weight * thinking_loss
+                    metrics["thinking_loss"] = thinking_loss
+                
+                return loss, metrics
+            
+            # Compute gradients
+            grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+            (loss, metrics), grads = grad_fn(state.params)
+            
+            # Update state
+            new_state = state.apply_gradients(grads=grads)
+            
+            # Update metrics 
+            metrics["loss"] = loss
+            metrics["learning_rate"] = self._get_learning_rate(state)
+            
+            return new_state, metrics
+        
+        return train_step
+    
+    def _get_learning_rate(self, state: TPUTrainingState) -> float:
+        """Get current learning rate."""
+        return state.opt_state.hyperparams["learning_rate"]
+    
+    def train(
+        self,
+        train_dataset: Any,
+        eval_dataset: Optional[Any] = None,
+        max_steps: Optional[int] = None,
+        eval_steps: int = 100,
+        save_steps: int = 1000,
+        checkpoint_dir: Optional[str] = None
+    ):
+        """Train student model with knowledge distillation."""
+        max_steps = max_steps or self.config.max_steps
+        step = 0
+        
+        for batch in train_dataset:
+            if step >= max_steps:
+                break
+            
+            # Get teacher predictions
+            teacher_logits = self.teacher_model.apply(
+                {"params": self.teacher_model.params},
+                batch["input_ids"],
+                deterministic=True
+            )
+            
+            # Training step
+            rng = jax.random.fold_in(jax.random.PRNGKey(42), step)
+            self.state, metrics = self.train_step(
+                self.state,
+                batch,
+                teacher_logits,
+                rng
+            )
+            
+            # Log metrics
+            if self.profiler and step % 100 == 0:
+                self.profiler.log_metrics(metrics, step)
+            
+            # Evaluate
+            if eval_dataset and step % eval_steps == 0:
+                eval_metrics = self.evaluate(eval_dataset)
+                if self.profiler:
+                    self.profiler.log_metrics(eval_metrics, step, prefix="eval/")
+            
+            # Save checkpoint
+            if checkpoint_dir and step % save_steps == 0:
+                train_utils.save_checkpoint(
+                    checkpoint_dir,
+                    self.state,
+                    step,
+                    keep=2
+                )
+            
+            step += 1
+    
+    def evaluate(self, eval_dataset: Any) -> Dict[str, float]:
+        """Evaluate student model."""
+        metrics = []
+        
+        for batch in eval_dataset:
+            # Get teacher and student predictions
+            teacher_logits = self.teacher_model.apply(
+                {"params": self.teacher_model.params},
+                batch["input_ids"],
+                deterministic=True
+            )
+            
+            student_logits = self.student_model.apply(
+                {"params": self.state.params},
+                batch["input_ids"],
+                deterministic=True
+            )
+            
+            # Compute metrics
+            _, batch_metrics = compute_distillation_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                labels=batch.get("labels"),
+                temperature=self.config.temperature,
+                alpha=self.config.alpha
+            )
+            metrics.append(batch_metrics)
+        
+        # Average metrics
+        avg_metrics = jax.tree_map(
+            lambda *x: jnp.mean(jnp.stack(x)),
+            *metrics
+        )
+        
+        return avg_metrics
 
 def create_student_config(teacher_config: Dict[str, Any], reduction_factor: float) -> EnhancedTransformerConfig:
     """Create credit-optimized student config for TPU v3-8."""
@@ -118,45 +360,6 @@ def create_student_model(
     variables = student_model.init(rng, dummy_input, deterministic=False)
     
     return student_model, variables, student_config.__dict__
-
-def create_distillation_train_state(
-    student_model: EnhancedTransformerModel,
-    learning_rate: float = 1e-4,
-    warmup_steps: int = 1000,
-    rng: Optional[jnp.ndarray] = None
-) -> Any:
-    """Create training state optimized for TPU v3-8."""
-    
-    if rng is None:
-        rng = jax.random.PRNGKey(42)
-    
-    # TPU-optimized learning rate schedule
-    schedule_fn = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=learning_rate,
-        warmup_steps=warmup_steps,
-        decay_steps=100_000,
-        end_value=learning_rate * 0.1
-    )
-    
-    # Optimizer with gradient clipping and weight decay
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(
-            learning_rate=schedule_fn,
-            b1=0.9,
-            b2=0.999,
-            eps=1e-8,
-            weight_decay=0.01
-        )
-    )
-    
-    # Create training state
-    return train_utils.create_train_state(
-        model=student_model,
-        optimizer=optimizer,
-        rng=rng
-    )
 
 def initialize_from_teacher(
     student_state: Any,

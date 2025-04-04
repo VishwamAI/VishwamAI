@@ -1,30 +1,35 @@
-"""Automated kernel tuning and benchmarking."""
+"""Kernel autotuning and optimization."""
 
+from typing import Dict, Any, List, Optional, Tuple, Callable
+import dataclasses
 import time
-from typing import Dict, Any, List, Tuple, Optional, Callable
-import numpy as np
-from dataclasses import dataclass
 import jax
-import torch
+import jax.numpy as jnp
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
-from . import get_compiler, KernelProfiler
+from vishwamai.kernels.core.compiler import get_compiler, KernelProfiler
 from vishwamai.kernels.core.kernel import KernelConfig, HardwareType
 from vishwamai.kernels.core.memory import MemoryManager
 from vishwamai.kernels.core.shapes import DynamicShapeOptimizer
-@dataclass
-class TuningConfig:
-    """Configuration for kernel tuning."""
-    block_sizes: List[int]
-    batch_sizes: List[int]
-    num_warps: List[int]
-    precision_modes: List[str]
-    num_trials: int = 10
-    min_runtime_ms: float = 1.0
 
-@dataclass
+@dataclasses.dataclass
+class TuningConfig:
+    """Configuration for kernel autotuning."""
+    num_trials: int = 10
+    num_warmup: int = 5
+    min_block_size: int = 32
+    max_block_size: int = 256
+    search_parallel: bool = True
+    timeout_seconds: float = 60.0
+    block_sizes: List[int] = dataclasses.field(default_factory=lambda: [128, 256, 512])
+    batch_sizes: List[int] = dataclasses.field(default_factory=lambda: [1, 8, 16, 32])
+    num_warps: List[int] = dataclasses.field(default_factory=lambda: [4, 8, 16, 32])
+    precision_modes: List[str] = dataclasses.field(default_factory=lambda: ["fp32", "bf16"])
+
+@dataclasses.dataclass 
 class TuningResult:
-    """Results from kernel tuning."""
+    """Results from kernel autotuning."""
     best_config: Dict[str, Any]
     timing_ms: float
     throughput: float
@@ -85,7 +90,7 @@ class KernelTuner:
                     profile = self.profiler.profile_kernel(
                         compiled,
                         sample_inputs,
-                        num_warmup=5,
+                        num_warmup=tuning_config.num_warmup,
                         num_runs=tuning_config.num_trials
                     )
                     
@@ -123,27 +128,21 @@ class KernelTuner:
                         hardware=HardwareType.GPU,
                         block_size=block_size,
                         num_warps=num_warps,
-                        precision=precision,
-                        use_tensor_cores=True
+                        precision=precision
                     )
                     
-                    # Compile with test config
-                    compiled = self.compiler.get_or_compile(
+                    # Compile with test config using JAX's jit
+                    compiled = jax.jit(
                         kernel_fn,
-                        test_config,
-                        kernel_fn.__name__,
-                        input_spec={
-                            f"arg_{i}": torch.float16 if precision == "fp16"
-                            else torch.float32
-                            for i in range(len(sample_inputs))
-                        }
+                        static_argnums=(1,),  # Assume second arg is static
+                        backend='gpu'
                     )
                     
                     # Profile execution
                     profile = self.profiler.profile_kernel(
                         compiled,
                         sample_inputs,
-                        num_warmup=5,
+                        num_warmup=tuning_config.num_warmup,
                         num_runs=tuning_config.num_trials
                     )
                     
@@ -182,11 +181,18 @@ class KernelTuner:
                     batch_size=batch_size
                 )
                 
+                # Compile with JAX jit for CPU
+                compiled = jax.jit(
+                    kernel_fn,
+                    static_argnums=(1,),
+                    backend='cpu'
+                )
+                
                 # Profile execution
                 profile = self.profiler.profile_kernel(
-                    kernel_fn,
+                    compiled,
                     sample_inputs,
-                    num_warmup=5,
+                    num_warmup=tuning_config.num_warmup,
                     num_runs=tuning_config.num_trials
                 )
                 

@@ -1,5 +1,21 @@
 """VishwamAI TPU-optimized kernel implementations."""
 
+from vishwamai.kernels.core import (
+    Kernel,  # Import the aliased AbstractKernel
+    KernelConfig,
+    HardwareType,
+    KernelType,
+    KernelManager,
+    get_kernel_manager,
+    MemoryLayout,
+    MemoryBlock,
+    MemoryManager,
+    TuningConfig,
+    TuningResult,
+    KernelTuner,
+    AutotuneManager
+)
+
 from vishwamai.kernels.tpu.optimizers import (
     TPUOptimizer,
     TPUAdam,
@@ -35,31 +51,6 @@ from vishwamai.kernels.tpu.distillation_kernels import (
     DistillationKernelManager
 )
 
-from vishwamai.kernels.core.kernel import (
-    HardwareType,
-    KernelConfig,
-    AbstractKernel
-)
-
-from vishwamai.kernels.core.kernel_manager import (
-    KernelType,
-    KernelManager,
-    get_kernel_manager
-)
-
-from vishwamai.kernels.core.memory import (
-    MemoryLayout,
-    MemoryBlock,
-    MemoryManager
-)
-
-from vishwamai.kernels.core.tuner import (
-    TuningConfig,
-    TuningResult,
-    KernelTuner,
-    AutotuneManager
-)
-
 from vishwamai.kernels.optimizers.quantized_adam import QuantizedState
 from vishwamai.kernels.optimizers.quantized_lion import TPUQuantizedLion
 
@@ -72,9 +63,17 @@ except ImportError:
     CUDA_AVAILABLE = False
 
 __all__ = [
+    # Core Classes
+    'Kernel',
+    'KernelConfig',
+    'HardwareType',
+    'KernelType',
+    'KernelManager',
+    'get_kernel_manager',
+    
     # TPU Optimizers
     'TPUOptimizer',
-    'TPUAdam',
+    'TPUAdam', 
     'TPULion',
     'TPUAdafactor',
     'TPUQuantizedLion',
@@ -103,14 +102,6 @@ __all__ = [
     'DistillationOutput',
     'DistillationKernelManager',
     
-    # Core Types & Management
-    'HardwareType',
-    'KernelConfig',
-    'AbstractKernel',
-    'KernelType',
-    'KernelManager',
-    'get_kernel_manager',
-    
     # Memory Management
     'MemoryLayout',
     'MemoryBlock',
@@ -118,7 +109,7 @@ __all__ = [
     
     # Tuning & Optimization
     'TuningConfig',
-    'TuningResult', 
+    'TuningResult',
     'KernelTuner',
     'AutotuneManager',
     

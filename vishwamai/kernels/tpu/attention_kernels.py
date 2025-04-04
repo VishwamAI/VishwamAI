@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from jax import lax
 from typing import Optional, Tuple, Dict
 import flax.linen as nn
-from jax import partial
+from functools import partial
 
 @partial(jax.jit, static_argnums=(5, 6, 7, 8))
 def flash_attention_inference(

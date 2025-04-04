@@ -7,8 +7,7 @@ from typing import Optional, Tuple, Dict, Any, NamedTuple
 import numpy as np
 from functools import partial
 
-from vishwamai.kernels.core.kernel import Kernel, KernelConfig
-from vishwamai.kernels.core.kernel_manager import HardwareType
+from vishwamai.kernels.core import Kernel, KernelConfig, HardwareType
 from vishwamai.kernels.tpu.tpu_custom_call import optimize_tpu_layout, pad_to_tpu_multiple
 
 class LayerNormOutput(NamedTuple):

@@ -11,7 +11,7 @@ import warnings
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 from jax.sharding import PositionalSharding
-
+import flash_mla_cuda
 # Initialize TPU device mesh
 devices = jax.devices()
 device_mesh = mesh_utils.create_device_mesh((2, 4))  # 2x4 mesh for 8 TPU cores

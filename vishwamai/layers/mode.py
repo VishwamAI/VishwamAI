@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any, Optional, Tuple, Dict, List
 from vishwamai.kernels.core.kernel import fp8_gemm_optimized, act_quant
-from vishwamai.layers.layers import TPUGEMMLinear
+from vishwamai.layers.tpu_gemm_linear import TPUGEMMLinear
 
 class MoERouter(nn.Module):
     """Expert routing with dynamic capacity and load balancing."""

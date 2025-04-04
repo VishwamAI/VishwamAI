@@ -135,13 +135,15 @@ class TPUMultiHeadAttention(nn.Module):
         
         # Flash Attention module
         if self.use_flash_attn:
-            self.flash_attn = FlashAttention(
+            from vishwamai.layers.flash_attention import FlashAttentionConfig
+            config = FlashAttentionConfig(
                 block_size=self.block_size,
-                use_fp8=self.use_fp8,
                 head_dim=self.head_dim,
                 num_heads=self.num_heads,
-                dropout_rate=self.dropout_rate
+                dropout_rate=self.dropout_rate,
+                use_fp8=self.use_fp8
             )
+            self.flash_attn = FlashAttention(config)
 
     def __call__(
         self,

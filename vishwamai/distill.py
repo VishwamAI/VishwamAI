@@ -9,18 +9,28 @@ from vishwamai.transformer import EnhancedTransformerConfig, EnhancedTransformer
 from vishwamai.kernels.core import train_utils
 
 def create_student_config(teacher_config: Dict[str, Any], reduction_factor: float) -> EnhancedTransformerConfig:
-    """Create optimal student config for TPU v3-8."""
+    """Create credit-optimized student config for TPU v3-8."""
+    # Calculate efficient dimensions that are multiples of 128 for TPU
+    hidden_size = max(512, ((int(teacher_config["hidden_size"] * reduction_factor) + 127) // 128) * 128)
+    intermediate_size = max(2048, ((int(teacher_config["intermediate_size"] * reduction_factor) + 127) // 128) * 128)
+    
+    # Optimize number of heads for TPU utilization
+    num_attention_heads = max(8, ((int(teacher_config["num_attention_heads"] * reduction_factor) + 3) // 4) * 4)
+    
+    # Use shorter sequences initially and gradually increase
+    max_seq_length = min(teacher_config["max_position_embeddings"], 1024)  # Start with shorter sequences
+    
     return EnhancedTransformerConfig(
         vocab_size=teacher_config["vocab_size"],
-        hidden_size=max(512, int(teacher_config["hidden_size"] * reduction_factor)),
-        num_attention_heads=max(8, int(teacher_config["num_attention_heads"] * reduction_factor)),
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
         num_hidden_layers=max(4, int(teacher_config["num_hidden_layers"] * reduction_factor)),
-        intermediate_size=max(2048, int(teacher_config["intermediate_size"] * reduction_factor)),
-        max_position_embeddings=teacher_config["max_position_embeddings"],
+        intermediate_size=intermediate_size,
+        max_position_embeddings=max_seq_length,
         dropout_rate=0.1,
         attention_dropout=0.1,
         use_flash_attention=True,
-        use_fp8=True,
+        use_fp8=True,  # Enable FP8 for memory efficiency
         use_parallel=True,
         block_size=128  # Optimal for TPU v3
     )

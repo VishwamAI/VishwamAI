@@ -34,6 +34,8 @@ from .tuner import (
     KernelTuner
 )
 
+from .train_utils import create_train_state
+
 __all__ = [
     # Hardware and Kernel Types
     "HardwareType",
@@ -56,6 +58,9 @@ __all__ = [
     # Memory Management
     "MemoryLayout",
     "MemoryBlock",
+    
+    # Training
+    "create_train_state",
     
     # Tuning
     "TuningConfig",

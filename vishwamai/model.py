@@ -28,6 +28,7 @@ class VishwamAIConfig:
     max_seq_len: int = 2048
     dropout_rate: float = 0.1
     attention_dropout: float = 0.1
+    use_flash_attn: bool = True  # Enable Flash Attention by default
     
     # Thoughts configuration
     max_branches: int = 3

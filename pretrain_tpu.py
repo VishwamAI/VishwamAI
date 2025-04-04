@@ -44,7 +44,19 @@ def get_pretrain_config() -> Dict[str, Any]:
     tpu_config = TPUV3Config()
     
     return {
-        "model": tpu_config.model_config,
+        "model": {
+            **tpu_config.model_config,
+            "use_flash_attn": True,  # Add flash attention parameter
+            "vocab_size": 32000,
+            "hidden_dim": 2048,
+            "num_layers": 24,
+            "num_heads": 16,
+            "head_dim": 128,
+            "mlp_dim": 8192,
+            "max_seq_len": 2048,
+            "dropout_rate": 0.1,
+            "attention_dropout": 0.1
+        },
         "training": {
             **tpu_config.training_config,
             "weight_decay": 0.01,  # Add weight decay parameter
@@ -79,14 +91,16 @@ def create_vishwamai_transformer(model_name: str, dtype: str = "bfloat16") -> Vi
         vocab_size=32000,
         hidden_dim=2048,
         num_layers=24,
-        num_heads=16,
+        num_heads=16, 
         head_dim=128,
         mlp_dim=8192,
         max_seq_len=2048,
         dropout_rate=0.1,
-        attention_dropout=0.1
+        attention_dropout=0.1,
+        use_flash_attn=True  # Enable flash attention
     )
-    return VishwamAI.from_pretrained(model_name, config=config, dtype=dtype)
+    
+    return VishwamAI(config=config)
 
 def setup_tpu_training(
     config: TPUTrainingConfig,

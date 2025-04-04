@@ -86,8 +86,8 @@ def get_pretrain_config() -> Dict[str, Any]:
         }
     }
 
-def create_vishwamai_transformer(model_name: str, dtype: str = "bfloat16") -> VishwamAI:
-    """Create a VishwamAI transformer model."""
+def create_vishwamai_transformer(model_name: str, dtype: str = "bfloat16") -> Tuple[VishwamAI, Any]:
+    """Create a VishwamAI transformer model and initialize its parameters."""
     config = VishwamAIConfig(
         vocab_size=32000,
         hidden_dim=2048,
@@ -98,10 +98,17 @@ def create_vishwamai_transformer(model_name: str, dtype: str = "bfloat16") -> Vi
         max_seq_len=2048,
         dropout_rate=0.1,
         attention_dropout=0.1,
-        use_flash_attn=True  # Enable flash attention
+        use_flash_attn=True
     )
     
-    return VishwamAI(config=config)
+    model = VishwamAI(config=config)
+    
+    # Initialize model parameters
+    rng = jax.random.PRNGKey(0)
+    dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
+    variables = model.init(rng, dummy_input)
+    
+    return model, variables['params']
 
 def setup_tpu_training(
     config: TPUTrainingConfig,
@@ -117,7 +124,7 @@ def setup_tpu_training(
     
     # Initialize model if not provided
     if model is None:
-        model = create_vishwamai_transformer(config.model_config)
+        model = create_vishwamai_transformer(config.model_config)[0]
     
     # Set up training state
     rng = jax.random.PRNGKey(42)
@@ -175,8 +182,8 @@ def main():
     print(f"Available TPU devices: {devices}")
     mesh_context = TPUMeshContext(config, data_parallel=True)
 
-    # Initialize teacher model (Gemma-27B)
-    teacher_model = create_vishwamai_transformer(
+    # Initialize teacher model (Gemma-27B) with parameters
+    teacher_model, teacher_params = create_vishwamai_transformer(
         model_name=config["distillation"]["teacher_model"],
         dtype=config["optimization"]["teacher_load_dtype"]
     )
@@ -184,7 +191,7 @@ def main():
     # Initialize Tree of Thoughts for teacher model
     teacher_tot = TreeOfThoughts(
         model=teacher_model,
-        params=teacher_model.params,
+        params=teacher_params,  # Use initialized parameters
         tokenizer=teacher_model.tokenizer,
         max_branches=config["thinking"]["max_branches"],
         max_depth=config["thinking"]["max_depth"],
@@ -196,6 +203,7 @@ def main():
     student_model, student_vars, student_config = create_student_model(
         config=config["model"],
         teacher_model=teacher_model,
+        teacher_params=teacher_params,  # Pass teacher parameters
         reduction_factor=32/80  # Ratio of student layers (32) to teacher layers (80)
     )
     
@@ -213,6 +221,7 @@ def main():
     # Initialize distillation trainer with memory optimizations and thinking
     distill_trainer = DistillationTrainer(
         teacher_model=teacher_model,
+        teacher_params=teacher_params,  # Pass teacher parameters
         student_config=student_config,
         temperature=config["distillation"]["temperature"],
         alpha=config["distillation"]["alpha"],
@@ -234,7 +243,7 @@ def main():
     # Initialize student parameters from teacher using uniform layer mapping
     state = initialize_from_teacher(
         student_state=state,
-        teacher_state=teacher_model.params,
+        teacher_state=teacher_params,
         method="layer_mapping",
         mapping_strategy=config["distillation"]["layer_mapping_strategy"]
     )

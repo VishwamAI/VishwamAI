@@ -1,12 +1,6 @@
-"""Layer components of VishwamAI."""
+"""VishwamAI layer implementations."""
 
-from .attention import (
-    FlashAttention,
-    flash_attention,
-    flash_attention_inference,
-    create_flash_attention,
-    mha_with_flash_attention
-)
+from .flash_attention import FlashAttention, FlashAttentionConfig
 from .layers import (
     TPUGEMMLinear,
     TPULayerNorm,
@@ -16,14 +10,11 @@ from .layers import (
 )
 
 __all__ = [
-    "FlashAttention",
-    "flash_attention",
-    "flash_attention_inference",
-    "create_flash_attention",
-    "mha_with_flash_attention",
-    "TPUGEMMLinear",
-    "TPULayerNorm",
     "TPUMultiHeadAttention",
+    "TPUGEMMLinear",
+    "FlashAttention",
+    "FlashAttentionConfig",
+    "TPULayerNorm",
     "TPUMoELayer",
     "MoELayer",
     "MLABlock",

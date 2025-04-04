@@ -3,9 +3,19 @@
 import jax
 import jax.numpy as jnp 
 from jax import lax
+from jax.interpreters import xla
+from jax.lib import xla_client
 from functools import partial
 from typing import Optional, Tuple, Dict, Any, NamedTuple
 import flax.linen as nn
+
+# TPU-specific XLA custom call registration
+for cpu_backend in ['cpu', 'tpu']:
+    xla_client.register_custom_call_target(
+        f"flash_attention_{cpu_backend}",
+        xla.get_backend(cpu_backend).get_custom_call_target("flash_attention"),
+        platform=cpu_backend
+    )
 
 class FlashAttentionConfig(NamedTuple):
     """Configuration for TPU Flash Attention."""
@@ -17,6 +27,62 @@ class FlashAttentionConfig(NamedTuple):
     use_fp8: bool = True
     num_pipeline_stages: int = 3
     prefetch_size: int = 2
+
+class FlashAttention(nn.Module):
+    """Standard Flash Attention implementation."""
+    dim: int
+    num_heads: int = 8
+    dropout: float = 0.0
+    max_seq_length: int = 2048
+    causal: bool = False
+    
+    def setup(self):
+        assert self.dim % self.num_heads == 0, 'dim must be divisible by num_heads'
+        self.head_dim = self.dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # Convert to TPU config for internal implementation
+        self.tpu_config = FlashAttentionConfig(
+            block_size=128,  # TPU requires multiple of 128
+            head_dim=self.head_dim,
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout,
+            causal=self.causal
+        )
+        self.tpu_attention = TPUFlashAttention(self.tpu_config)
+    
+    def __call__(
+        self, 
+        q: jnp.ndarray,
+        k: jnp.ndarray,
+        v: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> jnp.ndarray:
+        """Apply Flash Attention."""
+        # Reshape for multi-head attention
+        batch_size = q.shape[0]
+        q = q.reshape(batch_size, -1, self.num_heads, self.head_dim)
+        k = k.reshape(batch_size, -1, self.num_heads, self.head_dim)
+        v = v.reshape(batch_size, -1, self.num_heads, self.head_dim)
+        
+        # Transpose to [batch, heads, seq_len, head_dim]
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+        
+        # Apply TPU-optimized attention
+        output = self.tpu_attention(
+            q=q * self.scale,  # Apply scaling factor
+            k=k,
+            v=v,
+            mask=mask,
+            deterministic=deterministic
+        )
+        
+        # Reshape back to original dimensions
+        output = jnp.transpose(output, (0, 2, 1, 3))
+        return output.reshape(batch_size, -1, self.dim)
 
 class TPUFlashAttention(nn.Module):
     """TPU-optimized Flash Attention with O(1) memory."""

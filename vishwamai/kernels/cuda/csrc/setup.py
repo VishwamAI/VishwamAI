@@ -22,15 +22,25 @@ setup(
             ],
             include_dirs=get_cuda_include(),
             extra_compile_args={
-                "cxx": ["-O3"],
+                "cxx": [
+                    "-O3",
+                    "-march=native",
+                    "-mtune=native"
+                ],
                 "nvcc": [
                     "-O3",
-                    "-gencode=arch=compute_70,code=sm_70",  # Volta
-                    "-gencode=arch=compute_75,code=sm_75",  # Turing
-                    "-gencode=arch=compute_80,code=sm_80",  # Ampere
-                    "-gencode=arch=compute_86,code=sm_86",  # Ada Lovelace/RTX 4000
+                    # Optimize specifically for GTX 1650 (Turing)
+                    "-gencode=arch=compute_75,code=sm_75",
                     "--use_fast_math",
                     "--ptxas-options=-v",
+                    "-maxrregcount=64",  # Optimize register usage for Turing
+                    "--gpu-architecture=sm_75",  # Target Turing specifically
+                    "-std=c++17",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "-Xptxas=-O3,-v",  # Aggressive PTX optimization
+                    "--compiler-options=-O3,-march=native,-mtune=native",
+                    "--disable-warnings",
                 ],
             },
         )

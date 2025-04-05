@@ -271,6 +271,7 @@ class TransformerBlock(nn.Module):
     mlp_dim: int
     dropout_rate: float = 0.1
     attention_dropout: float = 0.1
+    dtype: Any = jnp.bfloat16
     
     def setup(self):
         self.attention = TPUMultiHeadAttention(
@@ -279,14 +280,24 @@ class TransformerBlock(nn.Module):
             dropout_rate=self.attention_dropout
         )
         
-        self.feed_forward = FeedForward(
-            hidden_dim=self.hidden_dim,
-            mlp_dim=self.mlp_dim,
-            dropout_rate=self.dropout_rate
+        # First feed-forward projection
+        self.ff1 = TPUGEMMLinear(
+            features=self.mlp_dim,
+            dtype=self.dtype,
+            use_fp8=True,
+            block_size=128
         )
         
-        self.layer_norm1 = TPULayerNorm(dtype=jnp.bfloat16)
-        self.layer_norm2 = TPULayerNorm(dtype=jnp.bfloat16)
+        # Second feed-forward projection
+        self.ff2 = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype,
+            use_fp8=True,
+            block_size=128
+        )
+        
+        self.layer_norm1 = TPULayerNorm(dtype=self.dtype)
+        self.layer_norm2 = TPULayerNorm(dtype=self.dtype)
         self.dropout = nn.Dropout(rate=self.dropout_rate)
         
     def __call__(
@@ -305,33 +316,15 @@ class TransformerBlock(nn.Module):
         )
         
         # First residual connection
-        x = x + attn_output
+        x = inputs + self.dropout(attn_output, deterministic=deterministic)
         
-        # FFN branch with residual
+        # FFN branch
         y = self.layer_norm2(x)
-        ffn_output = self.feed_forward(
-            y,
-            deterministic=deterministic
-        )
+        y = self.ff1(y)
+        y = nn.gelu(y)
+        y = self.dropout(y, deterministic=deterministic)
+        y = self.ff2(y)
+        y = self.dropout(y, deterministic=deterministic)
         
         # Second residual connection
-        return x + ffn_output
-
-class FeedForward(nn.Module):
-    """Feed-forward network with TPU optimizations."""
-    
-    hidden_dim: int
-    mlp_dim: int
-    dropout_rate: float = 0.1
-    
-    @nn.compact
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        deterministic: bool = True
-    ) -> jnp.ndarray:
-        x = TPUGEMMLinear(features=self.mlp_dim)(x)
-        x = nn.gelu(x)
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-        x = TPUGEMMLinear(features=self.hidden_dim)(x)
-        return x
+        return x + y

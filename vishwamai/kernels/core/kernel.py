@@ -220,53 +220,80 @@ def fp8_gemm_optimized(
     block_size: int = 128
 ) -> jnp.ndarray:
     """Optimized FP8 GEMM operation with memory-efficient blocked computation."""
-    orig_x_shape = x.shape
-    orig_kernel_shape = kernel.shape
-    
-    # Reshape input to 2D
-    if len(x.shape) > 2:
-        x = x.reshape(-1, x.shape[-1])
-        
-    # Get matrix dimensions
+    # Validate matrix dimensions
     M, K = x.shape
     K_, N = kernel.shape
-    assert K == K_, f"Incompatible dimensions {K} != {K_}"
+    if K != K_:
+        raise ValueError(f"Incompatible inner dimensions: {K} != {K_}")
 
-    # Calculate optimal chunk size based on available memory
-    # Use 1GB chunks to avoid OOM
-    max_chunk_bytes = 1024 * 1024 * 1024  # 1GB
-    bytes_per_element = 4  # assuming float32
-    max_chunk_elements = max_chunk_bytes // bytes_per_element
-    chunk_size = min(block_size, max(1, max_chunk_elements // (K * N)))
-    chunk_size = (chunk_size // block_size) * block_size  # Round to block size
-    
+    # Compute chunk sizes that divide evenly into the matrix dimensions
+    M_chunks = (M + block_size - 1) // block_size
+    N_chunks = (N + block_size - 1) // block_size
+    K_chunks = (K + block_size - 1) // block_size
+
+    # Pad dimensions to chunk boundaries if needed
+    M_pad = M_chunks * block_size - M
+    N_pad = N_chunks * block_size - N
+    K_pad = K_chunks * block_size - K
+
+    if M_pad > 0 or K_pad > 0:
+        x = jnp.pad(x, ((0, M_pad), (0, K_pad)))
+        x_scale = jnp.pad(x_scale, ((0, M_pad), (0, 0)))
+
+    if K_pad > 0 or N_pad > 0:
+        kernel = jnp.pad(kernel, ((0, K_pad), (0, N_pad)))
+        kernel_scale = jnp.pad(kernel_scale, ((0, 0), (0, N_pad)))
+
     # Initialize output array
-    result = jnp.zeros((M, N), dtype=x.dtype)
-    
-    # Process in chunks
-    for i in range(0, M, chunk_size):
-        chunk_end = min(i + chunk_size, M)
-        x_chunk = x[i:chunk_end]
-        x_scale_chunk = x_scale[i:chunk_end]
-        
-        # Compute chunk result
-        chunk_result = jax.lax.dot_general(
-            x_chunk, 
-            kernel,
-            dimension_numbers=(((1,), (0,)), ((), ())),
-            precision=jax.lax.Precision.HIGHEST
-        )
-        
-        # Apply scales for chunk
-        x_scale_chunk = jnp.reshape(x_scale_chunk, (-1, 1))
-        chunk_scale = jnp.multiply(x_scale_chunk, kernel_scale.reshape(1, -1))
-        chunk_result = chunk_result * chunk_scale
-        
-        # Update result
-        result = result.at[i:chunk_end].set(chunk_result)
-    
-    # Restore original dimensions if needed
-    if len(orig_x_shape) > 2:
-        result = result.reshape(*orig_x_shape[:-1], orig_kernel_shape[-1])
-        
+    result = jnp.zeros((M_chunks * block_size, N_chunks * block_size), dtype=x.dtype)
+
+    # Process matrix multiply in chunks
+    for i in range(M_chunks):
+        for j in range(N_chunks):
+            # Extract current chunks
+            x_chunk = jax.lax.dynamic_slice(
+                x, 
+                (i * block_size, 0), 
+                (block_size, K)
+            )
+            x_scale_chunk = jax.lax.dynamic_slice(
+                x_scale,
+                (i * block_size, 0),
+                (block_size, 1)
+            )
+
+            kernel_chunk = jax.lax.dynamic_slice(
+                kernel,
+                (0, j * block_size),
+                (K, block_size)
+            )
+            kernel_scale_chunk = jax.lax.dynamic_slice(
+                kernel_scale,
+                (0, j * block_size),
+                (1, block_size)
+            )
+
+            # Compute chunk result
+            chunk_result = jax.lax.dot_general(
+                x_chunk,
+                kernel_chunk,
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                precision=jax.lax.Precision.HIGHEST
+            )
+
+            # Apply scales
+            chunk_scale = x_scale_chunk * kernel_scale_chunk
+            chunk_result = chunk_result * chunk_scale
+
+            # Update result
+            result = jax.lax.dynamic_update_slice(
+                result,
+                chunk_result,
+                (i * block_size, j * block_size)
+            )
+
+    # Remove padding if added
+    if M_pad > 0 or N_pad > 0:
+        result = result[:M, :N]
+
     return result

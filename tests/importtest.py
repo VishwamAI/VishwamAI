@@ -6,7 +6,13 @@ def test_jax_imports():
     """Test JAX and related imports."""
     import jax
     import jax.numpy as jnp
-    assert jax.devices(), "No JAX devices found"
+    
+    # Force CPU device usage when no GPU is available
+    jax.config.update('jax_platforms', 'cpu')
+    
+    devices = jax.devices()
+    assert len(devices) > 0, "No JAX devices found"
+    assert all(isinstance(d.platform, str) for d in devices)
 
 def test_core_imports():
     """Test core VishwamAI imports."""

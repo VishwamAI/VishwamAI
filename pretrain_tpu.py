@@ -208,12 +208,12 @@ def main():
         temperature=config["thinking"]["temperature"]
     )
     
-    # Create and initialize student model (7B) from teacher
+    # Create and initialize student model from teacher
     student_model, student_vars, student_config = create_student_model(
-        config=config["model"],
-        teacher_model=teacher_model,
-        teacher_params=teacher_params,  # Pass teacher parameters
-        reduction_factor=32/80  # Ratio of student layers (32) to teacher layers (80)
+        config["model"],           # Pass model config directly
+        teacher_model,             # Pass teacher model
+        32/80,                    # reduction_factor (32 layers for student, 80 for teacher)
+        jax.random.PRNGKey(42)    # rng
     )
     
     # Initialize Tree of Thoughts for student model 

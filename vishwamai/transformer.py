@@ -14,6 +14,8 @@ from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec, NamedSharding
 from jax.experimental.shard_map import shard_map
+from flax.training import dynamic_scale
+from dataclasses import dataclass
 
 # TPU-specific configuration
 TPU_SPECIFIC_CONFIG = {
@@ -46,7 +48,9 @@ class TPUOptimizer:
         query: jnp.ndarray,
         key: jnp.ndarray,
         value: jnp.ndarray,
-        mask: Optional[jnp.ndarray] = None
+        mask: Optional[jnp.ndarray] = None,
+        dropout_rng: Optional[jax.random.PRNGKey] = None,
+        dropout_rate: float = 0.0
     ) -> jnp.ndarray:
         """Memory-optimized attention for TPU with reduced memory footprint"""
         # Scale query
@@ -75,6 +79,9 @@ class TPUOptimizer:
         
         # Combine chunks
         attention_weights = TPUOptimizer.tpu_friendly_softmax(all_scores, axis=-1)
+        
+        if dropout_rng is not None and dropout_rate > 0.0:
+            attention_weights = nn.Dropout(rate=dropout_rate)(attention_weights, deterministic=False, rng=dropout_rng)
         
         # Apply to values
         return TPUOptimizer.tpu_einsum('...qhk,...khd->...qhd', attention_weights, value)
@@ -170,18 +177,18 @@ class TPUMultiHeadAttention(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         value = value.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         
-        # Prepare attention mask in correct format
-        if mask is not None:
-            # Expand mask dims to match attention shape [batch, heads, q_len, kv_len]
-            mask = mask[:, None, :, :]
-            mask = jnp.broadcast_to(mask, (batch_size, self.num_heads, seq_len, seq_len))
-
-        # Compute attention using memory-efficient TPU implementation
+        # Apply attention with dropout during training
+        dropout_rng = None
+        if not deterministic and self.dropout_rate > 0:
+            dropout_rng = self.make_rng('dropout')
+            
+        # Pass dropout_rng instead of deterministic
         attention_output = TPUOptimizer.memory_efficient_attention(
-            query, key, value, mask
+            query, key, value, mask=mask, dropout_rng=dropout_rng,
+            dropout_rate=self.dropout_rate if not deterministic else 0.0
         )
 
-        # Reshape and project output with sharding
+        # Reshape and project output
         attention_output = attention_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         
         output = TPUShardedLinear(
@@ -330,28 +337,81 @@ class TPUTransformer(nn.Module):
         
         return logits
 
-# Distributed training utilities
+@dataclass
 class TPUTrainingState:
-    """Container for TPU-optimized training state with sharded parameters"""
-    
-    def __init__(self, params, opt_state, model_fn, tx):
-        self.params = params
-        self.opt_state = opt_state
-        self.model_fn = model_fn
-        self.tx = tx
-        
-    def apply_fn(self, *args, **kwargs):
-        return self.model_fn(*args, **kwargs)
-    
-    def apply_gradients(self, *, grads, **kwargs):
-        updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
-        new_params = optax.apply_updates(self.params, updates)
-        return TPUTrainingState(
-            params=new_params,
-            opt_state=new_opt_state,
-            model_fn=self.model_fn,
-            tx=self.tx
+    """Training state optimized for TPU."""
+    step: int
+    params: Any
+    opt_state: Any
+    model_fn: Any
+    tx: Any
+    dynamic_scale: Optional[Any] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        apply_fn: Callable,
+        params: Any,
+        tx: Any,
+        dynamic_scale: Optional[Any] = None
+    ):
+        """Create a new training state."""
+        opt_state = tx.init(params)
+        return cls(
+            step=0,
+            params=params,
+            opt_state=opt_state,
+            model_fn=apply_fn,
+            tx=tx,
+            dynamic_scale=dynamic_scale
         )
+
+    def replace(self, **kwargs) -> 'TPUTrainingState':
+        """Create a new state with updated values."""
+        return TPUTrainingState(
+            step=kwargs.get('step', self.step),
+            params=kwargs.get('params', self.params),
+            opt_state=kwargs.get('opt_state', self.opt_state),
+            model_fn=kwargs.get('model_fn', self.model_fn),
+            tx=kwargs.get('tx', self.tx),
+            dynamic_scale=kwargs.get('dynamic_scale', self.dynamic_scale)
+        )
+
+    def apply_gradients(self, *, grads: Any) -> 'TPUTrainingState':
+        """Apply gradients and return updated state."""
+        # Ensure params and grads have the same structure
+        if isinstance(self.params, dict) and 'params' in self.params:
+            if not isinstance(grads, dict) or 'params' not in grads:
+                grads = {'params': grads}
+                
+        updates, new_opt_state = self.tx.update(
+            grads,
+            self.opt_state,
+            self.params
+        )
+        
+        new_params = optax.apply_updates(self.params, updates)
+        
+        return self.replace(
+            step=self.step + 1,
+            params=new_params,
+            opt_state=new_opt_state
+        )
+
+    def apply_fn(self, *args, **kwargs):
+        """Apply the model function."""
+        if not args:
+            return self.model_fn(*args, **kwargs)
+            
+        params = args[0]
+        # Handle nested params structure
+        if isinstance(params, dict) and 'params' in params:
+            if isinstance(params['params'], dict) and 'params' in params['params']:
+                # Double nested - unwrap one layer
+                args = ({'params': params['params']}, *args[1:])
+            # Single nested - keep as is
+        return self.model_fn(*args, **kwargs)
 
 def create_distributed_train_state(
     rng: jax.random.PRNGKey,
@@ -395,10 +455,9 @@ def create_distributed_train_state(
         out_shardings=None
     )(variables['params'])
     
-    return TPUTrainingState(
+    return TPUTrainingState.create(
+        apply_fn=model.apply,
         params=variables['params'],
-        opt_state=opt_state,
-        model_fn=model.apply,
         tx=tx
     )
 
@@ -492,8 +551,6 @@ if __name__ == "__main__":
     print("\nBenchmarking performance on TPU pod...")
     benchmark_tpu_performance(model_state)
 
-from dataclasses import dataclass
-
 @dataclass
 class EnhancedTransformerConfig:
     vocab_size: int
@@ -540,34 +597,33 @@ class EnhancedTransformerModel(nn.Module):
         return x
 
 class TransformerBlock(nn.Module):
-    hidden_size: int
-    num_attention_heads: int
-    intermediate_size: int
-    dropout_rate: float
-    attention_dropout: float
-    use_flash_attention: bool
-    use_fp8: bool
-    use_parallel: bool
-    block_size: int
+    """Transformer block implementation."""
+    hidden_dim: int
+    num_heads: int
+    head_dim: int
+    mlp_dim: int
+    dropout_rate: float = 0.1
+    attention_dropout: float = 0.1
+    dtype: Any = jnp.bfloat16
 
     def setup(self):
-        self.attention = nn.SelfAttention(
-            num_heads=self.num_attention_heads,
-            qkv_features=self.hidden_size,
-            dropout_rate=self.attention_dropout,
-            deterministic=True
-        )
-        self.mlp = nn.Dense(
-            features=self.intermediate_size,
-            use_bias=True
-        )
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
         self.layer_norm1 = nn.LayerNorm()
         self.layer_norm2 = nn.LayerNorm()
+        self.attention = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            dropout_rate=self.attention_dropout,
+        )
+        self.mlp = nn.Dense(features=self.mlp_dim)
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, x, deterministic=True):
-        attn_output = self.attention(self.layer_norm1(x), deterministic=deterministic)
-        x = x + self.dropout(attn_output, deterministic=deterministic)
-        mlp_output = self.mlp(self.layer_norm2(x))
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        y = self.layer_norm1(x)
+        # Pass deterministic only to dropout layers
+        attention_output = self.attention(y, y)  # Self-attention
+        x = x + self.dropout(attention_output, deterministic=deterministic)
+        
+        y = self.layer_norm2(x)
+        mlp_output = self.mlp(y)
         x = x + self.dropout(mlp_output, deterministic=deterministic)
         return x

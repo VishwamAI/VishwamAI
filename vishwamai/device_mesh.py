@@ -10,44 +10,34 @@ from typing import Any, Dict, Optional, Tuple, List
 import time
 
 class TPUMeshContext:
-    """Manages TPU device mesh and data/model parallelism."""
+    """Context manager for TPU mesh execution."""
     
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        data_parallel: bool = True,
-        model_parallel: bool = False,  # Default to data parallel for credit efficiency
-        pipeline_parallel: bool = False
-    ):
-        self.config = config
+    def __init__(self, mesh_config: Dict[str, Any], data_parallel: bool = True):
+        if 'tpu' not in mesh_config or 'mesh_shape' not in mesh_config['tpu']:
+            raise ValueError("mesh_config must contain 'tpu.mesh_shape'")
+            
+        mesh_shape = mesh_config['tpu']['mesh_shape']
+        if not isinstance(mesh_shape, (list, tuple)) or any(x <= 0 for x in mesh_shape):
+            raise ValueError("mesh_shape must be positive")
+            
+        self.mesh_shape = mesh_shape
         self.data_parallel = data_parallel
-        self.model_parallel = model_parallel
-        self.pipeline_parallel = pipeline_parallel
         self.devices = jax.devices()
-        self.num_devices = len(self.devices)
+        self.mesh = None
         
-        # Initialize credit monitoring
-        self.credit_metrics = {
-            "compute_hours": 0.0,
-            "memory_gb_hours": 0.0,
-            "last_update": time.time()
-        }
-        
-        # Create mesh shape and device mesh
-        self.mesh_shape = self._compute_mesh_shape()
-        self.mesh = self._create_device_mesh()
-        self.sharding_rules = self._create_sharding_rules()
-        
-        # Initialize performance monitoring
-        self.perf_metrics = {"hbm_usage": [], "compute_util": []}
-    
     def __enter__(self):
-        """Enter mesh context."""
+        if self.data_parallel:
+            self.mesh = jax.sharding.Mesh(self.devices, ('data',))
+        else:
+            self.mesh = jax.sharding.Mesh(
+                mesh_utils.create_device_mesh(self.mesh_shape),
+                ('batch', 'model')
+            )
         return self.mesh.__enter__()
-    
+        
     def __exit__(self, exc_type, exc_value, traceback):
-        """Exit mesh context."""
-        return self.mesh.__exit__(exc_type, exc_value, traceback)
+        if self.mesh:
+            return self.mesh.__exit__(exc_type, exc_value, traceback)
 
     def _compute_mesh_shape(self) -> Tuple[int, ...]:
         """Compute cost-efficient device mesh shape based on workload."""

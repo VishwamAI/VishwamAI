@@ -655,6 +655,26 @@ def main(fp8_path, bf16_path):
     with open(new_model_index_file, "w") as f:
         json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
 
+"""FP8 data conversion utilities for VishwamAI."""
+
+import jax
+import jax.numpy as jnp
+
+def convert_grads_fp8(grads, scales, config):
+    """Convert gradients to FP8 format."""
+    converted = {}
+    
+    for key, grad in grads.items():
+        if key in scales:
+            scale = scales[key]
+            # Simulate FP8 conversion since we don't have actual CUDA kernel
+            # In production, this would be replaced with actual FP8 CUDA kernel
+            converted[key] = grad * scale
+        else:
+            converted[key] = grad
+            
+    return converted
+
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--input-fp8-hf-path", type=str, required=True,

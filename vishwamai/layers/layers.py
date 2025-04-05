@@ -152,55 +152,59 @@ class TPUShardedLinear(nn.Module):
         return y
 
 class TPUMultiHeadAttention(nn.Module):
+    """TPU-optimized multi-head attention."""
     num_heads: int
-    head_dim: int
+    head_dim: int 
     dropout_rate: float = 0.0
-    
-    def setup(self):
-        total_dim = self.num_heads * self.head_dim
-        self.q_proj = TPUShardedLinear(total_dim)
-        self.k_proj = TPUShardedLinear(total_dim)
-        self.v_proj = TPUShardedLinear(total_dim)
-        self.output_proj = TPUShardedLinear(total_dim)
-        
-    def __call__(self, 
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self,
                  inputs_q: jnp.ndarray,
                  inputs_kv: jnp.ndarray,
                  mask: Optional[jnp.ndarray] = None,
                  deterministic: bool = True) -> jnp.ndarray:
-        batch_size = inputs_q.shape[0]
-        seq_len_q = inputs_q.shape[1]
-        seq_len_kv = inputs_kv.shape[1]
         
-        # Project inputs to queries, keys, and values
-        q = self.q_proj(inputs_q)
-        k = self.k_proj(inputs_kv)
-        v = self.v_proj(inputs_kv)
+        batch_size, seq_len = inputs_q.shape[0], inputs_q.shape[1]
         
-        # Reshape to separate heads
-        q = q.reshape(batch_size, seq_len_q, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len_kv, self.num_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len_kv, self.num_heads, self.head_dim)
+        # Create attention weights
+        query = nn.Dense(features=self.num_heads * self.head_dim)(inputs_q)
+        key = nn.Dense(features=self.num_heads * self.head_dim)(inputs_kv)
+        value = nn.Dense(features=self.num_heads * self.head_dim)(inputs_kv)
         
-        # Compute attention scores
-        scale = 1.0 / jnp.sqrt(self.head_dim)
-        scores = jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale
+        # Reshape for attention
+        query = query.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        key = key.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        value = value.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         
+        # Scale query
+        depth = self.head_dim
+        query = query / jnp.sqrt(depth).astype(self.dtype)
+        
+        # Calculate attention scores
+        weights = jnp.einsum('bqhd,bkhd->bhqk', query, key)
+        
+        # Apply mask if provided
         if mask is not None:
-            scores = scores + mask
-            
-        # Apply softmax and dropout
-        weights = jax.nn.softmax(scores, axis=-1)
-        if not deterministic and self.dropout_rate > 0:
-            weights = nn.Dropout(rate=self.dropout_rate)(
-                weights, deterministic=False)
-            
-        # Compute attention output
-        attention = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
+            weights = jnp.where(mask[:, None, :, :], weights, -1e10)
         
-        # Project back to original dimension
-        attention = attention.reshape(batch_size, seq_len_q, -1)
-        output = self.output_proj(attention)
+        # Apply softmax
+        weights = jax.nn.softmax(weights, axis=-1)
+        
+        # Apply dropout inside the compact context
+        weights = nn.Dropout(
+            rate=self.dropout_rate,
+            deterministic=deterministic
+        )(weights)
+        
+        # Calculate attention output
+        output = jnp.einsum('bhqk,bkhd->bqhd', weights, value)
+        
+        # Reshape output
+        output = output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+        
+        # Final dense projection
+        output = nn.Dense(features=inputs_q.shape[-1])(output)
         
         return output
 

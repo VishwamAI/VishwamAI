@@ -178,88 +178,106 @@ def create_tpu_data_pipeline(config: Dict[str, Any]) -> TPUDataPipeline:
     
     return TPUDataPipeline(config, devices)
 
-class DistillationDataPipeline(TPUDataPipeline):
-    """Data pipeline optimized for knowledge distillation on TPU."""
+class DistillationDataPipeline:
+    """Pipeline for distillation training data."""
     
     def __init__(
         self,
         config: Dict[str, Any],
         teacher_model: Any,
-        devices: Optional[Any] = None
+        devices: Any,
+        enable_thinking: bool = False
     ):
-        super().__init__(config, devices)
+        """Initialize pipeline for distillation."""
+        # Validate config
+        if not config.get("training", {}).get("batch_size", 0) > 0:
+            raise ValueError("batch_size must be positive")
+
+        self.config = config
         self.teacher_model = teacher_model
+        self.devices = devices
+        self.enable_thinking = enable_thinking
         
-    def generate_teacher_logits(
-        self,
-        input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        temperature: float = 2.0
-    ) -> jnp.ndarray:
-        """Generate teacher logits in parallel on TPU."""
-        # Split input across devices
-        device_inputs = jax.device_put_sharded(
-            list(input_ids), 
-            self.devices
-        )
-        
-        if attention_mask is not None:
-            device_masks = jax.device_put_sharded(
-                list(attention_mask),
-                self.devices
-            )
+        # Initialize teacher model variables only if model is provided
+        if self.teacher_model is not None:
+            rng = jax.random.PRNGKey(0)
+            dummy_input = jnp.ones((1, 32), dtype=jnp.int32)
+            self.teacher_variables = self.teacher_model.init(rng, dummy_input)
         else:
-            device_masks = None
-        
-        # Define parallel forward pass
-        def forward_pass(x, mask=None):
-            logits = self.teacher_model(
-                x,
-                attention_mask=mask,
-                training=False
-            )
-            return logits / temperature
-        
-        # Run parallel forward passes
-        p_forward = jax.pmap(forward_pass, axis_name='batch')
-        logits = p_forward(device_inputs, device_masks)
-        
-        # Gather results
-        return jax.device_get(logits)
+            self.teacher_variables = None
     
-    def create_distillation_dataset(
-        self,
-        file_pattern: str,
-        is_training: bool = True,
-        cache_teacher_outputs: bool = True
-    ) -> tf.data.Dataset:
-        """Create dataset for distillation with teacher outputs."""
-        base_dataset = super().create_dataset(
-            file_pattern,
-            is_training
+    def process_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a batch of data for distillation."""
+        if self.teacher_model is None or self.teacher_variables is None:
+            return batch
+            
+        # Get teacher predictions - handle dict output
+        outputs = self.teacher_model.apply(
+            self.teacher_variables,
+            batch["input_ids"],
+            deterministic=True
         )
         
-        if not cache_teacher_outputs:
-            # Generate teacher logits on the fly
-            def add_teacher_outputs(batch):
-                input_ids = batch['input_ids']
-                attention_mask = batch.get('attention_mask')
-                
-                teacher_logits = self.generate_teacher_logits(
-                    input_ids,
-                    attention_mask,
-                    temperature=self.config['distillation']['temperature']
-                )
-                
-                batch['teacher_logits'] = teacher_logits
-                return batch
-                
-            base_dataset = base_dataset.map(
-                add_teacher_outputs,
-                num_parallel_calls=tf.data.AUTOTUNE
-            )
+        # Extract logits from output dict
+        teacher_logits = outputs["logits"] if isinstance(outputs, dict) else outputs
+            
+        processed = {
+            **batch,
+            "teacher_logits": teacher_logits
+        }
+        return processed
+
+    def train_step(self, state: Any, batch: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        """Perform a training step."""
+        rng = jax.random.PRNGKey(0)
         
-        return base_dataset
+        def loss_fn(params):
+            # Extract student logits ensuring correct parameter structure
+            student_logits = state.apply_fn(
+                {"params": params},  # Pass params without extra nesting
+                batch["input_ids"],
+                deterministic=False,
+                rngs={"dropout": rng}
+            )
+            
+            # Get teacher predictions
+            if self.teacher_model is not None and self.teacher_variables is not None:
+                teacher_outputs = self.teacher_model.apply(
+                    self.teacher_variables,
+                    batch["input_ids"],
+                    deterministic=True
+                )
+                teacher_logits = teacher_outputs["logits"] if isinstance(teacher_outputs, dict) else teacher_outputs
+                
+                loss, metrics = compute_distillation_loss(
+                    student_logits=student_logits["logits"] if isinstance(student_logits, dict) else student_logits,
+                    teacher_logits=teacher_logits,
+                    labels=batch.get("labels"),
+                    temperature=self.config["distillation"]["temperature"],
+                    alpha=self.config["distillation"]["alpha"]
+                )
+            else:
+                # Standard cross entropy loss if no teacher
+                logits = student_logits["logits"] if isinstance(student_logits, dict) else student_logits
+                loss = optax.softmax_cross_entropy_with_integer_labels(
+                    logits,
+                    batch["labels"]
+                ).mean()
+                metrics = {"loss": loss}
+                
+            return loss, metrics
+            
+        # Compute gradients
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        
+        # Ensure params have the correct structure - remove extra nesting if present
+        params = state.params["params"] if isinstance(state.params, dict) and "params" in state.params else state.params
+        (loss, metrics), grads = grad_fn(params)
+        
+        # Update state
+        new_state = state.apply_gradients(grads=grads)
+        
+        return new_state, metrics
 
 def prepare_distillation_data(
     config: Dict[str, Any],
@@ -271,15 +289,16 @@ def prepare_distillation_data(
     
     pipeline = DistillationDataPipeline(
         config,
-        teacher_model
+        teacher_model,
+        devices=jax.devices()
     )
     
-    train_dataset = pipeline.create_distillation_dataset(
+    train_dataset = pipeline.create_dataset(
         train_files,
         is_training=True
     )
     
-    eval_dataset = pipeline.create_distillation_dataset(
+    eval_dataset = pipeline.create_dataset(
         eval_files,
         is_training=False
     )

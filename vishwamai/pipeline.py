@@ -234,7 +234,7 @@ class DistillationDataPipeline:
         def loss_fn(params):
             # Extract student logits ensuring correct parameter structure
             student_logits = state.apply_fn(
-                {"params": params},  # Pass params without extra nesting
+                {"params": params},
                 batch["input_ids"],
                 deterministic=False,
                 rngs={"dropout": rng}
@@ -256,6 +256,9 @@ class DistillationDataPipeline:
                     temperature=self.config["distillation"]["temperature"],
                     alpha=self.config["distillation"]["alpha"]
                 )
+                
+                # Add total loss to metrics
+                metrics["loss"] = loss
             else:
                 # Standard cross entropy loss if no teacher
                 logits = student_logits["logits"] if isinstance(student_logits, dict) else student_logits
@@ -269,14 +272,23 @@ class DistillationDataPipeline:
             
         # Compute gradients
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        
-        # Ensure params have the correct structure - remove extra nesting if present
         params = state.params["params"] if isinstance(state.params, dict) and "params" in state.params else state.params
         (loss, metrics), grads = grad_fn(params)
         
         # Update state
         new_state = state.apply_gradients(grads=grads)
         
+        # Add learning rate to metrics
+        if hasattr(state.tx, "learning_rate"):
+            metrics["learning_rate"] = state.tx.learning_rate
+        elif isinstance(state.opt_state, (tuple, list)) and hasattr(state.opt_state[0], "hyperparams"):
+            metrics["learning_rate"] = state.opt_state[0].hyperparams["learning_rate"]
+        elif hasattr(state.opt_state, "hyperparams"):
+            metrics["learning_rate"] = state.opt_state.hyperparams["learning_rate"]
+        else:
+            # Fallback to configuration value
+            metrics["learning_rate"] = self.config["training"]["learning_rate"]
+            
         return new_state, metrics
 
 def prepare_distillation_data(
@@ -466,6 +478,9 @@ class VishwamAIPipeline:
                 temperature=self.config.get('temperature', 2.0),
                 alpha=self.config.get('distill_alpha', 0.5)
             )
+            
+            # Add total loss to metrics
+            metrics['loss'] = loss.mean()
             
             return loss.mean(), (metrics, student_logits)
         

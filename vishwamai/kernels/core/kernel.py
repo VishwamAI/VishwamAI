@@ -244,16 +244,17 @@ def fp8_gemm_optimized(
         kernel = jnp.pad(kernel, ((0, K_pad), (0, N_pad)))
         kernel_scale = jnp.pad(kernel_scale, ((0, 0), (0, N_pad)))
 
-    # Initialize output array
-    result = jnp.zeros((M_chunks * block_size, N_chunks * block_size), dtype=x.dtype)
+    # Initialize output array with correct dtype
+    compute_dtype = jnp.bfloat16
+    result = jnp.zeros((M_chunks * block_size, N_chunks * block_size), dtype=compute_dtype)
 
     # Process matrix multiply in chunks
     for i in range(M_chunks):
         for j in range(N_chunks):
             # Extract current chunks
             x_chunk = jax.lax.dynamic_slice(
-                x, 
-                (i * block_size, 0), 
+                x,
+                (i * block_size, 0),
                 (block_size, K)
             )
             x_scale_chunk = jax.lax.dynamic_slice(
@@ -273,7 +274,11 @@ def fp8_gemm_optimized(
                 (1, block_size)
             )
 
-            # Compute chunk result
+            # Cast chunks to compute dtype for matmul
+            x_chunk = x_chunk.astype(compute_dtype)
+            kernel_chunk = kernel_chunk.astype(compute_dtype)
+
+            # Compute chunk result with appropriate precision
             chunk_result = jax.lax.dot_general(
                 x_chunk,
                 kernel_chunk,
@@ -281,19 +286,19 @@ def fp8_gemm_optimized(
                 precision=jax.lax.Precision.HIGHEST
             )
 
-            # Apply scales
-            chunk_scale = x_scale_chunk * kernel_scale_chunk
+            # Apply scales (as bfloat16)
+            chunk_scale = (x_scale_chunk * kernel_scale_chunk).astype(compute_dtype)
             chunk_result = chunk_result * chunk_scale
 
-            # Update result
+            # Update result with proper dtype casting
             result = jax.lax.dynamic_update_slice(
                 result,
-                chunk_result,
+                chunk_result.astype(compute_dtype),
                 (i * block_size, j * block_size)
             )
 
-    # Remove padding if added
+    # Remove padding if needed
     if M_pad > 0 or N_pad > 0:
-        result = result[:M, :N]
+        result = jax.lax.dynamic_slice(result, (0, 0), (M, N))
 
     return result

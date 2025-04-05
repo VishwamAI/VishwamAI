@@ -20,7 +20,7 @@ class TPUFlashAttention:
     
     Features:
     - O(n) memory complexity
-    - Block-sparse attention patterns
+    - Block-sparse attention patterns 
     - TPU-optimized memory access
     - Automatic precision switching
     """
@@ -36,19 +36,6 @@ class TPUFlashAttention:
         scale_factor: Optional[float] = None,
         mask_value: float = -1e9
     ):
-        """
-        Initialize Flash Attention.
-        
-        Args:
-            block_size: Size of attention blocks (must be multiple of 128 for TPU)
-            num_heads: Number of attention heads
-            head_dim: Dimension of each head
-            dropout_rate: Attention dropout rate
-            causal: Whether to apply causal mask
-            use_bias: Whether to use attention bias
-            scale_factor: Optional custom scale factor (default: 1/sqrt(head_dim))
-            mask_value: Value to use for masked positions
-        """
         if block_size % 128 != 0:
             raise ValueError("Block size must be multiple of 128 for TPU")
             
@@ -58,7 +45,7 @@ class TPUFlashAttention:
         self.dropout_rate = dropout_rate
         self.causal = causal
         self.use_bias = use_bias
-        self.scale_factor = scale_factor or 1.0 / np.sqrt(head_dim)
+        self.scale_factor = scale_factor or 1.0 / jnp.sqrt(head_dim)
         self.mask_value = mask_value
         
     def __call__(
@@ -100,16 +87,16 @@ class TPUFlashAttention:
         def attention_block(query_block, key_block, value_block, mask_block=None):
             # Compute attention scores for block
             scores = jnp.einsum(
-                "bshd,bthd->bhst",
-                query_block * self.scale_factor,
+                'bshd,bthd->bhst',  # [batch, heads, src_len, tgt_len]
+                query_block,
                 key_block,
-                precision=lax.Precision.HIGHEST
-            )
+                precision=jax.lax.Precision.HIGHEST
+            ) * self.scale_factor
             
             # Apply mask if provided
             if self.causal or mask_block is not None:
                 causal_mask = (
-                    jnp.triu(jnp.ones((seq_len, seq_len)), 1)
+                    jnp.triu(jnp.ones((block_size, block_size)), 1)
                     if self.causal else 0.0
                 )
                 if mask_block is not None:
@@ -142,10 +129,10 @@ class TPUFlashAttention:
                 
             # Compute attention output
             return jnp.einsum(
-                "bhst,bthd->bshd",
+                'bhst,bthd->bshd',  # [batch, src_len, heads, dim]
                 weights,
                 value_block,
-                precision=lax.Precision.HIGHEST
+                precision=jax.lax.Precision.HIGHEST
             )
             
         # Process attention in blocks
@@ -153,6 +140,7 @@ class TPUFlashAttention:
         
         for i in range(0, seq_len, block_size):
             block_end = min(i + block_size, seq_len)
+            
             q_block = jax.lax.dynamic_slice(
                 query,
                 (0, i, 0, 0),
@@ -174,8 +162,7 @@ class TPUFlashAttention:
         
         return FlashAttentionOutput(
             output=output,
-            attention_probs=None,  # Don't store for memory efficiency
-            attention_bias=bias if self.use_bias else None
+            attention_probs=None  # Don't store for memory efficiency
         )
         
     def efficient_attention(

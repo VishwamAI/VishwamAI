@@ -18,19 +18,22 @@ def test_imports():
         import jax.numpy as jnp
         jax.config.update('jax_platform_name', 'cpu')
         print("✓ JAX imports successful")
-        
+
         print("\nPatching JAX mesh utilities...")
-        import jax._src.mesh_utils as mesh_utils
-        mesh_utils.create_device_mesh = mock_create_device_mesh
-        print("✓ JAX mesh utilities patched successfully")
-        
+        try:
+            import jax._src.mesh_utils as mesh_utils
+            mesh_utils.create_device_mesh = mock_create_device_mesh
+            print("✓ JAX mesh utilities patched successfully")
+        except ImportError:
+            print("⚠️ Could not patch JAX mesh utilities (optional)")
+
         print("\nTesting core VishwamAI imports...")
         from vishwamai.model import VishwamAI, VishwamAIConfig
         from vishwamai.transformer import EnhancedTransformerModel, TPUTrainingState
         from vishwamai.pipeline import TPUDataPipeline, DistillationDataPipeline
         from vishwamai.device_mesh import TPUMeshContext
         print("✓ Core VishwamAI imports successful")
-        
+
         print("\nTesting distillation imports...")
         from vishwamai.distill import (
             create_student_model,
@@ -38,27 +41,48 @@ def test_imports():
             DistillationTrainer
         )
         print("✓ Distillation imports successful")
-        
+
         print("\nTesting thoughts imports...")
         from vishwamai.thoughts import TreeOfThoughts
         print("✓ Thoughts imports successful")
-        
+
         print("\nTesting config imports...")
         from vishwamai.configs.tpu_v3_config import TPUV3Config
         from vishwamai.configs.budget_model_config import BudgetModelConfig
         print("✓ Config imports successful")
-        
+
         print("\nTesting utility imports...")
         from vishwamai.profiler import TPUProfiler
         from tqdm.auto import tqdm
         print("✓ Utility imports successful")
-        
-        print("\nAll imports successful!")
+
+        print("\n🎉 All imports successful!")
         return True
-        
+
     except ImportError as e:
-        print(f"\n❌ Import failed: {str(e)}")
+        print(f"\n❌ Import failed: {e.__class__.__name__}: {str(e)}")
         return False
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e.__class__.__name__}: {str(e)}")
+        return False
+
+__all__ = [
+    'VishwamAI',
+    'VishwamAIConfig',
+    'EnhancedTransformerModel',
+    'TPUTrainingState',
+    'TPUDataPipeline',
+    'DistillationDataPipeline',
+    'TPUMeshContext',
+    'create_student_model',
+    'initialize_from_teacher',
+    'DistillationTrainer',
+    'TreeOfThoughts',
+    'TPUV3Config',
+    'BudgetModelConfig',
+    'TPUProfiler',
+    'tqdm',
+]  # type: ignore[assignment]
 
 if __name__ == "__main__":
     success = test_imports()

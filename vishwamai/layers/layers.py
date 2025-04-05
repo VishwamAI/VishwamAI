@@ -117,9 +117,10 @@ class TPUMultiHeadAttention(nn.Module):
     block_size: int = 128
     
     def setup(self):
-        # Projection layers
+        # Projection layers with aligned dimensions
+        hidden_dim = self.num_heads * self.head_dim
         self.qkv = TPUGEMMLinear(
-            features=3 * self.num_heads * self.head_dim,
+            features=3 * hidden_dim,
             use_bias=self.qkv_bias,
             dtype=self.dtype,
             use_fp8=self.use_fp8,
@@ -127,7 +128,7 @@ class TPUMultiHeadAttention(nn.Module):
         )
         
         self.out = TPUGEMMLinear(
-            features=self.num_heads * self.head_dim,
+            features=hidden_dim,
             dtype=self.dtype,
             use_fp8=self.use_fp8,
             block_size=self.block_size
@@ -135,22 +136,13 @@ class TPUMultiHeadAttention(nn.Module):
         
         # Flash Attention module
         if self.use_flash_attn:
-            from vishwamai.layers.flash_attention import FlashAttentionConfig, FlashAttention
-            config = FlashAttentionConfig(
-                block_size=self.block_size,
-                head_dim=self.head_dim,
-                num_heads=self.num_heads,
-                dropout_rate=self.dropout_rate,
-                use_fp8=self.use_fp8
-            )
-            # Initialize FlashAttention with extracted parameters from config
             self.flash_attn = FlashAttention(
-                dim=self.num_heads * self.head_dim,
-                num_heads=config.num_heads,
-                dropout=config.dropout_rate,
-                max_seq_length=2048  # Default max sequence length
+                dim=hidden_dim,
+                num_heads=self.num_heads,
+                dropout=self.dropout_rate,
+                max_seq_length=2048
             )
-
+    
     def __call__(
         self,
         x: jnp.ndarray,
@@ -159,31 +151,32 @@ class TPUMultiHeadAttention(nn.Module):
         past_key_value: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
     ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]]:
         batch_size, seq_len, _ = x.shape
+        hidden_dim = self.num_heads * self.head_dim
         
-        # Project to Q, K, V
+        # Project to Q, K, V ensuring aligned dimensions
         qkv = self.qkv(x)  # [batch, seq, 3*heads*dim]
         qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         qkv = qkv.transpose(2, 0, 3, 1, 4)  # [3, batch, heads, seq, dim]
         q, k, v = qkv[0], qkv[1], qkv[2]
-        
+
         # Add past key/values for inference
         if past_key_value is not None:
             past_k, past_v = past_key_value
             k = jnp.concatenate([past_k, k], axis=2)  # Concat on seq length
             v = jnp.concatenate([past_v, v], axis=2)
         
-        # Apply attention with consistent dimensions
+        # Apply attention
         if self.use_flash_attn:
-            # Flash attention expects [batch, heads, seq, dim]
             attn_output = self.flash_attn(
-                q, k, v,
+                q=q,
+                k=k,
+                v=v,
                 mask=mask,
                 deterministic=deterministic
             )
         else:
             # Standard scaled dot-product attention
             scale = 1.0 / jnp.sqrt(self.head_dim)
-            # q, k: [batch, heads, seq, dim]
             attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
             
             if mask is not None:
@@ -206,11 +199,9 @@ class TPUMultiHeadAttention(nn.Module):
         # Save current key/values for next step if needed
         present = (k, v) if past_key_value is not None else None
         
-        # Reshape output to [batch, seq, heads*dim]
+        # Reshape output and final projection
         attn_output = attn_output.transpose(0, 2, 1, 3)
-        attn_output = attn_output.reshape(batch_size, seq_len, -1)
-        
-        # Final projection
+        attn_output = attn_output.reshape(batch_size, seq_len, hidden_dim)
         attn_output = self.out(attn_output)
         
         return attn_output, present

@@ -230,60 +230,37 @@ def block_tpu_matmul(
     
     return result
 
-@partial(jax.jit, static_argnums=(4,))
 def fp8_gemm_optimized(
-    a_quant: jnp.ndarray,
-    a_scale: jnp.ndarray,
-    b_quant: jnp.ndarray,
-    b_scale: jnp.ndarray,
+    x: jnp.ndarray,
+    x_scale: jnp.ndarray,
+    kernel: jnp.ndarray,
+    kernel_scale: jnp.ndarray,
     block_size: int = 128
 ) -> jnp.ndarray:
-    """
-    Optimized FP8 matrix multiplication for TPU.
+    """Optimized FP8 GEMM operation with proper dimension handling."""
+    # Reshape scales for correct broadcasting
+    x_scale = x_scale.reshape(*x_scale.shape, 1)  # Add feature dim
+    kernel_scale = kernel_scale.reshape(1, *kernel_scale.shape)  # Add batch dim
     
-    Features:
-    - Block-wise processing for TPU efficiency
-    - Int8 computation with dynamic scaling
-    - Automatic layout optimization
-    - TPU-friendly memory access patterns
+    # Compute aligned dimensions
+    batch_size = x.shape[0]
+    seq_len = x.shape[1] if len(x.shape) > 2 else 1
+    in_features = x.shape[-1]
+    out_features = kernel.shape[-1]
     
-    Args:
-        a_quant: First quantized matrix (int8)
-        a_scale: Scales for first matrix
-        b_quant: Second quantized matrix (int8)
-        b_scale: Scales for second matrix
-        block_size: Block size for processing (must be multiple of 128 for TPU)
-        
-    Returns:
-        Result of matrix multiplication in original precision
-    """
-    # Validate block size
-    if block_size % 128 != 0:
-        raise ValueError("Block size must be multiple of 128 for TPU efficiency")
-        
-    # Optimize memory layout for TPU
-    a_quant = optimize_kernel_layout(a_quant, block_size)
-    b_quant = optimize_kernel_layout(b_quant, block_size)
+    # Reshape input for matmul
+    x_reshaped = x.reshape(-1, in_features)
     
-    # Perform integer matrix multiplication
-    result_int = jax.lax.dot_general(
-        a_quant,
-        b_quant,
-        (((a_quant.ndim - 1,), (0,)), ((), ())),
-        precision=lax.Precision.HIGHEST
+    # Block-wise matrix multiplication
+    result = jax.lax.dot_general(
+        x_reshaped,
+        kernel,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        precision=jax.lax.Precision.HIGHEST
     )
     
-    # Compute and apply scales
-    if result_int.ndim >= 2:
-        # For 2D+ tensors
-        *batch_dims, rows, cols = result_int.shape
-        result_scale = 1.0 / (a_scale * b_scale)
-        result_scale = result_scale.reshape(*batch_dims, rows, 1, cols, 1)
-    else:
-        # For 1D tensors
-        result_scale = 1.0 / (a_scale * b_scale)
-        
-    # Convert back to floating point with proper scaling
-    result = result_int.astype(jnp.float32) * result_scale
+    # Restore batch/sequence dimensions
+    result = result.reshape(batch_size, seq_len, out_features)
     
-    return result
+    # Apply scales with proper broadcasting
+    return result * (x_scale * kernel_scale)

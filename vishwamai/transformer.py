@@ -130,7 +130,7 @@ class TPUShardedLinear(nn.Module):
 class TPUMultiHeadAttention(nn.Module):
     """TPU-optimized multi-head attention with model and data parallelism"""
     num_heads: int
-    head_dim: int
+    head_dim: int 
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
     
@@ -152,7 +152,7 @@ class TPUMultiHeadAttention(nn.Module):
         )(inputs_q)
         
         key = TPUShardedLinear(
-            features=self.num_heads * self.head_dim,
+            features=self.num_heads * self.head_dim, 
             dtype=self.dtype,
             kernel_shard_axes=(None, 'model'),
             name='key'
@@ -169,6 +169,12 @@ class TPUMultiHeadAttention(nn.Module):
         query = query.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         key = key.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         value = value.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Prepare attention mask in correct format
+        if mask is not None:
+            # Expand mask dims to match attention shape [batch, heads, q_len, kv_len]
+            mask = mask[:, None, :, :]
+            mask = jnp.broadcast_to(mask, (batch_size, self.num_heads, seq_len, seq_len))
 
         # Compute attention using memory-efficient TPU implementation
         attention_output = TPUOptimizer.memory_efficient_attention(

@@ -287,23 +287,28 @@ class TransformerBlock(nn.Module):
         
     def __call__(
         self,
-        x: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
+        inputs: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
         deterministic: bool = True
     ) -> jnp.ndarray:
-        # Attention block
-        y = self.layer_norm1(x)
-        y = self.attention(
-            y, y,
-            mask=attention_mask,
+        # Attention branch
+        attn_output = self.attention(
+            inputs_q=inputs,
+            inputs_kv=inputs,
             deterministic=deterministic
         )
-        x = x + self.dropout(y, deterministic=deterministic)
         
-        # Feed-forward block
-        y = self.layer_norm2(x)
-        y = self.feed_forward(y, deterministic=deterministic)
-        x = x + self.dropout(y, deterministic=deterministic)
+        # FFN branch with residual
+        ffn_output = self.feed_forward(
+            inputs,
+            deterministic=deterministic
+        )
+        
+        # Combine branches with residual connections
+        x = inputs + attn_output + ffn_output
+        
+        # Layer norm
+        x = self.layer_norm(x)
         
         return x
 

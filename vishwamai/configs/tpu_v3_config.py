@@ -23,6 +23,7 @@ class TPUV3Config:
     training_config = {
         "batch_size": 32,  # Per TPU core
         "grad_accum_steps": 4,  # Effective batch size = 1024
+        "gradient_accumulation_steps": 4,  # Added for compatibility
         "learning_rate": 1e-4,
         "warmup_steps": 1000,
         "max_steps": 50000,

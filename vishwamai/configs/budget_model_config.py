@@ -10,11 +10,11 @@ class BudgetModelConfig:
         # Model configuration optimized for efficiency
         self.model_config = {
             "vocab_size": 32000,
-            "hidden_size": 512,
-            "intermediate_size": 2048,
-            "num_attention_heads": 8,
-            "num_hidden_layers": 8,
-            "max_position_embeddings": 512,
+            "hidden_size": 256,  # Reduced from 512
+            "intermediate_size": 1024,  # Reduced from 2048
+            "num_attention_heads": 4,  # Reduced from 8
+            "num_hidden_layers": 4,  # Reduced from 8
+            "max_position_embeddings": 256,  # Reduced from 512
             "attention_dropout": 0.1,
             "hidden_dropout": 0.1,
             "use_flash_attention": True,
@@ -24,8 +24,8 @@ class BudgetModelConfig:
 
         # Training configuration for maximum efficiency
         self.training_config = {
-            "batch_size": 16,        # Reduced from 32 
-            "gradient_accumulation_steps": 8,  # Adjusted for effective batch size <= 256
+            "batch_size": 4,  # Reduced from 16
+            "gradient_accumulation_steps": 4,  # Reduced from 8
             "learning_rate": 5e-4,
             "warmup_steps": 500,
             "max_steps": 20000,
@@ -33,7 +33,7 @@ class BudgetModelConfig:
             "eval_steps": 500
         }
 
-        # Memory optimizations 
+        # Memory optimizations
         self.memory_config = {
             "use_gradient_checkpointing": True,
             "use_fp8_kv_cache": True,

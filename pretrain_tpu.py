@@ -208,12 +208,19 @@ def main():
         temperature=config["thinking"]["temperature"]
     )
     
-    # Create and initialize student model from teacher
+    # Create and initialize student model from teacher with memory optimizations
     student_model, student_vars, student_config = create_student_model(
-        config["model"],           # Pass model config directly
-        teacher_model,             # Pass teacher model
-        32/80,                    # reduction_factor (32 layers for student, 80 for teacher)
-        jax.random.PRNGKey(42)    # rng
+        {
+            **config["model"],
+            "gradient_checkpointing": True,  # Enable gradient checkpointing
+            "hidden_dim": 4096,    # Reduce model size initially
+            "num_layers": 24,      # Reduce number of layers
+            "num_heads": 32,       # Adjust head count
+            "mlp_dim": 16384      # Reduce MLP dimension
+        },
+        teacher_model,
+        24/80,  # Adjusted reduction factor for smaller initial model
+        jax.random.PRNGKey(42)
     )
     
     # Initialize Tree of Thoughts for student model 

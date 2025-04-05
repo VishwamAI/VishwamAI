@@ -55,7 +55,12 @@ class VishwamAI(nn.Module):
             features=self.config.hidden_dim,
             dtype=jnp.bfloat16
         )
-        self.transformer_blocks = [
+        self.pos_embed = nn.Embed(
+            num_embeddings=self.config.max_seq_len,
+            features=self.config.hidden_dim,
+            dtype=jnp.bfloat16
+        )
+        self.blocks = [
             TransformerBlock(
                 hidden_dim=self.config.hidden_dim,
                 num_heads=self.config.num_heads,
@@ -66,7 +71,34 @@ class VishwamAI(nn.Module):
                 name=f'transformer_block_{i}'
             ) for i in range(self.config.num_layers)
         ]
-        self.layer_norm = TPULayerNorm(dtype=jnp.bfloat16)
+        self.norm = TPULayerNorm(dtype=jnp.bfloat16)
+        self.head = nn.Dense(features=self.config.vocab_size, dtype=jnp.bfloat16)
+
+    def __call__(self, input_ids, deterministic=False, rngs=None):
+        """Forward pass with memory optimizations."""
+        # Cast inputs to bfloat16 for TPU efficiency
+        x = self.embed(input_ids.astype(jnp.int32)).astype(jnp.bfloat16)
+        
+        # Add positional embeddings
+        positions = jnp.arange(input_ids.shape[1])[None]
+        x = x + self.pos_embed(positions).astype(jnp.bfloat16)
+        
+        # Optional dropout for training
+        if not deterministic and self.dropout_rate > 0:
+            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=False)
+            
+        # Process through transformer blocks with memory optimizations
+        for i, block in enumerate(self.blocks):
+            if self.gradient_checkpointing and not deterministic:
+                x = nn.remat(block, prevent_cse=True)(x, deterministic=deterministic)
+            else:
+                x = block(x, deterministic=deterministic)
+                
+        # Final layer norm and output projection
+        x = self.norm(x)
+        logits = self.head(x)
+        
+        return {"logits": logits}
 
     def attention(self, query, key, value):
         """Apply regular attention."""
@@ -94,8 +126,8 @@ class VishwamAI(nn.Module):
     def get_attention_pattern(self, hidden_states):
         """Get attention pattern from first layer."""
         # Get attention pattern from first transformer block
-        query = self.transformer_blocks[0].attention.q_proj(hidden_states)
-        key = self.transformer_blocks[0].attention.k_proj(hidden_states)
+        query = self.blocks[0].attention.q_proj(hidden_states)
+        key = self.blocks[0].attention.k_proj(hidden_states)
         
         # Compute attention scores
         attention_scores = jnp.matmul(query, key.transpose(-2, -1))
@@ -111,15 +143,6 @@ class VishwamAI(nn.Module):
             "values": jnp.zeros((batch_size, max_length, num_heads, head_dim), dtype=jnp.bfloat16),
             "length": jnp.zeros((batch_size,), dtype=jnp.int32)
         }
-
-    def __call__(self, input_ids: jnp.ndarray, mask: Optional[jnp.ndarray] = None, deterministic: bool = True) -> Dict[str, jnp.ndarray]:
-        """Forward pass through the model."""
-        x = self.embed(input_ids)
-        for block in self.transformer_blocks:
-            x = block(x, mask=mask, deterministic=deterministic)
-        x = self.layer_norm(x)
-        logits = jnp.dot(x, self.embed.embedding.T)
-        return {'logits': logits, 'last_hidden_state': x}
 
     def generate(
         self,

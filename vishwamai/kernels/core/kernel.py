@@ -62,42 +62,34 @@ class AbstractKernel(ABC):
             if self.config.block_size % 32 != 0:
                 raise ValueError("GPU block size must be multiple of 32")
 
-def act_quant(x: jnp.ndarray, block_size: int = 128) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Quantize activations to FP8 with dynamic per-block scaling.
+def act_quant(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Quantize activations with memory-efficient implementation."""
+    # Get max absolute value per axis for scaling
+    max_abs = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
     
-    Args:
-        x: Input tensor
-        block_size: Block size for quantization (must be multiple of 128 for TPU)
-        
-    Returns:
-        Tuple of (quantized tensor, scale factors)
-    """
-    # Ensure block size is TPU-friendly
-    if block_size % 128 != 0:
-        raise ValueError("Block size must be multiple of 128 for TPU efficiency")
-        
-    shape = x.shape
-    ndim = len(shape)
+    # Calculate scales to maximize precision while avoiding overflow
+    scales = (127.0 / jnp.maximum(max_abs, 1e-6))
     
-    if ndim >= 2:
-        # For attention tensors (BHQK format) or other multi-dim tensors,
-        # compute scales over the last dimension only
-        abs_max = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-        scales = jnp.where(abs_max > 0, 127.0 / (abs_max + 1e-5), 1.0)
+    # Split large tensors into chunks for quantization
+    chunk_size = 1024  # Adjust based on available memory
+    num_chunks = (x.shape[-1] + chunk_size - 1) // chunk_size
+    chunks = []
+    
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min(start_idx + chunk_size, x.shape[-1])
+        chunk = x[..., start_idx:end_idx]
         
-        # Broadcast scales to match input shape for quantization
-        scales = jnp.broadcast_to(scales, shape)
-        
-        # Quantize
-        x_quant = jnp.clip(jnp.round(x * scales), -127, 127).astype(jnp.int8)
-        
-    else:
-        # For 1D tensors, use simple quantization
-        abs_max = jnp.max(jnp.abs(x), keepdims=True)
-        scales = jnp.where(abs_max > 0, 127.0 / (abs_max + 1e-5), 1.0)
-        x_quant = jnp.clip(jnp.round(x * scales), -127, 127).astype(jnp.int8)
-        
+        # Quantize chunk
+        chunk_quant = jnp.clip(
+            jnp.round(chunk * scales[..., start_idx:end_idx]), 
+            -127, 
+            127
+        ).astype(jnp.int8)
+        chunks.append(chunk_quant)
+    
+    # Concatenate chunks
+    x_quant = jnp.concatenate(chunks, axis=-1)
     return x_quant, scales
 
 def optimize_kernel_layout(x: jnp.ndarray, block_size: int = 128) -> jnp.ndarray:

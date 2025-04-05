@@ -15,6 +15,7 @@ from .distill import (
 from vishwamai.thoughts.cot import ChainOfThoughtPrompting
 from vishwamai.thoughts.tot import TreeOfThoughts
 import flax
+import pandas as pd
 
 """TPU-optimized data pipeline"""
 
@@ -198,14 +199,81 @@ class DistillationDataPipeline:
         self.devices = devices
         self.enable_thinking = enable_thinking
         
-        # Initialize teacher model variables only if model is provided
+        # Initialize with smaller chunk size for memory efficiency
+        self.chunk_size = min(128, config["training"]["batch_size"])
+        
+        # Initialize teacher model variables for inference only
         if self.teacher_model is not None:
             rng = jax.random.PRNGKey(0)
             dummy_input = jnp.ones((1, 32), dtype=jnp.int32)
-            self.teacher_variables = self.teacher_model.init(rng, dummy_input)
+            self.teacher_variables = jax.jit(
+                lambda: self.teacher_model.init(rng, dummy_input)
+            )()
         else:
             self.teacher_variables = None
-    
+
+    def create_distillation_dataset(
+        self,
+        file_pattern: str,
+        is_training: bool = True,
+        cache_teacher_outputs: bool = True
+    ) -> tf.data.Dataset:
+        """Create dataset for distillation with memory optimizations."""
+        dataset = tf.data.Dataset.list_files(file_pattern)
+        
+        # Use small prefetch and buffer sizes
+        dataset = dataset.prefetch(2)
+        
+        def load_and_process_chunk(file_path):
+            # Read data in smaller chunks
+            df = pd.read_parquet(file_path.numpy().decode(), chunksize=self.chunk_size)
+            for chunk in df:
+                # Process each chunk
+                batch = {
+                    "input_ids": chunk["input_ids"].values,
+                    "labels": chunk["labels"].values if "labels" in chunk else None
+                }
+                if cache_teacher_outputs and self.teacher_model is not None:
+                    # Get teacher predictions in smaller batches
+                    teacher_outputs = []
+                    for i in range(0, len(batch["input_ids"]), self.chunk_size):
+                        chunk_inputs = batch["input_ids"][i:i + self.chunk_size]
+                        outputs = self.teacher_model.apply(
+                            self.teacher_variables,
+                            jnp.array(chunk_inputs),
+                            deterministic=True
+                        )
+                        teacher_outputs.append(outputs)
+                    batch["teacher_logits"] = jnp.concatenate(teacher_outputs, axis=0)
+                yield batch
+
+        # Map and batch with optimized settings
+        dataset = dataset.interleave(
+            lambda x: tf.data.Dataset.from_generator(
+                lambda y: load_and_process_chunk(y),
+                output_types={
+                    "input_ids": tf.int32,
+                    "labels": tf.int32,
+                    "teacher_logits": tf.float32
+                },
+                args=(x,)
+            ),
+            cycle_length=2,
+            block_length=1,
+            num_parallel_calls=2
+        )
+        
+        if is_training:
+            dataset = dataset.shuffle(buffer_size=1000)
+            
+        # Use dynamic batching
+        dataset = dataset.batch(
+            self.config["training"]["batch_size"],
+            drop_remainder=is_training
+        )
+        
+        return dataset.prefetch(2)
+
     def process_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Process a batch of data for distillation."""
         if self.teacher_model is None or self.teacher_variables is None:
@@ -305,12 +373,12 @@ def prepare_distillation_data(
         devices=jax.devices()
     )
     
-    train_dataset = pipeline.create_dataset(
+    train_dataset = pipeline.create_distillation_dataset(
         train_files,
         is_training=True
     )
     
-    eval_dataset = pipeline.create_dataset(
+    eval_dataset = pipeline.create_distillation_dataset(
         eval_files,
         is_training=False
     )

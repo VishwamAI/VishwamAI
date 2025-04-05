@@ -21,18 +21,20 @@ class TPUGEMMLinear(nn.Module):
     
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # Create kernel with input_dim as first dimension for proper matmul
         kernel = self.param(
             'kernel',
             self.kernel_init,
-            (x.shape[-1], self.features),
+            (x.shape[-1], self.features),  # [input_dim, output_dim]
             self.dtype
         )
         
         if self.use_fp8:
-            # Use FP8 GEMM for faster computation
+            # Quantize inputs and kernel
             x_quant, x_scale = act_quant(x, block_size=self.block_size)
             kernel_quant, kernel_scale = act_quant(kernel, block_size=self.block_size)
             
+            # Use FP8 GEMM 
             y = fp8_gemm_optimized(
                 x_quant,
                 x_scale,
@@ -42,7 +44,7 @@ class TPUGEMMLinear(nn.Module):
             )
         else:
             kernel = optimize_kernel_layout(kernel)
-            y = jnp.dot(x, kernel, precision=self.precision)
+            y = jnp.dot(x, kernel)
             
         if self.use_bias:
             bias = self.param('bias', self.bias_init, (self.features,), self.dtype)
@@ -117,94 +119,103 @@ class TPUMultiHeadAttention(nn.Module):
     block_size: int = 128
     
     def setup(self):
-        # Projection layers with aligned dimensions
-        hidden_dim = self.num_heads * self.head_dim
-        self.qkv = TPUGEMMLinear(
-            features=3 * hidden_dim,
+        self.hidden_dim = self.num_heads * self.head_dim
+        self.q_proj = TPUGEMMLinear(
+            features=self.hidden_dim,
             use_bias=self.qkv_bias,
-            dtype=self.dtype,
-            use_fp8=self.use_fp8,
-            block_size=self.block_size
+            dtype=self.dtype
         )
         
-        self.out = TPUGEMMLinear(
-            features=hidden_dim,
-            dtype=self.dtype,
-            use_fp8=self.use_fp8,
-            block_size=self.block_size
+        self.k_proj = TPUGEMMLinear(
+            features=self.hidden_dim,
+            use_bias=self.qkv_bias,
+            dtype=self.dtype
         )
         
-        # Flash Attention module
-        if self.use_flash_attn:
-            self.flash_attn = FlashAttention(
-                dim=hidden_dim,
-                num_heads=self.num_heads,
-                dropout=self.dropout_rate,
-                max_seq_length=2048
-            )
-    
+        self.v_proj = TPUGEMMLinear(
+            features=self.hidden_dim,
+            use_bias=self.qkv_bias,
+            dtype=self.dtype
+        )
+        
+        self.out_proj = TPUGEMMLinear(
+            features=self.hidden_dim,
+            dtype=self.dtype
+        )
+
     def __call__(
         self,
-        x: jnp.ndarray,
+        inputs_q: jnp.ndarray,
+        inputs_kv: jnp.ndarray,
         mask: Optional[jnp.ndarray] = None,
-        deterministic: bool = True,
-        past_key_value: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
-    ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]]:
-        batch_size, seq_len, _ = x.shape
-        hidden_dim = self.num_heads * self.head_dim
-        
-        # Project to Q, K, V ensuring aligned dimensions
-        qkv = self.qkv(x)  # [batch, seq, 3*heads*dim]
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.transpose(2, 0, 3, 1, 4)  # [3, batch, heads, seq, dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        deterministic: bool = True
+    ) -> jnp.ndarray:
+        batch_size, q_len = inputs_q.shape[:2]
+        kv_len = inputs_kv.shape[1]
 
-        # Add past key/values for inference
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            k = jnp.concatenate([past_k, k], axis=2)  # Concat on seq length
-            v = jnp.concatenate([past_v, v], axis=2)
-        
-        # Apply attention
+        # Project inputs
+        q = self.q_proj(inputs_q)
+        k = self.k_proj(inputs_kv)
+        v = self.v_proj(inputs_kv)
+
+        # Reshape for attention
+        def split_heads(x: jnp.ndarray) -> jnp.ndarray:
+            return x.reshape(batch_size, -1, self.num_heads, self.head_dim)
+
+        q = split_heads(q)
+        k = split_heads(k)
+        v = split_heads(v)
+
+        # Transpose for attention calculation
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        # Compute attention with proper padding for TPU
         if self.use_flash_attn:
-            attn_output = self.flash_attn(
-                q=q,
-                k=k,
-                v=v,
-                mask=mask,
-                deterministic=deterministic
-            )
-        else:
-            # Standard scaled dot-product attention
-            scale = 1.0 / jnp.sqrt(self.head_dim)
-            attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-            
+            # Ensure dimensions are multiples of block_size
+            def pad_to_block(x: jnp.ndarray, seq_len: int) -> Tuple[jnp.ndarray, int]:
+                pad_len = (self.block_size - seq_len % self.block_size) % self.block_size
+                if pad_len > 0:
+                    padding = [(0, 0), (0, 0), (0, pad_len), (0, 0)]
+                    x = jnp.pad(x, padding)
+                return x, pad_len
+
+            q, q_pad = pad_to_block(q, q_len)
+            k, k_pad = pad_to_block(k, kv_len)
+            v, v_pad = pad_to_block(v, kv_len)
+
+            # Update attention mask for padded sequence
             if mask is not None:
-                attn_weights = jnp.where(mask, attn_weights, -1e10)
-            
-            attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-            
-            if not deterministic and self.dropout_rate > 0.0:
-                dropout_rng = self.make_rng('dropout')
-                keep_prob = 1.0 - self.dropout_rate
-                dropout_mask = jax.random.bernoulli(
-                    dropout_rng,
-                    p=keep_prob,
-                    shape=attn_weights.shape
-                )
-                attn_weights = attn_weights * dropout_mask / keep_prob
-            
-            attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+                mask_padding = [(0, 0), (0, 0), (0, q_pad), (0, k_pad)]
+                mask = jnp.pad(mask, mask_padding, constant_values=0)
+
+        # Compute scaled dot-product attention
+        scale = 1.0 / jnp.sqrt(self.head_dim)
+        attention = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+
+        if mask is not None:
+            big_neg = jnp.finfo(attention.dtype).min
+            attention = jnp.where(mask, attention, big_neg)
+
+        # Apply softmax and dropout
+        attention = jax.nn.softmax(attention, axis=-1)
+        if not deterministic and self.dropout_rate > 0:
+            attention = nn.Dropout(rate=self.dropout_rate)(
+                attention, deterministic=False
+            )
+
+        # Compute output
+        out = jnp.einsum('bhqk,bhkd->bhqd', attention, v)
         
-        # Save current key/values for next step if needed
-        present = (k, v) if past_key_value is not None else None
-        
-        # Reshape output and final projection
-        attn_output = attn_output.transpose(0, 2, 1, 3)
-        attn_output = attn_output.reshape(batch_size, seq_len, hidden_dim)
-        attn_output = self.out(attn_output)
-        
-        return attn_output, present
+        # Remove padding if needed
+        if self.use_flash_attn and q_pad > 0:
+            out = out[:, :, :q_len]
+
+        # Reshape output
+        out = out.transpose(0, 2, 1, 3)
+        out = out.reshape(batch_size, -1, self.hidden_dim)
+        return self.out_proj(out)
 
 class TPURMSNorm(nn.Module):
     """TPU-optimized Root Mean Square normalization layer."""

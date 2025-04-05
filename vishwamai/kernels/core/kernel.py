@@ -78,37 +78,19 @@ def act_quant(x: jnp.ndarray, block_size: int = 128) -> Tuple[jnp.ndarray, jnp.n
         raise ValueError("Block size must be multiple of 128 for TPU efficiency")
         
     shape = x.shape
+    ndim = len(shape)
     
-    # Reshape input into blocks for TPU-efficient quantization
-    if len(shape) >= 2:
-        # For 2D+ tensors, block along last two dimensions
-        *batch_dims, rows, cols = shape
-        row_blocks = (rows + block_size - 1) // block_size
-        col_blocks = (cols + block_size - 1) // block_size
-        
-        # Pad if needed
-        padded_rows = row_blocks * block_size
-        padded_cols = col_blocks * block_size
-        if padded_rows > rows or padded_cols > cols:
-            padding = [(0, 0)] * len(batch_dims) + [
-                (0, padded_rows - rows),
-                (0, padded_cols - cols)
-            ]
-            x = jnp.pad(x, padding)
-            
-        # Reshape for block-wise processing
-        x_blocked = x.reshape(*batch_dims, row_blocks, block_size, col_blocks, block_size)
-        
-        # Compute scales per block (using max absolute value)
-        abs_max = jnp.max(jnp.abs(x_blocked), axis=(-3, -1), keepdims=True)
+    if ndim >= 2:
+        # For attention tensors (BHQK format) or other multi-dim tensors,
+        # compute scales over the last dimension only
+        abs_max = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
         scales = jnp.where(abs_max > 0, 127.0 / (abs_max + 1e-5), 1.0)
         
-        # Quantize to int8 range
-        x_quant = jnp.clip(jnp.round(x_blocked * scales), -127, 127).astype(jnp.int8)
+        # Broadcast scales to match input shape for quantization
+        scales = jnp.broadcast_to(scales, shape)
         
-        # Restore original shape
-        x_quant = x_quant.reshape(shape)
-        scales = scales.reshape(*batch_dims, row_blocks, 1, col_blocks, 1)
+        # Quantize
+        x_quant = jnp.clip(jnp.round(x * scales), -127, 127).astype(jnp.int8)
         
     else:
         # For 1D tensors, use simple quantization
@@ -237,30 +219,54 @@ def fp8_gemm_optimized(
     kernel_scale: jnp.ndarray,
     block_size: int = 128
 ) -> jnp.ndarray:
-    """Optimized FP8 GEMM operation with proper dimension handling."""
-    # Reshape scales for correct broadcasting
-    x_scale = x_scale.reshape(*x_scale.shape, 1)  # Add feature dim
-    kernel_scale = kernel_scale.reshape(1, *kernel_scale.shape)  # Add batch dim
+    """Optimized FP8 GEMM operation with memory-efficient blocked computation."""
+    orig_x_shape = x.shape
+    orig_kernel_shape = kernel.shape
     
-    # Compute aligned dimensions
-    batch_size = x.shape[0]
-    seq_len = x.shape[1] if len(x.shape) > 2 else 1
-    in_features = x.shape[-1]
-    out_features = kernel.shape[-1]
+    # Reshape input to 2D
+    if len(x.shape) > 2:
+        x = x.reshape(-1, x.shape[-1])
+        
+    # Get matrix dimensions
+    M, K = x.shape
+    K_, N = kernel.shape
+    assert K == K_, f"Incompatible dimensions {K} != {K_}"
+
+    # Calculate optimal chunk size based on available memory
+    # Use 1GB chunks to avoid OOM
+    max_chunk_bytes = 1024 * 1024 * 1024  # 1GB
+    bytes_per_element = 4  # assuming float32
+    max_chunk_elements = max_chunk_bytes // bytes_per_element
+    chunk_size = min(block_size, max(1, max_chunk_elements // (K * N)))
+    chunk_size = (chunk_size // block_size) * block_size  # Round to block size
     
-    # Reshape input for matmul
-    x_reshaped = x.reshape(-1, in_features)
+    # Initialize output array
+    result = jnp.zeros((M, N), dtype=x.dtype)
     
-    # Block-wise matrix multiplication
-    result = jax.lax.dot_general(
-        x_reshaped,
-        kernel,
-        dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=jax.lax.Precision.HIGHEST
-    )
+    # Process in chunks
+    for i in range(0, M, chunk_size):
+        chunk_end = min(i + chunk_size, M)
+        x_chunk = x[i:chunk_end]
+        x_scale_chunk = x_scale[i:chunk_end]
+        
+        # Compute chunk result
+        chunk_result = jax.lax.dot_general(
+            x_chunk, 
+            kernel,
+            dimension_numbers=(((1,), (0,)), ((), ())),
+            precision=jax.lax.Precision.HIGHEST
+        )
+        
+        # Apply scales for chunk
+        x_scale_chunk = jnp.reshape(x_scale_chunk, (-1, 1))
+        chunk_scale = jnp.multiply(x_scale_chunk, kernel_scale.reshape(1, -1))
+        chunk_result = chunk_result * chunk_scale
+        
+        # Update result
+        result = result.at[i:chunk_end].set(chunk_result)
     
-    # Restore batch/sequence dimensions
-    result = result.reshape(batch_size, seq_len, out_features)
-    
-    # Apply scales with proper broadcasting
-    return result * (x_scale * kernel_scale)
+    # Restore original dimensions if needed
+    if len(orig_x_shape) > 2:
+        result = result.reshape(*orig_x_shape[:-1], orig_kernel_shape[-1])
+        
+    return result

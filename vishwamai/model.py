@@ -69,7 +69,7 @@ class VishwamAI(nn.Module):
     def __call__(
         self,
         input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
+        mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         enable_thoughts: bool = False
@@ -83,7 +83,7 @@ class VishwamAI(nn.Module):
         for block in self.transformer_blocks:
             x = block(
                 x,
-                attention_mask=attention_mask,
+                mask=mask,
                 deterministic=deterministic
             )
             
@@ -91,7 +91,7 @@ class VishwamAI(nn.Module):
         x = self.layer_norm(x)
         
         # Project to vocabulary
-        logits = self.embed.attend(x)
+        logits = jnp.dot(x, self.embed.embedding.T)
         
         outputs = {
             'logits': logits,
@@ -227,7 +227,11 @@ class VishwamAI(nn.Module):
         
         # Auto-regressive generation
         for _ in range(max_length - len(cur_ids)):
-            logits = self(jnp.array([cur_ids]))['logits'][0, -1]
+            mask = None
+            if len(cur_ids) > 1:
+                mask = jnp.tril(jnp.ones((1, 1, len(cur_ids), len(cur_ids))))
+            
+            logits = self(jnp.array([cur_ids]), mask=mask)['logits'][0, -1]
             next_token = sample_next_token(logits)
             
             if next_token == self.tokenizer.eos_token_id:
@@ -292,25 +296,26 @@ class TransformerBlock(nn.Module):
         deterministic: bool = True
     ) -> jnp.ndarray:
         # Attention branch
+        x = self.layer_norm1(inputs)
         attn_output = self.attention(
-            inputs_q=inputs,
-            inputs_kv=inputs,
+            inputs_q=x,
+            inputs_kv=x,
+            mask=mask,
             deterministic=deterministic
         )
+        
+        # First residual connection
+        x = x + attn_output
         
         # FFN branch with residual
+        y = self.layer_norm2(x)
         ffn_output = self.feed_forward(
-            inputs,
+            y,
             deterministic=deterministic
         )
         
-        # Combine branches with residual connections
-        x = inputs + attn_output + ffn_output
-        
-        # Layer norm
-        x = self.layer_norm(x)
-        
-        return x
+        # Second residual connection
+        return x + ffn_output
 
 class FeedForward(nn.Module):
     """Feed-forward network with TPU optimizations."""

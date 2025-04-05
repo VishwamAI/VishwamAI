@@ -46,30 +46,39 @@ def get_pretrain_config() -> Dict[str, Any]:
     return {
         "model": {
             **tpu_config.model_config,
-            "use_flash_attn": True,  # Add flash attention parameter
-            "vocab_size": 32000,
-            "hidden_dim": 2048,
-            "num_layers": 24,
-            "num_heads": 16,
+            "use_flash_attn": True,
+            "vocab_size": 256000,  # Updated for Gemma-3 tokenizer
+            "hidden_dim": 8192,    # Scaled up for 27B model
+            "num_layers": 80,      # Gemma-3-27b architecture
+            "num_heads": 64,       # Increased for 27B
             "head_dim": 128,
-            "mlp_dim": 8192,
-            "max_seq_len": 2048,
-            "dropout_rate": 0.1,
-            "attention_dropout": 0.1
+            "mlp_dim": 28672,     # Increased for 27B
+            "max_seq_len": 8192,   # Support longer sequences
+            "dropout_rate": 0.0,   # Reduced for pre-training
+            "attention_dropout": 0.0
         },
         "training": {
             **tpu_config.training_config,
-            "weight_decay": 0.01,  # Add weight decay parameter
-            "max_grad_norm": 1.0  # Add gradient clipping parameter
+            "batch_size": 32,      # Adjusted for TPU memory
+            "grad_accum_steps": 8, # Increased for effective batch size
+            "learning_rate": 1e-4,
+            "warmup_steps": 2000,
+            "max_steps": 100000,
+            "weight_decay": 0.01,
+            "max_grad_norm": 1.0,
+            "checkpoint_steps": 1000
         },
-        "tpu": tpu_config.tpu_config,
-        "memory": tpu_config.memory_config,
+        "tpu": {
+            **tpu_config.tpu_config,
+            "device_strategy": "data_parallel"
+        },
         "optimization": {
             "dtype": "bfloat16",
-            "use_fp8_gemm": True,
+            "use_fp8_gemm": False,  # Disabled since fp8 not available
             "block_size": 128,
             "mixed_precision": True,
-            "teacher_load_dtype": "bfloat16"
+            "teacher_load_dtype": "bfloat16",
+            "gradient_checkpointing": True  # Enable for memory efficiency
         },
         "thinking": {
             "num_steps": 3,
@@ -79,7 +88,7 @@ def get_pretrain_config() -> Dict[str, Any]:
             "temperature": 0.7
         },
         "distillation": {
-            "teacher_model": "google/gemma-7b",
+            "teacher_model": "google/gemma-3-27b-pt",  # Updated to 27B
             "temperature": 2.0,
             "alpha": 0.5,
             "layer_mapping_strategy": "uniform"

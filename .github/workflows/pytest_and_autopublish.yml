@@ -7,14 +7,14 @@ jobs:
   pytest-job:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    
+
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     # Install deps
     - uses: actions/setup-python@v5
       with:
@@ -22,12 +22,13 @@ jobs:
         # Uncomment to cache of pip dependencies (if tests too slow)
         # cache: pip
         # cache-dependency-path: '**/pyproject.toml'
-    
+
     - run: pip --version
     - run: pip install -e .[dev]
     - run: pip freeze
-    - run: pytest -v
-    
+
+
+  # Auto-publish when version is increased
   publish-job:
     # Only try to publish if:
     # * Repo is self (prevents running from forks)
@@ -40,54 +41,11 @@ jobs:
     permissions:
       contents: write
     timeout-minutes: 30
-    
+
     steps:
-    - uses: actions/checkout@v4
+    # Publish the package (if local `__version__` > pip version)
+    - uses: etils-actions/pypi-auto-publish@v1
       with:
-        fetch-depth: 0  # Fetch all history for proper version detection
-    
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-    
-    # Install build dependencies
-    - run: pip install build twine
-    
-    # Build package
-    - run: python -m build
-    
-    # Upload to PyPI
-    - name: Publish to PyPI
-      env:
-        TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      run: twine upload dist/*
-    
-    # Create GitHub Release if new version
-    - name: Check version and create GitHub release
-      id: check_version
-      run: |
-        VERSION=$(python -c "import vishwamai; print(vishwamai.__version__)")
-        echo "Current version: $VERSION"
-        
-        # Set version for next steps
-        echo "VERSION=$VERSION" >> $GITHUB_ENV
-        
-        # Check if this version already exists as a GitHub release
-        if ! git ls-remote --tags origin | grep -q refs/tags/v$VERSION; then
-          echo "Creating new release for v$VERSION"
-          echo "CREATE_RELEASE=true" >> $GITHUB_ENV
-        else
-          echo "Release v$VERSION already exists"
-          echo "CREATE_RELEASE=false" >> $GITHUB_ENV
-        fi
-    
-    - name: Create Release
-      if: env.CREATE_RELEASE == 'true'
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: v${{ env.VERSION }}
-        name: Release v${{ env.VERSION }}
-        draft: false
-        prerelease: false
-        generate_release_notes: true
+        pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+        gh-token: ${{ secrets.GITHUB_TOKEN }}
+        parse-changelog: true

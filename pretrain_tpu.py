@@ -5,23 +5,21 @@ import jax.numpy as jnp
 import optax
 import logging
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, Tuple, List, Union
+from typing import Dict, Any, Optional, Tuple
 from functools import partial
 
 from vishwamai.model import VishwamAI, VishwamAIConfig
-from vishwamai.transformer import EnhancedTransformerModel, TPUTrainingState 
+from vishwamai.transformer import TPUTrainingState 
 from vishwamai.pipeline import TPUDataPipeline, DistillationDataPipeline
 from vishwamai.device_mesh import TPUMeshContext
-from vishwamai.distill import create_student_model
-from vishwamai.thoughts import TreeOfThoughts
+from vishwamai.distill import DistillationTrainer, create_student_model
+from vishwamai.thoughts import TreeOfThoughts, ChainOfThoughtPrompting
 from vishwamai.configs.tpu_v3_config import TPUV3Config
-from vishwamai.utils.model_loading import load_pretrained_weights
 from vishwamai.profiler import TPUProfiler
 from vishwamai.logger import setup_logging
+from vishwamai import init_thinking_components
 import time
 from tqdm.auto import tqdm
 
@@ -34,73 +32,29 @@ LOGS_DIR = Path("logs")
 GEMMA_MODEL_ID = "google/gemma-3-27b-pt"
 CACHE_DIR = Path("model_cache")
 
-def train_step(state: TPUTrainingState, batch: Dict[str, Any]) -> Tuple[TPUTrainingState, Dict[str, Any]]:
-    """Perform a single training step."""
-    def loss_fn(params):
-        logits = state.apply_fn(
-            {'params': params},
-            batch['input_ids'],
-            deterministic=False
-        )['logits']
-        
-        # Calculate loss with label smoothing
-        labels = batch['labels']
-        padding_mask = (labels != 0)
-        label_smoothing = 0.1
-        
-        # Convert labels to one-hot with label smoothing
-        num_classes = logits.shape[-1]
-        labels_onehot = jax.nn.one_hot(labels, num_classes)
-        labels_smooth = ((1.0 - label_smoothing) * labels_onehot +
-                        label_smoothing / num_classes)
-        
-        # Compute cross entropy loss
-        logits_shifted = logits[..., :-1, :]
-        labels_shifted = labels_smooth[..., 1:, :]
-        padding_mask_shifted = padding_mask[..., 1:]
-        
-        loss = -jnp.sum(
-            labels_shifted * jax.nn.log_softmax(logits_shifted, axis=-1),
-            axis=-1
-        )
-        loss = jnp.sum(loss * padding_mask_shifted) / jnp.sum(padding_mask_shifted)
-        
-        return loss, logits
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
-    
-    # Update state
-    state = state.apply_gradients(grads=grads)
-    
-    # Compute metrics
-    metrics = {
-        'loss': loss,
-        'learning_rate': state.opt_state[1].learning_rate,
-        'gradient_norm': optax.global_norm(grads)
-    }
-    
-    return state, metrics
-
 def get_pretrain_config() -> Dict[str, Any]:
     """Get pretraining configuration."""
     # Start with TPU v3 optimized base config
-    config = {
+    tpu_config = TPUV3Config()
+    
+    return {
         "model": {
-            "vocab_size": 256000,  # Gemma vocabulary size
-            "hidden_dim": 5120,    # Matches Gemma-3b architecture
-            "num_layers": 28,
-            "num_heads": 32,
-            "head_dim": 160,
-            "mlp_dim": 20480,
+            **tpu_config.model_config,
+            "use_flash_attn": True,
+            "vocab_size": 256000,  # Gemma tokenizer vocab size
+            "hidden_dim": 8192,    # Scaled for 27B model
+            "num_layers": 80,      # Gemma architecture
+            "num_heads": 64,
+            "head_dim": 128,
+            "mlp_dim": 28672,
             "max_seq_len": 8192,
             "dropout_rate": 0.0,
-            "attention_dropout": 0.0,
-            "use_flash_attn": True
+            "attention_dropout": 0.0
         },
         "training": {
-            "batch_size": 32,      # Reduced for GPU memory
-            "grad_accum_steps": 4,
+            **tpu_config.training_config,
+            "batch_size": 32,      # Per TPU core
+            "grad_accum_steps": 8,
             "learning_rate": 1e-4,
             "warmup_steps": 2000,
             "max_steps": 100000,
@@ -114,83 +68,39 @@ def get_pretrain_config() -> Dict[str, Any]:
             "mixed_precision": True
         },
         "thinking": {
-            "num_steps": 3,
             "max_branches": 4,
             "max_depth": 3,
             "beam_width": 4,
-            "temperature": 0.7
+            "temperature": 0.7,
+            "max_length": 512,
+            "num_samples": 3
         },
-        "hardware": {
-            "device": "gpu",  # Will be auto-detected
-            "mesh_shape": [1, 1],  # Single device for now
-            "mesh_order": ['data', 'model']
+        "distillation": {
+            "teacher_model": GEMMA_MODEL_ID,
+            "temperature": 2.0,
+            "alpha": 0.5,
+            "layer_mapping_strategy": "uniform"
         }
     }
-    
-    # Auto-detect hardware and adjust configuration
-    try:
-        import jax
-        if len(jax.devices()) > 1:
-            config["hardware"]["mesh_shape"] = [len(jax.devices()), 1]
-        if any(d.platform == "tpu" for d in jax.devices()):
-            config["hardware"]["device"] = "tpu"
-            config["training"]["batch_size"] = 512  # Increase for TPU
-    except:
-        pass
-        
-    return config
-
-def create_vishwamai_transformer(
-    config: VishwamAIConfig,
-    pretrained_weights_path: Optional[str] = None,
-    dtype: str = "bfloat16"
-) -> Tuple[VishwamAI, Dict[str, Any]]:
-    """Create a VishwamAI transformer model and initialize with Gemma weights."""
-    model = VishwamAI(config=config)
-    
-    if pretrained_weights_path:
-        # Load pretrained Gemma weights
-        pretrained_weights = load_pretrained_weights(
-            model_id=GEMMA_MODEL_ID,
-            cache_dir=str(CACHE_DIR),
-            dtype=getattr(jnp, dtype)
-        )
-        
-        # Initialize with dummy input to get param structure
-        rng = jax.random.PRNGKey(0)
-        dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
-        variables = model.init(rng, dummy_input)
-        
-        # Map pretrained weights to model structure
-        mapped_weights = {}
-        for name, param in variables['params'].items():
-            if name in pretrained_weights:
-                mapped_weights[name] = pretrained_weights[name]
-            else:
-                logger.warning(f"Parameter {name} not found in pretrained weights")
-                mapped_weights[name] = param
-        
-        variables['params'] = mapped_weights
-    else:
-        # Initialize from scratch
-        rng = jax.random.PRNGKey(0)
-        dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
-        variables = model.init(rng, dummy_input)
-    
-    return model, variables
 
 def main():
     # Load configuration
     config = get_pretrain_config()
     
-    # Create cache directory if it doesn't exist
+    # Create cache directory
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Initialize model with pretrained Gemma weights
-    model, variables = create_vishwamai_transformer(
-        config=VishwamAIConfig(**config["model"]),
-        pretrained_weights_path=GEMMA_MODEL_ID,
-        dtype=config["optimization"]["dtype"]
+    # Initialize teacher (Gemma) model
+    logger.info("Loading Gemma teacher model...")
+    teacher_model = VishwamAI(config=VishwamAIConfig(**config["model"]))
+    
+    # Create and initialize student model
+    logger.info("Creating student model...")
+    student_model, student_vars, student_config = create_student_model(
+        config["model"],
+        teacher_model,
+        reduction_factor=0.3,  # Start with 30% of teacher size
+        rng=jax.random.PRNGKey(42)
     )
 
     # Initialize TPU mesh
@@ -198,43 +108,48 @@ def main():
     logger.info(f"Available TPU devices: {devices}")
     mesh_context = TPUMeshContext(config, data_parallel=True)
 
-    # Create Tree of Thoughts for reasoning capabilities
-    tot = TreeOfThoughts(
-        model=model,
-        params=variables["params"],
-        tokenizer=model.tokenizer,
-        max_branches=config["thinking"]["max_branches"],
-        max_depth=config["thinking"]["max_depth"],
-        beam_width=config["thinking"]["beam_width"],
-        temperature=config["thinking"]["temperature"]
+    # Initialize thinking components for both teacher and student
+    logger.info("Initializing thinking components...")
+    teacher_tot, teacher_cot = init_thinking_components(
+        model=teacher_model,
+        params=teacher_model.params,
+        tokenizer=teacher_model.tokenizer,
+        thinking_config=config["thinking"]
+    )
+    
+    student_tot, student_cot = init_thinking_components(
+        model=student_model,
+        params=student_vars,
+        tokenizer=student_model.tokenizer,
+        thinking_config=config["thinking"]
     )
 
-    # Setup training state and optimizer
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(config["training"]["max_grad_norm"]),
-        optax.adamw(
-            learning_rate=config["training"]["learning_rate"],
-            weight_decay=config["training"]["weight_decay"]
-        )
-    )
-
-    state = TPUTrainingState.create(
-        apply_fn=model.apply,
-        params=variables["params"],
-        tx=optimizer,
-        dynamic_scale=None  # We're using bfloat16 which doesn't need dynamic scaling
+    # Create distillation trainer with thinking components
+    trainer = DistillationTrainer(
+        teacher_model=teacher_model,
+        student_config=student_config,
+        temperature=config["distillation"]["temperature"],
+        alpha=config["distillation"]["alpha"],
+        use_flash_attn=config["model"]["use_flash_attn"],
+        profiler=TPUProfiler(config),
+        teacher_tot=teacher_tot,
+        teacher_cot=teacher_cot,
+        student_tot=student_tot,
+        student_cot=student_cot
     )
 
     # Create data pipeline
-    data_pipeline = TPUDataPipeline(
+    data_pipeline = DistillationDataPipeline(
         config=config,
+        teacher_model=teacher_model,
         devices=devices,
         enable_thinking=True
     )
 
-    train_loader = data_pipeline.create_training_dataset(
+    train_loader = data_pipeline.create_distillation_dataset(
         "train-*.parquet",
-        is_training=True
+        is_training=True,
+        cache_teacher_outputs=True
     )
 
     # Training loop with TPU optimizations
@@ -247,21 +162,35 @@ def main():
                 if step >= config["training"]["max_steps"]:
                     break
                 
-                # Training step
-                state, metrics = train_step(state, batch)
+                # Training step with distillation and thinking
+                state, metrics = trainer.train_step(
+                    batch,
+                    enable_thinking=True,
+                    thinking_weight=0.3  # Weight for thinking loss
+                )
                 
                 # Update progress
                 step += 1
                 pbar.update(1)
                 pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
-                    'lr': f"{metrics.get('learning_rate', 0.0):.6f}",
+                    'distill_loss': f"{metrics.get('distill_loss', 0.0):.4f}",
+                    'thinking_loss': f"{metrics.get('thinking_loss', 0.0):.4f}",
+                    'lr': f"{metrics.get('learning_rate', 0.0):.6f}"
                 })
                 
                 # Save checkpoints periodically
                 if step % config["training"]["checkpoint_steps"] == 0:
                     checkpoint_path = CHECKPOINT_DIR / f"checkpoint-{step}"
-                    save_checkpoint(checkpoint_path, state, tot, metrics)
+                    save_checkpoint(
+                        checkpoint_path, 
+                        state, 
+                        teacher_tot, 
+                        teacher_cot,
+                        student_tot,
+                        student_cot,
+                        metrics
+                    )
                     
                 # Log metrics
                 if step % 100 == 0:
@@ -269,27 +198,34 @@ def main():
                     steps_per_second = 100 / (current_time - start_time)
                     logger.info(
                         f"Step {step}: loss = {metrics['loss']:.4f}, "
+                        f"thinking_quality = {metrics.get('thinking_quality', 0.0):.4f}, "
                         f"steps/second = {steps_per_second:.2f}"
                     )
                     start_time = current_time
 
         total_time = time.time() - start_time
         logger.info(f"Training completed in {total_time:.2f} seconds")
-        logger.info(f"Final metrics: {metrics}")
 
-        # Save final checkpoint
-        final_checkpoint_path = CHECKPOINT_DIR / "checkpoint-final"
-        save_checkpoint(final_checkpoint_path, state, tot, metrics)
-
-def save_checkpoint(path: Path, state: TPUTrainingState, tot: TreeOfThoughts, metrics: Dict[str, Any]):
-    """Save training checkpoint with model state and metrics."""
+def save_checkpoint(
+    path: Path,
+    state: TPUTrainingState,
+    teacher_tot: TreeOfThoughts,
+    teacher_cot: ChainOfThoughtPrompting,
+    student_tot: TreeOfThoughts,
+    student_cot: ChainOfThoughtPrompting,
+    metrics: Dict[str, Any]
+):
+    """Save training checkpoint with model and thinking component states."""
     path.mkdir(parents=True, exist_ok=True)
     
     checkpoint_dict = {
         'step': state.step,
         'state': state.params,
         'optimizer_state': state.opt_state,
-        'tot_state': tot.get_state(),
+        'teacher_tot_state': teacher_tot.get_state(),
+        'teacher_cot_state': teacher_cot.get_state(),
+        'student_tot_state': student_tot.get_state(),
+        'student_cot_state': student_cot.get_state(),
         'metrics': metrics
     }
     

@@ -71,54 +71,68 @@ class TPUFlashAttention:
         Returns:
             FlashAttentionOutput with results
         """
-        # Validate and prepare inputs
+        # Reshape inputs to combine batch and head dimensions
         batch_size, seq_len, num_heads, head_dim = query.shape
-        assert key.shape == value.shape == (batch_size, seq_len, num_heads, head_dim)
-        
-        # Optimize memory layout
-        query = optimize_tpu_layout(query, self.block_size)
-        key = optimize_tpu_layout(key, self.block_size)
-        value = optimize_tpu_layout(value, self.block_size)
-        
+        query = query.reshape(batch_size * num_heads, seq_len, head_dim)
+        key = key.reshape(batch_size * num_heads, seq_len, head_dim)
+        value = value.reshape(batch_size * num_heads, seq_len, head_dim)
+
         # Compute attention in blocks
         block_size = min(self.block_size, seq_len)
         num_blocks = (seq_len + block_size - 1) // block_size
-        
-        def attention_block(query_block, key_block, value_block, mask_block=None):
-            # Compute attention scores for block
-            scores = jnp.einsum(
-                'bshd,bthd->bhst',  # [batch, heads, src_len, tgt_len]
-                query_block,
-                key_block,
-                precision=jax.lax.Precision.HIGHEST
-            ) * self.scale_factor
+
+        # Initialize output accumulator
+        output = jnp.zeros((batch_size * num_heads, seq_len, head_dim), dtype=query.dtype)
+
+        for i in range(0, seq_len, block_size):
+            block_end = min(i + block_size, seq_len)
             
+            # Extract current query block
+            q_block = jax.lax.dynamic_slice(
+                query,
+                (0, i, 0),
+                (batch_size * num_heads, block_end - i, head_dim)
+            )
+
+            # Compute scaled dot product attention
+            scores = jnp.einsum(
+                'bhd,bkd->bhk',
+                q_block * self.scale_factor,
+                key,
+                precision=jax.lax.Precision.HIGHEST
+            )
+
             # Apply mask if provided
-            if self.causal or mask_block is not None:
-                causal_mask = (
-                    jnp.triu(jnp.ones((block_size, block_size)), 1)
-                    if self.causal else 0.0
+            if attention_mask is not None:
+                mask_block = jax.lax.dynamic_slice(
+                    attention_mask,
+                    (0, 0, i, 0),
+                    (batch_size, num_heads, block_end - i, seq_len)
                 )
-                if mask_block is not None:
-                    scores = jnp.where(
-                        causal_mask + mask_block,
-                        self.mask_value,
-                        scores
-                    )
-                else:
-                    scores = jnp.where(
-                        causal_mask,
-                        self.mask_value,
-                        scores
-                    )
-                    
-            # Apply attention bias
+                mask_block = mask_block.reshape(batch_size * num_heads, block_end - i, seq_len)
+                scores = jnp.where(mask_block, scores, self.mask_value)
+
+            # Apply causal mask if needed
+            if self.causal:
+                causal_mask = jnp.triu(
+                    jnp.ones((block_end - i, seq_len), dtype=bool),
+                    k=1
+                )
+                scores = jnp.where(causal_mask, self.mask_value, scores)
+
+            # Add bias if provided
             if bias is not None:
-                scores = scores + bias
-                
+                bias_block = jax.lax.dynamic_slice(
+                    bias,
+                    (0, 0, i, 0),
+                    (batch_size, num_heads, block_end - i, seq_len)
+                )
+                bias_block = bias_block.reshape(batch_size * num_heads, block_end - i, seq_len)
+                scores = scores + bias_block
+
             # Compute attention weights
             weights = jax.nn.softmax(scores, axis=-1)
-            
+
             # Apply dropout if training
             if self.dropout_rate > 0.0 and not deterministic:
                 weights = jax.random.dropout(
@@ -126,40 +140,22 @@ class TPUFlashAttention:
                     self.dropout_rate,
                     weights
                 )
-                
+
             # Compute attention output
-            return jnp.einsum(
-                'bhst,bthd->bshd',  # [batch, src_len, heads, dim]
+            block_output = jnp.einsum(
+                'bhk,bkd->bhd',
                 weights,
-                value_block,
+                value,
                 precision=jax.lax.Precision.HIGHEST
             )
-            
-        # Process attention in blocks
-        output_blocks = []
-        
-        for i in range(0, seq_len, block_size):
-            block_end = min(i + block_size, seq_len)
-            
-            q_block = jax.lax.dynamic_slice(
-                query,
-                (0, i, 0, 0),
-                (batch_size, block_size, num_heads, head_dim)
-            )
-            
-            # Compute attention for block
-            block_output = attention_block(
-                q_block,
-                key,
-                value,
-                attention_mask[:, i:block_end] if attention_mask is not None else None
-            )
-            
-            output_blocks.append(block_output)
-            
-        # Concatenate blocks
-        output = jnp.concatenate(output_blocks, axis=1)
-        
+
+            # Update output with block result
+            output = output.at[:, i:block_end].set(block_output)
+
+        # Reshape output back to original dimensions
+        output = output.reshape(batch_size, num_heads, seq_len, head_dim)
+        output = jnp.transpose(output, (0, 2, 1, 3))
+
         return FlashAttentionOutput(
             output=output,
             attention_probs=None  # Don't store for memory efficiency

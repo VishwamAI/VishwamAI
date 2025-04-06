@@ -218,79 +218,11 @@ def fp8_gemm_optimized(
     if K != K_:
         raise ValueError(f"Incompatible inner dimensions: {K} != {K_}")
 
-    # Compute chunk sizes that divide evenly into the matrix dimensions
-    M_chunks = (M + block_size - 1) // block_size
-    N_chunks = (N + block_size - 1) // block_size
-    K_chunks = (K + block_size - 1) // block_size
+    # Ensure scales are vectors
+    if x_scale.ndim > 1:
+        x_scale = x_scale.reshape(-1)
+    if kernel_scale.ndim > 1:
+        kernel_scale = kernel_scale.reshape(-1)
 
-    # Pad dimensions to chunk boundaries if needed
-    M_pad = M_chunks * block_size - M
-    N_pad = N_chunks * block_size - N
-    K_pad = K_chunks * block_size - K
-
-    if M_pad > 0 or K_pad > 0:
-        x = jnp.pad(x, ((0, M_pad), (0, K_pad)))
-        x_scale = jnp.pad(x_scale, ((0, M_pad), (0, 0)))
-
-    if K_pad > 0 or N_pad > 0:
-        kernel = jnp.pad(kernel, ((0, K_pad), (0, N_pad)))
-        kernel_scale = jnp.pad(kernel_scale, ((0, 0), (0, N_pad)))
-
-    # Initialize output array with correct dtype
-    compute_dtype = jnp.bfloat16
-    result = jnp.zeros((M_chunks * block_size, N_chunks * block_size), dtype=compute_dtype)
-
-    # Process matrix multiply in chunks
-    for i in range(M_chunks):
-        for j in range(N_chunks):
-            # Extract current chunks
-            x_chunk = jax.lax.dynamic_slice(
-                x,
-                (i * block_size, 0),
-                (block_size, K)
-            )
-            x_scale_chunk = jax.lax.dynamic_slice(
-                x_scale,
-                (i * block_size, 0),
-                (block_size, 1)
-            )
-
-            kernel_chunk = jax.lax.dynamic_slice(
-                kernel,
-                (0, j * block_size),
-                (K, block_size)
-            )
-            kernel_scale_chunk = jax.lax.dynamic_slice(
-                kernel_scale,
-                (0, j * block_size),
-                (1, block_size)
-            )
-
-            # Cast chunks to compute dtype for matmul
-            x_chunk = x_chunk.astype(compute_dtype)
-            kernel_chunk = kernel_chunk.astype(compute_dtype)
-
-            # Compute chunk result with appropriate precision
-            chunk_result = jax.lax.dot_general(
-                x_chunk,
-                kernel_chunk,
-                dimension_numbers=(((1,), (0,)), ((), ())),
-                precision=jax.lax.Precision.HIGHEST
-            )
-
-            # Apply scales (as bfloat16)
-            chunk_scale = (x_scale_chunk * kernel_scale_chunk).astype(compute_dtype)
-            chunk_result = chunk_result * chunk_scale
-
-            # Update result with proper dtype casting
-            result = jax.lax.dynamic_update_slice(
-                result,
-                chunk_result.astype(compute_dtype),
-                (i * block_size, j * block_size)
-            )
-
-    # Remove padding if needed
-    if M_pad > 0 or N_pad > 0:
-        result = jax.lax.dynamic_slice(result, (0, 0), (M, N))
-
-    return result
+    # Simple but efficient matrix multiplication with broadcasting
+    return jnp.dot(x * x_scale[:, None], kernel * kernel_scale[None, :])

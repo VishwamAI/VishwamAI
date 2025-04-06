@@ -1,293 +1,253 @@
-"""Pre-training script optimized for TPU execution with Gemma distillation and thinking layers."""
+"""Pre-training script optimized for TPU execution with Gemma weights loading."""
 
 import jax
 import jax.numpy as jnp
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+import optax
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, Tuple, List, Union
+from functools import partial
+
 from vishwamai.model import VishwamAI, VishwamAIConfig
 from vishwamai.transformer import EnhancedTransformerModel, TPUTrainingState 
 from vishwamai.pipeline import TPUDataPipeline, DistillationDataPipeline
 from vishwamai.device_mesh import TPUMeshContext
-from vishwamai.distill import (
-    create_student_model, 
-    initialize_from_teacher,
-    DistillationTrainer
-)
+from vishwamai.distill import create_student_model
 from vishwamai.thoughts import TreeOfThoughts
 from vishwamai.configs.tpu_v3_config import TPUV3Config
-from vishwamai.configs.budget_model_config import BudgetModelConfig
+from vishwamai.utils.model_loading import load_pretrained_weights
 from vishwamai.profiler import TPUProfiler
+from vishwamai.logger import setup_logging
 import time
 from tqdm.auto import tqdm
 
-@dataclass
-class TPUTrainingConfig:
-    """Training configuration for TPU."""
-    model_config: Dict[str, Any]
-    thinking_config: Dict[str, Any]
-    batch_size: int
-    grad_accum_steps: int
-    learning_rate: float
-    warmup_steps: int
-    max_steps: int
-    weight_decay: float
-    max_grad_norm: float
-    dtype: Any
-    enable_pjit: bool = True
-    block_size: int = 128
-    use_flash_attn: bool = True
-    mixed_precision: bool = True
+# Setup logging
+logger = setup_logging(__name__)
+
+# Constants
+CHECKPOINT_DIR = Path("checkpoints")
+LOGS_DIR = Path("logs")
+GEMMA_MODEL_ID = "google/gemma-3-27b-pt"
+CACHE_DIR = Path("model_cache")
+
+def train_step(state: TPUTrainingState, batch: Dict[str, Any]) -> Tuple[TPUTrainingState, Dict[str, Any]]:
+    """Perform a single training step."""
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {'params': params},
+            batch['input_ids'],
+            deterministic=False
+        )['logits']
+        
+        # Calculate loss with label smoothing
+        labels = batch['labels']
+        padding_mask = (labels != 0)
+        label_smoothing = 0.1
+        
+        # Convert labels to one-hot with label smoothing
+        num_classes = logits.shape[-1]
+        labels_onehot = jax.nn.one_hot(labels, num_classes)
+        labels_smooth = ((1.0 - label_smoothing) * labels_onehot +
+                        label_smoothing / num_classes)
+        
+        # Compute cross entropy loss
+        logits_shifted = logits[..., :-1, :]
+        labels_shifted = labels_smooth[..., 1:, :]
+        padding_mask_shifted = padding_mask[..., 1:]
+        
+        loss = -jnp.sum(
+            labels_shifted * jax.nn.log_softmax(logits_shifted, axis=-1),
+            axis=-1
+        )
+        loss = jnp.sum(loss * padding_mask_shifted) / jnp.sum(padding_mask_shifted)
+        
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, logits), grads = grad_fn(state.params)
+    
+    # Update state
+    state = state.apply_gradients(grads=grads)
+    
+    # Compute metrics
+    metrics = {
+        'loss': loss,
+        'learning_rate': state.opt_state[1].learning_rate,
+        'gradient_norm': optax.global_norm(grads)
+    }
+    
+    return state, metrics
 
 def get_pretrain_config() -> Dict[str, Any]:
-    """Get pre-training configuration."""
+    """Get pretraining configuration."""
     # Start with TPU v3 optimized base config
-    tpu_config = TPUV3Config()
-    
-    return {
+    config = {
         "model": {
-            **tpu_config.model_config,
-            "use_flash_attn": True,
-            "vocab_size": 256000,  # Updated for Gemma-3 tokenizer
-            "hidden_dim": 8192,    # Scaled up for 27B model
-            "num_layers": 80,      # Gemma-3-27b architecture
-            "num_heads": 64,       # Increased for 27B
-            "head_dim": 128,
-            "mlp_dim": 28672,     # Increased for 27B
-            "max_seq_len": 8192,   # Support longer sequences
-            "dropout_rate": 0.0,   # Reduced for pre-training
-            "attention_dropout": 0.0
+            "vocab_size": 256000,  # Gemma vocabulary size
+            "hidden_dim": 5120,    # Matches Gemma-3b architecture
+            "num_layers": 28,
+            "num_heads": 32,
+            "head_dim": 160,
+            "mlp_dim": 20480,
+            "max_seq_len": 8192,
+            "dropout_rate": 0.0,
+            "attention_dropout": 0.0,
+            "use_flash_attn": True
         },
         "training": {
-            **tpu_config.training_config,
-            "batch_size": 32,      # Adjusted for TPU memory
-            "grad_accum_steps": 8, # Increased for effective batch size
+            "batch_size": 32,      # Reduced for GPU memory
+            "grad_accum_steps": 4,
             "learning_rate": 1e-4,
             "warmup_steps": 2000,
             "max_steps": 100000,
-            "weight_decay": 0.01,
+            "weight_decay": 0.1,
             "max_grad_norm": 1.0,
             "checkpoint_steps": 1000
         },
-        "tpu": {
-            **tpu_config.tpu_config,
-            "device_strategy": "data_parallel"
-        },
         "optimization": {
             "dtype": "bfloat16",
-            "use_fp8_gemm": False,  # Disabled since fp8 not available
-            "block_size": 128,
-            "mixed_precision": True,
-            "teacher_load_dtype": "bfloat16",
-            "gradient_checkpointing": True  # Enable for memory efficiency
+            "gradient_checkpointing": True,
+            "mixed_precision": True
         },
         "thinking": {
             "num_steps": 3,
-            "max_branches": 3,
-            "max_depth": 5,
-            "beam_width": 5,
+            "max_branches": 4,
+            "max_depth": 3,
+            "beam_width": 4,
             "temperature": 0.7
         },
-        "distillation": {
-            "teacher_model": "google/gemma-3-27b-pt",  # Updated to 27B
-            "temperature": 2.0,
-            "alpha": 0.5,
-            "layer_mapping_strategy": "uniform"
+        "hardware": {
+            "device": "gpu",  # Will be auto-detected
+            "mesh_shape": [1, 1],  # Single device for now
+            "mesh_order": ['data', 'model']
         }
     }
-
-def create_vishwamai_transformer(model_name: str, dtype: str = "bfloat16") -> Tuple[VishwamAI, Any]:
-    """Create a VishwamAI transformer model and initialize its parameters."""
-    config = VishwamAIConfig(
-        vocab_size=32000,
-        hidden_dim=2048,
-        num_layers=24,
-        num_heads=16, 
-        head_dim=128,
-        mlp_dim=8192,
-        max_seq_len=2048,
-        dropout_rate=0.1,
-        attention_dropout=0.1,
-        use_flash_attn=True
-    )
     
+    # Auto-detect hardware and adjust configuration
+    try:
+        import jax
+        if len(jax.devices()) > 1:
+            config["hardware"]["mesh_shape"] = [len(jax.devices()), 1]
+        if any(d.platform == "tpu" for d in jax.devices()):
+            config["hardware"]["device"] = "tpu"
+            config["training"]["batch_size"] = 512  # Increase for TPU
+    except:
+        pass
+        
+    return config
+
+def create_vishwamai_transformer(
+    config: VishwamAIConfig,
+    pretrained_weights_path: Optional[str] = None,
+    dtype: str = "bfloat16"
+) -> Tuple[VishwamAI, Dict[str, Any]]:
+    """Create a VishwamAI transformer model and initialize with Gemma weights."""
     model = VishwamAI(config=config)
     
-    # Initialize model parameters
-    rng = jax.random.PRNGKey(0)
-    dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
-    variables = model.init(rng, dummy_input)
-    
-    return model, variables['params']
-
-def setup_tpu_training(
-    config: TPUTrainingConfig,
-    enable_profiling: bool = True,
-    model: Optional[EnhancedTransformerModel] = None,
-    initial_params: Optional[Dict[str, Any]] = None
-) -> Tuple[TPUTrainingState, Any, Any, Optional[TPUProfiler]]:
-    """Set up TPU training state and components."""
-    
-    # Create device mesh
-    devices = jax.devices()
-    device_mesh = jax.sharding.Mesh(devices, ("data",))
-    
-    # Initialize model if not provided
-    if model is None:
-        model = create_vishwamai_transformer(config.model_config)[0]
-    
-    # Set up training state
-    rng = jax.random.PRNGKey(42)
-    state = TPUTrainingState(
-        params=initial_params or model.init(rng, jnp.ones((1, 128), dtype=jnp.int32)),
-        opt_state=None,  # Will be initialized by optimizer
-        model_fn=model.apply,
-        tx=None  # Will be initialized by optimizer
-    )
-    
-    # Create profiler if requested
-    profiler = TPUProfiler(config) if enable_profiling else None
-    
-    # Create training step function
-    @jax.jit
-    def train_step(state: TPUTrainingState, batch: Dict[str, jnp.ndarray]):
-        """Single training step."""
-        def loss_fn(params):
-            logits = state.model_fn({"params": params}, batch["input_ids"])
-            return jax.nn.softmax_cross_entropy_with_integer_labels(
-                logits, batch["labels"]
-            ).mean()
+    if pretrained_weights_path:
+        # Load pretrained Gemma weights
+        pretrained_weights = load_pretrained_weights(
+            model_id=GEMMA_MODEL_ID,
+            cache_dir=str(CACHE_DIR),
+            dtype=getattr(jnp, dtype)
+        )
         
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grads = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grads)
+        # Initialize with dummy input to get param structure
+        rng = jax.random.PRNGKey(0)
+        dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
+        variables = model.init(rng, dummy_input)
         
-        metrics = {"loss": loss}
-        return new_state, metrics
+        # Map pretrained weights to model structure
+        mapped_weights = {}
+        for name, param in variables['params'].items():
+            if name in pretrained_weights:
+                mapped_weights[name] = pretrained_weights[name]
+            else:
+                logger.warning(f"Parameter {name} not found in pretrained weights")
+                mapped_weights[name] = param
+        
+        variables['params'] = mapped_weights
+    else:
+        # Initialize from scratch
+        rng = jax.random.PRNGKey(0)
+        dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
+        variables = model.init(rng, dummy_input)
     
-    return state, device_mesh, train_step, profiler
+    return model, variables
 
 def main():
     # Load configuration
     config = get_pretrain_config()
-    training_config = TPUTrainingConfig(
-        model_config=config["model"],
-        thinking_config=config["thinking"],  # Add thinking config
-        batch_size=config["training"]["batch_size"],
-        grad_accum_steps=config["training"]["grad_accum_steps"],
-        learning_rate=config["training"]["learning_rate"],
-        warmup_steps=config["training"]["warmup_steps"],
-        max_steps=config["training"]["max_steps"],
-        weight_decay=config["training"]["weight_decay"],
-        max_grad_norm=config["training"]["max_grad_norm"],
-        dtype=config["optimization"]["dtype"],
-        enable_pjit=True,
-        block_size=config["optimization"]["block_size"],
-        use_flash_attn=config["model"]["use_flash_attn"],
-        mixed_precision=config["optimization"]["mixed_precision"]
+    
+    # Create cache directory if it doesn't exist
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize model with pretrained Gemma weights
+    model, variables = create_vishwamai_transformer(
+        config=VishwamAIConfig(**config["model"]),
+        pretrained_weights_path=GEMMA_MODEL_ID,
+        dtype=config["optimization"]["dtype"]
     )
 
     # Initialize TPU mesh
     devices = jax.devices()
-    print(f"Available TPU devices: {devices}")
+    logger.info(f"Available TPU devices: {devices}")
     mesh_context = TPUMeshContext(config, data_parallel=True)
 
-    # Initialize teacher model (Gemma-27B) with parameters
-    teacher_model, teacher_params = create_vishwamai_transformer(
-        model_name=config["distillation"]["teacher_model"],
-        dtype=config["optimization"]["teacher_load_dtype"]
-    )
-    
-    # Initialize Tree of Thoughts for teacher model
-    teacher_tot = TreeOfThoughts(
-        model=teacher_model,
-        params=teacher_params,  # Use initialized parameters
-        tokenizer=teacher_model.tokenizer,
+    # Create Tree of Thoughts for reasoning capabilities
+    tot = TreeOfThoughts(
+        model=model,
+        params=variables["params"],
+        tokenizer=model.tokenizer,
         max_branches=config["thinking"]["max_branches"],
         max_depth=config["thinking"]["max_depth"],
         beam_width=config["thinking"]["beam_width"],
         temperature=config["thinking"]["temperature"]
     )
-    
-    # Create and initialize student model from teacher with memory optimizations
-    student_model, student_vars, student_config = create_student_model(
-        {
-            **config["model"],
-            "gradient_checkpointing": True,  # Enable gradient checkpointing
-            "hidden_dim": 4096,    # Reduce model size initially
-            "num_layers": 24,      # Reduce number of layers
-            "num_heads": 32,       # Adjust head count
-            "mlp_dim": 16384      # Reduce MLP dimension
-        },
-        teacher_model,
-        24/80,  # Adjusted reduction factor for smaller initial model
-        jax.random.PRNGKey(42)
-    )
-    
-    # Initialize Tree of Thoughts for student model 
-    student_tot = TreeOfThoughts(
-        model=student_model,
-        params=student_vars,
-        tokenizer=student_model.tokenizer,
-        max_branches=config["thinking"]["max_branches"],
-        max_depth=config["thinking"]["max_depth"],
-        beam_width=config["thinking"]["beam_width"],
-        temperature=config["thinking"]["temperature"]
-    )
-    
-    # Initialize distillation trainer with memory optimizations and thinking
-    distill_trainer = DistillationTrainer(
-        teacher_model=teacher_model,
-        teacher_params=teacher_params,  # Pass teacher parameters
-        student_config=student_config,
-        temperature=config["distillation"]["temperature"],
-        alpha=config["distillation"]["alpha"],
-        use_flash_attn=config["model"]["use_flash_attn"],
-        use_fp8=config["optimization"]["use_fp8_gemm"],
-        block_size=config["optimization"]["block_size"],
-        teacher_tot=teacher_tot,
-        student_tot=student_tot
+
+    # Setup training state and optimizer
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config["training"]["max_grad_norm"]),
+        optax.adamw(
+            learning_rate=config["training"]["learning_rate"],
+            weight_decay=config["training"]["weight_decay"]
+        )
     )
 
-    # Setup training state and data pipeline with profiling
-    state, device_mesh, train_step, profiler = setup_tpu_training(
-        training_config, 
-        enable_profiling=True,
-        model=student_model,
-        initial_params=student_vars
+    state = TPUTrainingState.create(
+        apply_fn=model.apply,
+        params=variables["params"],
+        tx=optimizer,
+        dynamic_scale=None  # We're using bfloat16 which doesn't need dynamic scaling
     )
 
-    # Initialize student parameters from teacher using uniform layer mapping
-    state = initialize_from_teacher(
-        student_state=state,
-        teacher_state=teacher_params,
-        method="layer_mapping",
-        mapping_strategy=config["distillation"]["layer_mapping_strategy"]
-    )
-
-    # Create optimized data pipeline for distillation
-    data_pipeline = DistillationDataPipeline(
-        config=config, 
-        teacher_model=teacher_model,
+    # Create data pipeline
+    data_pipeline = TPUDataPipeline(
+        config=config,
         devices=devices,
-        enable_thinking=True  # Enable thinking in data pipeline
+        enable_thinking=True
     )
-    train_loader = data_pipeline.create_distillation_dataset(
+
+    train_loader = data_pipeline.create_training_dataset(
         "train-*.parquet",
-        is_training=True,
-        cache_teacher_outputs=True
+        is_training=True
     )
-    
+
     # Training loop with TPU optimizations
     with mesh_context:
         step = 0
         start_time = time.time()
         
-        with tqdm(total=training_config.max_steps) as pbar:
+        with tqdm(total=config["training"]["max_steps"]) as pbar:
             for batch in train_loader:
-                if step >= training_config.max_steps:
+                if step >= config["training"]["max_steps"]:
                     break
-                    
-                # Training step with distillation and thinking
+                
+                # Training step
                 state, metrics = train_step(state, batch)
                 
                 # Update progress
@@ -295,35 +255,51 @@ def main():
                 pbar.update(1)
                 pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
-                    'distill_loss': f"{metrics.get('distill_loss', 0.0):.4f}",
-                    'thinking_loss': f"{metrics.get('thinking_loss', 0.0):.4f}",
                     'lr': f"{metrics.get('learning_rate', 0.0):.6f}",
                 })
                 
-                # Log performance metrics and save checkpoints
-                if step % 100 == 0 and profiler is not None:
-                    stats = profiler.get_metrics_summary()
-                    print(f"\nStep {step} statistics:")
-                    print(f"TPU utilization: {stats['tpu_utilization_mean']:.2%}")
-                    print(f"Memory usage: {stats['memory_usage_mean']:.2f} GB")
-                    print(f"Training throughput: {stats['throughput_mean']:.2f} samples/sec")
-                    print(f"Teacher agreement: {metrics.get('teacher_agreement', 0.0):.2%}")
-                    print(f"Thinking quality: {metrics.get('thinking_quality', 0.0):.2%}")
-                
+                # Save checkpoints periodically
                 if step % config["training"]["checkpoint_steps"] == 0:
-                    # Save checkpoint with thinking state
-                    checkpoint_dict = {
-                        'step': step,
-                        'state': state,
-                        'teacher_tot_state': teacher_tot.get_state(),
-                        'student_tot_state': student_tot.get_state(),
-                        'metrics': metrics
-                    }
-                    # Checkpoint saving logic here
-        
+                    checkpoint_path = CHECKPOINT_DIR / f"checkpoint-{step}"
+                    save_checkpoint(checkpoint_path, state, tot, metrics)
+                    
+                # Log metrics
+                if step % 100 == 0:
+                    current_time = time.time()
+                    steps_per_second = 100 / (current_time - start_time)
+                    logger.info(
+                        f"Step {step}: loss = {metrics['loss']:.4f}, "
+                        f"steps/second = {steps_per_second:.2f}"
+                    )
+                    start_time = current_time
+
         total_time = time.time() - start_time
-        print(f"\nTraining completed in {total_time:.2f} seconds")
-        print("Final training metrics:", metrics)
+        logger.info(f"Training completed in {total_time:.2f} seconds")
+        logger.info(f"Final metrics: {metrics}")
+
+        # Save final checkpoint
+        final_checkpoint_path = CHECKPOINT_DIR / "checkpoint-final"
+        save_checkpoint(final_checkpoint_path, state, tot, metrics)
+
+def save_checkpoint(path: Path, state: TPUTrainingState, tot: TreeOfThoughts, metrics: Dict[str, Any]):
+    """Save training checkpoint with model state and metrics."""
+    path.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint_dict = {
+        'step': state.step,
+        'state': state.params,
+        'optimizer_state': state.opt_state,
+        'tot_state': tot.get_state(),
+        'metrics': metrics
+    }
+    
+    with (path / "checkpoint.safetensors").open('wb') as f:
+        jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.bfloat16) if x.dtype == jnp.float32 else x,
+            checkpoint_dict
+        ).save(f)
+    
+    logger.info(f"Saved checkpoint to {path}")
 
 if __name__ == "__main__":
     main()

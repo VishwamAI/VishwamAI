@@ -186,11 +186,32 @@ def test_flash_attention(student_model, training_config):
     num_heads = training_config["model"]["num_heads"]
     head_dim = training_config["model"]["head_dim"]
     shape = (batch_size, seq_len, num_heads, head_dim)
+    
+    # Create inputs
     query = jnp.ones(shape)
     key = jnp.ones(shape)
     value = jnp.ones(shape)
-    output = student_model.attention(query, key, value)
+    
+    # Initialize model variables
+    rng = jax.random.PRNGKey(0)
+    variables = student_model.init(
+        rng, 
+        jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    )
+    
+    # Call attention through apply for proper scoping
+    output = student_model.apply(
+        variables,
+        query,
+        key,
+        value,
+        method=student_model.memory_efficient_attention,
+        deterministic=True
+    )
+    
+    # Check output shape and values
     assert output.shape == shape
+    assert not jnp.any(jnp.isnan(output))
 
 def test_model_parallel_setup():
     """Test model parallel initialization."""
@@ -257,9 +278,15 @@ def test_optimized_kv_cache(student_model):
         num_heads=num_heads,
         head_dim=head_dim
     )
-    assert "keys" in kv_cache
-    assert "values" in kv_cache
-    assert kv_cache["keys"].shape == (batch_size, max_length, num_heads, head_dim)
+    
+    # Check cache structure and shapes
+    assert 'key_cache' in kv_cache
+    assert 'value_cache' in kv_cache
+    assert 'cur_index' in kv_cache
+    
+    assert kv_cache['key_cache'].shape == (batch_size, max_length, num_heads, head_dim)
+    assert kv_cache['value_cache'].shape == (batch_size, max_length, num_heads, head_dim)
+    assert kv_cache['cur_index'] == 0
 
 def test_memory_efficient_attention(student_model, training_config):
     """Test memory-efficient attention implementation."""
@@ -410,3 +437,46 @@ def test_error_handling():
             teacher_model=None,
             devices=jax.devices()
         )
+
+def test_duckdb_logging(tmp_path):
+    """Test DuckDB logging functionality."""
+    from vishwamai.logger import setup_logging
+    import pandas as pd
+    import shutil
+    
+    # Setup test logging
+    log_dir = tmp_path / "test_logs"
+    db_path = str(log_dir / "test.duckdb")
+    logger = setup_logging(
+        name="test_logger",
+        db_path=db_path,
+        log_dir=str(log_dir),
+        experiment_name="test_experiment",
+        config={"test": True}
+    )
+    
+    # Log some test metrics
+    metrics = {
+        'loss': 0.5,
+        'accuracy': 0.95,
+        'learning_rate': 0.001
+    }
+    
+    for step in range(10):
+        logger.log_metrics(metrics, step)
+        metrics['loss'] *= 0.9  # Simulate improving loss
+    
+    # Get experiment summary
+    summary = logger.get_experiment_summary()
+    assert summary['total_steps'] == 9
+    assert 'metrics_summary' in summary
+    assert 'train/loss' in summary['metrics_summary']
+    
+    # Export to CSV and verify
+    logger.export_to_csv(str(log_dir))
+    metrics_csv = pd.read_csv(f"{log_dir}/test_experiment_metrics.csv")
+    assert len(metrics_csv) == 30  # 10 steps * 3 metrics
+    
+    # Clean up
+    logger.close()
+    shutil.rmtree(log_dir)

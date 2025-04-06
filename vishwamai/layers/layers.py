@@ -9,71 +9,68 @@ from vishwamai.kernels.core.kernel import fp8_gemm_optimized, act_quant, optimiz
 from vishwamai.layers.mode import DynamicExpertGating
 
 class TPUGEMMLinear(nn.Module):
-    """Linear layer with TPU-optimized GEMM operations."""
+    """TPU-optimized linear layer with FP8 support."""
     features: int
     use_bias: bool = True
-    dtype: Any = jnp.bfloat16  # Changed to bfloat16 for TPU
-    precision: Any = None
-    kernel_init: Any = nn.initializers.lecun_normal()
-    bias_init: Any = nn.initializers.zeros
-    use_fp8: bool = True
-    block_size: int = 128
-    
+    dtype: Any = jnp.bfloat16
+    precision: Optional[Any] = None
+    kernel_init: Callable = nn.initializers.glorot_uniform()
+    bias_init: Callable = nn.initializers.zeros
+    transpose: bool = False
+
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        input_shape = x.shape
+    def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        """Apply linear transformation."""
+        inputs = jnp.asarray(inputs, self.dtype)
         
-        # Flatten input if needed
-        x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+        # Store original shape for reshaping output
+        orig_shape = inputs.shape
         
+        # Reshape input to 2D for matrix multiplication
+        if inputs.ndim > 2:
+            inputs = inputs.reshape(-1, inputs.shape[-1])
+            
+        in_features = inputs.shape[-1]
+
         # Initialize kernel with correct shape
-        kernel_shape = (x_flat.shape[-1], self.features)
         kernel = self.param(
             'kernel',
             self.kernel_init,
-            kernel_shape,
+            (in_features, self.features) if not self.transpose else (self.features, in_features),
             self.dtype
         )
-        
-        # Initialize bias if needed
+
+        # Initialize scales for fp8
+        input_scale = self.param(
+            'input_scale',
+            nn.initializers.ones,
+            (1,),
+            jnp.float32
+        )
+        kernel_scale = self.param(
+            'kernel_scale',
+            nn.initializers.ones,
+            (1,),
+            jnp.float32
+        )
+
+        # Apply matrix multiplication with FP8 optimization
+        y = fp8_gemm_optimized(
+            inputs, 
+            input_scale,
+            kernel,
+            kernel_scale,
+            block_size=128
+        )
+
         if self.use_bias:
-            bias = self.param(
-                'bias',
-                self.bias_init,
-                (self.features,),
-                self.dtype
-            )
-        
-        if self.use_fp8:
-            # Quantize inputs and kernel
-            x_quant, x_scale = act_quant(x_flat)
-            kernel_quant, kernel_scale = act_quant(kernel)
-            
-            # Perform matrix multiplication with correct shapes
-            y = fp8_gemm_optimized(
-                x_quant,
-                x_scale,
-                kernel_quant,
-                kernel_scale,
-                block_size=self.block_size
-            )
-        else:
-            # Regular matrix multiplication
-            y = jax.lax.dot_general(
-                x_flat, 
-                kernel,
-                (((1,), (0,)), ((), ())),
-                precision=self.precision or jax.lax.Precision.HIGHEST
-            )
-        
-        # Add bias if needed
-        if self.use_bias:
+            bias = self.param('bias', self.bias_init, (self.features,), self.dtype)
             y = y + bias
-            
-        # Restore original dimensions if input was higher-dimensional
-        if x.ndim > 2:
-            y = y.reshape(input_shape[:-1] + (self.features,))
-            
+
+        # Restore original dimensions if input was higher dimensional
+        if len(orig_shape) > 2:
+            y = y.reshape(orig_shape[:-1] + (self.features,))
+
         return y
 
 class TPULayerNorm(nn.Module):
@@ -154,58 +151,86 @@ class TPUShardedLinear(nn.Module):
 class TPUMultiHeadAttention(nn.Module):
     """TPU-optimized multi-head attention."""
     num_heads: int
-    head_dim: int 
+    head_dim: int
     dropout_rate: float = 0.0
-    dtype: jnp.dtype = jnp.bfloat16
+    dtype: Any = jnp.bfloat16
+    use_flash_attn: bool = True
 
-    @nn.compact
-    def __call__(self,
-                 inputs_q: jnp.ndarray,
-                 inputs_kv: jnp.ndarray,
-                 mask: Optional[jnp.ndarray] = None,
-                 deterministic: bool = True) -> jnp.ndarray:
+    def setup(self):
+        """Initialize attention components."""
+        self.q_proj = TPUGEMMLinear(self.num_heads * self.head_dim, dtype=self.dtype)
+        self.k_proj = TPUGEMMLinear(self.num_heads * self.head_dim, dtype=self.dtype)
+        self.v_proj = TPUGEMMLinear(self.num_heads * self.head_dim, dtype=self.dtype)
+        self.out_proj = TPUGEMMLinear(self.num_heads * self.head_dim, dtype=self.dtype)
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
         
-        batch_size, seq_len = inputs_q.shape[0], inputs_q.shape[1]
+        # Check if flash attention is available
+        try:
+            if self.use_flash_attn:
+                from ..kernels.cuda.flash_mla_cuda import FlashMLA
+                self.has_flash_attn = True
+            else:
+                self.has_flash_attn = False
+        except ImportError:
+            self.has_flash_attn = False
+
+    def __call__(
+        self,
+        queries: jnp.ndarray,
+        keys: jnp.ndarray,
+        values: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+        rng: Optional[Any] = None
+    ) -> jnp.ndarray:
+        """Compute attention with optimizations."""
+        # Project inputs
+        q = self.q_proj(queries)
+        k = self.k_proj(keys)
+        v = self.v_proj(values)
         
-        # Create attention weights
-        query = nn.Dense(features=self.num_heads * self.head_dim)(inputs_q)
-        key = nn.Dense(features=self.num_heads * self.head_dim)(inputs_kv)
-        value = nn.Dense(features=self.num_heads * self.head_dim)(inputs_kv)
-        
-        # Reshape for attention
-        query = query.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        key = key.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        value = value.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        
-        # Scale query
-        depth = self.head_dim
-        query = query / jnp.sqrt(depth).astype(self.dtype)
-        
-        # Calculate attention scores
-        weights = jnp.einsum('bqhd,bkhd->bhqk', query, key)
-        
-        # Apply mask if provided
-        if mask is not None:
-            weights = jnp.where(mask[:, None, :, :], weights, -1e10)
-        
-        # Apply softmax
-        weights = jax.nn.softmax(weights, axis=-1)
-        
-        # Apply dropout inside the compact context
-        weights = nn.Dropout(
-            rate=self.dropout_rate,
-            deterministic=deterministic
-        )(weights)
-        
-        # Calculate attention output
-        output = jnp.einsum('bhqk,bkhd->bqhd', weights, value)
-        
-        # Reshape output
-        output = output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
-        
-        # Final dense projection
-        output = nn.Dense(features=inputs_q.shape[-1])(output)
-        
+        # Reshape for multi-head attention
+        batch_size = queries.shape[0]
+        q = q.reshape(batch_size, -1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(batch_size, -1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(batch_size, -1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        # Try to use flash attention if available
+        if self.has_flash_attn:
+            try:
+                from ..kernels.cuda.flash_mla_cuda import FlashMLA
+                flash_attn = FlashMLA(
+                    head_dim=self.head_dim,
+                    num_heads=self.num_heads,
+                    dropout_rate=self.dropout_rate if not deterministic else 0.0,
+                    causal=False
+                )
+                output = flash_attn(q, k, v, mask=mask)
+            except Exception:
+                # Fallback to standard attention if flash attention fails
+                self.has_flash_attn = False
+                
+        if not self.has_flash_attn:
+            # Standard scaled dot-product attention
+            scale = 1.0 / jnp.sqrt(self.head_dim)
+            scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+
+            if mask is not None:
+                # Broadcast mask to attention shape
+                mask = mask[:, None, None, :] if mask.ndim == 2 else mask
+                scores = jnp.where(mask, scores, float('-inf'))
+
+            weights = jax.nn.softmax(scores, axis=-1)
+            
+            if not deterministic and self.dropout_rate > 0.0:
+                weights = self.dropout(weights, deterministic=False, rng=rng)
+                
+            output = jnp.matmul(weights, v)
+
+        # Reshape back and project output
+        output = output.transpose(0, 2, 1, 3).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        output = self.out_proj(output)
+
         return output
 
 class TPURMSNorm(nn.Module):

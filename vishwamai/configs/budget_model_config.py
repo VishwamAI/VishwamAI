@@ -40,6 +40,20 @@ class BudgetModelConfig:
             "use_flash_attention": True
         }
 
+        # Compute configuration
+        self.compute_config = {
+            "platform": "cpu",  # or "gpu" or "tpu"
+            "num_devices": 1,
+            "device_memory_limit": None,
+            "mesh_shape": [1],
+            "data_parallel": True
+        }
+
+    @property
+    def tpu_config(self):
+        """Compatibility property for TPU configuration."""
+        return self.compute_config
+
     def get_effective_batch_size(self) -> int:
         """Calculate effective batch size with gradient accumulation."""
         return (self.training_config["batch_size"] * 

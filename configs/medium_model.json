@@ -1,0 +1,37 @@
+{
+  "model_config": {
+    "dim": 4096,
+    "depth": 32,
+    "heads": 32,
+    "head_dim": 128,
+    "vocab_size": 50304,
+    "max_seq_len": 4096,
+    "dropout_rate": 0.1,
+    "use_flash_attention": true,
+    "use_grouped_query_attention": true,
+    "gqa_groups": 8,
+    "use_rmsnorm": true,
+    "use_rotary_embeddings": true,
+    "vision_patch_size": 16,
+    "vision_dim": 1024,
+    "audio_dim": 512,
+    "enable_multimodal": true,
+    "expert_count": 8,
+    "expert_capacity": 4,
+    "use_moe": false,
+    "use_bfloat16": true,
+    "gradient_checkpointing": true,
+    "kernel_fusion": true
+  },
+  "description": "Medium VishwamAI model with multimodal capabilities for balanced performance",
+  "estimated_parameters": "7B",
+  "estimated_memory": {
+    "inference_gb": 14.0,
+    "training_gb": 56.0
+  },
+  "recommended_hardware": [
+    "GPU with 24GB+ VRAM (A100, RTX 3090/4090)",
+    "TPU v3/v4",
+    "CPU with 64GB+ RAM"
+  ]
+}

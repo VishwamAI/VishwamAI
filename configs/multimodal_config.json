@@ -1,0 +1,65 @@
+{
+  "model_config": {
+    "dim": 2048,
+    "depth": 24,
+    "heads": 32,
+    "head_dim": 64,
+    "vocab_size": 50304,
+    "max_seq_len": 2048,
+    "dropout_rate": 0.1,
+    "use_flash_attention": true,
+    "use_grouped_query_attention": true,
+    "gqa_groups": 8,
+    "use_rmsnorm": true,
+    "use_rotary_embeddings": true,
+    "vision_patch_size": 16,
+    "vision_dim": 1024,
+    "audio_dim": 512,
+    "enable_multimodal": true,
+    "expert_count": 8,
+    "expert_capacity": 4,
+    "use_moe": false,
+    "use_bfloat16": true,
+    "gradient_checkpointing": true,
+    "kernel_fusion": true
+  },
+  "training_config": {
+    "learning_rate": 1e-4,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "gradient_clip_norm": 1.0,
+    "warmup_steps": 2000,
+    "total_steps": 100000,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 2,
+    "use_curriculum": true,
+    "curriculum_stages": [
+      {
+        "name": "simple",
+        "steps": 20000,
+        "max_seq_len": 512,
+        "description": "Start with short sequences"
+      },
+      {
+        "name": "medium", 
+        "steps": 40000,
+        "max_seq_len": 1024,
+        "description": "Medium length sequences"
+      },
+      {
+        "name": "complex",
+        "steps": 40000,
+        "max_seq_len": 2048,
+        "description": "Full length sequences"
+      }
+    ],
+    "use_lora": true,
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "lora_dropout": 0.1,
+    "lora_modules": ["attention", "feed_forward"]
+  },
+  "description": "Multimodal VishwamAI configuration with curriculum learning and LoRA fine-tuning",
+  "use_case": "Multimodal understanding and generation with efficient training"
+}

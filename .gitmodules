@@ -1,3 +1,0 @@
-[submodule "vishwamai/models/gpu/integrations/3FS"]
-	path = vishwamai/models/gpu/integrations/3FS
-	url = https://github.com/deepseek-ai/3FS.git

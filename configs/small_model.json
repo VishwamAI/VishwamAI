@@ -1,0 +1,37 @@
+{
+  "model_config": {
+    "dim": 1024,
+    "depth": 12,
+    "heads": 16,
+    "head_dim": 64,
+    "vocab_size": 32000,
+    "max_seq_len": 2048,
+    "dropout_rate": 0.1,
+    "use_flash_attention": true,
+    "use_grouped_query_attention": true,
+    "gqa_groups": 4,
+    "use_rmsnorm": true,
+    "use_rotary_embeddings": true,
+    "vision_patch_size": 16,
+    "vision_dim": 768,
+    "audio_dim": 512,
+    "enable_multimodal": false,
+    "expert_count": 4,
+    "expert_capacity": 2,
+    "use_moe": false,
+    "use_bfloat16": true,
+    "gradient_checkpointing": true,
+    "kernel_fusion": true
+  },
+  "description": "Small VishwamAI model suitable for experimentation and resource-constrained environments",
+  "estimated_parameters": "1.2B",
+  "estimated_memory": {
+    "inference_gb": 2.4,
+    "training_gb": 9.6
+  },
+  "recommended_hardware": [
+    "GPU with 8GB+ VRAM",
+    "TPU v2/v3",
+    "CPU with 16GB+ RAM"
+  ]
+}

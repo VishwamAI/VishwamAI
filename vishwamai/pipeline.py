@@ -1,651 +1,453 @@
 """
-Training pipeline and utilities for VishwamAI transformer.
+Text generation and model inference pipeline for VishwamAI.
+
+Provides high-level interfaces for text generation, chat completion,
+and multimodal inference tasks.
 """
 
 import jax
 import jax.numpy as jnp
-import optax
-from typing import Any, Dict, Optional, Tuple, Callable, Iterator
-from functools import partial
-from .distill import (
-    compute_distillation_loss,
-    create_student_model,
-    initialize_from_teacher
-)
-from vishwamai.thoughts.cot import ChainOfThoughtPrompting
-from vishwamai.thoughts.tot import TreeOfThoughts
-import flax
-import pandas as pd
+from flax.training import train_state
+from typing import Dict, Any, Optional, List, Union, Callable
+import chex
+import time
 
-"""TPU-optimized data pipeline"""
+from .model import VishwamAIModel, ModelConfig
+from .multimodal import MultimodalProcessor
 
-import tensorflow as tf
-import numpy as np
 
-class TPUDataPipeline:
-    """Data pipeline optimized for TPU training."""
+class TextGenerator:
+    """High-level text generation interface."""
     
     def __init__(
         self,
-        config: Dict[str, Any],
-        devices: Optional[Any] = None
+        model: VishwamAIModel,
+        params: Dict[str, Any],
+        tokenizer: Any = None,
+        config: Optional[ModelConfig] = None
     ):
-        self.config = config
-        self.batch_size = config['training']['batch_size']
-        self.block_size = config['optimization']['block_size']
-        self.grad_accum_steps = config['training']['grad_accum_steps']
-        self.devices = devices or jax.devices()
-        self.num_devices = len(self.devices)
-        
-        # Compute global batch size
-        self.global_batch_size = (
-            self.batch_size * 
-            self.grad_accum_steps * 
-            self.num_devices
-        )
-        
-        # Set up TF data pipeline
-        tf.config.set_visible_devices([], 'GPU')  # Prevent TF from using GPU
-        
-    def create_dataset(
-        self,
-        file_pattern: str,
-        is_training: bool = True
-    ) -> tf.data.Dataset:
-        """Create optimized dataset for TPU training."""
-        
-        files = tf.data.Dataset.list_files(file_pattern, shuffle=is_training)
-        
-        def parse_example(example):
-            features = {
-                'input_ids': tf.io.FixedLenFeature([self.block_size], tf.int64),
-                'labels': tf.io.FixedLenFeature([self.block_size], tf.int64),
-            }
-            
-            # For distillation
-            if self.config.get('distillation'):
-                features['teacher_logits'] = tf.io.FixedLenFeature(
-                    [self.block_size * self.config['model']['vocab_size']], 
-                    tf.float32
-                )
-            
-            parsed = tf.io.parse_single_example(example, features)
-            
-            # Cast to optimal TPU dtype
-            if self.config['tpu']['use_bfloat16']:
-                for k, v in parsed.items():
-                    if v.dtype == tf.float32:
-                        parsed[k] = tf.cast(v, tf.bfloat16)
-            
-            return parsed
-        
-        def read_tfrecord(filename):
-            dataset = tf.data.TFRecordDataset(
-                filename,
-                compression_type='GZIP',
-                buffer_size=self.block_size * 1024,  # 128KB buffer
-                num_parallel_reads=tf.data.AUTOTUNE
-            )
-            return dataset
-        
-        # Create dataset pipeline
-        dataset = files.interleave(
-            read_tfrecord,
-            cycle_length=tf.data.AUTOTUNE,
-            num_parallel_calls=tf.data.AUTOTUNE,
-            deterministic=not is_training
-        )
-        
-        # Parse examples
-        dataset = dataset.map(
-            parse_example,
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
-        
-        if is_training:
-            # Shuffle before batching
-            dataset = dataset.shuffle(
-                self.global_batch_size * 10,
-                reshuffle_each_iteration=True
-            )
-        
-        # Optimize batch size for TPU
-        dataset = dataset.batch(
-            self.global_batch_size,
-            drop_remainder=is_training
-        )
-        
-        # Prefetch to device
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
-        
-        return dataset
-    
-    def preprocess_batch(
-        self,
-        batch: Dict[str, tf.Tensor]
-    ) -> Dict[str, jnp.ndarray]:
-        """Preprocess batch for TPU training."""
-        # Convert to JAX arrays
-        jax_batch = {
-            k: jnp.array(v) 
-            for k, v in batch.items()
-        }
-        
-        # Reshape for devices and grad accumulation
-        def reshape_for_devices(x):
-            return x.reshape(
-                self.num_devices,
-                self.grad_accum_steps,
-                self.batch_size,
-                *x.shape[1:]
-            )
-        
-        jax_batch = {
-            k: reshape_for_devices(v)
-            for k, v in jax_batch.items()
-        }
-        
-        return jax_batch
-    
-    def get_training_iter(
-        self,
-        dataset: tf.data.Dataset
-    ) -> Iterator[Dict[str, jnp.ndarray]]:
-        """Get iterator for TPU training."""
-        
-        for batch in dataset.as_numpy_iterator():
-            # Preprocess batch
-            jax_batch = self.preprocess_batch(batch)
-            
-            # Split across devices
-            device_batch = {
-                k: jax.device_put_sharded(
-                    list(v), 
-                    self.devices
-                )
-                for k, v in jax_batch.items()
-            }
-            
-            yield device_batch
-
-def create_tpu_data_pipeline(config: Dict[str, Any]) -> TPUDataPipeline:
-    """Create TPU-optimized data pipeline."""
-    # Get TPU devices
-    if config['tpu']['device_strategy'] == 'data_parallel':
-        devices = jax.devices()
-    else:
-        # Set up custom device mesh if needed
-        devices = jax.devices()[:config['tpu']['tpu_cores']]
-    
-    return TPUDataPipeline(config, devices)
-
-class DistillationDataPipeline:
-    """Pipeline for distillation training data."""
-    
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        teacher_model: Any,
-        devices: Any,
-        enable_thinking: bool = False
-    ):
-        """Initialize pipeline for distillation."""
-        # Validate config
-        if not config.get("training", {}).get("batch_size", 0) > 0:
-            raise ValueError("batch_size must be positive")
-
-        self.config = config
-        self.teacher_model = teacher_model
-        self.devices = devices
-        self.enable_thinking = enable_thinking
-        
-        # Initialize with smaller chunk size for memory efficiency
-        self.chunk_size = min(128, config["training"]["batch_size"])
-        
-        # Initialize teacher model variables for inference only
-        if self.teacher_model is not None:
-            rng = jax.random.PRNGKey(0)
-            dummy_input = jnp.ones((1, 32), dtype=jnp.int32)
-            self.teacher_variables = jax.jit(
-                lambda: self.teacher_model.init(rng, dummy_input)
-            )()
-        else:
-            self.teacher_variables = None
-
-    def create_distillation_dataset(
-        self,
-        file_pattern: str,
-        is_training: bool = True,
-        cache_teacher_outputs: bool = True
-    ) -> tf.data.Dataset:
-        """Create dataset for distillation with memory optimizations."""
-        dataset = tf.data.Dataset.list_files(file_pattern)
-        
-        # Use small prefetch and buffer sizes
-        dataset = dataset.prefetch(2)
-        
-        def load_and_process_chunk(file_path):
-            # Read data in smaller chunks
-            df = pd.read_parquet(file_path.numpy().decode(), chunksize=self.chunk_size)
-            for chunk in df:
-                # Process each chunk
-                batch = {
-                    "input_ids": chunk["input_ids"].values,
-                    "labels": chunk["labels"].values if "labels" in chunk else None
-                }
-                if cache_teacher_outputs and self.teacher_model is not None:
-                    # Get teacher predictions in smaller batches
-                    teacher_outputs = []
-                    for i in range(0, len(batch["input_ids"]), self.chunk_size):
-                        chunk_inputs = batch["input_ids"][i:i + self.chunk_size]
-                        outputs = self.teacher_model.apply(
-                            self.teacher_variables,
-                            jnp.array(chunk_inputs),
-                            deterministic=True
-                        )
-                        teacher_outputs.append(outputs)
-                    batch["teacher_logits"] = jnp.concatenate(teacher_outputs, axis=0)
-                yield batch
-
-        # Map and batch with optimized settings
-        dataset = dataset.interleave(
-            lambda x: tf.data.Dataset.from_generator(
-                lambda y: load_and_process_chunk(y),
-                output_types={
-                    "input_ids": tf.int32,
-                    "labels": tf.int32,
-                    "teacher_logits": tf.float32
-                },
-                args=(x,)
-            ),
-            cycle_length=2,
-            block_length=1,
-            num_parallel_calls=2
-        )
-        
-        if is_training:
-            dataset = dataset.shuffle(buffer_size=1000)
-            
-        # Use dynamic batching
-        dataset = dataset.batch(
-            self.config["training"]["batch_size"],
-            drop_remainder=is_training
-        )
-        
-        return dataset.prefetch(2)
-
-    def process_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a batch of data for distillation."""
-        if self.teacher_model is None or self.teacher_variables is None:
-            return batch
-            
-        # Get teacher predictions - handle dict output
-        outputs = self.teacher_model.apply(
-            self.teacher_variables,
-            batch["input_ids"],
-            deterministic=True
-        )
-        
-        # Extract logits from output dict
-        teacher_logits = outputs["logits"] if isinstance(outputs, dict) else outputs
-            
-        processed = {
-            **batch,
-            "teacher_logits": teacher_logits
-        }
-        return processed
-
-    def train_step(self, state: Any, batch: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        """Perform a training step."""
-        rng = jax.random.PRNGKey(0)
-        
-        def loss_fn(params):
-            # Extract student logits ensuring correct parameter structure
-            student_logits = state.apply_fn(
-                {"params": params},
-                batch["input_ids"],
-                deterministic=False,
-                rngs={"dropout": rng}
-            )
-            
-            # Get teacher predictions
-            if self.teacher_model is not None and self.teacher_variables is not None:
-                teacher_outputs = self.teacher_model.apply(
-                    self.teacher_variables,
-                    batch["input_ids"],
-                    deterministic=True
-                )
-                teacher_logits = teacher_outputs["logits"] if isinstance(teacher_outputs, dict) else teacher_outputs
-                
-                loss, metrics = compute_distillation_loss(
-                    student_logits=student_logits["logits"] if isinstance(student_logits, dict) else student_logits,
-                    teacher_logits=teacher_logits,
-                    labels=batch.get("labels"),
-                    temperature=self.config["distillation"]["temperature"],
-                    alpha=self.config["distillation"]["alpha"]
-                )
-                
-                # Add total loss to metrics
-                metrics["loss"] = loss
-            else:
-                # Standard cross entropy loss if no teacher
-                logits = student_logits["logits"] if isinstance(student_logits, dict) else student_logits
-                loss = optax.softmax_cross_entropy_with_integer_labels(
-                    logits,
-                    batch["labels"]
-                ).mean()
-                metrics = {"loss": loss}
-                
-            return loss, metrics
-            
-        # Compute gradients
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        params = state.params["params"] if isinstance(state.params, dict) and "params" in state.params else state.params
-        (loss, metrics), grads = grad_fn(params)
-        
-        # Update state
-        new_state = state.apply_gradients(grads=grads)
-        
-        # Add learning rate to metrics
-        if hasattr(state.tx, "learning_rate"):
-            metrics["learning_rate"] = state.tx.learning_rate
-        elif isinstance(state.opt_state, (tuple, list)) and hasattr(state.opt_state[0], "hyperparams"):
-            metrics["learning_rate"] = state.opt_state[0].hyperparams["learning_rate"]
-        elif hasattr(state.opt_state, "hyperparams"):
-            metrics["learning_rate"] = state.opt_state.hyperparams["learning_rate"]
-        else:
-            # Fallback to configuration value
-            metrics["learning_rate"] = self.config["training"]["learning_rate"]
-            
-        return new_state, metrics
-
-def prepare_distillation_data(
-    config: Dict[str, Any],
-    teacher_model: Any,
-    train_files: str,
-    eval_files: str
-) -> Tuple[TPUDataPipeline, tf.data.Dataset, tf.data.Dataset]:
-    """Prepare data pipeline and datasets for distillation."""
-    
-    pipeline = DistillationDataPipeline(
-        config,
-        teacher_model,
-        devices=jax.devices()
-    )
-    
-    train_dataset = pipeline.create_distillation_dataset(
-        train_files,
-        is_training=True
-    )
-    
-    eval_dataset = pipeline.create_distillation_dataset(
-        eval_files,
-        is_training=False
-    )
-    
-    return pipeline, train_dataset, eval_dataset
-
-class VishwamAIPipeline:
-    """Pipeline for training and inference with VishwamAI transformer."""
-    
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        tokenizer: Any,
-        model: Optional[Any] = None,
-        teacher_model: Optional[Any] = None
-    ):
-        self.config = config
+        self.model = model
+        self.params = params
         self.tokenizer = tokenizer
+        self.config = config
         
-        # Create or use provided model
-        if model is None:
-            self.model = create_vishwamai_transformer(config)
+        # JIT compile generation function
+        self.generate_fn = jax.jit(self._generate_step)
+    
+    def _generate_step(
+        self,
+        input_ids: chex.Array,
+        cache: Optional[Dict[str, Any]] = None,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        rng_key: Optional[jax.random.PRNGKey] = None
+    ) -> chex.Array:
+        """Single generation step."""
+        
+        # Forward pass
+        logits = self.model.apply(
+            self.params,
+            input_ids,
+            training=False
+        )
+        
+        # Get logits for next token
+        next_token_logits = logits[:, -1, :] / temperature
+        
+        # Apply top-k filtering
+        if top_k > 0:
+            top_k_indices = jnp.argsort(next_token_logits, axis=-1)[:, -top_k:]
+            min_top_k = jnp.take_along_axis(
+                next_token_logits, top_k_indices[:, 0:1], axis=-1
+            )
+            next_token_logits = jnp.where(
+                next_token_logits < min_top_k,
+                -jnp.inf,
+                next_token_logits
+            )
+        
+        # Apply top-p (nucleus) filtering
+        if top_p < 1.0:
+            sorted_logits = jnp.sort(next_token_logits, axis=-1)[:, ::-1]
+            sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+            cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
+            
+            # Find cutoff index
+            cutoff_mask = cumulative_probs <= top_p
+            cutoff_indices = jnp.sum(cutoff_mask, axis=-1, keepdims=True)
+            
+            # Apply cutoff
+            sorted_indices = jnp.argsort(next_token_logits, axis=-1)[:, ::-1]
+            cutoff_logits = jnp.take_along_axis(sorted_logits, cutoff_indices, axis=-1)
+            
+            next_token_logits = jnp.where(
+                next_token_logits < cutoff_logits,
+                -jnp.inf,
+                next_token_logits
+            )
+        
+        # Sample next token
+        if rng_key is not None:
+            next_token = jax.random.categorical(rng_key, next_token_logits)
         else:
-            self.model = model
-            
-        self.teacher_model = teacher_model
+            # Greedy sampling
+            next_token = jnp.argmax(next_token_logits, axis=-1)
         
-        # Initialize components
-        self.cot = ChainOfThoughtPrompting(
-            self.model,
-            self.tokenizer,
-            temperature=config.get('temperature', 0.7)
-        )
-        
-        self.tot = TreeOfThoughts(
-            self.model,
-            self.tokenizer,
-            temperature=config.get('temperature', 0.7),
-            max_depth=config.get('tot_max_depth', 5),
-            beam_width=config.get('tot_beam_width', 3)
-        )
-        
-        # Training state
-        self.state = None
-        self.teacher_state = None
-        
-    def setup_training(
-        self,
-        learning_rate_schedule: Callable[[int], float],
-        teacher_state: Optional[Any] = None
-    ):
-        """Setup training state and optimizer."""
-        rng = jax.random.PRNGKey(self.config.get('seed', 42))
-        
-        if self.config.get('use_distillation', False) and teacher_state is not None:
-            # Setup distillation training
-            self.teacher_state = teacher_state
-            self.state = create_train_state(
-                rng,
-                self.config,
-                learning_rate_schedule
-            )
-            self.state = initialize_from_teacher(
-                self.state,
-                teacher_state,
-                method=self.config.get('init_method', 'layer_random')
-            )
-        else:
-            # Standard training
-            self.state = create_train_state(
-                rng,
-                self.config,
-                learning_rate_schedule
-            )
-    
-    @partial(jax.jit, static_argnums=(0,))
-    def train_step(
-        self,
-        state: Any,
-        batch: Dict[str, jnp.ndarray],
-        dropout_rng: Any
-    ) -> Tuple[Any, Dict[str, float]]:
-        """Single training step."""
-        
-        if self.teacher_state is not None:
-            # Distillation training step
-            return self._distillation_train_step(
-                state,
-                self.teacher_state,
-                batch,
-                dropout_rng
-            )
-        else:
-            # Standard training step
-            return self._standard_train_step(
-                state,
-                batch,
-                dropout_rng
-            )
-    
-    def _standard_train_step(
-        self,
-        state: Any,
-        batch: Dict[str, jnp.ndarray],
-        dropout_rng: Any
-    ) -> Tuple[Any, Dict[str, float]]:
-        """Standard training step without distillation."""
-        
-        def loss_fn(params):
-            logits = state.apply_fn(
-                {'params': params},
-                batch['input_ids'],
-                deterministic=False,
-                rngs={'dropout': dropout_rng}
-            )
-            
-            loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits,
-                batch['labels']
-            )
-            return loss.mean(), logits
-        
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, logits), grads = grad_fn(state.params)
-        
-        new_state = state.apply_gradients(grads=grads)
-        
-        metrics = {
-            'loss': loss,
-            'learning_rate': state.opt_state.hyperparams['learning_rate']
-        }
-        
-        return new_state, metrics
-    
-    def _distillation_train_step(
-        self,
-        state: Any,
-        teacher_state: Any,
-        batch: Dict[str, jnp.ndarray],
-        dropout_rng: Any
-    ) -> Tuple[Any, Dict[str, float]]:
-        """Training step with knowledge distillation."""
-        
-        def loss_fn(params):
-            # Get student predictions
-            student_logits = state.apply_fn(
-                {'params': params},
-                batch['input_ids'],
-                deterministic=False,
-                rngs={'dropout': dropout_rng}
-            )
-            
-            # Get teacher predictions
-            teacher_logits = teacher_state.apply_fn(
-                {'params': teacher_state.params},
-                batch['input_ids'],
-                deterministic=True
-            )
-            
-            # Compute distillation loss
-            loss, metrics = compute_distillation_loss(
-                student_logits,
-                teacher_logits,
-                batch['labels'],
-                temperature=self.config.get('temperature', 2.0),
-                alpha=self.config.get('distill_alpha', 0.5)
-            )
-            
-            # Add total loss to metrics
-            metrics['loss'] = loss.mean()
-            
-            return loss.mean(), (metrics, student_logits)
-        
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, (metrics, _)), grads = grad_fn(state.params)
-        
-        new_state = state.apply_gradients(grads=grads)
-        metrics['learning_rate'] = state.opt_state.hyperparams['learning_rate']
-        
-        return new_state, metrics
-    
-    @partial(jax.jit, static_argnums=(0,))
-    def eval_step(
-        self,
-        state: Any,
-        batch: Dict[str, jnp.ndarray]
-    ) -> Dict[str, jnp.ndarray]:
-        """Evaluation step."""
-        
-        logits = state.apply_fn(
-            {'params': state.params},
-            batch['input_ids'],
-            deterministic=True
-        )
-        
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits,
-            batch['labels']
-        )
-        
-        return {
-            'loss': loss.mean(),
-            'logits': logits
-        }
+        return next_token
     
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[int]],
+        max_length: int = 512,
+        min_length: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        seed: Optional[int] = None
+    ) -> Union[str, List[int]]:
+        """Generate text from prompt."""
+        
+        # Setup RNG
+        if seed is not None:
+            rng_key = jax.random.PRNGKey(seed)
+        else:
+            rng_key = jax.random.PRNGKey(int(time.time()))
+        
+        # Tokenize prompt if string
+        if isinstance(prompt, str):
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer required for string prompts")
+            input_ids = self.tokenizer.encode(prompt)
+            return_string = True
+        else:
+            input_ids = prompt
+            return_string = False
+        
+        # Convert to JAX array
+        input_ids = jnp.array([input_ids], dtype=jnp.int32)
+        batch_size, prompt_length = input_ids.shape
+        
+        # Generation loop
+        generated = input_ids
+        
+        for step in range(max_length - prompt_length):
+            # Generate next token
+            rng_key, step_key = jax.random.split(rng_key)
+            next_token = self.generate_fn(
+                generated,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                rng_key=step_key
+            )
+            
+            # Add to sequence
+            generated = jnp.concatenate([generated, next_token[:, None]], axis=-1)
+            
+            # Check for EOS
+            if eos_token_id is not None and jnp.all(next_token == eos_token_id):
+                break
+            
+            # Check minimum length
+            if step + prompt_length >= min_length and eos_token_id is not None:
+                if jnp.any(next_token == eos_token_id):
+                    break
+        
+        # Extract generated tokens (remove prompt)
+        generated_tokens = generated[0, prompt_length:].tolist()
+        
+        # Convert back to string if needed
+        if return_string:
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer required for string output")
+            return self.tokenizer.decode(generated_tokens)
+        else:
+            return generated_tokens
+    
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
         max_length: int = 512,
         temperature: float = 0.7,
-        top_p: float = 0.95,
-        mode: str = 'standard'
-    ) -> Dict[str, Any]:
-        """
-        Generate text using specified mode.
+        **kwargs
+    ) -> str:
+        """Chat completion interface."""
         
-        Args:
-            prompt: Input prompt
-            max_length: Maximum sequence length
-            temperature: Sampling temperature
-            top_p: Nucleus sampling threshold
-            mode: Generation mode ('standard', 'cot', or 'tot')
-        """
-        if mode == 'cot':
-            return self.cot.reason(
-                prompt,
-                num_paths=self.config.get('num_reasoning_paths', 3)
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer required for chat interface")
+        
+        # Format messages into prompt
+        prompt = self._format_chat_prompt(messages)
+        
+        # Generate response
+        response = self.generate(
+            prompt,
+            max_length=max_length,
+            temperature=temperature,
+            **kwargs
+        )
+        
+        return response
+    
+    def _format_chat_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """Format chat messages into a prompt."""
+        
+        formatted_prompt = ""
+        
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            
+            if role == "system":
+                formatted_prompt += f"System: {content}\n"
+            elif role == "user":
+                formatted_prompt += f"User: {content}\n"
+            elif role == "assistant":
+                formatted_prompt += f"Assistant: {content}\n"
+        
+        formatted_prompt += "Assistant: "
+        
+        return formatted_prompt
+
+
+class MultimodalGenerator:
+    """Generator for multimodal inputs."""
+    
+    def __init__(
+        self,
+        model: VishwamAIModel,
+        params: Dict[str, Any],
+        processor: MultimodalProcessor,
+        tokenizer: Any = None
+    ):
+        self.model = model
+        self.params = params
+        self.processor = processor
+        self.tokenizer = tokenizer
+        
+        # JIT compile functions
+        self.generate_fn = jax.jit(self._generate_step)
+    
+    def _generate_step(
+        self,
+        embeddings: chex.Array,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        rng_key: Optional[jax.random.PRNGKey] = None
+    ) -> chex.Array:
+        """Generate next token from embeddings."""
+        
+        # Forward pass
+        logits = self.model.apply(
+            self.params,
+            embeddings,
+            training=False,
+            method=self.model.forward_embeddings  # Assume we have this method
+        )
+        
+        # Sample next token
+        next_token_logits = logits[:, -1, :] / temperature
+        
+        if top_k > 0:
+            top_k_indices = jnp.argsort(next_token_logits, axis=-1)[:, -top_k:]
+            min_top_k = jnp.take_along_axis(
+                next_token_logits, top_k_indices[:, 0:1], axis=-1
             )
-        elif mode == 'tot':
-            # Fix: Call search() instead of reason()
-            objective = self.config.get('tot_evaluation_criteria', "Provide a logical and comprehensive answer")
-            thoughts = self.tot.search(
-                initial_prompt=prompt,
-                objective=objective,
-                max_steps=self.config.get('tot_max_steps', 10)
+            next_token_logits = jnp.where(
+                next_token_logits < min_top_k,
+                -jnp.inf,
+                next_token_logits
             )
-            return {
-                'thoughts': thoughts,
-                'text': '\n'.join(thoughts) if thoughts else ''
-            }
+        
+        if rng_key is not None:
+            next_token = jax.random.categorical(rng_key, next_token_logits)
         else:
-            # Standard generation
-            input_ids = self.tokenizer.encode(prompt)
-            output = self.model.generate(
-                input_ids,
-                max_length=max_length,
+            next_token = jnp.argmax(next_token_logits, axis=-1)
+        
+        return next_token
+    
+    def generate_from_multimodal(
+        self,
+        text: Optional[str] = None,
+        images: Optional[chex.Array] = None,
+        audio: Optional[chex.Array] = None,
+        max_length: int = 512,
+        temperature: float = 0.7,
+        seed: Optional[int] = None
+    ) -> str:
+        """Generate text from multimodal inputs."""
+        
+        # Setup RNG
+        if seed is not None:
+            rng_key = jax.random.PRNGKey(seed)
+        else:
+            rng_key = jax.random.PRNGKey(int(time.time()))
+        
+        # Process inputs
+        text_ids = None
+        if text is not None:
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer required for text input")
+            text_ids = jnp.array([self.tokenizer.encode(text)], dtype=jnp.int32)
+        
+        # Get multimodal embeddings
+        embeddings = self.processor(
+            text_ids=text_ids,
+            images=images,
+            audio=audio,
+            training=False
+        )
+        
+        # Generate response tokens
+        generated_tokens = []
+        current_embeddings = embeddings
+        
+        for _ in range(max_length):
+            rng_key, step_key = jax.random.split(rng_key)
+            
+            next_token = self.generate_fn(
+                current_embeddings,
                 temperature=temperature,
-                top_p=top_p
+                rng_key=step_key
             )
-            return {
-                'text': self.tokenizer.decode(output[0]),
-                'output_ids': output
-            }
-    
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        if self.state is not None:
-            with open(path, 'wb') as f:
-                f.write(flax.serialization.to_bytes(self.state))
-    
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint."""
-        if self.state is not None:
-            with open(path, 'rb') as f:
-                self.state = flax.serialization.from_bytes(
-                    self.state,
-                    f.read()
-                )
+            
+            generated_tokens.append(int(next_token[0]))
+            
+            # Convert token to embedding and append
+            if self.tokenizer.eos_token_id and next_token[0] == self.tokenizer.eos_token_id:
+                break
+            
+            # TODO: Implement token-to-embedding conversion for continuation
+            # This would require extending the model to handle mixed embeddings/tokens
+        
+        # Decode tokens to text
+        if self.tokenizer is None:
+            return " ".join(map(str, generated_tokens))
         else:
-            raise ValueError("Initialize training state before loading checkpoint")
+            return self.tokenizer.decode(generated_tokens)
+
+
+def pipeline(
+    task: str,
+    model: Optional[str] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    device_map: str = "auto",
+    **kwargs
+) -> Union[TextGenerator, MultimodalGenerator]:
+    """Create a pipeline for various tasks.
+    
+    Args:
+        task: Task type ("text-generation", "chat", "multimodal-generation")
+        model: Model name or path
+        model_kwargs: Additional model arguments
+        device_map: Device mapping strategy
+        **kwargs: Additional pipeline arguments
+    
+    Returns:
+        Appropriate generator instance
+    """
+    
+    if model_kwargs is None:
+        model_kwargs = {}
+    
+    # For now, return a basic text generator
+    # In a full implementation, this would load models from HuggingFace or local paths
+    
+    if task == "text-generation":
+        # Create basic configuration
+        config = ModelConfig(
+            dim=2048,
+            depth=24,
+            heads=32,
+            vocab_size=50304
+        )
+        
+        # Create model (would normally load from checkpoint)
+        model_instance = VishwamAIModel(config)
+        
+        # Initialize dummy parameters (would normally load from checkpoint)
+        dummy_input = jnp.ones((1, 10), dtype=jnp.int32)
+        params = model_instance.init(jax.random.PRNGKey(0), dummy_input)
+        
+        return TextGenerator(model_instance, params, config=config)
+    
+    elif task == "multimodal-generation":
+        # Create multimodal configuration
+        config = ModelConfig(
+            dim=2048,
+            depth=24,
+            heads=32,
+            vocab_size=50304,
+            enable_multimodal=True
+        )
+        
+        # Create model and processor
+        model_instance = VishwamAIModel(config)
+        processor = MultimodalProcessor(
+            vocab_size=config.vocab_size,
+            embed_dim=config.dim,
+            vision_config={"image_size": 224, "patch_size": 16},
+            audio_config={"n_mels": 80}
+        )
+        
+        # Initialize parameters
+        dummy_input = jnp.ones((1, 10), dtype=jnp.int32)
+        params = model_instance.init(jax.random.PRNGKey(0), dummy_input)
+        
+        return MultimodalGenerator(model_instance, params, processor)
+    
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+
+
+# Utility functions for common inference patterns
+
+def generate_text(
+    prompt: str,
+    model_path: Optional[str] = None,
+    max_length: int = 512,
+    temperature: float = 0.7,
+    **kwargs
+) -> str:
+    """Quick text generation function."""
+    
+    generator = pipeline("text-generation", model=model_path)
+    return generator.generate(
+        prompt,
+        max_length=max_length,
+        temperature=temperature,
+        **kwargs
+    )
+
+
+def chat_completion(
+    messages: List[Dict[str, str]],
+    model_path: Optional[str] = None,
+    **kwargs
+) -> str:
+    """Quick chat completion function."""
+    
+    generator = pipeline("text-generation", model=model_path)
+    return generator.chat(messages, **kwargs)
+
+
+def multimodal_completion(
+    prompt: str,
+    images: Optional[chex.Array] = None,
+    audio: Optional[chex.Array] = None,
+    model_path: Optional[str] = None,
+    **kwargs
+) -> str:
+    """Quick multimodal completion function."""
+    
+    generator = pipeline("multimodal-generation", model=model_path)
+    return generator.generate_from_multimodal(
+        text=prompt,
+        images=images,
+        audio=audio,
+        **kwargs
+    )

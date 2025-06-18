@@ -1,270 +1,304 @@
-"""VishwamAI model implementation."""
+"""
+Core model architecture for VishwamAI.
 
-from .layers.layers import (
-    TPUGEMMLinear,
-    TPULayerNorm,
-    TPUMultiHeadAttention,
-    TPUMoELayer
-)
-from .thoughts.tot import TreeOfThoughts
-from .thoughts.cot import ChainOfThoughtPrompting
+Implements a unified Transformer-based architecture that can handle multiple modalities
+through tokenization into a shared sequence space.
+"""
 
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
-from typing import Any, Dict, Optional, Tuple
+from flax import linen as nn
+from flax.training import train_state
+import optax
+from typing import Dict, Optional, Tuple, Any
 from dataclasses import dataclass
+import chex
+
+from .attention import FlashAttention, OptimizedAttention
+from .layers import FeedForward, RMSNorm, RotaryEmbedding
+from .kernels import get_optimal_kernels
+
 
 @dataclass
-class VishwamAIConfig:
+class ModelConfig:
     """Configuration for VishwamAI model."""
-    vocab_size: int = 32000
-    hidden_dim: int = 2048
-    num_layers: int = 24
-    num_heads: int = 16
-    head_dim: int = 128
-    mlp_dim: int = 8192
-    max_seq_len: int = 2048
+    
+    # Model dimensions
+    dim: int = 2048
+    depth: int = 32
+    heads: int = 32
+    head_dim: Optional[int] = None
+    vocab_size: int = 50304
+    max_seq_len: int = 8192
+    
+    # Efficiency features
     dropout_rate: float = 0.1
-    attention_dropout: float = 0.1
-    use_flash_attn: bool = True
-    gradient_checkpointing: bool = False
-    max_branches: int = 3
-    max_depth: int = 3
-    beam_width: int = 5
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 50
-
+    use_flash_attention: bool = True
+    use_grouped_query_attention: bool = True
+    gqa_groups: int = 8
+    use_rmsnorm: bool = True
+    use_rotary_embeddings: bool = True
+    
+    # Multimodal features
+    vision_patch_size: int = 16
+    vision_dim: int = 1024
+    audio_dim: int = 512
+    enable_multimodal: bool = True
+    
+    # Mixed Expert features
+    expert_count: int = 8
+    expert_capacity: int = 4
+    use_moe: bool = False
+    
+    # Hardware optimizations
+    use_bfloat16: bool = True
+    gradient_checkpointing: bool = True
+    kernel_fusion: bool = True
+    
     def __post_init__(self):
-        """Validate configuration parameters."""
-        if self.vocab_size <= 0:
-            raise ValueError("vocab_size must be positive")
-        if self.hidden_dim <= 0:
-            raise ValueError("hidden_dim must be positive")
-        if self.num_layers <= 0:
-            raise ValueError("num_layers must be positive")
+        if self.head_dim is None:
+            self.head_dim = self.dim // self.heads
+        assert self.dim % self.heads == 0, "dim must be divisible by heads"
 
-class VishwamAI(nn.Module):
-    """TPU-optimized language model with advanced reasoning capabilities."""
-    config: VishwamAIConfig
-
-    def setup(self):
-        """Initialize the model components."""
-        # Initialize attention module
-        self.attention = TPUMultiHeadAttention(
-            num_heads=self.config.num_heads,
-            head_dim=self.config.head_dim,
-            dropout_rate=self.config.attention_dropout,
-            use_flash_attn=self.config.use_flash_attn
-        )
-        
-        # Other components
-        self.dropout = nn.Dropout(rate=self.config.dropout_rate)
-        
-        # Token embedding
-        self.token_embedding = nn.Embed(
-            num_embeddings=self.config.vocab_size,
-            features=self.config.hidden_dim
-        )
-        
-        # Position embedding
-        self.position_embedding = nn.Embed(
-            num_embeddings=self.config.max_seq_len,
-            features=self.config.hidden_dim
-        )
-        
-        # Output head
-        self.output_proj = TPUGEMMLinear(
-            features=self.config.vocab_size,
-            use_bias=True
-        )
-
-    def compute_attention(
-        self,
-        query: jnp.ndarray,
-        key: jnp.ndarray,
-        value: jnp.ndarray,
-        mask: Optional[jnp.ndarray] = None,
-        deterministic: bool = True,
-        rng: Optional[Any] = None
-    ) -> jnp.ndarray:
-        """Compute attention using the model's attention mechanism."""
-        # This can be called from outside since it doesn't rely on setup() fields
-        attn = TPUMultiHeadAttention(
-            num_heads=self.config.num_heads,
-            head_dim=self.config.head_dim,
-            dropout_rate=self.config.attention_dropout,
-            use_flash_attn=self.config.use_flash_attn,
-            name='compute_attention'
-        )
-        return attn(query, key, value, mask=mask, deterministic=deterministic, rng=rng)
-
-    @nn.compact
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        deterministic: bool = True,
-        rngs: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, jnp.ndarray]:
-        """Forward pass through the model."""
-        if rngs is None:
-            rngs = {}
-
-        # Cast inputs to bfloat16 for TPU efficiency
-        x = self.token_embedding(input_ids.astype(jnp.int32))
-
-        # Add positional embeddings
-        positions = jnp.arange(input_ids.shape[1])[None]
-        x = x + self.position_embedding(positions)
-
-        # Optional dropout for training
-        x = self.dropout(x, deterministic=deterministic, rng=rngs.get('dropout'))
-
-        # Process through transformer blocks
-        for i in range(self.config.num_layers):
-            x = TransformerBlock(
-                config=self.config,
-                name=f'block_{i}'
-            )(x, deterministic=deterministic, rngs=rngs)
-
-        # Final layer norm and output projection
-        x = TPULayerNorm(
-            epsilon=1e-5,
-            dtype=jnp.bfloat16,
-            name='ln_f'
-        )(x)
-        logits = self.output_proj(x)
-
-        return {"logits": logits}
-
-    def initialize_kv_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        num_heads: int,
-        head_dim: int
-    ) -> Dict[str, jnp.ndarray]:
-        """Initialize key-value cache for inference."""
-        return {
-            'key_cache': jnp.zeros((batch_size, max_length, num_heads, head_dim), dtype=jnp.float32),
-            'value_cache': jnp.zeros((batch_size, max_length, num_heads, head_dim), dtype=jnp.float32),
-            'cur_index': 0
-        }
-
-    def memory_efficient_attention(
-        self,
-        query: jnp.ndarray,
-        key: jnp.ndarray,
-        value: jnp.ndarray,
-        mask: Optional[jnp.ndarray] = None,
-        deterministic: bool = True,
-        rngs: Optional[Dict[str, Any]] = None
-    ) -> jnp.ndarray:
-        """Memory-efficient attention implementation."""
-        # Compute attention scores with flash attention when possible
-        scale = 1.0 / jnp.sqrt(query.shape[-1])
-
-        # Handle batch, seq_len, num_heads, head_dim properly
-        b, s, h, d = query.shape
-        q_reshaped = query.transpose(0, 2, 1, 3)  # [b, h, s, d]
-        k_reshaped = key.transpose(0, 2, 1, 3)    # [b, h, s, d]
-        v_reshaped = value.transpose(0, 2, 1, 3)   # [b, h, s, d]
-
-        scores = jnp.matmul(q_reshaped, jnp.swapaxes(k_reshaped, -2, -1)) * scale
-
-        if mask is not None:
-            scores = jnp.where(mask[:, None, None, :], scores, float('-inf'))
-
-        # Apply softmax
-        weights = jax.nn.softmax(scores, axis=-1)
-
-        if not deterministic:
-            dropout = nn.Dropout(
-                rate=self.config.dropout_rate,
-                broadcast_dims=(1, 2),
-                rng_collection='dropout'
-            )
-            weights = dropout(weights, deterministic=False, rng=rngs.get('dropout') if rngs else None)
-
-        # Compute attention output and restore original shape
-        output = jnp.matmul(weights, v_reshaped)  # [b, h, s, d]
-        output = output.transpose(0, 2, 1, 3)      # [b, s, h, d]
-
-        return output
 
 class TransformerBlock(nn.Module):
-    """Transformer block with TPU optimizations."""
-    config: VishwamAIConfig
-
+    """Single transformer block with optimizations."""
+    
+    config: ModelConfig
+    
     def setup(self):
-        """Initialize transformer block components."""
-        # Initialize attention module
-        self.attention = TPUMultiHeadAttention(
-            num_heads=self.config.num_heads,
-            head_dim=self.config.head_dim,
-            dropout_rate=self.config.attention_dropout,
-            use_flash_attn=self.config.use_flash_attn
-        )
-        
-        # MLP components
-        self.mlp_dense1 = TPUGEMMLinear(
-            features=self.config.mlp_dim,
-            use_bias=True,
-            dtype=jnp.bfloat16
-        )
-        self.mlp_dense2 = TPUGEMMLinear(
-            features=self.config.hidden_dim,
-            use_bias=True,
-            dtype=jnp.bfloat16
-        )
-        
-        # Layer norms
-        self.ln1 = TPULayerNorm(epsilon=1e-5, dtype=jnp.bfloat16)
-        self.ln2 = TPULayerNorm(epsilon=1e-5, dtype=jnp.bfloat16)
-        
-        # Dropouts
-        self.dropout = nn.Dropout(rate=self.config.dropout_rate)
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True, rngs: Optional[Dict[str, Any]] = None) -> jnp.ndarray:
-        """Forward pass through transformer block with memory optimizations."""
-        if rngs is None:
-            rngs = {}
-
-        # Split computation for gradient checkpointing
-        def attention_block(x):
-            x_norm = self.ln1(x)
-            attn_output = self.attention(
-                x_norm, x_norm, x_norm,  # q, k, v
-                deterministic=deterministic,
-                rng=rngs.get('dropout')
+        # Attention layer
+        if self.config.use_flash_attention:
+            self.attention = FlashAttention(
+                dim=self.config.dim,
+                heads=self.config.heads,
+                head_dim=self.config.head_dim,
+                dropout=self.config.dropout_rate,
+                use_gqa=self.config.use_grouped_query_attention,
+                gqa_groups=self.config.gqa_groups
             )
-            if not deterministic:
-                attn_output = self.dropout(
-                    attn_output,
-                    deterministic=deterministic,
-                    rng=rngs.get('dropout')
-                )
-            return x + attn_output
-
-        def mlp_block(x):
-            x_norm = self.ln2(x)
-            h = self.mlp_dense1(x_norm)
-            h = jax.nn.gelu(h)
-            if not deterministic:
-                h = self.dropout(h, deterministic=deterministic, rng=rngs.get('dropout'))
-            h = self.mlp_dense2(h)
-            if not deterministic:
-                h = self.dropout(h, deterministic=deterministic, rng=rngs.get('dropout'))
-            return x + h
-
-        # Apply blocks with optional gradient checkpointing
-        if self.config.gradient_checkpointing:
-            x = jax.checkpoint(attention_block)(x)
-            x = jax.checkpoint(mlp_block)(x)
         else:
-            x = attention_block(x)
-            x = mlp_block(x)
-
+            self.attention = OptimizedAttention(
+                dim=self.config.dim,
+                heads=self.config.heads,
+                head_dim=self.config.head_dim,
+                dropout=self.config.dropout_rate
+            )
+        
+        # Feed forward layer
+        self.ff = FeedForward(
+            dim=self.config.dim,
+            hidden_dim=self.config.dim * 4,
+            dropout=self.config.dropout_rate,
+            use_moe=self.config.use_moe,
+            expert_count=self.config.expert_count,
+            expert_capacity=self.config.expert_capacity
+        )
+        
+        # Normalization layers
+        if self.config.use_rmsnorm:
+            self.norm1 = RMSNorm(self.config.dim)
+            self.norm2 = RMSNorm(self.config.dim)
+        else:
+            self.norm1 = nn.LayerNorm(self.config.dim)
+            self.norm2 = nn.LayerNorm(self.config.dim)
+    
+    def __call__(self, x: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
+        # Pre-norm architecture for better stability
+        attn_out = self.attention(self.norm1(x), mask=mask)
+        x = x + attn_out
+        
+        ff_out = self.ff(self.norm2(x))
+        x = x + ff_out
+        
         return x
+
+
+class VishwamAIModel(nn.Module):
+    """Main VishwamAI model with multimodal capabilities."""
+    
+    config: ModelConfig
+    
+    def setup(self):
+        # Token embeddings
+        self.token_embedding = nn.Embed(
+            num_embeddings=self.config.vocab_size,
+            features=self.config.dim
+        )
+        
+        # Positional embeddings
+        if self.config.use_rotary_embeddings:
+            self.pos_embedding = RotaryEmbedding(
+                dim=self.config.head_dim,
+                max_seq_len=self.config.max_seq_len
+            )
+        else:
+            self.pos_embedding = nn.Embed(
+                num_embeddings=self.config.max_seq_len,
+                features=self.config.dim
+            )
+        
+        # Transformer blocks
+        self.blocks = [
+            TransformerBlock(self.config)
+            for _ in range(self.config.depth)
+        ]
+        
+        # Final normalization
+        if self.config.use_rmsnorm:
+            self.final_norm = RMSNorm(self.config.dim)
+        else:
+            self.final_norm = nn.LayerNorm(self.config.dim)
+        
+        # Output projection
+        self.output_projection = nn.Dense(
+            features=self.config.vocab_size,
+            use_bias=False
+        )
+        
+        # Dropout
+        self.dropout = nn.Dropout(rate=self.config.dropout_rate)
+    
+    def __call__(
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        training: bool = True
+    ) -> chex.Array:
+        """Forward pass through the model."""
+        
+        # Token embeddings
+        x = self.token_embedding(input_ids)
+        
+        # Positional embeddings
+        seq_len = input_ids.shape[-1]
+        if self.config.use_rotary_embeddings:
+            # RoPE is applied within attention layers
+            pass
+        else:
+            positions = jnp.arange(seq_len)
+            pos_emb = self.pos_embedding(positions)
+            x = x + pos_emb
+        
+        # Apply dropout
+        x = self.dropout(x, deterministic=not training)
+        
+        # Apply transformer blocks with optional gradient checkpointing
+        for block in self.blocks:
+            if self.config.gradient_checkpointing and training:
+                x = nn.remat(block)(x, mask=attention_mask)
+            else:
+                x = block(x, mask=attention_mask)
+        
+        # Final normalization
+        x = self.final_norm(x)
+        
+        # Output projection
+        logits = self.output_projection(x)
+        
+        return logits
+    
+    def generate(
+        self,
+        params: Dict[str, Any],
+        input_ids: chex.Array,
+        max_length: int = 512,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        rng_key: Optional[jax.random.PRNGKey] = None
+    ) -> chex.Array:
+        """Generate text using the model."""
+        
+        if rng_key is None:
+            rng_key = jax.random.PRNGKey(0)
+        
+        batch_size, seq_len = input_ids.shape
+        generated = input_ids
+        
+        for _ in range(max_length - seq_len):
+            # Get logits for next token
+            logits = self.apply(params, generated, training=False)
+            next_token_logits = logits[:, -1, :] / temperature
+            
+            # Apply top-k and top-p filtering
+            if top_k > 0:
+                top_k_indices = jnp.argsort(next_token_logits, axis=-1)[:, -top_k:]
+                top_k_logits = jnp.take_along_axis(next_token_logits, top_k_indices, axis=-1)
+                next_token_logits = jnp.where(
+                    jnp.arange(next_token_logits.shape[-1])[None, :] >= top_k_indices[:, 0:1],
+                    next_token_logits,
+                    -jnp.inf
+                )
+            
+            # Sample next token
+            rng_key, sample_key = jax.random.split(rng_key)
+            next_token = jax.random.categorical(sample_key, next_token_logits)
+            
+            # Append to sequence
+            generated = jnp.concatenate([generated, next_token[:, None]], axis=-1)
+            
+            # Check for EOS token (assuming token ID 2)
+            if jnp.all(next_token == 2):
+                break
+        
+        return generated
+
+
+def create_integrated_model(config: ModelConfig) -> Dict[str, Any]:
+    """Create an integrated VishwamAI model with all components."""
+    
+    # Get optimal kernels for current hardware
+    kernels = get_optimal_kernels()
+    
+    # Create model
+    model = VishwamAIModel(config)
+    
+    # Create optimizer
+    optimizer = optax.adamw(
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        b1=0.9,
+        b2=0.95
+    )
+    
+    # Setup mixed precision if enabled
+    if config.use_bfloat16:
+        optimizer = optax.apply_if_finite(optimizer, max_consecutive_errors=5)
+    
+    return {
+        'model': model,
+        'optimizer': optimizer,
+        'kernels': kernels,
+        'config': config
+    }
+
+
+def create_train_state(
+    model: VishwamAIModel,
+    config: ModelConfig,
+    rng_key: jax.random.PRNGKey,
+    learning_rate: float = 1e-4
+) -> train_state.TrainState:
+    """Create training state for the model."""
+    
+    # Initialize parameters
+    dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
+    params = model.init(rng_key, dummy_input, training=True)
+    
+    # Create optimizer
+    optimizer = optax.adamw(
+        learning_rate=learning_rate,
+        weight_decay=0.01,
+        b1=0.9,
+        b2=0.95
+    )
+    
+    # Create training state
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=optimizer
+    )
+    
+    return state

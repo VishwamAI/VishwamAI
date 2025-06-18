@@ -1,0 +1,37 @@
+{
+  "model_config": {
+    "dim": 8192,
+    "depth": 40,
+    "heads": 64,
+    "head_dim": 128,
+    "vocab_size": 50304,
+    "max_seq_len": 8192,
+    "dropout_rate": 0.1,
+    "use_flash_attention": true,
+    "use_grouped_query_attention": true,
+    "gqa_groups": 16,
+    "use_rmsnorm": true,
+    "use_rotary_embeddings": true,
+    "vision_patch_size": 16,
+    "vision_dim": 1536,
+    "audio_dim": 768,
+    "enable_multimodal": true,
+    "expert_count": 16,
+    "expert_capacity": 8,
+    "use_moe": true,
+    "use_bfloat16": true,
+    "gradient_checkpointing": true,
+    "kernel_fusion": true
+  },
+  "description": "Large VishwamAI model with MoE for high-performance multimodal tasks",
+  "estimated_parameters": "20B",
+  "estimated_memory": {
+    "inference_gb": 40.0,
+    "training_gb": 160.0
+  },
+  "recommended_hardware": [
+    "Multiple GPUs (A100 80GB)",
+    "TPU v4 Pod",
+    "High-memory CPU cluster"
+  ]
+}

@@ -1,0 +1,41 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include QUICKSTART.md
+include requirements.txt
+include pytest.ini
+include Makefile
+
+# Include configuration files
+recursive-include configs *.json
+
+# Include documentation
+recursive-include docs *.md *.markdown
+
+# Include examples
+recursive-include examples *.py
+
+# Include scripts
+recursive-include scripts *.py
+
+# Include research papers and documentation
+recursive-include Research *.pdf
+
+# Include notebooks
+recursive-include notebooks *.ipynb *.sh
+
+# Include model analysis
+recursive-include "model analysis" *.py
+
+# Exclude cache and build files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude .git*
+global-exclude .pytest_cache
+global-exclude .coverage
+global-exclude *.egg-info

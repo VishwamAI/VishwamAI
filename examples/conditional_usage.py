@@ -3,7 +3,7 @@
 import jax
 import jax.numpy as jnp
 from vishwamai import VishwamAI
-from vishwamai.layers.layers import (
+from vishwamai.layers import (
     DynamicChannelGating,
     ConditionalInfoGainNode,
     CIGTLayer,

@@ -150,3 +150,11 @@ tmp/
 temp/
 scratch/
 *.bak
+
+# Demo and temporary files
+demo_*.py
+framework_status.py
+quickstart_*.py
+test_advanced_*.py
+*_demo.py
+*_test_*.py

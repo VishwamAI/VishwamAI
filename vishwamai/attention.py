@@ -327,3 +327,18 @@ class SparseAttention(nn.Module):
         mask = mask & causal_mask
         
         return mask[None, None, :, :]  # Add batch and head dimensions
+
+# Standard aliases for compatibility
+Attention = OptimizedAttention
+MultiHeadAttention = OptimizedAttention
+
+# Export all attention classes
+__all__ = [
+    'RotaryEmbedding',
+    'FlashAttention', 
+    'OptimizedAttention',
+    'SparseAttention',
+    'Attention',
+    'MultiHeadAttention',
+    'apply_rotary_pos_emb'
+]

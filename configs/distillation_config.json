@@ -1,0 +1,70 @@
+{
+  "model_config": {
+    "student_config": {
+      "dim": 1024,
+      "depth": 12,
+      "heads": 16,
+      "head_dim": 64,
+      "vocab_size": 50304,
+      "max_seq_len": 1024,
+      "dropout_rate": 0.1,
+      "use_flash_attention": true,
+      "use_grouped_query_attention": true,
+      "gqa_groups": 4,
+      "use_rmsnorm": true,
+      "use_rotary_embeddings": true
+    },
+    "teacher_model_name": "microsoft/DialoGPT-medium",
+    "use_multiple_teachers": false,
+    "teacher_models": ["microsoft/DialoGPT-medium"]
+  },
+  "training_config": {
+    "num_train_epochs": 3,
+    "per_device_train_batch_size": 8,
+    "per_device_eval_batch_size": 8,
+    "learning_rate": 5e-5,
+    "weight_decay": 0.01,
+    "max_seq_length": 512,
+    "warmup_steps": 500,
+    "logging_steps": 100,
+    "save_steps": 1000,
+    "eval_steps": 500,
+    "output_dir": "./distillation_outputs",
+    "overwrite_output_dir": true,
+    "remove_unused_columns": false,
+    "load_best_model_at_end": true,
+    "metric_for_best_model": "eval_loss",
+    "greater_is_better": false,
+    "save_total_limit": 3
+  },
+  "distillation_config": {
+    "temperature": 4.0,
+    "distillation_alpha": 0.7,
+    "use_attention_distillation": false,
+    "use_hidden_state_distillation": false,
+    "use_progressive_distillation": false,
+    "progressive_stages": []
+  },
+  "data_config": {
+    "use_synthetic_data": false,
+    "synthetic_data_ratio": 0.2,
+    "max_synthetic_samples": 1000,
+    "synthetic_data_quality_threshold": 0.7
+  },
+  "tracking_config": {
+    "use_duckdb": true,
+    "db_path": "./vishwamai_experiments.duckdb",
+    "experiment_name": "vishwamai_distillation",
+    "log_predictions": true,
+    "log_attention_weights": false,
+    "save_training_logs": true,
+    "export_to_csv": true,
+    "generate_plots": true
+  },
+  "hardware_config": {
+    "use_mixed_precision": true,
+    "gradient_checkpointing": true,
+    "dataloader_num_workers": 4,
+    "pin_memory": true
+  }
+}

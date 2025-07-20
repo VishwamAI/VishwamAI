@@ -267,7 +267,7 @@ class FeedForward(nn.Module):
         
         for depth in range(self.max_recursion_depth):
             # Create mask for tokens using this depth
-            depth_mask = (topk_depth_indices == depth).any(axis=-1, keepdims=True)  # [batch, seq, 1]
+            depth_mask = jnp.isin(depth, topk_depth_indices).reshape(batch_size, seq_len, 1)  # [batch, seq, 1]
             active_tokens = jnp.where(depth_mask, x, 0)
             
             if depth == 0:

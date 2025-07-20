@@ -199,7 +199,7 @@ class FeedForward(nn.Module):
         
         # Apply dropout
         if training:
-            output = self.dropout_layer(output, deterministic=training)
+            output = self.dropout_layer(output, deterministic=not training)
         
         return output
     

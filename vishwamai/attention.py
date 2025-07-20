@@ -42,6 +42,10 @@ def apply_rotary_pos_emb(q: chex.Array, k: chex.Array, cos: chex.Array, sin: che
         x1, x2 = jnp.split(x, 2, axis=-1)
         return jnp.concatenate([-x2, x1], axis=-1)
     
+    # Reshape cos/sin to match q/k dimensions: (seq_len, head_dim) -> (1, seq_len, 1, head_dim)
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
+    
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     
@@ -63,6 +67,7 @@ class FlashAttention(nn.Module):
     use_gqa: bool = True
     gqa_groups: int = 8
     block_size: int = 128
+    support_recursion: bool = False
     
     def setup(self):
         self.scale = 1.0 / math.sqrt(self.head_dim)
@@ -170,6 +175,34 @@ class FlashAttention(nn.Module):
         out = jnp.einsum('bhij,bhjd->bhid', attn_weights, v)
         
         return out
+    
+    def _selective_attention(
+        self,
+        q: chex.Array,
+        k: chex.Array, 
+        v: chex.Array,
+        active_mask: chex.Array,
+        training: bool
+    ) -> chex.Array:
+        """Attention computation only for active tokens."""
+        
+        q_masked = jnp.where(active_mask[..., None], q, 0)
+        
+        # Standard attention computation with masked queries
+        scores = jnp.einsum('bhid,bhjd->bhij', q_masked, k) * self.scale
+        
+        # Apply causal mask and active token mask
+        seq_len = q.shape[2]
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        combined_mask = causal_mask & active_mask[..., None]
+        
+        scores = jnp.where(combined_mask, scores, -jnp.inf)
+        attn_weights = jax.nn.softmax(scores, axis=-1)
+        
+        if training:
+            attn_weights = self.dropout_layer(attn_weights, deterministic=False)
+        
+        return jnp.einsum('bhij,bhjd->bhid', attn_weights, v)
 
 
 class OptimizedAttention(nn.Module):

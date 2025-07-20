@@ -451,11 +451,14 @@ class AttentionPoolingHead(nn.Module):
 
 
 class FeedForwardNetwork(nn.Module):
-    """Feed-forward network with SwiGLU activation."""
+    """Feed-forward network with SwiGLU activation and optional recursion support."""
     
     embed_dim: int
     hidden_dim: int
     dropout: float = 0.1
+    use_recursion: bool = False
+    max_recursion_depth: int = 3
+    recursion_capacity: int = 2
     
     def setup(self):
         # SwiGLU requires two linear projections for gating
@@ -533,7 +536,10 @@ class MultimodalTransformerLayer(nn.Module):
         self.mlp = FeedForwardNetwork(
             embed_dim=self.config.embed_dim,
             hidden_dim=self.config.embed_dim * 4,
-            dropout=self.config.dropout
+            dropout=self.config.dropout,
+            use_recursion=getattr(self.config, 'use_recursion', False),
+            max_recursion_depth=getattr(self.config, 'max_recursion_depth', 3),
+            recursion_capacity=getattr(self.config, 'recursion_capacity', 2)
         )
         
         # Layer normalizations

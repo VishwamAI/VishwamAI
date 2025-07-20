@@ -263,7 +263,7 @@ class FeedForward(nn.Module):
         topk_depths = topk_depths / jnp.sum(topk_depths, axis=-1, keepdims=True)
         
         output = jnp.zeros_like(x)
-        kv_cache = {}
+        kv_cache = jnp.zeros((self.max_recursion_depth, batch_size, seq_len, dim), dtype=x.dtype)
         
         for depth in range(self.max_recursion_depth):
             # Create mask for tokens using this depth

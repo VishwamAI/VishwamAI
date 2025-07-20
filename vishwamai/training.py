@@ -69,9 +69,9 @@ class TrainingConfig:
     def __post_init__(self):
         if self.curriculum_stages is None:
             self.curriculum_stages = [
-                {"name": "simple", "steps": 10000, "max_seq_len": 512},
-                {"name": "medium", "steps": 30000, "max_seq_len": 1024},
-                {"name": "complex", "steps": 60000, "max_seq_len": 2048},
+                {"name": "simple", "steps": 10000, "max_seq_len": 512, "max_recursion_depth": 1},
+                {"name": "medium", "steps": 30000, "max_seq_len": 1024, "max_recursion_depth": 2},
+                {"name": "complex", "steps": 60000, "max_seq_len": 2048, "max_recursion_depth": 3},
             ]
         
         if self.lora_modules is None:

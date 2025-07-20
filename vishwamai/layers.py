@@ -66,10 +66,10 @@ class RotaryEmbedding(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Feed-forward network with optional MoE support.
+    """Feed-forward network with optional MoE and MoR support.
     
-    Implements both standard FFN and Mixture of Experts (MoE)
-    variants for improved parameter efficiency.
+    Implements standard FFN, Mixture of Experts (MoE), and 
+    Mixture of Recursions (MoR) variants for improved parameter efficiency.
     """
     
     dim: int
@@ -80,6 +80,11 @@ class FeedForward(nn.Module):
     expert_count: int = 8
     expert_capacity: int = 4
     use_bias: bool = False
+    
+    # Mixture of Recursions parameters
+    use_recursion: bool = False
+    max_recursion_depth: int = 3
+    recursion_capacity: int = 2
     
     def setup(self):
         kernels = get_optimal_kernels()
@@ -93,6 +98,14 @@ class FeedForward(nn.Module):
                 features=self.expert_count,
                 use_bias=self.use_bias,
                 name="router"
+            )
+        
+        if self.use_recursion:
+            # Mixture of Recursions setup
+            self.recursion_router = nn.Dense(
+                features=self.max_recursion_depth,
+                use_bias=self.use_bias,
+                name="recursion_router"
             )
         else:
             # Standard FFN
@@ -156,7 +169,9 @@ class FeedForward(nn.Module):
     def __call__(self, x: chex.Array, training: bool = True) -> chex.Array:
         """Forward pass through feed-forward network."""
         
-        if self.use_moe:
+        if self.use_recursion and self.use_moe:
+            return self._recursive_moe_forward(x, training)
+        elif self.use_moe:
             return self._moe_forward(x, training)
         else:
             return self._standard_forward(x, training)
@@ -184,7 +199,7 @@ class FeedForward(nn.Module):
         
         # Apply dropout
         if training:
-            output = self.dropout_layer(output, deterministic=False)
+            output = self.dropout_layer(output, deterministic=not training)
         
         return output
     
@@ -230,7 +245,44 @@ class FeedForward(nn.Module):
         
         # Apply dropout
         if training:
-            output = self.dropout_layer(output, deterministic=False)
+            output = self.dropout_layer(output, deterministic=training)
+        
+        return output
+    
+    def _recursive_moe_forward(self, x: chex.Array, training: bool) -> chex.Array:
+        """Mixture of Recursions forward pass with selective computation."""
+        
+        batch_size, seq_len, dim = x.shape
+        
+        recursion_logits = self.recursion_router(x)  # [batch, seq, max_depth]
+        recursion_weights = jax.nn.softmax(recursion_logits, axis=-1)
+        
+        # Select top-k recursion depths per token (ensure k <= available depths)
+        k = min(self.recursion_capacity, self.max_recursion_depth)
+        topk_depths, topk_depth_indices = jax.lax.top_k(recursion_weights, k)
+        topk_depths = topk_depths / jnp.sum(topk_depths, axis=-1, keepdims=True)
+        
+        output = jnp.zeros_like(x)
+        kv_cache = jnp.zeros((self.max_recursion_depth, batch_size, seq_len, dim), dtype=x.dtype)
+        
+        for depth in range(self.max_recursion_depth):
+            # Create mask for tokens using this depth
+            depth_mask = jnp.isin(depth, topk_depth_indices).reshape(batch_size, seq_len, 1)  # [batch, seq, 1]
+            active_tokens = jnp.where(depth_mask, x, 0)
+            
+            if depth == 0:
+                depth_output = self._moe_forward(active_tokens, training)
+                kv_cache[depth] = depth_output
+            else:
+                prev_kv = kv_cache.get(depth-1, jnp.zeros_like(active_tokens))
+                depth_output = self._moe_forward(active_tokens + prev_kv, training)
+                kv_cache[depth] = depth_output
+            
+            # Weight the output by recursion weights for this depth
+            depth_weight_mask = (topk_depth_indices == depth)  # [batch, seq, k]
+            if depth_weight_mask.any():
+                depth_weights = jnp.where(depth_weight_mask, topk_depths, 0).sum(axis=-1, keepdims=True)  # [batch, seq, 1]
+                output = output + depth_weights * depth_output
         
         return output
 

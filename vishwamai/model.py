@@ -50,6 +50,10 @@ class ModelConfig:
     expert_capacity: int = 4
     use_moe: bool = False
     
+    use_recursion: bool = False
+    max_recursion_depth: int = 3
+    recursion_capacity: int = 2
+    
     # Hardware optimizations
     use_bfloat16: bool = True
     gradient_checkpointing: bool = True
@@ -92,7 +96,10 @@ class TransformerBlock(nn.Module):
             dropout=self.config.dropout_rate,
             use_moe=self.config.use_moe,
             expert_count=self.config.expert_count,
-            expert_capacity=self.config.expert_capacity
+            expert_capacity=self.config.expert_capacity,
+            use_recursion=getattr(self.config, 'use_recursion', False),
+            max_recursion_depth=getattr(self.config, 'max_recursion_depth', 3),
+            recursion_capacity=getattr(self.config, 'recursion_capacity', 2)
         )
         
         # Normalization layers
@@ -186,7 +193,7 @@ class VishwamAIModel(nn.Module):
         # Apply transformer blocks with optional gradient checkpointing
         for block in self.blocks:
             if self.config.gradient_checkpointing and training:
-                x = nn.remat(block)(x, mask=attention_mask)
+                x = nn.remat(self.make_block_fn(block))(x, attention_mask)
             else:
                 x = block(x, mask=attention_mask)
         

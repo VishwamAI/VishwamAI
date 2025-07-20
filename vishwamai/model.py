@@ -193,11 +193,7 @@ class VishwamAIModel(nn.Module):
         # Apply transformer blocks with optional gradient checkpointing
         for block in self.blocks:
             if self.config.gradient_checkpointing and training:
-                def make_block_fn(block_instance):
-                    def block_fn(x, mask):
-                        return block_instance(x, mask=mask)
-                    return block_fn
-                x = nn.remat(make_block_fn(block))(x, attention_mask)
+                x = nn.remat(self.make_block_fn(block))(x, attention_mask)
             else:
                 x = block(x, mask=attention_mask)
         

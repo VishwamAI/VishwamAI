@@ -194,7 +194,8 @@ class FlashAttention(nn.Module):
         # Apply causal mask and active token mask
         seq_len = q.shape[2]
         causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        combined_mask = causal_mask & active_mask[..., None]
+        causal_mask = causal_mask[None, :, :]  # Reshape to [1, seq, seq]
+        combined_mask = causal_mask & active_mask[..., None]  # Broadcast to [batch, seq, seq]
         
         scores = jnp.where(combined_mask, scores, -jnp.inf)
         attn_weights = jax.nn.softmax(scores, axis=-1)

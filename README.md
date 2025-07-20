@@ -1,8 +1,10 @@
 # VishwamAI
 
-**Advanced generative AI framework like GPT, Claude, and Gemini - with efficient multimodal capabilities and curriculum learning support for resource-constrained environments.**
+**A cutting-edge generative AI framework for resource-constrained environments.**
 
-VishwamAI is a comprehensive generative AI framework for building and training multimodal AI models optimized for resource-constrained environments, similar to how GPT, Claude, and Gemini provide advanced language understanding and generation. It implements a unified Transformer-based architecture that can handle text, vision, and audio inputs through tokenization into a shared sequence space.
+Efficiently supports multimodal capabilities and curriculum learning, similar to GPT, Claude, and Gemini.
+
+VishwamAI is a comprehensive generative AI framework for building and training multimodal AI models optimized for resource-constrained environments. Similar to how GPT, Claude, and Gemini provide advanced language understanding and generation, it implements a unified Transformer-based architecture that can handle text, vision, and audio inputs through tokenization into a shared sequence space.
 
 ## 🏗️ Architecture Overview
 
